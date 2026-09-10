@@ -894,7 +894,7 @@ void OnPresent(command_queue *queue, swapchain *sc, const rect *, const rect *, 
     // the problem is downstream in the copy/encode pipeline.
     {
         static bool probed = false;
-        if (!probed && g.frame > 60)
+        if (!probed && g.frame > 1800)
         {
             probed = true;
             ComPtr<ID3D12CommandAllocator> diagAlloc;
