@@ -56,6 +56,9 @@ constexpr Profile kTargets[] = {
     { L"NFS16.exe", Tier::C, 1.0f,
       "NFS 2015" },
 
+    { L"Spider-Man2.exe", Tier::C, 1.0f,
+      "Marvel's Spider-Man 2, Direct3D 12 (Nixxes port; untested, first real AAA D3D12 target)" },
+
     { nullptr, Tier::C, 1.0f,
       "uncatalogued target" },
 };
