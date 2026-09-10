@@ -310,6 +310,155 @@ void Barrier(ID3D12GraphicsCommandList *c, ID3D12Resource *r, D3D12_RESOURCE_STA
     c->ResourceBarrier(1, &v);
 }
 
+// DIAGNOSTIC: read a D3D12_RESOURCE_STATE_PRESENT texture straight off the GPU, on its own
+// dedicated command list so it cannot disturb the caller's own recording, and dump it both as a
+// mean/min/max log line and as a viewable BMP. `logFrame` is just what gets printed; `tag`
+// distinguishes call sites ("pre"/"post") in the output filename.
+void CaptureBackbuffer(ID3D12Device *device, ID3D12CommandQueue *queue, ID3D12Resource *backbuffer,
+                        const D3D12_RESOURCE_DESC &bd, UINT64 logFrame, const wchar_t *tag)
+{
+    ComPtr<ID3D12CommandAllocator> diagAlloc;
+    ComPtr<ID3D12GraphicsCommandList> diagList;
+    const UINT bpp = 4;
+    const UINT rowPitch = (static_cast<UINT>(bd.Width) * bpp + 255) & ~255u;
+    const UINT64 size = static_cast<UINT64>(rowPitch) * bd.Height;
+    D3D12_HEAP_PROPERTIES rb {};
+    rb.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> raw;
+    if (!SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&diagAlloc))) ||
+        !SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, diagAlloc.Get(), nullptr,
+                                             IID_PPV_ARGS(&diagList))) ||
+        !SUCCEEDED(device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(&raw))))
+    {
+        Log("RAW PROBE (%ls): setup failed (command list or readback resource).", tag);
+        return;
+    }
+
+    Barrier(diagList.Get(), backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from {}, to {};
+    from.pResource = backbuffer;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.pResource = raw.Get();
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint.Footprint = { bd.Format, static_cast<UINT>(bd.Width), bd.Height, 1, rowPitch };
+    diagList->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    Barrier(diagList.Get(), backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    diagList->Close();
+    ID3D12CommandList *lists[] = { diagList.Get() };
+    queue->ExecuteCommandLists(1, lists);
+
+    ComPtr<ID3D12Fence> f;
+    if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))) &&
+        SUCCEEDED(queue->Signal(f.Get(), 1)))
+    {
+        if (HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr))
+        {
+            f->SetEventOnCompletion(1, ev);
+            WaitForSingleObject(ev, 2000);
+            CloseHandle(ev);
+        }
+    }
+    void *mapped = nullptr;
+    D3D12_RANGE range { 0, static_cast<SIZE_T>(size) };
+    if (!SUCCEEDED(raw->Map(0, &range, &mapped)))
+    {
+        Log("RAW PROBE (%ls): readback Map() failed.", tag);
+        return;
+    }
+
+    double sum = 0.0, mn = 1e9, mx = -1e9;
+    uint64_t n = 0;
+    const auto *bytes = static_cast<const uint8_t *>(mapped);
+    for (UINT y = 0; y < bd.Height; y += 4)
+        for (UINT x = 0; x < static_cast<UINT>(bd.Width); x += 4)
+        {
+            const uint8_t *px = bytes + static_cast<size_t>(y) * rowPitch + static_cast<size_t>(x) * bpp;
+            const double v = (px[0] + px[1] + px[2]) / (3.0 * 255.0);
+            sum += v;
+            mn = std::min(mn, v);
+            mx = std::max(mx, v);
+            ++n;
+        }
+    Log("RAW PROBE (%ls): back buffer at frame %llu, format %d, mean %.6f min %.6f max %.6f "
+        "over %llu samples", tag, static_cast<unsigned long long>(logFrame), static_cast<int>(bd.Format),
+        n ? sum / n : 0.0, mn, mx, static_cast<unsigned long long>(n));
+
+    // Also dump the capture to an actual BMP -- a picture settles "does this match what's on
+    // screen" far more conclusively than an average ever could.
+    {
+        wchar_t name[64];
+        swprintf(name, std::size(name), L"dlss5-neural-rawprobe-%ls-%06llu.bmp", tag,
+                 static_cast<unsigned long long>(logFrame));
+        const auto bmpPath = ExeDirectory() / name;
+        std::ofstream out(bmpPath, std::ios::binary);
+        if (out)
+        {
+            const UINT w = static_cast<UINT>(bd.Width);
+            const UINT h = bd.Height;
+            const UINT bmpRowBytes = (w * 3 + 3) & ~3u;
+            const uint32_t pixelBytes = bmpRowBytes * h;
+
+            BITMAPFILEHEADER fh {};
+            fh.bfType = 0x4D42; // 'BM'
+            fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+            fh.bfSize = fh.bfOffBits + pixelBytes;
+
+            BITMAPINFOHEADER ih {};
+            ih.biSize = sizeof(BITMAPINFOHEADER);
+            ih.biWidth = static_cast<LONG>(w);
+            ih.biHeight = static_cast<LONG>(h); // positive: bottom-up, universally readable
+            ih.biPlanes = 1;
+            ih.biBitCount = 24;
+            ih.biCompression = BI_RGB;
+            ih.biSizeImage = pixelBytes;
+
+            out.write(reinterpret_cast<const char *>(&fh), sizeof(fh));
+            out.write(reinterpret_cast<const char *>(&ih), sizeof(ih));
+
+            std::vector<uint8_t> row(bmpRowBytes, 0);
+            for (UINT yy = 0; yy < h; ++yy)
+            {
+                // BMP rows go bottom-up; the captured buffer is top-down.
+                const uint8_t *src = bytes + static_cast<size_t>(h - 1 - yy) * rowPitch;
+                for (UINT x = 0; x < w; ++x)
+                {
+                    // Source is R8G8B8A8; BMP wants B,G,R.
+                    row[x * 3 + 0] = src[x * bpp + 2];
+                    row[x * 3 + 1] = src[x * bpp + 1];
+                    row[x * 3 + 2] = src[x * bpp + 0];
+                }
+                out.write(reinterpret_cast<const char *>(row.data()), bmpRowBytes);
+            }
+            Log("RAW PROBE (%ls): wrote %ux%u capture to %ls", tag, w, h, name);
+        }
+        else
+        {
+            Log("RAW PROBE (%ls): could not open %ls for writing", tag, name);
+        }
+    }
+
+    D3D12_RANGE empty { 0, 0 };
+    raw->Unmap(0, &empty);
+}
+
+// Multi-shot checkpoint gate shared by the pre- and post-compose capture call sites: fires once
+// per checkpoint frame, both before the network touches the back buffer and again right after our
+// own compose write, so the two BMPs can be compared side by side.
+constexpr UINT64 kProbeCheckpoints[] = { 300, 1200, 3600, 7200, 12000 };
+size_t g_probeNext = 0;
+UINT64 g_probePendingFrame = 0;
+bool g_probePostPending = false;
+
 constexpr unsigned char kRuntimeSha256[32] = { 0x81, 0xef, 0xaa, 0xdc, 0x8d, 0x0d, 0xea, 0xa2,
                                                0xc2, 0x3f, 0x64, 0xae, 0xe8, 0x3b, 0x81, 0xe9,
                                                0xf4, 0x8e, 0x2d, 0xa4, 0xd0, 0xc3, 0xfb, 0xae,
@@ -888,105 +1037,17 @@ void OnPresent(command_queue *queue, swapchain *sc, const rect *, const rect *, 
         bd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
         return;
 
-    // DIAGNOSTIC, one-shot: read the back buffer straight off the GPU, before any shader or
-    // encoding touches it, on its own dedicated command list so it cannot disturb the frame's
-    // normal recording. Answers whether the capture itself is already near-black or whether
-    // the problem is downstream in the copy/encode pipeline.
+    // DIAGNOSTIC, multi-shot: capture the back buffer before the network touches it (raw game
+    // render) at a handful of checkpoints through one play session, so we get a timeline
+    // (splash -> loading -> real gameplay) instead of guessing a single frame number. A second
+    // capture right after our own compose write happens further below, same checkpoint frames.
+    if (g_probeNext < std::size(kProbeCheckpoints) && g.frame > kProbeCheckpoints[g_probeNext])
     {
-        static bool probed = false;
-        if (!probed && g.frame > 1800)
-        {
-            probed = true;
-            ComPtr<ID3D12CommandAllocator> diagAlloc;
-            ComPtr<ID3D12GraphicsCommandList> diagList;
-            const UINT bpp = 4;
-            const UINT rowPitch = (static_cast<UINT>(bd.Width) * bpp + 255) & ~255u;
-            const UINT64 size = static_cast<UINT64>(rowPitch) * bd.Height;
-            D3D12_HEAP_PROPERTIES rb {};
-            rb.Type = D3D12_HEAP_TYPE_READBACK;
-            D3D12_RESOURCE_DESC rd {};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = size;
-            rd.Height = 1;
-            rd.DepthOrArraySize = 1;
-            rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            ComPtr<ID3D12Resource> raw;
-            if (SUCCEEDED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                           IID_PPV_ARGS(&diagAlloc))) &&
-                SUCCEEDED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                      diagAlloc.Get(), nullptr,
-                                                      IID_PPV_ARGS(&diagList))) &&
-                SUCCEEDED(g.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &rd,
-                                                            D3D12_RESOURCE_STATE_COPY_DEST,
-                                                            nullptr, IID_PPV_ARGS(&raw))))
-            {
-                Barrier(diagList.Get(), backbuffer, D3D12_RESOURCE_STATE_PRESENT,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE);
-                D3D12_TEXTURE_COPY_LOCATION from {}, to {};
-                from.pResource = backbuffer;
-                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                to.pResource = raw.Get();
-                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                to.PlacedFootprint.Footprint = { bd.Format, static_cast<UINT>(bd.Width), bd.Height,
-                                                 1, rowPitch };
-                diagList->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-                Barrier(diagList.Get(), backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_PRESENT);
-                diagList->Close();
-                ID3D12CommandList *lists[] = { diagList.Get() };
-                g.queue->ExecuteCommandLists(1, lists);
-
-                ComPtr<ID3D12Fence> f;
-                if (SUCCEEDED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))) &&
-                    SUCCEEDED(g.queue->Signal(f.Get(), 1)))
-                {
-                    if (HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr))
-                    {
-                        f->SetEventOnCompletion(1, ev);
-                        WaitForSingleObject(ev, 2000);
-                        CloseHandle(ev);
-                    }
-                }
-                void *mapped = nullptr;
-                D3D12_RANGE range { 0, static_cast<SIZE_T>(size) };
-                if (SUCCEEDED(raw->Map(0, &range, &mapped)))
-                {
-                    double sum = 0.0, mn = 1e9, mx = -1e9;
-                    uint64_t n = 0;
-                    const auto *bytes = static_cast<const uint8_t *>(mapped);
-                    for (UINT y = 0; y < bd.Height; y += 4)
-                        for (UINT x = 0; x < static_cast<UINT>(bd.Width); x += 4)
-                        {
-                            const uint8_t *px =
-                                bytes + static_cast<size_t>(y) * rowPitch + static_cast<size_t>(x) * bpp;
-                            const double v = (px[0] + px[1] + px[2]) / (3.0 * 255.0);
-                            sum += v;
-                            mn = std::min(mn, v);
-                            mx = std::max(mx, v);
-                            ++n;
-                        }
-                    D3D12_RANGE empty { 0, 0 };
-                    raw->Unmap(0, &empty);
-                    Log("RAW PROBE: back buffer straight off the GPU at frame %llu, format %d, "
-                        "mean %.6f min %.6f max %.6f over %llu samples -- taken before any "
-                        "shader or encoding touches it",
-                        static_cast<unsigned long long>(g.frame), static_cast<int>(bd.Format),
-                        n ? sum / n : 0.0, mn, mx, static_cast<unsigned long long>(n));
-                }
-                else
-                {
-                    Log("RAW PROBE: readback Map() failed.");
-                }
-            }
-            else
-            {
-                Log("RAW PROBE: setup failed (command list or readback resource).");
-            }
-        }
+        g_probePendingFrame = kProbeCheckpoints[g_probeNext];
+        g_probePostPending = true;
+        ++g_probeNext;
+        CaptureBackbuffer(g.device.Get(), g.queue.Get(), backbuffer, bd, g.frame, L"pre");
     }
-
     if (!EnsureResources(static_cast<UINT>(bd.Width), bd.Height, bd.Format, g.scale.load()))
     {
         g.unavailable = true;
@@ -1477,6 +1538,19 @@ void OnPresent(command_queue *queue, swapchain *sc, const rect *, const rect *, 
         reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(g.runtimes[i]) + 0x4640)(
             g.queue.Get(), 1, submitted);
     queue->flush_immediate_command_list();
+
+    // DIAGNOSTIC: other half of the pre/post pair started near the top of this function --
+    // capture the SAME checkpoint frame's back buffer again, now that our own compose write has
+    // landed in it (this is what actually gets presented). Placed here, after the real flush
+    // above and the runtime notification it follows, so cmd_list's frame content is already
+    // submitted and this capture's own separate command list cannot race or corrupt it -- same
+    // ordering the pendingFlow/pendingMeasure readbacks below already rely on.
+    if (g_probePostPending)
+    {
+        g_probePostPending = false;
+        CaptureBackbuffer(g.device.Get(), g.queue.Get(), backbuffer, bd, g_probePendingFrame, L"post");
+    }
+
     if (g.pendingFlow)
     {
         g.pendingFlow = false;
