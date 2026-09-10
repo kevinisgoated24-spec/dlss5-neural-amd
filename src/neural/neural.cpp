@@ -887,6 +887,106 @@ void OnPresent(command_queue *queue, swapchain *sc, const rect *, const rect *, 
     if (bd.SampleDesc.Count != 1 || bd.DepthOrArraySize != 1 ||
         bd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
         return;
+
+    // DIAGNOSTIC, one-shot: read the back buffer straight off the GPU, before any shader or
+    // encoding touches it, on its own dedicated command list so it cannot disturb the frame's
+    // normal recording. Answers whether the capture itself is already near-black or whether
+    // the problem is downstream in the copy/encode pipeline.
+    {
+        static bool probed = false;
+        if (!probed && g.frame > 60)
+        {
+            probed = true;
+            ComPtr<ID3D12CommandAllocator> diagAlloc;
+            ComPtr<ID3D12GraphicsCommandList> diagList;
+            const UINT bpp = 4;
+            const UINT rowPitch = (static_cast<UINT>(bd.Width) * bpp + 255) & ~255u;
+            const UINT64 size = static_cast<UINT64>(rowPitch) * bd.Height;
+            D3D12_HEAP_PROPERTIES rb {};
+            rb.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = size;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ComPtr<ID3D12Resource> raw;
+            if (SUCCEEDED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                           IID_PPV_ARGS(&diagAlloc))) &&
+                SUCCEEDED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      diagAlloc.Get(), nullptr,
+                                                      IID_PPV_ARGS(&diagList))) &&
+                SUCCEEDED(g.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &rd,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST,
+                                                            nullptr, IID_PPV_ARGS(&raw))))
+            {
+                Barrier(diagList.Get(), backbuffer, D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION from {}, to {};
+                from.pResource = backbuffer;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                to.pResource = raw.Get();
+                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                to.PlacedFootprint.Footprint = { bd.Format, static_cast<UINT>(bd.Width), bd.Height,
+                                                 1, rowPitch };
+                diagList->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                Barrier(diagList.Get(), backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_PRESENT);
+                diagList->Close();
+                ID3D12CommandList *lists[] = { diagList.Get() };
+                g.queue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> f;
+                if (SUCCEEDED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))) &&
+                    SUCCEEDED(g.queue->Signal(f.Get(), 1)))
+                {
+                    if (HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr))
+                    {
+                        f->SetEventOnCompletion(1, ev);
+                        WaitForSingleObject(ev, 2000);
+                        CloseHandle(ev);
+                    }
+                }
+                void *mapped = nullptr;
+                D3D12_RANGE range { 0, static_cast<SIZE_T>(size) };
+                if (SUCCEEDED(raw->Map(0, &range, &mapped)))
+                {
+                    double sum = 0.0, mn = 1e9, mx = -1e9;
+                    uint64_t n = 0;
+                    const auto *bytes = static_cast<const uint8_t *>(mapped);
+                    for (UINT y = 0; y < bd.Height; y += 4)
+                        for (UINT x = 0; x < static_cast<UINT>(bd.Width); x += 4)
+                        {
+                            const uint8_t *px =
+                                bytes + static_cast<size_t>(y) * rowPitch + static_cast<size_t>(x) * bpp;
+                            const double v = (px[0] + px[1] + px[2]) / (3.0 * 255.0);
+                            sum += v;
+                            mn = std::min(mn, v);
+                            mx = std::max(mx, v);
+                            ++n;
+                        }
+                    D3D12_RANGE empty { 0, 0 };
+                    raw->Unmap(0, &empty);
+                    Log("RAW PROBE: back buffer straight off the GPU at frame %llu, format %d, "
+                        "mean %.6f min %.6f max %.6f over %llu samples -- taken before any "
+                        "shader or encoding touches it",
+                        static_cast<unsigned long long>(g.frame), static_cast<int>(bd.Format),
+                        n ? sum / n : 0.0, mn, mx, static_cast<unsigned long long>(n));
+                }
+                else
+                {
+                    Log("RAW PROBE: readback Map() failed.");
+                }
+            }
+            else
+            {
+                Log("RAW PROBE: setup failed (command list or readback resource).");
+            }
+        }
+    }
+
     if (!EnsureResources(static_cast<UINT>(bd.Width), bd.Height, bd.Format, g.scale.load()))
     {
         g.unavailable = true;
