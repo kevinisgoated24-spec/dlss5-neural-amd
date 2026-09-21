@@ -3,7 +3,7 @@
 <head>
 <meta charset=utf8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>SVG Filter Fuzzer (Mega-Chaos + Structural Thrash)</title>
+<title>WebAudio UAF / Lifecycle Fuzzer</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap">
 <style>
 :root{--bg:#0c0c0c;--surf:#161616;--card:#1e1e1e;--border:#2a2a2a;--text:#e4e4e4;--muted:#888;--dim:#444;--red:#ff453a;--amber:#ff9f0a;--green:#32d74b;--red-dim:rgba(255,69,58,.12);--amber-dim:rgba(255,159,10,.1);--green-dim:rgba(50,215,75,.1)}
@@ -37,29 +37,29 @@ h1{font-size:18px;font-weight:700;color:var(--red)}
 <div class="wrap">
 
   <div>
-    <h1>🔺 SVG Filter Fuzzer (Mega-Chaos + Structural Thrash)</h1>
-    <div class="sub">Simultaneous Attribute Mutation & Node Destruction Under Load</div>
+    <h1>🔊 WebAudio Lifecycle & UAF Fuzzer</h1>
+    <div class="sub">Asynchronous Cross-Thread Node Thrashing & GC Stress</div>
   </div>
 
   <div class="status idle" id="statusBar">
-    <span>◆</span><span id="statusTxt">READY — COMBINED MODE</span>
+    <span>◆</span><span id="statusTxt">READY — WEBAUDIO MODE</span>
   </div>
 
   <div class="card">
     <div class="card-head"><span class="dot green"></span>Live Log</div>
     <div class="log" id="log"></div>
     <div class="btn-row">
-      <button class="btn btn-red" id="megaBtn" onclick="runMegaChaosTest()">🔥 Start Combined Mega-Chaos</button>
+      <button class="btn btn-red" id="audioBtn" onclick="runAudioFuzzTest()">⚡ Start Audio Thrash Loop</button>
       <button class="btn btn-dark" onclick="clearLog()">🗑 Clear</button>
     </div>
   </div>
 
 </div>
 
-<div id="svgPayload" style="position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0.001"></div>
-
 <script>
 'use strict';
+
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
 function log(msg,cls=''){
     const el=document.getElementById('log');
@@ -75,95 +75,68 @@ function setStatus(t,k){
     document.getElementById('statusTxt').textContent=t;
 }
 
-const payload = document.getElementById('svgPayload');
-
-async function runMegaChaosTest(){
-    const btn=document.getElementById('megaBtn');
+async function runAudioFuzzTest(){
+    const btn=document.getElementById('audioBtn');
     btn.disabled=true;
     clearLog();
-    setStatus('RUNNING MEGA-CHAOS...','running');
+    setStatus('RUNNING AUDIO THRASHER...','running');
 
-    log('=== Initializing Combined Chaos & Structural Graph ===','ok');
-    
-    const count = 1024; // Balanced count to allow intense frame-by-frame JS evaluation
-    let defs = '<defs id="mainDefs">';
-    for(let i = 0; i < count; i++) {
-        const targetRef = Math.abs((i * 37) % count);
-        defs += `<filter id="mega${i}">
-            <feGaussianBlur stdDeviation="${(i % 4) + 0.5}" result="blur${i}"/>
-            <feComposite in="blur${i}" in2="blur${targetRef}" operator="over" result="comp${i}"/>
-        </filter>`;
-    }
-    defs += '</defs>';
+    log('=== Initializing AudioContext Graph ===','ok');
 
-    payload.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
-        ${defs}
-        <rect id="targetRect" width="200" height="200" filter="url(#mega${count - 1})" fill="purple"/>
-    </svg>`;
+    let iterations = 0;
+    const maxIterations = 50;
 
-    log(`[+] Injected ${count} cross-referencing nodes. Starting dual-vector loop...`,'dim');
+    try {
+        while(iterations < maxIterations) {
+            // Spin up a fresh context or reuse with heavy node creation
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Create a dense cluster of interacting nodes
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            const biquad = ctx.createBiquadFilter();
+            const analyser = ctx.createAnalyser();
 
-    let frames = 0;
-    const maxFrames = 400;
-    const rect = payload.querySelector('#targetRect');
-    const mainDefs = payload.querySelector('#mainDefs');
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(100 + (iterations * 10), ctx.currentTime);
 
-    return new Promise((resolve) => {
-        function megaFrame() {
-            if(frames >= maxFrames) {
-                payload.innerHTML = '';
-                log('[*] Combined mega-chaos test completed safely without crash.','ok');
-                setStatus('DONE — CHECK ANALYTICS DATA','idle');
-                btn.disabled = false;
-                resolve();
-                return;
-            }
+            // Connect graph
+            osc.connect(biquad);
+            biquad.connect(gain);
+            gain.connect(analyser);
+            analyser.connect(ctx.destination);
 
-            try {
-                // Vector 1: Mutate attributes across random filter nodes
-                const allFilters = mainDefs.querySelectorAll('filter');
-                if (allFilters.length > 0) {
-                    const randFilter = allFilters[Math.floor(Math.random() * allFilters.length)];
-                    const blurChild = randFilter.querySelector('feGaussianBlur');
-                    if (blurChild) {
-                        blurChild.setAttribute('stdDeviation', (Math.random() * 20).toFixed(1));
-                    }
-                }
+            osc.start();
 
-                // Vector 2: Structural DOM thrashing (tearing down and adding child primitives on the fly)
-                const targetFilter = allFilters[frames % allFilters.length];
-                if (targetFilter) {
-                    if (frames % 2 === 0) {
-                        const extraNode = document.createElementNS("http://www.w3.org/2000/svg", "feOffset");
-                        extraNode.setAttribute("dx", (frames % 10));
-                        extraNode.setAttribute("dy", (frames % 10));
-                        targetFilter.appendChild(extraNode);
-                    } else {
-                        while (targetFilter.children.length > 2) {
-                            targetFilter.removeChild(targetFilter.lastChild);
-                        }
-                    }
-                }
+            // Force rapid asynchronous teardown mid-render cycle
+            await sleep(10);
+            
+            osc.stop();
+            osc.disconnect();
+            biquad.disconnect();
+            gain.disconnect();
+            analyser.disconnect();
 
-                // Force layout sync mid-operation
-                rect.getBoundingClientRect();
-
-                frames++;
-                requestAnimationFrame(megaFrame);
-            } catch(e) {
-                log(`[!] Mega-chaos exception at frame ${frames}: ${e.message}`, 'err');
-                setStatus('EXCEPTION CAUGHT — CHECK ANALYTICS','crashed');
-                btn.disabled = false;
-                resolve();
+            await ctx.close();
+            
+            iterations++;
+            if(iterations % 10 === 0) {
+                log(`[+] Completed batch iteration ${iterations}/${maxIterations}`,'dim');
             }
         }
 
-        requestAnimationFrame(megaFrame);
-    });
+        log('[*] WebAudio fuzzing loop completed safely.','ok');
+        setStatus('DONE — CHECK ANALYTICS DATA','idle');
+        btn.disabled = false;
+    } catch(e) {
+        log(`[!] Audio fuzzer exception: ${e.message}`, 'err');
+        setStatus('EXCEPTION CAUGHT — CHECK ANALYTICS','crashed');
+        btn.disabled = false;
+    }
 }
 
-setStatus('READY — COMBINED MODE','idle');
-log('Mega-Chaos Fuzzer loaded','ok');
+setStatus('READY — WEBAUDIO MODE','idle');
+log('WebAudio Fuzzer loaded','ok');
 </script>
 </body>
 </html>
