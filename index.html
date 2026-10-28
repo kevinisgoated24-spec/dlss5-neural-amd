@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v78 — SVGRect/SVGAnimatedLength TearOff deep probe</title>
+<title>SVG UAF v79 — SVGAnimatedLength notification chain + coordinate overflow</title>
 <style>
 *{box-sizing:border-box}
 body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
@@ -22,16 +22,16 @@ pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
 </style>
 </head>
 <body>
-<h2>SVG UAF v78 — SVGRect + SVGAnimatedLength TearOff deep probe (ADR119 HIT followup)</h2>
+<h2>SVG UAF v79 — Notification chain + coordinate overflow + SVGLength unit conversion</h2>
 <div id="controls">
   <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR120')">ADR120: SVGRect viewBox — stale write propagation + re-add + attr corruption</button>
-  <button onclick="runSuite('ADR121')">ADR121: SVGAnimatedLength (svg.width/height/x/y) — all survive removal?</button>
-  <button onclick="runSuite('ADR122')">ADR122: rect.width.baseVal — stale write timing + DOM propagation</button>
-  <button onclick="runSuite('ADR123')">ADR123: SVGRect extreme values — negative/zero/MAX_FLOAT viewport corruption</button>
-  <button onclick="runSuite('ADR124')">ADR124: viewBox TearOff — write then re-attach svg — does corrupted viewBox render?</button>
-  <button onclick="runSuite('ADR125')">ADR125: multiple svg viewBox TearOffs — cross-contamination after remove</button>
-  <button onclick="runSuite('ADR126')">ADR126: animVal TearOff data write (ADR116 followup) — propagation probe</button>
+  <button onclick="runSuite('ADR127')">ADR127: SVGLength unit type — px vs % vs em conversion during detach</button>
+  <button onclick="runSuite('ADR128')">ADR128: SVGLength rapid unit type change — conversion chain overflow</button>
+  <button onclick="runSuite('ADR129')">ADR129: viewBox write → child getBBox() → coordinate overflow chain</button>
+  <button onclick="runSuite('ADR130')">ADR130: SVGAnimatedLength 0ms timing — sub-ms resolution test (1000 iters)</button>
+  <button onclick="runSuite('ADR131')">ADR131: SVGAnimatedLength on text element — x/y/dx/dy baseVal after remove</button>
+  <button onclick="runSuite('ADR132')">ADR132: SVGLength from SVGPathElement.pathLength — alive after remove?</button>
+  <button onclick="runSuite('ADR133')">ADR133: detached svg + viewBox write + getComputedStyle — does computed layout update?</button>
   <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
   <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
 </div>
@@ -53,709 +53,676 @@ function copyAll(){
 function fb(text,toast){var ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;top:-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);}catch(e){}document.body.removeChild(ta);}
 function timeWrite(writeFn,label,ITER){
   ITER=ITER||500;
+  var errors=0;
   var t0=performance.now();
-  for(var i=0;i<ITER;i++) try{writeFn(i);}catch(e){L(label+': THREW at i='+i+': '+e.message,'warn');return -1;}
+  for(var i=0;i<ITER;i++){try{writeFn(i);}catch(e){errors++;break;}}
   var t1=performance.now();
   var ms=(t1-t0).toFixed(2);
-  var us=((t1-t0)*1000/ITER).toFixed(1);
-  L(label+': '+ms+'ms ('+us+'µs/write) '+(t1-t0>0.5?'★ALIVE':''),'info');
+  var us=((t1-t0)*1000/(ITER-errors)).toFixed(2);
+  L(label+': '+ms+'ms ('+us+'µs/write) '+(t1-t0>0.1?'★ALIVE':errors>0?'[THREW]':'')+(errors>0?' err='+errors:''),'info');
   return t1-t0;
 }
 var suites={};
 function runSuite(name){L('','');L('══ '+name+' ══════════════════════════════════','suite-hdr');try{suites[name]();}catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}}
-function runAll(){['ADR120','ADR121','ADR122','ADR123','ADR124','ADR125','ADR126'].forEach(function(n){runSuite(n);});}
+function runAll(){['ADR127','ADR128','ADR129','ADR130','ADR131','ADR132','ADR133'].forEach(function(n){runSuite(n);});}
+
+// SVGLength unit type constants
+var SVG_LENGTHTYPE_UNKNOWN=0,SVG_LENGTHTYPE_NUMBER=1,SVG_LENGTHTYPE_PERCENTAGE=2,
+    SVG_LENGTHTYPE_EMS=3,SVG_LENGTHTYPE_EXS=4,SVG_LENGTHTYPE_PX=5,
+    SVG_LENGTHTYPE_CM=6,SVG_LENGTHTYPE_MM=7,SVG_LENGTHTYPE_IN=8,
+    SVG_LENGTHTYPE_PT=9,SVG_LENGTHTYPE_PC=10;
 
 // ═══════════════════════════════════════════════════════════════
-// ADR120 — SVGRect viewBox stale write: propagation + re-add + attr check
+// ADR127 — SVGLength unit type conversion during detach
 //
-// v77 ADR119 confirmed: svg.viewBox.baseVal (SVGRect TearOff) stays
-// WRITABLE after svg.remove(). Timing = 1ms (ALIVE).
+// SVGLength has a .unitType and a .value and a .valueInSpecifiedUnits.
+// When unitType = PERCENTAGE (2), the .value getter needs the
+// PARENT element's dimension to convert. If the element is detached,
+// the parent dimension is unknown — what does it return?
 //
-// Now we need to know:
-// 1. Does the stale write propagate to the viewBox attribute?
-//    - Read svg.getAttribute('viewBox') after stale write to R_bv
-//    - If it shows the written value → notification chain still alive
-//      even after svg removed from DOM!
+// More importantly: .convertToSpecifiedUnits(newType) triggers a
+// conversion calculation. If the element is detached:
+// - Source value is a percentage (e.g. "50%")
+// - Target is pixels (unitType=5)
+// - Conversion: px = percentage * parentDimension / 100
+// - If parentDimension = 0 or garbage → overflow/bad value
 //
-// 2. After stale write, re-attach svg to DOM.
-//    - What viewBox does svg have after re-attachment?
-//    - The written value? The original? Something corrupt?
-//
-// 3. After re-attachment, does the svg RENDER with the written viewBox?
-//    - getScreenCTM on a child element should reflect the viewBox
-//
-// 4. Multi-write: write extremely large values then re-attach.
-//    Does the svg behave normally or has the viewBox state been corrupted?
-//
-// 5. Timing: how long does the TearOff stay alive?
-//    - Write immediately after remove
-//    - Write after 100 intermediate operations
-//    - Write after GC
-//    Each time: is it still writable?
+// Attack:
+// 1. rect with width="50%" (percentage unit)
+// 2. Grab rect.width.baseVal (SVGLength TearOff)
+// 3. Remove rect from DOM (or entire svg)
+// 4. Call convertToSpecifiedUnits(PX) — needs parent to compute
+// 5. Check the result: correct, NaN, Inf, or garbage?
+// 6. Then: newValueSpecifiedUnits(PERCENTAGE, extreme_value) while detached
+// 7. Re-attach and check what renderered value is
 // ═══════════════════════════════════════════════════════════════
-suites['ADR120']=function(){
-  L('ADR120: SVGRect viewBox stale write — propagation + re-add + corruption','info');
+suites['ADR127']=function(){
+  L('ADR127: SVGLength unit type conversion during detach','info');
   var container=document.createElement('div');
+  container.style.cssText='width:800px;height:600px';
   document.body.appendChild(container);
 
   var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('viewBox','0 0 1000 1000');
-  svg.setAttribute('width','200');svg.setAttribute('height','200');
+  svg.setAttribute('width','400');svg.setAttribute('height','300');
+  svg.setAttribute('viewBox','0 0 400 300');
+  container.appendChild(svg);
+
+  // rect with percentage-based width
+  var rect=document.createElementNS(SVG_NS,'rect');
+  rect.setAttribute('x','0');rect.setAttribute('y','0');
+  rect.setAttribute('width','50%');rect.setAttribute('height','25%');
+  svg.appendChild(rect);
+
+  var RW=rect.width.baseVal;
+  var RH=rect.height.baseVal;
+  L('ADR127: RW.unitType='+RW.unitType+' (2=PERCENTAGE)','info');
+  L('ADR127: RW.value='+RW.value+' (should be 200 = 50% of 400)','info');
+  L('ADR127: RW.valueInSpecifiedUnits='+RW.valueInSpecifiedUnits+' (should be 50)','info');
+
+  // Remove rect
+  svg.removeChild(rect);
+  L('ADR127: rect removed','info');
+
+  // Read value while detached — needs parent to compute %
+  L('ADR127: RW.value after remove='+RW.value,'info');
+  L('ADR127: RW.valueInSpecifiedUnits after remove='+RW.valueInSpecifiedUnits,'info');
+
+  // convertToSpecifiedUnits: % → px (needs parent dimension)
+  try{
+    RW.convertToSpecifiedUnits(SVG_LENGTHTYPE_PX);
+    L('ADR127: after convertToSpecifiedUnits(PX): unitType='+RW.unitType+' value='+RW.value+' vis='+RW.valueInSpecifiedUnits,'info');
+    if(!isFinite(RW.value)||isNaN(RW.value)||Math.abs(RW.value)>1e10){
+      L('★★★ ADR127: ANOMALOUS value after convertToSpecifiedUnits on detached element!','hit');
+    }
+  }catch(e){L('ADR127: convertToSpecifiedUnits threw: '+e.message,'warn');}
+
+  // newValueSpecifiedUnits: set to extreme % while detached
+  try{
+    RW.newValueSpecifiedUnits(SVG_LENGTHTYPE_PERCENTAGE, 1e10);
+    L('ADR127: newValueSpecifiedUnits(%, 1e10): value='+RW.value+' vis='+RW.valueInSpecifiedUnits,'info');
+  }catch(e){L('ADR127: newValueSpecifiedUnits threw: '+e.message,'warn');}
+
+  // Re-attach and check
+  svg.appendChild(rect);
+  L('ADR127: re-attached. RW.value='+RW.value+' attr='+rect.getAttribute('width'),'info');
+
+  // Try converting to EM while detached
+  svg.removeChild(rect);
+  try{
+    RW.newValueSpecifiedUnits(SVG_LENGTHTYPE_EMS, 99);
+    L('ADR127: newValueSpecifiedUnits(EM, 99) while detached: value='+RW.value,'info');
+    // EM conversion needs computed font-size — what does it return for detached element?
+  }catch(e){L('ADR127: EM conversion threw: '+e.message,'warn');}
+
+  // Re-attach with EM value
+  svg.appendChild(rect);
+  L('ADR127: re-attached with EM. value='+RW.value+' attr='+rect.getAttribute('width'),'info');
+
+  container.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR128 — SVGLength rapid unit type change — conversion chain
+//
+// All these unit types are valid for SVGLength:
+// NUMBER(1), PERCENTAGE(2), EMS(3), EXS(4), PX(5), CM(6), MM(7), IN(8), PT(9), PC(10)
+//
+// convertToSpecifiedUnits() converts the value FROM current unit TO new unit.
+// The conversion is: vis_new = vis_old * old_px_per_unit / new_px_per_unit
+//
+// Chain of conversions can accumulate floating point error.
+// More importantly: some conversions (EMS) require layout context.
+// If we chain: PX → EM → PX → EM repeatedly, each EM conversion
+// re-queries the computed font-size. If the element is detached
+// and font-size = 0 or undefined → division by zero in the chain.
+//
+// Also: newValueSpecifiedUnits(type, value) sets BOTH unitType AND
+// valueInSpecifiedUnits atomically. What happens if we set:
+// - type = UNKNOWN (0) — should throw
+// - type = 255 — out of range, what happens?
+// - type = -1 — what happens?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR128']=function(){
+  L('ADR128: SVGLength rapid unit type change — conversion chain probe','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('width','400');svg.setAttribute('height','400');
+  document.body.appendChild(svg);
   var rect=document.createElementNS(SVG_NS,'rect');
   rect.setAttribute('x','0');rect.setAttribute('y','0');
   rect.setAttribute('width','100');rect.setAttribute('height','100');
   svg.appendChild(rect);
-  container.appendChild(svg);
 
-  // Baseline: viewBox values
-  var R_bv=svg.viewBox.baseVal;
-  L('ADR120: R_bv before remove: x='+R_bv.x+' y='+R_bv.y+' w='+R_bv.width+' h='+R_bv.height,'info');
-  L('ADR120: getAttribute viewBox: '+svg.getAttribute('viewBox'),'info');
+  var RW=rect.width.baseVal;
+  L('ADR128: initial: unitType='+RW.unitType+' value='+RW.value,'info');
 
-  // CTM before remove
-  var ctm0=rect.getScreenCTM();
-  L('ADR120: rect CTM before remove: a='+ctm0.a.toFixed(4)+' e='+ctm0.e.toFixed(2),'info');
-
-  // Remove svg from DOM
-  container.removeChild(svg);
-  L('ADR120: svg removed','info');
-
-  // Immediate stale write — CANARY value
-  var CANARY_W=55555, CANARY_H=66666;
-  var wrote=false;
-  try{
-    R_bv.x=0; R_bv.y=0; R_bv.width=CANARY_W; R_bv.height=CANARY_H;
-    wrote=true;
-    L('ADR120: stale write OK: x=0 y=0 w='+CANARY_W+' h='+CANARY_H,'info');
-  }catch(e){L('ADR120: stale write THREW: '+e.message,'warn');}
-
-  if(wrote){
-    // Read back from TearOff
-    L('ADR120: R_bv after write: w='+R_bv.width+' h='+R_bv.height,'info');
-
-    // Check getAttribute — does write propagate to DOM attr?
-    L('ADR120: getAttribute(viewBox) after stale write: '+svg.getAttribute('viewBox'),'info');
-    if(svg.getAttribute('viewBox').indexOf(CANARY_W)!==-1||
-       svg.getAttribute('viewBox').indexOf(String(CANARY_W))!==-1){
-      L('★★★ ADR120: STALE WRITE PROPAGATED TO DOM ATTRIBUTE! Notification chain alive!','hit');
-    } else {
-      L('ADR120: DOM attr NOT updated by stale write. Data stored in TearOff only.','info');
-    }
-
-    // Check via viewBox property again
-    L('ADR120: svg.viewBox.baseVal.width after stale write = '+svg.viewBox.baseVal.width,'info');
-    // Is it the same object?
-    L('ADR120: R_bv === svg.viewBox.baseVal? '+(R_bv===svg.viewBox.baseVal),'info');
+  // Conversion chain while IN DOM
+  var types=[SVG_LENGTHTYPE_PX,SVG_LENGTHTYPE_CM,SVG_LENGTHTYPE_MM,SVG_LENGTHTYPE_IN,SVG_LENGTHTYPE_PT,SVG_LENGTHTYPE_PC];
+  for(var i=0;i<types.length;i++){
+    try{
+      RW.convertToSpecifiedUnits(types[i]);
+      L('ADR128: convert to type='+types[i]+': vis='+RW.valueInSpecifiedUnits.toFixed(4)+' value='+RW.value.toFixed(4),'info');
+    }catch(e){L('ADR128: convert to type='+types[i]+' threw: '+e.message,'warn');}
   }
 
-  // Re-attach svg to DOM
-  container.appendChild(svg);
-  L('ADR120: svg re-attached to DOM','info');
-
-  // Read viewBox after re-attachment
-  L('ADR120: getAttribute(viewBox) after re-attach: '+svg.getAttribute('viewBox'),'info');
-  L('ADR120: R_bv.width after re-attach: '+R_bv.width,'info');
-  L('ADR120: svg.viewBox.baseVal.width after re-attach: '+svg.viewBox.baseVal.width,'info');
-
-  // CTM after re-attachment — does it reflect the stale-written viewBox?
-  try{
-    var ctm1=rect.getScreenCTM();
-    L('ADR120: rect CTM after re-attach: a='+ctm1.a.toFixed(4)+' e='+ctm1.e.toFixed(2),'info');
-    // Original CTM.a was 200/1000 = 0.2 (svg width / viewBox width)
-    // If viewBox.width is now 55555, new CTM.a should be 200/55555 ≈ 0.0036
-    if(Math.abs(ctm1.a)<0.01&&ctm1.a>0){
-      L('★★★ ADR120: CTM REFLECTS STALE VIEWBOX! svg renders with corrupted viewport!','hit');
-    } else if(Math.abs(ctm1.a-0.2)<0.01){
-      L('ADR120: CTM reverted to original viewBox (safe path, viewBox restored on re-attach)','info');
-    } else {
-      L('ADR120: CTM.a='+ctm1.a.toFixed(6)+' (unexpected — check manually)','warn');
-    }
-  }catch(e){L('ADR120: CTM after re-attach threw: '+e.message,'warn');}
-
-  // Timing: are writes after GC still alive?
-  container.removeChild(svg);
-  try{var gc=[];for(var i=0;i<30000;i++)gc.push(new Uint8Array(512));gc=null;if(window.gc)window.gc();}catch(e){}
-  L('ADR120: GC applied after re-remove','info');
-
-  var tGC=timeWrite(function(i){R_bv.width=i+1000;R_bv.height=i+2000;},'ADR120: R_bv write AFTER GC',500);
-  if(tGC>0.5) L('★★★ ADR120: R_bv STILL ALIVE AFTER GC! Very long-lived TearOff!','hit');
-  else if(tGC<0) L('ADR120: R_bv write threw after GC (context killed by GC)','info');
-  else L('ADR120: R_bv dead after GC (GC killed TearOff context)','info');
-
-  container.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR121 — SVGAnimatedLength (svg.width/height/x/y) — all survive removal?
-//
-// An SVG element has several SVGAnimatedLength attributes:
-// - svg.width.baseVal → SVGLength TearOff (presentational width)
-// - svg.height.baseVal → SVGLength TearOff
-// - svg.x.baseVal → SVGLength TearOff
-// - svg.y.baseVal → SVGLength TearOff
-//
-// These are different from viewBox (SVGAnimatedRect). They're
-// SVGAnimatedLength — the same type as rect.width.baseVal.
-//
-// v77 ADR119 crashed when trying to write to R_av (animVal) and
-// rect.width.baseVal AFTER the error. But the viewBox baseVal
-// survived. Do these also survive?
-//
-// Also testing: nested svg. An inner svg inside outer svg.
-// Remove the inner svg. Do its TearOffs survive?
-// Remove the outer svg. Do both inner and outer TearOffs survive?
-// ═══════════════════════════════════════════════════════════════
-suites['ADR121']=function(){
-  L('ADR121: SVGAnimatedLength (svg.width/height/x/y) — stale writes after remove','info');
-  var container=document.createElement('div');
-  document.body.appendChild(container);
-
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','200');svg.setAttribute('height','200');
-  svg.setAttribute('x','0');svg.setAttribute('y','0');
-  svg.setAttribute('viewBox','0 0 200 200');
-  container.appendChild(svg);
-
-  // Grab all SVGAnimatedLength TearOffs
-  var W_bv=svg.width.baseVal;
-  var H_bv=svg.height.baseVal;
-  var X_bv=svg.x.baseVal;
-  var Y_bv=svg.y.baseVal;
-
-  L('ADR121: W='+W_bv.value+' H='+H_bv.value+' X='+X_bv.value+' Y='+Y_bv.value,'info');
-
-  // Baseline timing
-  var tW0=timeWrite(function(i){W_bv.value=i+100;},'ADR121: baseline W_bv.value write',200);
-
-  // Remove svg
-  container.removeChild(svg);
-  L('ADR121: svg removed','info');
-
-  // Test each TearOff
-  var tW=timeWrite(function(i){W_bv.value=i+11111;},'ADR121: W_bv stale write',500);
-  if(tW>0.5) L('★★★ ADR121: svg.width.baseVal ALIVE!','hit');
-
-  var tH=timeWrite(function(i){H_bv.value=i+22222;},'ADR121: H_bv stale write',500);
-  if(tH>0.5) L('★★★ ADR121: svg.height.baseVal ALIVE!','hit');
-
-  var tX=timeWrite(function(i){X_bv.value=i+33333;},'ADR121: X_bv stale write',500);
-  if(tX>0.5) L('★★★ ADR121: svg.x.baseVal ALIVE!','hit');
-
-  var tY=timeWrite(function(i){Y_bv.value=i+44444;},'ADR121: Y_bv stale write',500);
-  if(tY>0.5) L('★★★ ADR121: svg.y.baseVal ALIVE!','hit');
-
-  // Read back values after writes
-  L('ADR121: W_bv.value after stale writes='+W_bv.value,'info');
-  L('ADR121: H_bv.value after stale writes='+H_bv.value,'info');
-
-  // getAttribute to check propagation
-  L('ADR121: getAttribute(width) after stale write='+svg.getAttribute('width'),'info');
-  L('ADR121: getAttribute(height) after stale write='+svg.getAttribute('height'),'info');
-
-  // Check animVal — is it read-only or writable?
-  var W_av=svg.width.animVal;
-  var tWav=timeWrite(function(i){try{W_av.value=i+99999;}catch(e){throw e;}},'ADR121: W_av stale write (animVal)',100);
-  L('ADR121: W_av.value after write attempt='+W_av.value,'info');
-
-  // NESTED SVG: inner svg inside outer
-  var outer=document.createElementNS(SVG_NS,'svg');
-  outer.setAttribute('width','400');outer.setAttribute('height','400');
-  container.appendChild(outer);
-  var inner=document.createElementNS(SVG_NS,'svg');
-  inner.setAttribute('width','200');inner.setAttribute('height','200');
-  outer.appendChild(inner);
-
-  var IW=inner.width.baseVal;
-  var OW=outer.width.baseVal;
-  L('ADR121: nested: IW='+IW.value+' OW='+OW.value,'info');
-
-  // Remove inner only
-  outer.removeChild(inner);
-  var tIW=timeWrite(function(i){IW.value=i+55555;},'ADR121: inner.W_bv after inner removed',500);
-  if(tIW>0.5) L('★★★ ADR121: INNER svg.width.baseVal ALIVE after inner removed!','hit');
-
-  // Remove outer (inner already removed)
-  container.removeChild(outer);
-  var tOW=timeWrite(function(i){OW.value=i+66666;},'ADR121: outer.W_bv after outer removed',500);
-  if(tOW>0.5) L('★★★ ADR121: OUTER svg.width.baseVal ALIVE after outer removed!','hit');
-
-  L('ADR121: IW.value='+IW.value+' OW.value='+OW.value,'info');
-  container.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR122 — rect.width.baseVal — deep stale timing + DOM propagation
-//
-// v77 ADR119 crashed mid-run when trying to write to rect.width.baseVal.
-// The GLOBAL ERR was NoModificationAllowedError at line 782 — that was
-// the animVal write (R_av is read-only). We never got timing for rect.
-//
-// This suite properly tests rect (and other shape) SVGAnimatedLength:
-// - rect.width, rect.height, rect.x, rect.y (all SVGAnimatedLength)
-// - circle.cx, circle.cy, circle.r
-// - line.x1, line.y1, line.x2, line.y2
-// - ellipse.rx, ellipse.ry
-//
-// Remove the shape from DOM → time stale writes → check propagation
-// to getAttribute.
-//
-// Key question: after stale write to shape.width.baseVal:
-// 1. Does the written value appear in getAttribute('width')? (notification fires)
-// 2. Does it NOT appear? (data stored in TearOff only, same as SVGTransform)
-// 3. Is the TearOff alive at all? (v77 was ambiguous due to crash)
-// ═══════════════════════════════════════════════════════════════
-suites['ADR122']=function(){
-  L('ADR122: shape SVGAnimatedLength stale writes — rect/circle/line/ellipse','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('viewBox','0 0 1000 1000');svg.setAttribute('width','200');svg.setAttribute('height','200');
-  document.body.appendChild(svg);
-
-  // RECT
-  var rect=document.createElementNS(SVG_NS,'rect');
-  rect.setAttribute('x','10');rect.setAttribute('y','20');
-  rect.setAttribute('width','300');rect.setAttribute('height','400');
-  svg.appendChild(rect);
-
-  var RW=rect.width.baseVal, RH=rect.height.baseVal;
-  var RX=rect.x.baseVal, RY=rect.y.baseVal;
-  L('ADR122[rect]: W='+RW.value+' H='+RH.value+' X='+RX.value+' Y='+RY.value,'info');
-
-  var tRW0=timeWrite(function(i){RW.value=i+100;},'ADR122[rect]: baseline RW.value write',200);
-
+  // Remove and do conversion chain while detached
   svg.removeChild(rect);
-  L('ADR122[rect]: rect removed','info');
+  L('ADR128: rect removed — starting detached conversion chain','info');
 
-  var tRW=timeWrite(function(i){RW.value=i+11111;},'ADR122[rect]: RW stale write',500);
-  if(tRW>0.5) L('★★★ ADR122[rect]: rect.width.baseVal ALIVE!','hit');
-
-  var tRH=timeWrite(function(i){RH.value=i+22222;},'ADR122[rect]: RH stale write',500);
-  if(tRH>0.5) L('★★★ ADR122[rect]: rect.height.baseVal ALIVE!','hit');
-
-  L('ADR122[rect]: RW.value after writes='+RW.value,'info');
-  L('ADR122[rect]: getAttribute(width)='+rect.getAttribute('width'),'info');
-  if(rect.getAttribute('width')&&rect.getAttribute('width').indexOf('11')===0){
-    L('★★★ ADR122[rect]: WRITE PROPAGATED TO ATTR!','hit');
+  // Rapid unit switches while detached
+  for(var i=0;i<types.length;i++){
+    try{
+      RW.convertToSpecifiedUnits(types[i]);
+      L('ADR128[detached]: type='+types[i]+': vis='+RW.valueInSpecifiedUnits.toFixed(6)+' value='+RW.value.toFixed(6),'info');
+      if(!isFinite(RW.value)||isNaN(RW.value)){
+        L('★★★ ADR128: NaN/Inf in conversion chain while detached! type='+types[i],'hit');
+      }
+    }catch(e){L('ADR128[detached]: type='+types[i]+' threw: '+e.message,'warn');}
   }
 
-  // CIRCLE
-  var circle=document.createElementNS(SVG_NS,'circle');
-  circle.setAttribute('cx','100');circle.setAttribute('cy','100');circle.setAttribute('r','50');
-  svg.appendChild(circle);
+  // EM conversion while detached (needs font-size context)
+  try{
+    RW.convertToSpecifiedUnits(SVG_LENGTHTYPE_EMS);
+    L('ADR128[detached]: EM: vis='+RW.valueInSpecifiedUnits+' value='+RW.value,'info');
+  }catch(e){L('ADR128[detached]: EM threw: '+e.message,'warn');}
 
-  var CX=circle.cx.baseVal, CY=circle.cy.baseVal, CR=circle.r.baseVal;
-  L('ADR122[circle]: cx='+CX.value+' cy='+CY.value+' r='+CR.value,'info');
+  // Out of range unit types
+  var oddTypes=[0, 11, 255, -1, 100];
+  for(var i=0;i<oddTypes.length;i++){
+    try{
+      RW.newValueSpecifiedUnits(oddTypes[i], 100);
+      L('ADR128: newValueSpecifiedUnits('+oddTypes[i]+', 100): unitType='+RW.unitType+' value='+RW.value,'info');
+    }catch(e){L('ADR128: newValueSpecifiedUnits('+oddTypes[i]+') threw: '+e.message,'info');}
+  }
 
-  svg.removeChild(circle);
-  var tCX=timeWrite(function(i){CX.value=i+33333;},'ADR122[circle]: cx stale write',500);
-  if(tCX>0.5) L('★★★ ADR122[circle]: circle.cx.baseVal ALIVE!','hit');
+  // Rapid conversion timing — is there a notification each time?
+  svg.appendChild(rect);
+  var convCount=0;
+  var t0=performance.now();
+  for(var i=0;i<500;i++){
+    try{
+      RW.convertToSpecifiedUnits((i%5)+5);// PX/CM/MM/IN/PT cycle
+      convCount++;
+    }catch(e){}
+  }
+  var t1=performance.now();
+  L('ADR128: 500 rapid conversions in DOM: '+(t1-t0).toFixed(2)+'ms ('+((t1-t0)*1000/convCount).toFixed(1)+'µs each)','info');
 
-  var tCR=timeWrite(function(i){CR.value=i+44444;},'ADR122[circle]: r stale write',500);
-  if(tCR>0.5) L('★★★ ADR122[circle]: circle.r.baseVal ALIVE!','hit');
-
-  L('ADR122[circle]: CX.value='+CX.value+' CR.value='+CR.value,'info');
-
-  // LINE
-  var line=document.createElementNS(SVG_NS,'line');
-  line.setAttribute('x1','0');line.setAttribute('y1','0');
-  line.setAttribute('x2','500');line.setAttribute('y2','500');
-  svg.appendChild(line);
-
-  var LX1=line.x1.baseVal, LY1=line.y1.baseVal;
-  var LX2=line.x2.baseVal, LY2=line.y2.baseVal;
-  L('ADR122[line]: x1='+LX1.value+' y1='+LY1.value+' x2='+LX2.value+' y2='+LY2.value,'info');
-
-  svg.removeChild(line);
-  var tLX2=timeWrite(function(i){LX2.value=i+55555;},'ADR122[line]: x2 stale write',500);
-  if(tLX2>0.5) L('★★★ ADR122[line]: line.x2.baseVal ALIVE!','hit');
-
-  L('ADR122[line]: LX2.value='+LX2.value,'info');
-
-  // ELLIPSE
-  var ell=document.createElementNS(SVG_NS,'ellipse');
-  ell.setAttribute('cx','200');ell.setAttribute('cy','200');
-  ell.setAttribute('rx','100');ell.setAttribute('ry','50');
-  svg.appendChild(ell);
-
-  var ERX=ell.rx.baseVal, ERY=ell.ry.baseVal;
-  L('ADR122[ellipse]: rx='+ERX.value+' ry='+ERY.value,'info');
-
-  svg.removeChild(ell);
-  var tERX=timeWrite(function(i){ERX.value=i+66666;},'ADR122[ellipse]: rx stale write',500);
-  if(tERX>0.5) L('★★★ ADR122[ellipse]: ellipse.rx.baseVal ALIVE!','hit');
-
-  L('ADR122[ellipse]: ERX.value='+ERX.value,'info');
+  // Same while detached
+  svg.removeChild(rect);
+  convCount=0;
+  t0=performance.now();
+  for(var i=0;i<500;i++){
+    try{RW.convertToSpecifiedUnits((i%5)+5);convCount++;}catch(e){}
+  }
+  t1=performance.now();
+  L('ADR128: 500 rapid conversions DETACHED: '+(t1-t0).toFixed(2)+'ms ('+((t1-t0)*1000/convCount).toFixed(1)+'µs each)','info');
 
   svg.remove();
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR123 — SVGRect extreme values — negative/zero/MAX_FLOAT viewport corruption
+// ADR129 — viewBox write → child getBBox() → coordinate overflow chain
 //
-// SVGRect for viewBox has constraints: width and height MUST be > 0.
-// Writing 0 or negative should be an error, or silently clamped.
-// Writing MAX_FLOAT should wrap or produce INF/NaN in the matrix.
+// From ADR120: viewBox can be set to extreme values (1e15) while
+// detached. From ADR123: this gives CTM.a = 2e-13.
 //
-// After stale write of extreme values, re-attach svg to DOM.
-// Does the svg try to set up a coordinate system with 0-size or
-// negative viewBox? This could cause division by zero in the
-// transform matrix calculation (CTM.a = svgWidth / viewBox.width).
-// Division by zero → INF in the matrix → child elements get INF CTM.
+// Now: set viewBox to extreme, re-attach, then call getBBox() on
+// children with large coordinates. getBBox returns DOMRect in
+// user coordinate space. If the coordinate system has a 1e-13 scale,
+// a child with x=1000000 in user coords → getBBox().x = 1e-13 * 1e6 = 1e-7.
+// That's fine. But what about the inverse: if we set viewBox to near-zero
+// and the child has coordinates that overflow float32?
 //
-// Test values:
-// - viewBox.width = 0 → CTM.a = width / 0 = INF
-// - viewBox.width = -1 → negative scale factor
-// - viewBox.width = 1e308 → CTM.a ≈ 0 (underflow)
-// - viewBox.width = NaN → undefined behavior
-// - viewBox.width = Infinity → CTM.a = 0
+// The interesting attack path:
+// - viewBox.width set to near-0 (float32 min positive = 1.175e-38)
+// - CTM.a = svgCSSWidth / viewBoxWidth = 200 / 1.175e-38 = 1.7e40
+//   But CSS width is 200px, so CTM.a should be huge
+// - A child at x=1 in user space would have screen x = 1.7e40 → overflow
 //
-// If any of these produce NaN or INF in child CTMs that's exploitable
-// for pointer arithmetic in geometry calculations.
+// Also: getBBoxes cascade. Parent SVGGElement.getBBox() = union of
+// all children. If one child has an extreme coordinate, the union
+// has to compute min/max across all children → could this overflow
+// the coordinate accumulator?
+//
+// And: getComputedTextLength() on SVGText — does it use the CTM?
+// If CTM is extreme, does computed text length become extreme?
 // ═══════════════════════════════════════════════════════════════
-suites['ADR123']=function(){
-  L('ADR123: SVGRect extreme values — viewport corruption probe','info');
+suites['ADR129']=function(){
+  L('ADR129: viewBox extreme → child getBBox/getComputedTextLength overflow','info');
   var container=document.createElement('div');
   document.body.appendChild(container);
 
-  function testViewBox(label, x, y, w, h){
+  function testCoordOverflow(label, vbW, vbH, childX, childW){
     var svg=document.createElementNS(SVG_NS,'svg');
-    svg.setAttribute('viewBox','0 0 1000 1000');
     svg.setAttribute('width','200');svg.setAttribute('height','200');
-    var child=document.createElementNS(SVG_NS,'rect');
-    child.setAttribute('x','0');child.setAttribute('y','0');
-    child.setAttribute('width','100');child.setAttribute('height','100');
-    svg.appendChild(child);
+    svg.setAttribute('viewBox','0 0 1000 1000');
+    var g=document.createElementNS(SVG_NS,'g');
+    var r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('x',String(childX));r.setAttribute('y','0');
+    r.setAttribute('width',String(childW));r.setAttribute('height','100');
+    g.appendChild(r);
+    svg.appendChild(g);
     container.appendChild(svg);
 
-    var R=svg.viewBox.baseVal;
-    var ctmBefore=child.getScreenCTM();
-    L('ADR123['+label+']: CTM before: a='+ctmBefore.a.toFixed(4)+' e='+ctmBefore.e.toFixed(2),'info');
+    // Baseline
+    var bb0=r.getBBox();
+    var ctm0=r.getScreenCTM();
+    L('ADR129['+label+']: baseline: BB.x='+bb0.x+' CTM.a='+ctm0.a.toFixed(4),'info');
 
+    // Set extreme viewBox
+    var VB=svg.viewBox.baseVal;
     container.removeChild(svg);
-    try{R.x=x;R.y=y;R.width=w;R.height=h;}catch(e){L('ADR123['+label+']: stale write threw: '+e.message,'warn');container.appendChild(svg);svg.remove();return;}
-
-    L('ADR123['+label+']: wrote x='+x+' y='+y+' w='+w+' h='+h,'info');
-    L('ADR123['+label+']: R.x='+R.x+' R.width='+R.width,'info');
-    L('ADR123['+label+']: getAttribute: '+svg.getAttribute('viewBox'),'info');
-
-    // Re-attach and check CTM
+    try{VB.width=vbW;VB.height=vbH;}catch(e){L('ADR129['+label+']: vb write threw: '+e.message,'warn');container.appendChild(svg);svg.remove();return;}
     container.appendChild(svg);
+
+    // Now check CTM and getBBox
     try{
-      var ctmAfter=child.getScreenCTM();
-      var aVal=ctmAfter.a;
-      L('ADR123['+label+']: CTM after re-attach: a='+aVal+' e='+ctmAfter.e.toFixed(2)+' f='+ctmAfter.f.toFixed(2),'info');
-      if(!isFinite(aVal)||isNaN(aVal)||Math.abs(aVal)>1e6){
-        L('★★★ ADR123['+label+']: ANOMALOUS CTM.a='+aVal+' after extreme viewBox!','hit');
+      var ctm1=r.getScreenCTM();
+      var bb1=r.getBBox();
+      L('ADR129['+label+']: vbW='+vbW+' CTM.a='+ctm1.a+' BB.x='+bb1.x+' BB.w='+bb1.width,'info');
+      if(!isFinite(ctm1.a)||isNaN(ctm1.a)||Math.abs(ctm1.a)>1e15){
+        L('★★★ ADR129['+label+']: EXTREME CTM.a='+ctm1.a,'hit');
       }
-    }catch(e){L('ADR123['+label+']: CTM threw after re-attach: '+e.message,'warn');}
+      if(!isFinite(bb1.x)||isNaN(bb1.x)){
+        L('★★★ ADR129['+label+']: NaN/Inf in getBBox().x!','hit');
+      }
+      // g.getBBox() — union of children
+      var gb=g.getBBox();
+      L('ADR129['+label+']: g.getBBox(): x='+gb.x+' y='+gb.y+' w='+gb.width+' h='+gb.height,'info');
+      if(!isFinite(gb.x)||isNaN(gb.x)){
+        L('★★★ ADR129['+label+']: NaN/Inf in g.getBBox()!','hit');
+      }
+    }catch(e){L('ADR129['+label+']: getBBox/CTM threw: '+e.message,'warn');}
 
-    container.removeChild(svg);
-    svg.remove();
+    container.removeChild(svg);svg.remove();
   }
 
-  testViewBox('zero-width',0,0,0,1000);
-  testViewBox('zero-height',0,0,1000,0);
-  testViewBox('negative-width',0,0,-1,1000);
-  testViewBox('negative-height',0,0,1000,-1);
-  testViewBox('MAX_FLOAT',0,0,Number.MAX_VALUE,Number.MAX_VALUE);
-  testViewBox('Infinity',0,0,Infinity,Infinity);
-  testViewBox('NaN',0,0,NaN,NaN);
-  testViewBox('very-large',0,0,1e15,1e15);
-  testViewBox('neg-origin',-1e9,-1e9,1000,1000);
+  testCoordOverflow('tiny-vb', 1e-5, 1e-5, 0, 1000);      // near-zero viewBox
+  testCoordOverflow('huge-vb', 1e15, 1e15, 0, 1000);       // huge viewBox
+  testCoordOverflow('huge-child', 1000, 1000, 1e10, 1e10); // huge child coords
+  testCoordOverflow('neg-vb', 0.001, 0.001, 0, 1000);      // very small viewBox
+
+  // getComputedTextLength with extreme CTM
+  var svg2=document.createElementNS(SVG_NS,'svg');
+  svg2.setAttribute('width','200');svg2.setAttribute('height','200');
+  svg2.setAttribute('viewBox','0 0 1000 1000');
+  var text=document.createElementNS(SVG_NS,'text');
+  text.setAttribute('x','0');text.setAttribute('y','50');
+  text.textContent='Hello World Test String';
+  svg2.appendChild(text);
+  container.appendChild(svg2);
+
+  var tlen0=text.getComputedTextLength();
+  L('ADR129[text]: baseline getComputedTextLength='+tlen0.toFixed(2),'info');
+
+  var VB2=svg2.viewBox.baseVal;
+  container.removeChild(svg2);
+  try{VB2.width=0.001;VB2.height=0.001;}catch(e){}
+  container.appendChild(svg2);
+
+  try{
+    var tlen1=text.getComputedTextLength();
+    L('ADR129[text]: getComputedTextLength with tiny viewBox='+tlen1,'info');
+    if(!isFinite(tlen1)||isNaN(tlen1)||tlen1>1e10){
+      L('★★★ ADR129[text]: EXTREME getComputedTextLength!','hit');
+    }
+  }catch(e){L('ADR129[text]: getComputedTextLength threw: '+e.message,'warn');}
 
   container.remove();
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ADR124 — viewBox TearOff: write → re-attach → rendering corruption
+// ADR130 — SVGAnimatedLength "0ms" timing — sub-ms resolution test
 //
-// More focused version of ADR120 re-attach test.
-// Write CANARY to viewBox.baseVal after remove, then re-attach.
+// v78 results showed some SVGAnimatedLength TearOffs at "0ms" but
+// attributes were STILL UPDATED. The 0ms is due to timing granularity
+// at 500 iterations.
 //
-// Key thing to check: after re-attachment, is there a window where
-// the svg has BOTH the original DOM attribute value AND the TearOff
-// value? The attribute says "0 0 1000 1000" but the TearOff says
-// "0 0 55555 66666". Which one wins?
+// Determine true write cost with 5000 and 50000 iterations.
+// For the "0ms" ones: are they actually ~0µs (sub-100ns = dead)
+// or ~0.1µs (alive but fast)?
 //
-// Also: after re-attach, immediately write MORE to the TearOff.
-// Does the TearOff go from "stale" mode back to "live" mode?
-// If yes → we can corrupt the viewBox while it's in the DOM!
+// Also: measure the NOTIFICATION cost specifically.
+// Two timings:
+// (a) write value to stale TearOff (total including notification)
+// (b) write same value (no-op — value unchanged): should not fire notification
+// (c) difference = notification cost
 //
-// Sequence:
-// 1. Grab TearOff R
-// 2. Remove svg
-// 3. Write CANARY to R (stale write — survives per ADR119)
-// 4. Re-attach svg
-// 5. Write CANARY2 to R (is it still writable? Does it update the DOM now?)
-// 6. Check getAttribute — does CANARY2 appear?
+// If notification cost is 0 for detached elements, it confirms
+// that the notification fires into the DOM attribute setter but
+// the setAttribute call shortcuts because the element is detached.
 // ═══════════════════════════════════════════════════════════════
-suites['ADR124']=function(){
-  L('ADR124: viewBox TearOff — write after re-attach = in-DOM write?','info');
+suites['ADR130']=function(){
+  L('ADR130: SVGAnimatedLength precise timing — 5000 iterations','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('viewBox','0 0 1000 1000');svg.setAttribute('width','200');svg.setAttribute('height','200');
+  document.body.appendChild(svg);
+
+  function timePrecise(createFn, label){
+    // Create in svg, grab TearOff, remove, time
+    var el=createFn();
+    svg.appendChild(el);
+    var tearoff=el.width?el.width.baseVal:(el.cx?el.cx.baseVal:(el.r?el.r.baseVal:null));
+    if(!tearoff){L(label+': no tearoff found','warn');el.remove();return;}
+    var baseline0=tearoff.value;
+    L(label+': TearOff.value='+baseline0+' unitType='+tearoff.unitType,'info');
+
+    // Baseline timing IN DOM (5000 iters)
+    var t0=performance.now();
+    for(var i=0;i<5000;i++) tearoff.value=i+1000;
+    var t1=performance.now();
+    L(label+': IN DOM 5000: '+(t1-t0).toFixed(2)+'ms ('+(((t1-t0)/5000)*1000).toFixed(2)+'µs/write)','info');
+
+    // Remove and time DETACHED
+    svg.removeChild(el);
+    t0=performance.now();
+    for(var i=0;i<5000;i++) tearoff.value=i+2000;
+    t1=performance.now();
+    L(label+': DETACHED 5000: '+(t1-t0).toFixed(2)+'ms ('+(((t1-t0)/5000)*1000).toFixed(2)+'µs/write)','info');
+    L(label+': value after='+tearoff.value,'info');
+
+    // Attribute update test
+    L(label+': getAttribute='+el.getAttribute('width'),'info');
+  }
+
+  // rect.width — was ★ALIVE at 1ms in v78
+  timePrecise(function(){
+    var r=document.createElementNS(SVG_NS,'rect');
+    r.setAttribute('width','300');r.setAttribute('height','100');r.setAttribute('x','0');r.setAttribute('y','0');
+    return r;
+  },'ADR130[rect.width]');
+
+  // rect.height — was "0ms" at 500 iters but attr updated
+  var svg2=document.createElementNS(SVG_NS,'svg');
+  svg2.setAttribute('viewBox','0 0 1000 1000');svg2.setAttribute('width','200');svg2.setAttribute('height','200');
+  document.body.appendChild(svg2);
+  var r2=document.createElementNS(SVG_NS,'rect');
+  r2.setAttribute('width','300');r2.setAttribute('height','400');r2.setAttribute('x','0');r2.setAttribute('y','0');
+  svg2.appendChild(r2);
+  var RH=r2.height.baseVal;
+  L('ADR130[rect.height]: IN DOM baseline','info');
+  var t0b=performance.now();
+  for(var i=0;i<5000;i++) RH.value=i+1000;
+  var t1b=performance.now();
+  L('ADR130[rect.height]: IN DOM 5000: '+(t1b-t0b).toFixed(2)+'ms ('+(((t1b-t0b)/5000)*1000).toFixed(2)+'µs/write)','info');
+  svg2.removeChild(r2);
+  t0b=performance.now();
+  for(var i=0;i<5000;i++) RH.value=i+2000;
+  t1b=performance.now();
+  L('ADR130[rect.height]: DETACHED 5000: '+(t1b-t0b).toFixed(2)+'ms ('+(((t1b-t0b)/5000)*1000).toFixed(2)+'µs/write)','info');
+  L('ADR130[rect.height]: value='+RH.value+' attr='+r2.getAttribute('height'),'info');
+  svg2.remove();
+
+  // viewBox baseVal — was ★ALIVE
+  var svg3=document.createElementNS(SVG_NS,'svg');
+  svg3.setAttribute('viewBox','0 0 1000 1000');svg3.setAttribute('width','200');svg3.setAttribute('height','200');
+  document.body.appendChild(svg3);
+  var VB=svg3.viewBox.baseVal;
+  t0b=performance.now();for(var i=0;i<5000;i++){VB.width=i+1000;VB.height=i+1000;}
+  t1b=performance.now();
+  L('ADR130[viewBox]: IN DOM 5000: '+(t1b-t0b).toFixed(2)+'ms ('+(((t1b-t0b)/5000)*1000).toFixed(2)+'µs/write)','info');
+  document.body.removeChild(svg3);
+  t0b=performance.now();for(var i=0;i<5000;i++){VB.width=i+2000;VB.height=i+2000;}
+  t1b=performance.now();
+  L('ADR130[viewBox]: DETACHED 5000: '+(t1b-t0b).toFixed(2)+'ms ('+(((t1b-t0b)/5000)*1000).toFixed(2)+'µs/write)','info');
+  svg3.remove();
+
+  svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR131 — SVGAnimatedLength on text element — x/y/dx/dy after remove
+//
+// SVGText has multiple SVGAnimatedLength attributes:
+// - text.x.baseVal (SVGAnimatedLengthList — list, not single!)
+// - text.y.baseVal (same)
+// - text.dx.baseVal (same — delta position)
+// - text.dy.baseVal (same)
+//
+// These are LISTS of SVGLength objects (for per-character positioning).
+// e.g., text.x.baseVal.getItem(0) = SVGLength for first char's x position
+//
+// SVGLengthList TearOff — we haven't tested this extensively.
+// v67-v74 covered SVGNumberList. SVGLengthList is a different TearOff class.
+//
+// Attack:
+// 1. Create <text> with multiple x positions (x="10 20 30 40 50")
+// 2. Grab text.x.baseVal (SVGAnimatedLengthList)
+// 3. Grab individual SVGLength TearOffs from the list
+// 4. removeItem(0) → item TearOff becomes stale
+// 5. Remove the text element from DOM → list TearOff becomes stale
+// 6. Time writes to individual length TearOff
+// 7. Check propagation: does stale write update the text positioning?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR131']=function(){
+  L('ADR131: SVGText SVGAnimatedLengthList — stale writes after remove','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('viewBox','0 0 1000 1000');svg.setAttribute('width','200');svg.setAttribute('height','200');
+  document.body.appendChild(svg);
+
+  var text=document.createElementNS(SVG_NS,'text');
+  text.setAttribute('x','10 20 30 40 50');
+  text.setAttribute('y','50 50 50 50 50');
+  text.textContent='ABCDE';
+  svg.appendChild(text);
+
+  var XL=text.x.baseVal;// SVGAnimatedLengthList → baseVal is SVGLengthList
+  L('ADR131: text.x.baseVal.numberOfItems='+XL.numberOfItems,'info');
+
+  // Grab individual SVGLength TearOffs
+  var L0=XL.getItem(0),L1=XL.getItem(1),L4=XL.getItem(4);
+  L('ADR131: L0.value='+L0.value+' L4.value='+L4.value,'info');
+
+  // removeItem(0) → L0 stale
+  XL.removeItem(0);
+  L('ADR131: after removeItem(0): XL.N='+XL.numberOfItems,'info');
+
+  // Time stale write on L0 (removed from list, still in DOM)
+  var tL0=timeWrite(function(i){L0.value=i+11111;},'ADR131: L0 stale write (item removed, text in DOM)',500);
+  if(tL0>0.1) L('★★★ ADR131: L0 (removed SVGLength) ALIVE with text in DOM!','hit');
+  L('ADR131: L0.value='+L0.value+' getAttribute='+text.getAttribute('x'),'info');
+
+  // Remove text from DOM → all items stale
+  svg.removeChild(text);
+  L('ADR131: text removed from DOM','info');
+
+  var tL1=timeWrite(function(i){L1.value=i+22222;},'ADR131: L1 stale write (text removed)',500);
+  if(tL1>0.1) L('★★★ ADR131: L1 ALIVE after text remove!','hit');
+
+  var tL4=timeWrite(function(i){L4.value=i+33333;},'ADR131: L4 stale write (text removed)',500);
+  if(tL4>0.1) L('★★★ ADR131: L4 ALIVE after text remove!','hit');
+
+  L('ADR131: L1.value='+L1.value+' L4.value='+L4.value,'info');
+  L('ADR131: getAttribute(x)='+text.getAttribute('x'),'info');
+
+  // Also: SVGLengthList.appendItem while detached
+  try{
+    var newLen=svg.createSVGLength();
+    newLen.value=99999;
+    XL.appendItem(newLen);
+    L('ADR131: appendItem to detached list: XL.N='+XL.numberOfItems,'info');
+  }catch(e){L('ADR131: appendItem threw: '+e.message,'warn');}
+
+  svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR132 — SVGPathElement.getTotalLength / pathLength — alive after remove?
+//
+// SVGPathElement has:
+// - pathLength attribute → accessed via el.pathLength.baseVal (SVGAnimatedLength)
+// - getTotalLength() → computes path geometry (not a TearOff, a method)
+// - getPointAtLength(n) → returns DOMPoint on the path
+//
+// The pathLength attribute affects how the browser normalizes path coordinates
+// for animation. If we write to pathLength.baseVal while the element is
+// detached, then re-attach, does it affect getPointAtLength() behavior?
+//
+// Also: SVGGeometryElement.isPointInFill() and isPointInStroke() — these
+// compute geometric operations. If the path has been mutated via stale
+// TearOff, do these operations work on stale data?
+//
+// Also: SVGAnimatedString (href, class, type) — these are string-typed
+// SVGAnimated* attributes. Do they have TearOffs too?
+// ═══════════════════════════════════════════════════════════════
+suites['ADR132']=function(){
+  L('ADR132: SVGPathElement pathLength + geometry ops after remove','info');
+  var svg=document.createElementNS(SVG_NS,'svg');
+  svg.setAttribute('viewBox','0 0 1000 1000');svg.setAttribute('width','200');svg.setAttribute('height','200');
+  document.body.appendChild(svg);
+
+  var path=document.createElementNS(SVG_NS,'path');
+  path.setAttribute('d','M 0,0 C 200,400 500,-200 700,200 C 900,600 800,800 500,900 Z');
+  path.setAttribute('pathLength','1000');// normalized path length
+  svg.appendChild(path);
+
+  var PL=path.pathLength.baseVal;
+  L('ADR132: pathLength.value='+PL.value,'info');
+  L('ADR132: getTotalLength()='+path.getTotalLength().toFixed(2),'info');
+
+  var pt0=path.getPointAtLength(500);
+  L('ADR132: getPointAtLength(500): x='+pt0.x.toFixed(2)+' y='+pt0.y.toFixed(2),'info');
+
+  // Remove path
+  svg.removeChild(path);
+
+  // Stale write to pathLength
+  var tPL=timeWrite(function(i){PL.value=i+55555;},'ADR132: pathLength.baseVal stale write',500);
+  if(tPL>0.1) L('★★★ ADR132: pathLength.baseVal ALIVE after remove!','hit');
+  L('ADR132: PL.value='+PL.value+' attr='+path.getAttribute('pathLength'),'info');
+
+  // getTotalLength on detached path
+  try{
+    var tl=path.getTotalLength();
+    L('ADR132: getTotalLength() on detached path: '+tl.toFixed(2),'info');
+    // getPointAtLength on detached path
+    var pt1=path.getPointAtLength(500);
+    L('ADR132: getPointAtLength(500) on detached: x='+pt1.x.toFixed(2)+' y='+pt1.y.toFixed(2),'info');
+  }catch(e){L('ADR132: geometry ops on detached threw: '+e.message,'warn');}
+
+  // Re-attach with extreme pathLength
+  svg.removeChild=function(){}; // reset if needed
+  svg.appendChild(path);
+  try{
+    var tl2=path.getTotalLength();
+    var pt2=path.getPointAtLength(500);
+    L('ADR132: after re-attach with pathLength='+PL.value+': getTotalLength='+tl2.toFixed(2),'info');
+    L('ADR132: getPointAtLength(500): x='+pt2.x.toFixed(2)+' y='+pt2.y.toFixed(2),'info');
+  }catch(e){L('ADR132: geometry ops after re-attach threw: '+e.message,'warn');}
+
+  // SVGAnimatedString probe (href on use element)
+  var use=document.createElementNS(SVG_NS,'use');
+  use.setAttribute('href','#someID');
+  svg.appendChild(use);
+  // SVGAnimatedString doesn't have a TearOff in the same way, but probe it
+  L('ADR132: use.href type: '+(use.href?use.href.constructor.name:'null'),'info');
+  if(use.href&&use.href.baseVal!==undefined){
+    L('ADR132: use.href.baseVal='+use.href.baseVal,'info');
+    svg.removeChild(use);
+    try{
+      use.href.baseVal='#newID';
+      L('ADR132: use.href.baseVal after remove='+use.href.baseVal,'info');
+    }catch(e){L('ADR132: href write threw: '+e.message,'warn');}
+  }
+
+  svg.remove();
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ADR133 — Detached svg + viewBox write + getComputedStyle
+//
+// From ADR120: viewBox write while detached propagates to DOM attribute.
+// From ADR124: write while in DOM also works.
+//
+// Now: does the RENDERING ENGINE pick up the viewBox change
+// while the element is in the document?
+//
+// Specifically:
+// 1. Create svg with children, put in DOM
+// 2. Write to viewBox.baseVal (in-DOM write per ADR124)
+// 3. WITHOUT removing from DOM, check:
+//    a. getComputedStyle on a child — does it reflect new viewport?
+//    b. requestAnimationFrame timing — does layout update?
+//    c. IntersectionObserver — does the child's intersection change?
+//    d. ResizeObserver — does the svg resize notification fire?
+//
+// The goal: confirm this is a genuine in-DOM viewport manipulation.
+// If it is, it means we can continuously script the viewBox in a
+// rendering loop and distort child element coordinate spaces without
+// calling setAttribute() (bypassing normal DOM APIs).
+//
+// Note: we already know setAttribute triggers the change (ADR124 confirmed).
+// The question is whether the TearOff path vs setAttribute path differ
+// in any observable way (timing, event dispatch, computed style update).
+// ═══════════════════════════════════════════════════════════════
+suites['ADR133']=function(){
+  L('ADR133: in-DOM viewBox TearOff write — rendering engine response','info');
   var container=document.createElement('div');
   document.body.appendChild(container);
 
   var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('viewBox','0 0 1000 1000');
   svg.setAttribute('width','200');svg.setAttribute('height','200');
+  svg.setAttribute('viewBox','0 0 1000 1000');
   var child=document.createElementNS(SVG_NS,'rect');
   child.setAttribute('x','100');child.setAttribute('y','100');
   child.setAttribute('width','100');child.setAttribute('height','100');
   svg.appendChild(child);
   container.appendChild(svg);
 
-  var R=svg.viewBox.baseVal;
+  var VB=svg.viewBox.baseVal;
   var ctm0=child.getScreenCTM();
-  L('ADR124: initial CTM.a='+ctm0.a.toFixed(4)+' (should be 0.2 = 200/1000)','info');
-  L('ADR124: getAttribute(viewBox): '+svg.getAttribute('viewBox'),'info');
+  L('ADR133: initial CTM.a='+ctm0.a.toFixed(4)+' e='+ctm0.e.toFixed(2),'info');
 
-  // Remove
-  container.removeChild(svg);
-  L('ADR124: svg removed','info');
-
-  // Stale write
-  var CANARY1=55555;
-  try{R.width=CANARY1;R.height=CANARY1;}catch(e){L('ADR124: stale write1 threw: '+e.message,'warn');}
-  L('ADR124: after stale write: R.width='+R.width,'info');
-  L('ADR124: getAttribute after stale write: '+svg.getAttribute('viewBox'),'info');
-
-  // Re-attach
-  container.appendChild(svg);
-  L('ADR124: svg re-attached','info');
-
-  // Read state immediately after re-attach
-  L('ADR124: getAttribute after re-attach: '+svg.getAttribute('viewBox'),'info');
-  L('ADR124: R.width after re-attach: '+R.width,'info');
+  // In-DOM write via TearOff (not setAttribute)
+  VB.width=500;VB.height=500;// change viewBox while in DOM
+  var attr1=svg.getAttribute('viewBox');
   var ctm1=child.getScreenCTM();
-  L('ADR124: CTM after re-attach: a='+ctm1.a.toFixed(6)+' e='+ctm1.e.toFixed(2),'info');
+  L('ADR133: after TearOff write (in DOM): attr='+attr1,'info');
+  L('ADR133: CTM after write: a='+ctm1.a.toFixed(4)+' e='+ctm1.e.toFixed(2),'info');
+  if(Math.abs(ctm1.a-0.4)<0.01){
+    L('★★★ ADR133: IN-DOM TEAROFF WRITE = LIVE VIEWPORT UPDATE!','hit');
+    L('★★★ ADR133: CTM.a=0.4 = 200/500. Viewport remapped without setAttribute!','hit');
+  }
 
-  // Now write CANARY2 while svg IS in DOM — does TearOff work in-DOM?
-  var CANARY2=77777;
-  var wroteLive=false;
-  try{
-    R.width=CANARY2;R.height=CANARY2;
-    wroteLive=true;
-    L('ADR124: in-DOM write OK: R.width='+R.width,'info');
-  }catch(e){L('ADR124: in-DOM write threw: '+e.message,'warn');}
+  // Compare timing: TearOff write vs setAttribute
+  var ITER=1000;
+  var t0=performance.now();
+  for(var i=0;i<ITER;i++){VB.width=500+i;VB.height=500+i;}
+  var t1=performance.now();
+  L('ADR133: TearOff write 1000x: '+(t1-t0).toFixed(2)+'ms ('+(((t1-t0)/ITER)*1000).toFixed(1)+'µs each)','info');
 
-  if(wroteLive){
-    L('ADR124: getAttribute after in-DOM write: '+svg.getAttribute('viewBox'),'info');
-    var ctm2=child.getScreenCTM();
-    L('ADR124: CTM after in-DOM write: a='+ctm2.a.toFixed(6)+' e='+ctm2.e.toFixed(2),'info');
-    if(svg.getAttribute('viewBox').indexOf(CANARY2)!==-1||
-       svg.getAttribute('viewBox').indexOf(String(CANARY2))!==-1){
-      L('★★★ ADR124: IN-DOM WRITE PROPAGATED TO ATTR!','hit');
+  t0=performance.now();
+  for(var i=0;i<ITER;i++) svg.setAttribute('viewBox','0 0 '+(500+i)+' '+(500+i));
+  t1=performance.now();
+  L('ADR133: setAttribute 1000x: '+(t1-t0).toFixed(2)+'ms ('+(((t1-t0)/ITER)*1000).toFixed(1)+'µs each)','info');
+
+  // Is there any difference in how events fire?
+  // MutationObserver watching viewBox attribute changes
+  var moFires=0;
+  var mo=new MutationObserver(function(muts){moFires+=muts.length;});
+  mo.observe(svg,{attributes:true,attributeFilter:['viewBox']});
+
+  // TearOff writes
+  for(var i=0;i<10;i++){VB.width=1000+i;VB.height=1000+i;}
+  var moAfterTearOff=moFires;
+
+  // setAttribute writes
+  for(var i=0;i<10;i++) svg.setAttribute('viewBox','0 0 '+(1000+i)+' '+(1000+i));
+  var moAfterSetAttr=moFires;
+
+  // Check MO after delay (MO is microtask)
+  setTimeout(function(){
+    var moFinal=moFires;
+    L('ADR133: MO fires: TearOff writes='+moAfterTearOff+' setAttribute writes='+moAfterSetAttr+' final='+moFinal,'info');
+    if(moAfterTearOff>0){
+      L('★★★ ADR133: MutationObserver FIRES on TearOff writes!','hit');
     }
-    if(Math.abs(ctm2.a-(200/CANARY2))<0.001){
-      L('★★★ ADR124: CTM REFLECTS IN-DOM WRITE! Viewport corrupted while in DOM!','hit');
+    if(moAfterSetAttr>moAfterTearOff){
+      L('★★★ ADR133: MO fires more for setAttribute than TearOff — different path!','hit');
     }
-  }
-
-  // Timing: write vs remove/re-attach cycle repeated rapidly
-  var writeCount=0, writeAlive=0;
-  for(var cycle=0;cycle<10;cycle++){
-    container.removeChild(svg);
-    try{R.width=9999+cycle;R.height=9999+cycle;writeCount++;writeAlive++;}catch(e){writeCount++;}
-    container.appendChild(svg);
-  }
-  L('ADR124: rapid cycle: '+writeAlive+'/'+writeCount+' writes succeeded during remove phases','info');
-  L('ADR124: final getAttribute: '+svg.getAttribute('viewBox'),'info');
-
-  container.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR125 — Multiple svg viewBox TearOffs — cross-contamination
-//
-// Create N svg elements, grab viewBox.baseVal TearOff for each.
-// Remove all of them from DOM.
-// Write DIFFERENT canary values to each TearOff.
-// Check: do the TearOfs write to the RIGHT svg or is there confusion?
-//
-// Also: what if two svgs share the same viewBox C++ object?
-// (unlikely but worth checking — same viewBox attribute value)
-//
-// More importantly: IsoHeap test for SVGRect.
-// Remove N svgs, hold N TearOffs (keep references).
-// Now create M new svgs.
-// Check if any new svg's viewBox overlaps with old TearOff.
-// (SVGRect IsoHeap — is it also bump-only, or does it recycle?)
-// ═══════════════════════════════════════════════════════════════
-suites['ADR125']=function(){
-  L('ADR125: Multiple svg viewBox TearOffs — cross-contamination + IsoHeap','info');
-  var container=document.createElement('div');
-  document.body.appendChild(container);
-
-  var N=20;
-  var svgs=[], tearoffs=[];
-  for(var i=0;i<N;i++){
-    var s=document.createElementNS(SVG_NS,'svg');
-    s.setAttribute('viewBox','0 0 '+(1000+i)+' '+(2000+i));
-    s.setAttribute('width','10');s.setAttribute('height','10');
-    container.appendChild(s);
-    svgs.push(s);
-    tearoffs.push(s.viewBox.baseVal);
-  }
-  L('ADR125: created '+N+' svgs and grabbed TearOffs','info');
-  L('ADR125: tearoffs[0].width='+tearoffs[0].width+' tearoffs[N-1].width='+tearoffs[N-1].width,'info');
-
-  // Remove all svgs
-  for(var i=0;i<N;i++) container.removeChild(svgs[i]);
-  L('ADR125: all svgs removed','info');
-
-  // Write unique canary to each TearOff
-  var CANARY_BASE=10000;
-  var writeOk=0;
-  for(var i=0;i<N;i++){
-    try{tearoffs[i].width=CANARY_BASE+i;tearoffs[i].height=CANARY_BASE+i+N;writeOk++;}catch(e){}
-  }
-  L('ADR125: wrote canaries to '+writeOk+'/'+N+' TearOffs','info');
-
-  // Read back and check for cross-contamination
-  var contaminated=false;
-  for(var i=0;i<N;i++){
-    var expected=CANARY_BASE+i;
-    var actual=tearoffs[i].width;
-    if(Math.abs(actual-expected)>0.5){
-      L('★★★ ADR125: TearOff['+i+'] CONTAMINATED! expected='+expected+' got='+actual,'hit');
-      contaminated=true;
-    }
-  }
-  if(!contaminated) L('ADR125: No cross-contamination. Each TearOff holds its own value.','info');
-
-  // IsoHeap test: spray new svgs, check if sentinel TearOff is overwritten
-  var sentinel=tearoffs[0];
-  var sentinelPre=sentinel.width;// should be 10000
-  L('ADR125: sentinel TearOff[0].width before spray = '+sentinelPre,'info');
-
-  var SPRAY=100, newSvgs=[];
-  for(var i=0;i<SPRAY;i++){
-    var ns=document.createElementNS(SVG_NS,'svg');
-    ns.setAttribute('viewBox','0 0 '+(99999+i)+' '+(88888+i));
-    container.appendChild(ns);
-    newSvgs.push(ns);
-  }
-  L('ADR125: sprayed '+SPRAY+' new svgs','info');
-
-  var sentinelPost=sentinel.width;
-  L('ADR125: sentinel.width after spray = '+sentinelPost,'info');
-  if(Math.abs(sentinelPost-sentinelPre)>0.5){
-    L('★★★ ADR125: SENTINEL OVERWRITTEN by spray! IsoHeap REUSES SVGRect slots!','hit');
-    L('★★★ ADR125: sentinelPre='+sentinelPre+' sentinelPost='+sentinelPost,'hit');
-  } else {
-    L('ADR125: sentinel unchanged. SVGRect IsoHeap also bump-only.','info');
-  }
-
-  container.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR126 — animVal TearOff data write (ADR116 followup)
-//
-// ADR116 result: T_av0.tx = 33832 after writes.
-// That means the animVal SVGTransform TearOff stored data.
-// 33832 = 499 + 33333, which is the last write value.
-// Timing = 0ms (no notification). Data stored but isolated.
-//
-// This is the same as ADR110 result (T_av4.tx = 100498 after stale writes).
-// But in ADR116 the context was: baseVal.clear() had been called.
-// So after clear(), the animVal TearOff for item[0] stored writes.
-//
-// New test:
-// 1. What does the animVal TearOff RETURN for its tx after baseVal.clear()?
-//    - Is it reading from the freed C++ SVGTransform?
-//    - Or from a separate SVGTransform backing store?
-// 2. Can we INFLUENCE the returned value by spraying with createSVGTransform()?
-//    - If the freed SVGTransform slot is reused by a new createSVGTransform(),
-//      and we write to the new one, does the animVal TearOff now return OUR value?
-//    - This would be IsoHeap slot confusion — different from bump-only behavior
-//      that SVGTransform normally shows.
-// 3. Does the stored animVal value affect rendering?
-//    - Set animVal TearOff to CANARY, then call getScreenCTM — does it use it?
-// ═══════════════════════════════════════════════════════════════
-suites['ADR126']=function(){
-  L('ADR126: animVal TearOff data write (ADR116 followup) — spray + propagation','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('viewBox','0 0 1000 1000');svg.setAttribute('width','200');svg.setAttribute('height','200');
-  document.body.appendChild(svg);
-
-  // Add SMIL animate to make animVal truly differ from baseVal
-  var g=document.createElementNS(SVG_NS,'g');
-  g.setAttribute('transform','translate(111,222) translate(333,444)');
-  svg.appendChild(g);
-
-  var animEl=document.createElementNS(SVG_NS,'animateTransform');
-  animEl.setAttribute('attributeName','transform');
-  animEl.setAttribute('type','translate');
-  animEl.setAttribute('from','111 222');
-  animEl.setAttribute('to','500 600');
-  animEl.setAttribute('dur','10s');
-  animEl.setAttribute('repeatCount','indefinite');
-  animEl.setAttribute('additive','sum');
-  g.appendChild(animEl);
-
-  requestAnimationFrame(function(){
-    var TL_bv=g.transform.baseVal;
-    var TL_av=g.transform.animVal;
-    L('ADR126 f1: bv.N='+TL_bv.numberOfItems+' av.N='+TL_av.numberOfItems,'info');
-    L('ADR126 f1: bv[0].tx='+TL_bv.getItem(0).matrix.e+' av[0].tx='+TL_av.getItem(0).matrix.e,'info');
-
-    // Grab animVal TearOff for item[0]
-    var T_av0=TL_av.getItem(0);
-    var preClear_tx=T_av0.matrix.e;
-    L('ADR126 f1: T_av0.tx before clear='+preClear_tx,'info');
-
-    // Clear baseVal
-    TL_bv.clear();
-    L('ADR126 f1: baseVal.clear() done. av.N='+TL_av.numberOfItems,'info');
-
-    // T_av0 is now stale (its item was removed from the list)
-    var postClear_tx=T_av0.matrix.e;
-    L('ADR126 f1: T_av0.tx after clear='+postClear_tx,'info');
-
-    // Time stale write
-    var t=timeWrite(function(i){T_av0.setTranslate(i+77777,i);},'ADR126 f1: T_av0 stale write after baseVal.clear()',500);
-
-    // Read back
-    var storedVal=T_av0.matrix.e;
-    L('ADR126 f1: T_av0.tx after stale writes='+storedVal,'info');
-
-    // Does CTM reflect the stored value?
-    var ctm0=g.getScreenCTM();
-    L('ADR126 f1: g.getScreenCTM().e after stale writes='+ctm0.e.toFixed(2),'info');
-
-    // Spray with createSVGTransform to try to hit the freed slot
-    var SPRAY_CANARY=0xDEAD;
-    var spray=[];
-    for(var i=0;i<1000;i++){
-      var t2=svg.createSVGTransform();
-      t2.setTranslate(SPRAY_CANARY+i,SPRAY_CANARY+i+1000);
-      spray.push(t2);
-    }
-    L('ADR126 f1: sprayed 1000 createSVGTransform()','info');
-
-    // Read back animVal TearOff — if slot reused, it would show spray canary
-    var postSpray_tx=T_av0.matrix.e;
-    L('ADR126 f1: T_av0.tx after spray='+postSpray_tx,'info');
-    if(postSpray_tx>=SPRAY_CANARY&&postSpray_tx<SPRAY_CANARY+2000){
-      L('★★★ ADR126: T_av0 TearOff READS FROM SPRAYED SLOT! IsoHeap confusion!','hit');
-      L('★★★ ADR126: postSpray_tx='+postSpray_tx+' (= SPRAY_CANARY+'+( postSpray_tx-SPRAY_CANARY)+')','hit');
-    } else if(Math.abs(postSpray_tx-storedVal)<1){
-      L('ADR126: T_av0 unchanged by spray. Holds its own value.','info');
-    } else {
-      L('ADR126: T_av0 changed to unexpected value='+postSpray_tx+' (not spray, not stored)','warn');
-    }
-
-    // Try writing to the spray objects to contaminate T_av0
-    // Only works if they share the same C++ SVGTransform
-    for(var i=0;i<spray.length;i++) spray[i].setTranslate(0xBEEF+i,0);
-    var postWriteSprays=T_av0.matrix.e;
-    L('ADR126 f1: T_av0.tx after writing all spray objects='+postWriteSprays,'info');
-    if(postWriteSprays>=0xBEEF&&postWriteSprays<0xBEEF+1000){
-      L('★★★ ADR126: SPRAY WRITE CONTAMINATED T_av0! Same C++ SVGTransform!','hit');
-    }
-
-    spray=null;
-    svg.remove();
-  });
+    mo.disconnect();
+    container.remove();
+  },100);
 };
 </script>
 </body>
