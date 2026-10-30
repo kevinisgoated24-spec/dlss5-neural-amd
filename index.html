@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v27 — INT32 Wrap Hunt + ViewBox Precision Probe</title>
+<title>SVG v28 — Path Branch Race + Layout Confusion</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0a;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -25,17 +25,17 @@ button:active{background:#0d0;color:#000}
 </style>
 </head>
 <body>
-<h1>SVG v27 — INT32 Wrap Hunt + viewBox Precision</h1>
-<h2>iOS 26.5.2 · W32 / VBF / MXB / CTX / VBW / NEG</h2>
+<h1>SVG v28 — Two-Path Branch Race + Layout Confusion</h1>
+<h2>iOS 26.5.2 · BRC / LAY / ANM / MUT / STK / CTM</h2>
 
 <div class="suite">
 <button id="btn-all" onclick="runAll()">▶ ALL</button>
-<button onclick="go('W32')">W32</button>
-<button onclick="go('VBF')">VBF</button>
-<button onclick="go('MXB')">MXB</button>
-<button onclick="go('CTX')">CTX</button>
-<button onclick="go('VBW')">VBW</button>
-<button onclick="go('NEG')">NEG</button>
+<button onclick="go('BRC')">BRC</button>
+<button onclick="go('LAY')">LAY</button>
+<button onclick="go('ANM')">ANM</button>
+<button onclick="go('MUT')">MUT</button>
+<button onclick="go('STK')">STK</button>
+<button onclick="go('CTM')">CTM</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -45,7 +45,7 @@ button:active{background:#0d0;color:#000}
 var NS='http://www.w3.org/2000/svg';
 var LU_MAX=33554432;
 var INT32_MAX=2147483647;
-var INT32_OVF=2147483648;  // 2^31
+var INT32_OVF=2147483648;
 
 function log(m,c){
   var d=document.getElementById('out');
@@ -64,28 +64,24 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runW32();
-  setTimeout(function(){runVBF();},400);
-  setTimeout(function(){runMXB();},800);
-  setTimeout(function(){runCTX();},1200);
-  setTimeout(function(){runVBW();},1600);
-  setTimeout(function(){runNEG();},2000);
+  runBRC();
+  setTimeout(function(){runLAY();},500);
+  setTimeout(function(){runANM();},1000);
+  setTimeout(function(){runMUT();},1500);
+  setTimeout(function(){runSTK();},2000);
+  setTimeout(function(){runCTM();},2500);
 }
 
 var _fb=new ArrayBuffer(8);
-var _fv=new Float32Array(_fb);
 var _dv=new Float64Array(_fb);
 var _uv=new Uint32Array(_fb);
-function f64h(f){_dv[0]=f;return{hi:_uv[1],lo:_uv[0]};}
-function bitsF64(hi,lo){_uv[1]=hi;_uv[0]=lo;return _dv[0];}
-function f64hex(f){var h=f64h(f);return'0x'+h.hi.toString(16).padStart(8,'0')+'_'+h.lo.toString(16).padStart(8,'0');}
+function f64hex(f){_dv[0]=f;return'0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0');}
 
-function mkSVG(w,h,vb,vis){
+function mkSVG(w,h,vb){
   var s=document.createElementNS(NS,'svg');
   s.setAttribute('width',w||100);s.setAttribute('height',h||100);
   if(vb)s.setAttribute('viewBox',vb);
-  if(vis){s.style.cssText='position:absolute;left:0px;top:0px';}
-  else{s.style.cssText='position:absolute;left:-9999px;top:-9999px';}
+  s.style.cssText='position:absolute;left:-9999px;top:-9999px';
   document.body.appendChild(s);
   return s;
 }
@@ -96,530 +92,516 @@ function mkRect(parent,x,y,w,h){
   parent.appendChild(r);
   return r;
 }
+function getMX(el){
+  el.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  return el.transform.baseVal.getItem(0).matrix;
+}
+function bcr(el){try{return el.getBoundingClientRect();}catch(e){return null;}}
+function ctm(el){try{return el.getScreenCTM();}catch(e){return null;}}
 
 // ════════════════════════════════════════════════════════════════════════
-// W32 — fine probe around the 2^31 saturation point via viewBox path
-// v26 confirmed: viewBox bypasses LU_MAX, hits 2^31 hard
-// Key question: is 2^31 a hard clamp, or can values slip past?
-// Try to find BCR.x values between 2^31 and (2^31)+N
+// BRC — branch confusion: rapid flip across the 2^31 threshold
+// The matrix path switches code at mx.e = 2^31 (v26/v27 confirmed).
+// Flip rapidly between INT32_MAX (LU path) and INT32_OVF (other path)
+// while reading BCR/CTM — look for any inconsistency, leaked state, or
+// values that don't match either path cleanly.
 // ════════════════════════════════════════════════════════════════════════
-function runW32(){
-  hdr('W32: fine probe around 2^31 saturation — can we slip past?');
-  hdr('INT32_OVF='+INT32_OVF+' (0x'+INT32_OVF.toString(16)+')');
-
-  // W32[1]: viewBox "0 0 0.01 0.01" on 100px SVG → 1 unit = 10000px
-  // To get BCR = 2^31: x = 2147483648/10000 = 214748.3648 SVG units
-  // Fine sweep around that
-  var svg=mkSVG(100,100,'0 0 0.01 0.01');
-  var r=mkRect(svg,0,0,1,1);
-  var tf=r.x.baseVal;
+function runBRC(){
+  hdr('BRC: rapid flip across 2^31 branch threshold');
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  var mx=getMX(r);
   svg.removeChild(r);
 
-  hdr('W32[1]: viewBox 0.01 (10000px/unit) — probing near 2^31 boundary');
-  var scale=100/0.01;  // px per SVG unit = 10000
-  var target=INT32_OVF/scale;  // SVG x that should give BCR≈2^31
-  // target = 214748.3648
-  var probes=[];
-  // Step down from target, then up past it
-  for(var d=-10;d<=25;d++){
-    probes.push(target - 10 + d*1.5);
-  }
-  // Also try exact fractions near the boundary
-  probes.push(INT32_MAX/scale);    // exactly INT32_MAX/scale
-  probes.push(INT32_OVF/scale);    // exactly INT32_OVF/scale
-  probes.push((INT32_OVF+1)/scale);
-  probes.push((INT32_OVF+100)/scale);
-  probes.push((INT32_OVF+1000)/scale);
-  probes.push((INT32_OVF+65536)/scale);  // +0x10000
-  probes.push((INT32_OVF*2)/scale);      // 2^32
-
-  for(var i=0;i<probes.length;i++){
-    var xv=probes[i];
-    try{tf.value=xv;}catch(e){log('W32[1]: x='+xv+' err','fail');continue;}
+  // BRC[1]: alternating reads — does the BCR ever return a "confused" value?
+  hdr('BRC[1]: alternating INT32_MAX / INT32_OVF — look for non-canonical BCR values');
+  var anomalies=[];
+  for(var i=0;i<200;i++){
+    // Alternate between the two path-triggering values
+    var useOvf=(i%2===0);
+    mx.e=useOvf?INT32_OVF:INT32_MAX;
     svg.appendChild(r);
-    var bcr=r.getBoundingClientRect();
+    var b=bcr(r);
     svg.removeChild(r);
-    var expected=xv*scale;
-    var bx=bcr.x;
-    log('W32[1]: svgX='+xv.toFixed(4)+' exp='+expected.toFixed(0)+' BCR.x='+bx,
-      (bx<0&&expected>0?'uaf — NEGATIVE WRAP! exp='+expected+' got='+bx:
-       bx>INT32_OVF?'uaf — PAST 2^31! BCR.x='+bx:
-       bx===INT32_OVF?'crit — AT 2^31 exactly':
-       bx>LU_MAX&&bx<INT32_OVF?'star — between LU_MAX and 2^31: '+bx:
-       'info'));
+    var bx=b?b.x:null;
+    // Canonical: INT32_MAX → 33544432 (LU_MAX path), INT32_OVF → 2147473664 (other path)
+    var canonical_max=33544432;
+    var canonical_ovf=2147473664;
+    var expected=useOvf?canonical_ovf:canonical_max;
+    if(bx!==null&&bx!==expected){
+      anomalies.push({i:i,input:useOvf?'INT32_OVF':'INT32_MAX',expected:expected,got:bx});
+      log('BRC[1]: iter='+i+' input='+mx.e+' expected='+expected+' got='+bx+' ANOMALY!',
+        (bx<0?'uaf — NEGATIVE FROM BRANCH RACE!':
+         bx>canonical_ovf?'uaf — ABOVE EXPECTED MAX! '+bx:
+         'crit — WRONG VALUE: '+bx));
+    }
   }
+  log('BRC[1]: 200 iters done. anomalies='+anomalies.length,anomalies.length>0?'crit':'pass');
+
+  // BRC[2]: write INT32_MAX, force layout, then switch to INT32_OVF before layout completes
+  hdr('BRC[2]: write→read interleaved with forced reflow');
+  var results2=[];
+  for(var j=0;j<50;j++){
+    mx.e=INT32_MAX;  // LU clamp path
+    svg.appendChild(r);
+    // Force partial layout by reading offsetParent (triggers style recalc)
+    var _ = r.ownerSVGElement ? r.ownerSVGElement.parentNode : null;
+    mx.e=INT32_OVF;  // switch to other path BEFORE getBCR
+    var b2=bcr(r);
+    svg.removeChild(r);
+    results2.push(b2?b2.x:null);
+  }
+  // check if any result is between canonical values (confused state)
+  var between=results2.filter(function(v){return v!==null&&v>33544432&&v<2147473664;});
+  var below=results2.filter(function(v){return v!==null&&v<0;});
+  log('BRC[2]: 50 iters. between-paths='+between.length+' negative='+below.length,
+    (below.length>0?'uaf — NEGATIVE BCR IN INTERLEAVED READ!':
+     between.length>0?'crit — VALUE BETWEEN PATHS: '+between[0]:
+     'pass — consistent'));
+  if(between.length>0)log('BRC[2]: between-path values: '+between.slice(0,5).join(', '),'crit');
+
+  // BRC[3]: write to mx.e while element is being measured by requestAnimationFrame
+  hdr('BRC[3]: rAF-timed switch — mutate matrix during frame boundary');
+  var rafResults=[];
+  var rafDone=false;
+  mx.e=INT32_MAX;
+  svg.appendChild(r);
+  var rafCount=0;
+  function rafFlip(){
+    if(rafCount>=30){
+      rafDone=true;
+      var neg=rafResults.filter(function(v){return v<0;});
+      var anom=rafResults.filter(function(v){return v>0&&v!==33544432&&v!==2147473664&&v!==2147483648;});
+      log('BRC[3]: 30 rAF iters. negative='+neg.length+' anomalous='+anom.length,
+        (neg.length>0?'uaf — NEGATIVE IN rAF RACE!':
+         anom.length>0?'crit — ANOMALOUS IN rAF: '+anom[0]:
+         'pass'));
+      svg.removeChild(r);
+      svg.remove();
+      return;
+    }
+    // Flip between the two threshold values each frame
+    mx.e=(rafCount%2===0)?INT32_OVF:INT32_MAX;
+    var rb=bcr(r);
+    rafResults.push(rb?rb.x:null);
+    rafCount++;
+    requestAnimationFrame(rafFlip);
+  }
+  requestAnimationFrame(rafFlip);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// LAY — layout tree confusion: two elements sharing a matrix, one on each path
+// Can we get the layout engine to compute one element's position using
+// another element's (wrong) branch?
+// ════════════════════════════════════════════════════════════════════════
+function runLAY(){
+  hdr('LAY: shared transform list — two elements, both paths simultaneously');
+  var svg=mkSVG(100,100);
+
+  // LAY[1]: two rects share a transform, set one to LU path, one to overflow path
+  // In SVG, each element has its own transform list, can't truly share
+  // But: <g> parent transform affects children — can we confuse via group
+  var g=document.createElementNS(NS,'g');
+  g.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  svg.appendChild(g);
+  var mxG=g.transform.baseVal.getItem(0).matrix;
+
+  var r1=mkRect(g,0,0,10,10);
+  var r2=mkRect(g,5,0,10,10);
+
+  // Set group transform to LU path
+  mxG.e=INT32_MAX;  // → LU clamp (33.5M)
+  var b1a=bcr(r1);var b2a=bcr(r2);
+  log('LAY[1]: group e=INT32_MAX: r1.x='+( b1a?b1a.x:null)+' r2.x='+(b2a?b2a.x:null),'info');
+
+  // Switch group to overflow path
+  mxG.e=INT32_OVF;  // → float path (2.147B)
+  var b1b=bcr(r1);var b2b=bcr(r2);
+  log('LAY[1]: group e=INT32_OVF: r1.x='+(b1b?b1b.x:null)+' r2.x='+(b2b?b2b.x:null),'info');
+
+  // Now: set r1 to have its own LU-path transform WHILE group is on OVF path
+  r1.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var mxR1=r1.transform.baseVal.getItem(0).matrix;
+  mxR1.e=INT32_MAX;  // local: LU path
+  // group: INT32_OVF (overflow path)
+  // total transform = group * local. Does the combination confuse the branch?
+  var b1c=bcr(r1);
+  log('LAY[1]: combined (group OVF + local LU): r1.x='+(b1c?b1c.x:null),
+    (b1c&&b1c.x<0?'uaf — NEGATIVE IN COMBINED TRANSFORM!':
+     b1c&&b1c.x>INT32_OVF?'uaf — PAST 2^31 IN COMBINED!':
+     'info'));
+
+  // LAY[2]: deeply nested — each level at the threshold, compound effect
+  hdr('LAY[2]: 4-deep nested groups each at INT32_OVF — does compound confuse?');
+  var g1=document.createElementNS(NS,'g');g1.setAttribute('transform','matrix(1 0 0 1 0 0)');svg.appendChild(g1);
+  var g2=document.createElementNS(NS,'g');g2.setAttribute('transform','matrix(1 0 0 1 0 0)');g1.appendChild(g2);
+  var g3=document.createElementNS(NS,'g');g3.setAttribute('transform','matrix(1 0 0 1 0 0)');g2.appendChild(g3);
+  var r3=mkRect(g3,0,0,10,10);
+
+  var mx1=g1.transform.baseVal.getItem(0).matrix;
+  var mx2=g2.transform.baseVal.getItem(0).matrix;
+  var mx3=g3.transform.baseVal.getItem(0).matrix;
+
+  // all at INT32_OVF — the multiplied result would be astronomical
+  mx1.e=0;mx2.e=0;mx3.e=0;  // baseline
+  var b3base=bcr(r3);
+  log('LAY[2]: baseline: r3.x='+(b3base?b3base.x:null),'info');
+
+  mx1.e=INT32_OVF;
+  var b3one=bcr(r3);
+  log('LAY[2]: g1 at INT32_OVF: r3.x='+(b3one?b3one.x:null),'info');
+
+  mx2.e=INT32_OVF;
+  var b3two=bcr(r3);
+  log('LAY[2]: g1+g2 at INT32_OVF: r3.x='+(b3two?b3two.x:null),
+    (b3two&&b3two.x<0?'uaf — NEGATIVE FROM NESTED OVF TRANSFORMS!':'info'));
+
+  mx3.e=INT32_OVF;
+  var b3three=bcr(r3);
+  log('LAY[2]: all 3 groups at INT32_OVF: r3.x='+(b3three?b3three.x:null),
+    (b3three&&b3three.x<0?'uaf — NEGATIVE FROM TRIPLE NESTED!':'info'));
+
+  // what does CTM say?
+  var ctm3=ctm(r3);
+  log('LAY[2]: getScreenCTM with triple nest: e='+(ctm3?ctm3.e:null),
+    (ctm3&&ctm3.e<0?'uaf — CTM NEGATIVE FROM NESTED OVF!':
+     ctm3&&ctm3.e>INT32_OVF?'star — CTM past 2^31 in nested: '+ctm3.e:'info'));
+
   svg.remove();
+}
 
-  // W32[2]: ultra-fine sweep right at boundary — 1px increments
-  hdr('W32[2]: ultra-fine sweep — 1-unit steps around 2^31 boundary');
-  var svg2=mkSVG(100,100,'0 0 0.001 0.001');  // 1 unit=100000px
-  var r2=mkRect(svg2,0,0,0.1,0.1);
-  var tf2=r2.x.baseVal;
-  svg2.removeChild(r2);
-  var scale2=100/0.001;
-  var t2=INT32_OVF/scale2;  // ≈21474.83648 SVG units
+// ════════════════════════════════════════════════════════════════════════
+// ANM — animation path: can SMIL or CSS animation flip the matrix
+// through the branch point at a moment the layout engine isn't expecting?
+// ════════════════════════════════════════════════════════════════════════
+function runANM(){
+  hdr('ANM: animation through the branch threshold');
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
 
-  for(var j=-5;j<=15;j++){
-    var xv2=t2 + j;
-    try{tf2.value=xv2;}catch(e){continue;}
-    svg2.appendChild(r2);
-    var bcr2=r2.getBoundingClientRect();
-    svg2.removeChild(r2);
-    log('W32[2]: svgX='+xv2.toFixed(3)+' exp='+(xv2*scale2).toFixed(0)+' BCR.x='+bcr2.x,
-      (bcr2.x<0&&xv2*scale2>0?'uaf — NEGATIVE WRAP!':
-       bcr2.x>INT32_OVF?'uaf — PAST 2^31! '+bcr2.x:
-       bcr2.x===INT32_OVF?'crit — AT boundary':'info'));
+  // ANM[1]: CSS animation on transform — does it cross the branch threshold mid-animation?
+  hdr('ANM[1]: CSS keyframe animation crossing INT32_MAX→INT32_OVF boundary');
+  // Can't animate matrix.e directly via CSS on SVG easily
+  // But: use JS requestAnimationFrame to simulate, capture every frame's BCR
+  var mx=r.transform.baseVal.getItem(0).matrix;
+  var frames=[];
+  var frameCount=0;
+  var maxFrames=60;
+
+  function animFrame(){
+    if(frameCount>=maxFrames){
+      // analyze
+      var crossing=frames.filter(function(f){return f.bx>LU_MAX&&f.bx<2147473664;});
+      var negative=frames.filter(function(f){return f.bx<0;});
+      log('ANM[1]: '+maxFrames+' frames sampled. crossing='+crossing.length+' negative='+negative.length,
+        (negative.length>0?'uaf — NEGATIVE BCR DURING ANIMATION!':
+         crossing.length>0?'crit — VALUE IN NO-MAN ZONE DURING ANIM: '+crossing[0].bx:
+         'info — clean transition'));
+      if(crossing.length>0){
+        crossing.slice(0,3).forEach(function(f){
+          log('ANM[1]:   frame '+f.i+' e='+f.e+' BCR.x='+f.bx,'crit');
+        });
+      }
+      svg.remove();
+      return;
+    }
+    // linear interpolation from INT32_MAX-1000 through INT32_OVF+1000
+    var t=frameCount/maxFrames;
+    var eVal=INT32_MAX-1000 + t*(INT32_OVF+1000 - (INT32_MAX-1000));
+    mx.e=eVal;
+    var b=bcr(r);
+    frames.push({i:frameCount,e:eVal,bx:b?b.x:null});
+    frameCount++;
+    requestAnimationFrame(animFrame);
   }
-  svg2.remove();
+  requestAnimationFrame(animFrame);
 
-  // W32[3]: non-integer viewBox ratios — does float rounding slip past 2^31?
-  hdr('W32[3]: irrational scale factors (float rounding near 2^31)');
-  // Use viewBox values that create irrational px/unit ratios
-  // Hope: rounding at float→int cast creates a value just above 2^31
-  var vbTests=[
-    {vb:'0 0 0.03 0.03', scale:100/0.03, name:'0.03 (irrational ×3333.3...)'},
-    {vb:'0 0 0.07 0.07', scale:100/0.07, name:'0.07 (×1428.57...)'},
-    {vb:'0 0 0.13 0.13', scale:100/0.13, name:'0.13 (×769.23...)'},
-    {vb:'0 0 0.17 0.17', scale:100/0.17, name:'0.17 (×588.23...)'},
-    {vb:'0 0 0.19 0.19', scale:100/0.19, name:'0.19 (×526.31...)'},
-    {vb:'0 0 0.003 0.003', scale:100/0.003, name:'0.003 (×33333.3...)'},
-    {vb:'0 0 0.007 0.007', scale:100/0.007, name:'0.007 (×14285.7...)'},
-  ];
-  for(var k=0;k<vbTests.length;k++){
-    var vt=vbTests[k];
-    var svgk=mkSVG(100,100,vt.vb);
-    var rk=mkRect(svgk,0,0,0.1,0.1);
-    var tfk=rk.x.baseVal;
-    svgk.removeChild(rk);
-    // Try x values that should give screen coords near and past 2^31
-    var xt=(INT32_OVF+1)/vt.scale;
-    var targets=[
-      INT32_OVF/vt.scale,
-      (INT32_OVF+1)/vt.scale,
-      (INT32_OVF+100)/vt.scale,
-      (INT32_OVF+65536)/vt.scale,
-    ];
-    for(var t=0;t<targets.length;t++){
-      try{tfk.value=targets[t];}catch(e){continue;}
-      svgk.appendChild(rk);
-      var bcrk=rk.getBoundingClientRect();
-      svgk.removeChild(rk);
-      var bx=bcrk.x;
-      if(bx>INT32_OVF||bx<0){
-        log('W32[3]: ['+vt.name+'] x='+targets[t].toFixed(4)+' BCR.x='+bx,
-          (bx<0?'uaf — NEGATIVE WRAP! got '+bx:'uaf — PAST 2^31! got '+bx));
+  // ANM[2]: SMIL animate element crossing threshold
+  hdr('ANM[2]: SMIL animateTransform across INT32 boundary');
+  var svg2=mkSVG(100,100);
+  var r2=mkRect(svg2,0,0,10,10);
+  var anim=document.createElementNS(NS,'animateTransform');
+  anim.setAttribute('attributeName','transform');
+  anim.setAttribute('type','translate');
+  anim.setAttribute('from',INT32_MAX+' 0');
+  anim.setAttribute('to',(INT32_OVF+1000)+' 0');
+  anim.setAttribute('dur','0.5s');
+  anim.setAttribute('repeatCount','3');
+  r2.appendChild(anim);
+
+  var smilFrames=[];
+  var smilCount=0;
+  function smilSample(){
+    if(smilCount>=30){
+      var neg=smilFrames.filter(function(v){return v<0;});
+      var anom=smilFrames.filter(function(v){return v!==null&&v>LU_MAX&&v<2147473664;});
+      log('ANM[2]: SMIL 30 samples. negative='+neg.length+' anomalous='+anom.length,
+        (neg.length>0?'uaf — NEGATIVE IN SMIL ANIM!':
+         anom.length>0?'crit — ANOMALOUS IN SMIL: '+anom[0]:
+         'info'));
+      svg2.remove();
+      return;
+    }
+    var b2=bcr(r2);
+    smilFrames.push(b2?b2.x:null);
+    smilCount++;
+    setTimeout(smilSample,16);
+  }
+  smilSample();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// MUT — mutation during layout: modify matrix.e from a MutationObserver
+// or ResizeObserver callback — these fire during the style/layout phase
+// ════════════════════════════════════════════════════════════════════════
+function runMUT(){
+  hdr('MUT: mutation during layout phase via observer callbacks');
+  var svg=mkSVG(100,100);
+
+  // MUT[1]: ResizeObserver fires during layout — mutate matrix.e inside it
+  hdr('MUT[1]: ResizeObserver callback — mutate to INT32_OVF during layout');
+  var r=mkRect(svg,0,0,10,10);
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var mx=r.transform.baseVal.getItem(0).matrix;
+  mx.e=INT32_MAX;  // start on LU path
+
+  var roFired=false;
+  var roBCR=null;
+  var roE=null;
+  if(typeof ResizeObserver!=='undefined'){
+    var ro=new ResizeObserver(function(entries){
+      if(!roFired){
+        roFired=true;
+        // Switch to overflow path INSIDE the layout callback
+        mx.e=INT32_OVF;
+        roE=mx.e;
+        roBCR=bcr(r);
+        ro.disconnect();
+        log('MUT[1]: ResizeObserver fired. e='+roE+' BCR.x='+(roBCR?roBCR.x:null),
+          (roBCR&&roBCR.x<0?'uaf — NEGATIVE BCR IN ResizeObserver!':
+           roBCR&&roBCR.x>LU_MAX&&roBCR.x<2147473664?'crit — NO-MAN ZONE IN ResizeObserver: '+roBCR.x:
+           'info'));
+        // After observer: what does a fresh BCR say?
+        var freshBCR=bcr(r);
+        log('MUT[1]: fresh BCR after RO mutation: '+( freshBCR?freshBCR.x:null),
+          (freshBCR&&freshBCR.x<0?'uaf':'info'));
+      }
+    });
+    ro.observe(r);
+    // Trigger resize by changing width
+    r.setAttribute('width','20');
+  } else {
+    log('MUT[1]: ResizeObserver not available','warn');
+  }
+
+  // MUT[2]: MutationObserver on the transform attribute — mutate inside callback
+  hdr('MUT[2]: MutationObserver on transform attr — flip matrix during callback');
+  var r2=mkRect(svg,0,0,10,10);
+  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var mx2=r2.transform.baseVal.getItem(0).matrix;
+  var moFired=0;
+  var moBCRs=[];
+
+  var mo=new MutationObserver(function(mutations){
+    moFired++;
+    if(moFired<=5){
+      // flip to overflow path inside MutationObserver callback
+      var old=mx2.e;
+      mx2.e=(mx2.e===INT32_MAX?INT32_OVF:INT32_MAX);
+      var mb=bcr(r2);
+      moBCRs.push({old:old,new_e:mx2.e,bx:mb?mb.x:null});
+      if(moFired===5){
+        mo.disconnect();
+        var neg=moBCRs.filter(function(v){return v.bx<0;});
+        var anom=moBCRs.filter(function(v){
+          return v.bx!==null&&v.bx!==33544432&&v.bx!==2147473664&&v.bx!==2147483648&&v.bx>0;
+        });
+        log('MUT[2]: 5 MO callbacks. negative='+neg.length+' anomalous='+anom.length,
+          (neg.length>0?'uaf — NEGATIVE BCR IN MO CALLBACK!':
+           anom.length>0?'crit — ANOMALOUS IN MO: '+anom[0].bx:
+           'info'));
+        moBCRs.forEach(function(v,i){
+          log('MUT[2]:   flip '+i+': old='+v.old+' new='+v.new_e+' BCR.x='+v.bx,'info');
+        });
       }
     }
-    // Just log the boundary hit
-    var xbnd=INT32_OVF/vt.scale;
-    try{tfk.value=xbnd;}catch(e){svgk.remove();continue;}
-    svgk.appendChild(rk);
-    var bcrk2=rk.getBoundingClientRect();
-    svgk.removeChild(rk);
-    log('W32[3]: ['+vt.name+'] boundary x='+xbnd.toFixed(6)+' BCR.x='+bcrk2.x,
-      (bcrk2.x>INT32_OVF?'uaf — PAST 2^31!':
-       bcrk2.x===INT32_OVF?'crit — AT 2^31 exactly':
-       bcrk2.x<0?'uaf — NEGATIVE!':'info'));
-    svgk.remove();
-  }
-}
+  });
+  mo.observe(r2,{attributes:true,attributeFilter:['transform']});
 
-// ════════════════════════════════════════════════════════════════════════
-// VBF — viewBox float precision: does the float→int conversion lose bits?
-// If viewBox coordinate = 2^31 + N and N gets lost in float32 truncation
-// we might get values that round differently through the pipeline
-// ════════════════════════════════════════════════════════════════════════
-function runVBF(){
-  hdr('VBF: float precision at 2^31 boundary — does the cast truncate?');
+  // Trigger the observer by changing transform attribute
+  setTimeout(function(){mx2.e=INT32_MAX;},50);
+  setTimeout(function(){mx2.e=INT32_OVF;},100);
+  setTimeout(function(){mx2.e=INT32_MAX;},150);
 
-  // At 2^31, float32 precision is 256 (2^8), so nearby values can't all be repr.
-  // float64 precision at 2^31 is still fine (53 bit mantissa)
-  // The Q: what type is used for the int cast? float32→int32 or float64→int32?
-
-  // VBF[1]: check float32 precision at 2^31
-  hdr('VBF[1]: float32 representable values near 2^31 (step=256)');
-  var _fb2=new ArrayBuffer(4);
-  var _fv2=new Float32Array(_fb2);
-  var _iv2=new Int32Array(_fb2);
-  // float32 at 2^31: exponent=31, so ulp = 2^(31-23) = 2^8 = 256
-  var f32near=[];
-  for(var d2=-5;d2<=10;d2++){
-    _iv2[0]=0x4f000000+(d2);  // 2^31 in f32 is 0x4f000000, step by raw bits
-    f32near.push({bits:'0x'+(0x4f000000+d2).toString(16), val:_fv2[0]});
-  }
-  for(var i=0;i<f32near.length;i++){
-    log('VBF[1]: f32['+f32near[i].bits+']='+f32near[i].val,'info');
-  }
-
-  // VBF[2]: does viewBox pipeline use float32 or float64 for coords?
-  // Test: can we distinguish values 1 apart near 2^31 via BCR?
-  hdr('VBF[2]: can BCR distinguish values 1 apart near 2^31? (float64 vs float32 path)');
-  // viewBox="0 0 1 1" on 100px SVG → 1 unit = 100px
-  // To get BCR=2^31: x = 2147483648/100 = 21474836.48
-  var svg=mkSVG(100,100,'0 0 1 1');
-  var r=mkRect(svg,0,0,0.1,0.1);
-  var tf=r.x.baseVal;
-  svg.removeChild(r);
-  var scale=100;
-  var base=INT32_OVF/scale;  // 21474836.48
-  var fine=[-200,-100,-10,-1,0,1,10,100,200,256,257,512,1024];
-  var prevBCR=null;
-  for(var j=0;j<fine.length;j++){
-    var xv=base+fine[j];
-    try{tf.value=xv;}catch(e){continue;}
-    svg.appendChild(r);
-    var bcr=r.getBoundingClientRect();
-    svg.removeChild(r);
-    var bx=bcr.x;
-    var changed=(prevBCR!==null&&bx!==prevBCR);
-    log('VBF[2]: delta='+fine[j]+' svgX='+xv.toFixed(2)+' BCR.x='+bx+(changed?' ← CHANGED from '+prevBCR:''),
-      (bx<0?'uaf — NEGATIVE!':bx>INT32_OVF?'uaf — PAST 2^31!':bx===INT32_OVF?'crit':'info'));
-    prevBCR=bx;
-  }
-  svg.remove();
-
-  // VBF[3]: matrix path — same fine sweep (matrix clamps at LU_MAX for normal values,
-  // but showed transition at INT32_MAX threshold in v26)
-  hdr('VBF[3]: matrix fine sweep at the INT32_MAX threshold (v26 found behavioral change there)');
-  var svg3=mkSVG(100,100);
-  var r3=mkRect(svg3,0,0,10,10);
-  r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx=r3.transform.baseVal.getItem(0).matrix;
-  svg3.removeChild(r3);
-  // v26 line 70: mx.e=INT32_MAX → BCR=2147473664 (not LU_MAX, not exactly 2^31)
-  // v26 line 71: mx.e=INT32_MAX+1 → BCR=2147483648 (2^31)
-  // Fine sweep in that zone
-  var mxFine=[
-    2147483640, 2147483641, 2147483642, 2147483643,
-    2147483644, 2147483645, 2147483646,
-    INT32_MAX,       // 2147483647
-    INT32_OVF-1,     // 2147483647
-    INT32_OVF,       // 2147483648
-    INT32_OVF+1,
-    INT32_OVF+2,
-    INT32_OVF+100,
-    INT32_OVF+65536,
-    2147483648*2,    // 2^32
-  ];
-  for(var k=0;k<mxFine.length;k++){
-    try{mx.e=mxFine[k];}catch(e){continue;}
-    svg3.appendChild(r3);
-    var bcr3=r3.getBoundingClientRect();
-    svg3.removeChild(r3);
-    log('VBF[3]: mx.e='+mxFine[k]+' BCR.x='+bcr3.x,
-      (bcr3.x<0&&mxFine[k]>0?'uaf — NEGATIVE BCR FROM MATRIX!':
-       bcr3.x>INT32_OVF?'uaf — PAST 2^31! BCR='+bcr3.x:
-       bcr3.x===INT32_OVF?'crit — AT 2^31':
-       bcr3.x>LU_MAX&&bcr3.x<INT32_OVF?'star — between LU_MAX and 2^31: '+bcr3.x:
-       'info'));
-  }
-  svg3.remove();
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// MXB — matrix BOTH axes simultaneously at extreme values
-// Does X+Y combined overflow cause cross-contamination?
-// Can simultaneous saturation on both axes produce a different result?
-// ════════════════════════════════════════════════════════════════════════
-function runMXB(){
-  hdr('MXB: combined X+Y extreme matrix translate');
-  var svg=mkSVG(100,100);
-  var r=mkRect(svg,0,0,10,10);
-  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx=r.transform.baseVal.getItem(0).matrix;
-  svg.removeChild(r);
-
-  // MXB[1]: both at 2^31 simultaneously
-  hdr('MXB[1]: mx.e=mx.f=2^31 simultaneously');
-  var combined=[
-    {e:INT32_OVF,   f:INT32_OVF,   note:'both at 2^31'},
-    {e:INT32_OVF*2, f:INT32_OVF*2, note:'both at 2^32'},
-    {e:INT32_OVF,   f:0,           note:'e=2^31, f=0'},
-    {e:0,           f:INT32_OVF,   note:'e=0, f=2^31'},
-    {e:INT32_OVF-1, f:INT32_OVF-1, note:'both at INT32_MAX'},
-    {e:INT32_OVF+1, f:INT32_OVF+1, note:'both just past 2^31'},
-    {e:-INT32_OVF,  f:INT32_OVF,   note:'e=-2^31, f=+2^31 (opposite)'},
-    {e:INT32_OVF,   f:-INT32_OVF,  note:'e=+2^31, f=-2^31 (opposite)'},
-  ];
-  for(var i=0;i<combined.length;i++){
-    var c=combined[i];
-    try{mx.e=c.e;mx.f=c.f;}catch(e){log('MXB[1]: err setting matrix','fail');continue;}
-    svg.appendChild(r);
-    var bcr=r.getBoundingClientRect();
-    svg.removeChild(r);
-    log('MXB[1]: ['+c.note+'] BCR.x='+bcr.x+' BCR.y='+bcr.y,
-      (bcr.x<0&&c.e>0?'uaf — X NEGATIVE! e='+c.e+' got x='+bcr.x:
-       bcr.y<0&&c.f>0?'uaf — Y NEGATIVE! f='+c.f+' got y='+bcr.y:
-       bcr.x>INT32_OVF||bcr.y>INT32_OVF?'uaf — AXIS PAST 2^31!':
-       'info'));
-  }
-
-  // MXB[2]: scale + translate combo — does scale interact with translate overflow?
-  hdr('MXB[2]: scale overflow + translate near 2^31');
-  var sxcombos=[
-    {a:2, e:INT32_OVF/2, note:'scale=2 × translate=2^30 (product=2^31)'},
-    {a:2, e:INT32_OVF/2+1, note:'scale=2 × translate=2^30+1 (product just past 2^31)'},
-    {a:3, e:INT32_OVF/3, note:'scale=3 × (2^31/3)'},
-    {a:100, e:INT32_OVF/100, note:'scale=100 × (2^31/100)'},
-    {a:1000, e:INT32_OVF/1000, note:'scale=1000 × (2^31/1000) [each< LU_MAX]'},
-    {a:1e6, e:LU_MAX+1, note:'scale=1M × (LU_MAX+1) [translate under LU clamp]'},
-  ];
-  for(var j=0;j<sxcombos.length;j++){
-    var sc=sxcombos[j];
-    try{mx.a=sc.a;mx.e=sc.e;mx.f=0;}catch(e){continue;}
-    svg.appendChild(r);
-    var bcr2=r.getBoundingClientRect();
-    svg.removeChild(r);
-    // rect is at x=0,w=10, so position from translate only, but scale affects content
-    // The element starts at x=0 in local coords, translate gives screen offset
-    log('MXB[2]: ['+sc.note+'] BCR.x='+bcr2.x+' BCR.w='+bcr2.width,
-      (bcr2.x<0&&sc.e>0?'uaf — NEGATIVE X! a='+sc.a+' e='+sc.e+' got '+bcr2.x:
-       bcr2.width<0?'uaf — NEGATIVE WIDTH!':
-       bcr2.x>INT32_OVF||bcr2.width>INT32_OVF?'star — past 2^31 on axis':
-       'info'));
-  }
-  mx.a=1;mx.e=0;mx.f=0;
   svg.remove();
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// CTX — getScreenCTM extraction: can we read back values via CTM
-// that differ from BCR due to the float64 vs int32 discrepancy?
+// STK — stacking context race: create/destroy stacking contexts while
+// matrix is at the threshold — can the paint layer snapshot a confused value?
 // ════════════════════════════════════════════════════════════════════════
-function runCTX(){
-  hdr('CTX: getScreenCTM float64 vs BCR int32 — extract info from the gap');
+function runSTK(){
+  hdr('STK: stacking context creation/destruction at branch threshold');
   var svg=mkSVG(100,100);
   var r=mkRect(svg,0,0,10,10);
   r.setAttribute('transform','matrix(1 0 0 1 0 0)');
   var mx=r.transform.baseVal.getItem(0).matrix;
-  svg.removeChild(r);
 
-  // CTX[1]: at 2^31, does CTM.e = exact float64 or the clamped int32?
-  hdr('CTX[1]: does CTM.e give exact float64 even when BCR is clamped?');
-  var ctxTests=[
-    LU_MAX,           // 33.5M — LU clamp point
-    LU_MAX+1,
-    LU_MAX*2,         // 67M — above LU_MAX, in the "transition zone"
-    1e8,
-    1e9,
-    INT32_MAX,
-    INT32_OVF,
-    INT32_OVF+1,
-    INT32_OVF+65536,
-    INT32_OVF*2,      // 2^32
-    1e10,
-    1e15,
-    1e30,
+  // STK[1]: add/remove will-change while at threshold
+  hdr('STK[1]: will-change:transform at INT32_OVF vs INT32_MAX');
+  var results=[];
+  for(var i=0;i<20;i++){
+    var onOvf=(i%2===0);
+    mx.e=onOvf?INT32_OVF:INT32_MAX;
+    // Force new stacking context
+    r.style.willChange='transform';
+    var b1=bcr(r);
+    // Destroy stacking context
+    r.style.willChange='auto';
+    var b2=bcr(r);
+    if(b1&&b2&&b1.x!==b2.x){
+      log('STK[1]: iter='+i+' will-change='+b1.x+' auto='+b2.x+' DIFF!',
+        (b1.x<0||b2.x<0?'uaf — NEGATIVE IN STACKING CTX!':'crit — DIFF: '+b1.x+' vs '+b2.x));
+    }
+    results.push({wc:b1?b1.x:null,auto:b2?b2.x:null});
+  }
+  var diffs=results.filter(function(r){return r.wc!==r.auto;});
+  log('STK[1]: 20 iters. stacking-ctx diffs='+diffs.length,diffs.length>0?'crit':'pass');
+
+  // STK[2]: opacity triggers stacking context — add/remove during threshold
+  hdr('STK[2]: opacity<1 stacking ctx at branch threshold');
+  var opResults=[];
+  for(var j=0;j<20;j++){
+    mx.e=(j%2===0)?INT32_OVF:INT32_MAX;
+    r.style.opacity='0.99';  // creates stacking context
+    var bo1=bcr(r);
+    r.style.opacity='1';     // removes it
+    var bo2=bcr(r);
+    opResults.push({op:bo1?bo1.x:null,norm:bo2?bo2.x:null});
+  }
+  var opDiffs=opResults.filter(function(r){return r.op!==r.norm;});
+  var opNegs=opResults.filter(function(r){return r.op<0||r.norm<0;});
+  log('STK[2]: 20 iters. diffs='+opDiffs.length+' negatives='+opNegs.length,
+    (opNegs.length>0?'uaf — NEGATIVE IN OPACITY STACKING!':opDiffs.length>0?'crit':'pass'));
+
+  // STK[3]: filter creates stacking context — extreme filter + threshold matrix
+  hdr('STK[3]: SVG filter (stacking ctx) + branch threshold matrix');
+  var defs=document.createElementNS(NS,'defs');
+  var filt=document.createElementNS(NS,'filter');
+  filt.setAttribute('id','v28filt');
+  var feBlur=document.createElementNS(NS,'feGaussianBlur');
+  feBlur.setAttribute('stdDeviation','0.1');
+  filt.appendChild(feBlur);
+  defs.appendChild(filt);
+  svg.appendChild(defs);
+
+  var filtResults=[];
+  for(var k=0;k<10;k++){
+    mx.e=(k%2===0)?INT32_OVF:INT32_MAX;
+    r.setAttribute('filter','url(#v28filt)');
+    var bf1=bcr(r);
+    r.removeAttribute('filter');
+    var bf2=bcr(r);
+    filtResults.push({filt:bf1?bf1.x:null,no:bf2?bf2.x:null});
+  }
+  var filtDiffs=filtResults.filter(function(v){return v.filt!==v.no;});
+  var filtNegs=filtResults.filter(function(v){return v.filt<0||v.no<0;});
+  log('STK[3]: 10 iters. filter diffs='+filtDiffs.length+' negatives='+filtNegs.length,
+    (filtNegs.length>0?'uaf — NEGATIVE WITH FILTER STACKING!':filtDiffs.length>0?'crit':'pass'));
+  if(filtDiffs.length>0)log('STK[3]: diff sample: filter='+filtDiffs[0].filt+' no-filter='+filtDiffs[0].no,'crit');
+
+  svg.remove();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// CTM — deep CTM read primitive: now that we know CTM tracks past 2^31
+// while BCR is frozen, can we use CTM to detect different code paths
+// and find any path that returns a negative/wrapped value?
+// ════════════════════════════════════════════════════════════════════════
+function runCTM(){
+  hdr('CTM: deep read primitive — hunting for CTM values that differ from BCR pattern');
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var mx=r.transform.baseVal.getItem(0).matrix;
+
+  // CTM[1]: does CTM also saturate eventually, or does it track forever?
+  hdr('CTM[1]: CTM tracking range — where does CTM.e stop tracking linearly?');
+  var ctmTests=[
+    INT32_OVF, INT32_OVF*2, INT32_OVF*4,
+    1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+    1e20, 1e30, 1e38, 1e100, 1e200, 1e300,
+    Number.MAX_VALUE,
+    Number.MAX_SAFE_INTEGER,
   ];
-  for(var i=0;i<ctxTests.length;i++){
-    var v=ctxTests[i];
-    try{mx.e=v;}catch(e){continue;}
-    svg.appendChild(r);
-    var ctm=null,bcr=null;
-    try{ctm=r.getScreenCTM();}catch(e){}
-    try{bcr=r.getBoundingClientRect();}catch(e){}
-    svg.removeChild(r);
-    var ctme=ctm?ctm.e:null;
-    var bx=bcr?bcr.x:null;
-    var exact=(ctme===v);
-    log('CTX[1]: v='+v.toExponential(4)+' CTM.e='+ctme+' exact='+exact+' BCR.x='+bx,
-      (ctme!==null&&ctme!==bx&&Math.abs(v)>LU_MAX?'star — CTM≠BCR at extreme: CTM='+ctme+' BCR='+bx:
-       exact&&Math.abs(v)>INT32_OVF?'star — CTM exact even past 2^31: '+ctme:
+  var prevCTM=null;
+  for(var i=0;i<ctmTests.length;i++){
+    mx.e=ctmTests[i];
+    var c=ctm(r);
+    var ce=c?c.e:null;
+    var b=bcr(r);
+    var bx=b?b.x:null;
+    var ctmLinear=(prevCTM===null||ce>prevCTM);  // is it still going up?
+    log('CTM[1]: e='+ctmTests[i].toExponential(3)+' CTM.e='+ce+' BCR.x='+bx,
+      (ce!==null&&ce<0&&ctmTests[i]>0?'uaf — CTM NEGATIVE! overflow in CTM pipeline!':
+       ce!==null&&ce===bx?'info — CTM==BCR':
+       ce!==null&&ce!==bx&&Math.abs(ctmTests[i])>LU_MAX?'star — CTM≠BCR: CTM='+ce+' BCR='+bx:
        'info'));
-    if(ctm&&ctme!==null)log('CTX[1]:   CTM.e bits='+f64hex(ctme)+' written='+f64hex(v),'info');
+    prevCTM=ce;
   }
 
-  // CTX[2]: viewBox + getScreenCTM — does CTM give unclamped amplified value?
-  hdr('CTX[2]: viewBox amplified coord — CTM vs BCR');
+  // CTM[2]: combine viewBox + matrix — does CTM compound them differently than BCR?
+  hdr('CTM[2]: viewBox amplification + matrix translate — CTM vs BCR compound behavior');
   var svg2=mkSVG(100,100,'0 0 0.01 0.01');  // 1 unit = 10000px
   var r2=mkRect(svg2,0,0,0.1,0.1);
   r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
   var mx2=r2.transform.baseVal.getItem(0).matrix;
-  svg2.removeChild(r2);
-  // In viewBox=0.01 space, we need translate in SVG user units
-  // CTM.e should reflect screen px (amplified by viewBox)
-  var vb2Tests=[
-    {t:100, note:'100 SVG units → 1M px'},
-    {t:3355, note:'3355 SVG units → 33.55M px (LU_MAX zone)'},
-    {t:214748, note:'214748 SVG units → 2.147B px (INT32 zone)'},
-    {t:214749, note:'214749 SVG units → just past INT32'},
-    {t:214750, note:'214750 SVG units → deep past INT32'},
-    {t:1000000, note:'1M SVG units → 10B px'},
+
+  // Matrix translate in SVG user space + viewBox amplification
+  // If mx2.e = 1000 SVG units, and viewBox makes 1 SVG unit = 10000px
+  // then screen translation = 10M px
+  var vbMXTests=[
+    {t:0, note:'baseline'},
+    {t:100, note:'100 units → 1M px'},
+    {t:3355, note:'3355 units → 33.55M px (LU zone)'},
+    {t:3356, note:'3356 units → just past LU_MAX'},
+    {t:10000, note:'10K units → 100M px'},
+    {t:100000, note:'100K units → 1B px'},
+    {t:214748, note:'214748 → 2.14B px (near INT32)'},
+    {t:214749, note:'214749 → just past INT32 threshold'},
+    {t:215000, note:'215K → well past INT32'},
+    {t:1000000, note:'1M units → 10B px'},
   ];
-  for(var j=0;j<vb2Tests.length;j++){
-    var vt=vb2Tests[j];
-    try{mx2.e=vt.t;}catch(e){continue;}
-    svg2.appendChild(r2);
-    var ctm2=null,bcr2=null;
-    try{ctm2=r2.getScreenCTM();}catch(e){}
-    try{bcr2=r2.getBoundingClientRect();}catch(e){}
-    svg2.removeChild(r2);
-    var ctm2e=ctm2?ctm2.e:null;
-    var bcr2x=bcr2?bcr2.x:null;
+  for(var j=0;j<vbMXTests.length;j++){
+    var vt=vbMXTests[j];
+    mx2.e=vt.t;
+    var c2=ctm(r2);
+    var b2=bcr(r2);
+    var ce2=c2?c2.e:null;
+    var bx2=b2?b2.x:null;
     var expPx=vt.t*10000;
-    log('CTX[2]: ['+vt.note+']\n  exp='+expPx.toExponential(3)+' CTM.e='+ctm2e+' BCR.x='+bcr2x,
-      (ctm2e!==null&&ctm2e>LU_MAX&&(bcr2x===null||bcr2x<=LU_MAX)?'star — CTM past LU_MAX but BCR clamped!':
-       ctm2e!==null&&ctm2e>INT32_OVF&&(bcr2x===null||bcr2x<=INT32_OVF)?'uaf — CTM past 2^31 while BCR capped!':
-       ctm2e!==null&&ctm2e<0&&expPx>0?'uaf — CTM NEGATIVE (overflow)!':
+    log('CTM[2]: ['+vt.note+']\n  exp='+expPx.toExponential(3)+' CTM.e='+ce2+' BCR.x='+bx2,
+      (ce2!==null&&ce2<0&&expPx>0?'uaf — CTM NEGATIVE IN VIEWBOX+MX!':
+       ce2!==null&&bx2!==null&&ce2>bx2&&bx2===INT32_OVF?'star — CTM PAST 2^31 WHILE BCR FROZEN: CTM='+ce2:
+       ce2!==null&&bx2!==null&&Math.round(ce2)!==bx2&&expPx>LU_MAX?'star — CTM≠BCR discrepancy: CTM='+ce2+' BCR='+bx2:
        'info'));
   }
-  svg2.remove();
-  svg.remove();
-}
 
-// ════════════════════════════════════════════════════════════════════════
-// VBW — viewBox width/height amplification (not just x)
-// Can we overflow the width/height coordinates differently than x?
-// Also: what if viewBox min-x is negative — does that shift the coord range?
-// ════════════════════════════════════════════════════════════════════════
-function runVBW(){
-  hdr('VBW: viewBox width/height overflow + negative min-x offset');
-
-  // VBW[1]: negative viewBox min-x to shift coordinates
-  // If viewBox="-2147483648 0 0.001 0.001" the SVG coordinate system
-  // starts at -2^31, so an element at x=0 in SVG space should be at
-  // screen x = 0 - (-2^31) * scale = +2^31 * scale
-  hdr('VBW[1]: negative viewBox min-x to shift elem into overflow range');
-  var negMinX=[
-    {vb:'-100 0 200 100', rectX:0, note:'rect at x=0 with min-x=-100 → screen ~50px'},
-    {vb:'-33554432 0 67108864 100', rectX:0, note:'min-x=-LU_MAX, width=2*LU_MAX → rect@0 → LU_MAX px'},
-    {vb:'-2147483648 0 4294967296 100', rectX:0, note:'min-x=-2^31, width=2^32 → rect@0 → 2^31 screen?'},
-    {vb:'-1e10 0 2e10 100', rectX:0, note:'min-x=-1e10'},
-    {vb:'-1e15 0 2e15 100', rectX:0, note:'min-x=-1e15'},
-    {vb:'-1e30 0 2e30 100', rectX:0, note:'min-x=-1e30'},
-  ];
-  for(var i=0;i<negMinX.length;i++){
-    var t=negMinX[i];
-    var svg=mkSVG(100,100,t.vb);
-    var r=mkRect(svg,t.rectX,0,1,1);
-    var bcr=r.getBoundingClientRect();
-    log('VBW[1]: ['+t.note+']\n  BCR.x='+bcr.x.toExponential(4)+' BCR.y='+bcr.y,
-      (bcr.x<-1e8?'crit — LARGE NEGATIVE BCR.x: '+bcr.x:
-       bcr.x>LU_MAX?'star — past LU_MAX: '+bcr.x.toExponential(3):
-       'info'));
-    svg.remove();
+  // CTM[3]: negative matrix translate in viewBox space — does CTM track negative past -2^31?
+  hdr('CTM[3]: negative translate in viewBox space — CTM tracking range');
+  var negVBTests=[-100,-3355,-3356,-10000,-214748,-214749,-1000000];
+  for(var k=0;k<negVBTests.length;k++){
+    mx2.e=negVBTests[k];
+    var c3=ctm(r2);
+    var b3=bcr(r2);
+    log('CTM[3]: mx.e='+negVBTests[k]+' exp='+(negVBTests[k]*10000).toExponential(3)+' CTM.e='+(c3?c3.e:null)+' BCR.x='+(b3?b3.x:null),
+      (c3&&c3.e>0&&negVBTests[k]<0?'uaf — CTM POSITIVE FROM NEGATIVE! WRAP!':
+       c3&&c3.e<-INT32_OVF?'star — CTM past -2^31: '+c3.e:'info'));
   }
 
-  // VBW[2]: extreme viewBox width — not position, but size
-  // If viewBox width is tiny, elements appear large on screen
-  // But can we make the rect's RIGHT edge overflow past 2^31 while the LEFT is at 0?
-  hdr('VBW[2]: element WIDTH overflow past 2^31 via viewBox');
-  var wTests=[
-    {vb:'0 0 0.01 0.01', rectW:214748, note:'rect W=214748 SVG units → 2.14B px (near INT32)'},
-    {vb:'0 0 0.01 0.01', rectW:214749, note:'rect W=214749 → just past INT32'},
-    {vb:'0 0 0.01 0.01', rectW:214750, note:'rect W=214750 → past INT32'},
-    {vb:'0 0 0.01 0.01', rectW:1e6,    note:'rect W=1M SVG units → 10B px'},
-  ];
-  for(var j=0;j<wTests.length;j++){
-    var wt=wTests[j];
-    var svgw=mkSVG(100,100,wt.vb);
-    var rw=mkRect(svgw,0,0,wt.rectW,wt.rectW);
-    var bcrw=rw.getBoundingClientRect();
-    log('VBW[2]: ['+wt.note+']\n  BCR.w='+bcrw.width.toExponential(4)+' BCR.right='+bcrw.right.toExponential(4),
-      (bcrw.width<0?'uaf — NEGATIVE WIDTH! INT32 overflow on width!':
-       bcrw.width>INT32_OVF?'uaf — WIDTH past 2^31!':
-       bcrw.width>LU_MAX?'star — WIDTH past LU_MAX: '+bcrw.width.toExponential(3):
-       'info'));
-    svgw.remove();
-  }
-
-  // VBW[3]: can BCR.right or BCR.bottom overflow independently?
-  hdr('VBW[3]: BCR.right overflow (x+width) — can right > 2^31 when both are near the limit?');
-  var svg3=mkSVG(100,100,'0 0 0.01 0.01');
-  // rect at x=214000 SVG units (2.14B px) with width=750 SVG units (7.5M px)
-  // right edge = 2.147B + ... near INT32
-  var r3=mkRect(svg3,214000,0,750,750);
-  var bcr3=r3.getBoundingClientRect();
-  log('VBW[3]: x=214000, w=750 SVG units → BCR.x='+bcr3.x+' BCR.right='+bcr3.right+' BCR.w='+bcr3.width,
-    (bcr3.right<0&&bcr3.x>0?'uaf — RIGHT EDGE NEGATIVE OVERFLOW!':
-     bcr3.right>INT32_OVF?'uaf — RIGHT past 2^31!':
-     bcr3.right>LU_MAX?'star — RIGHT past LU_MAX':
-     'info'));
-  svg3.remove();
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// NEG — negative coordinate overflow: can we get BCR.x > 0 from negative inputs?
-// The v26 RAT suite showed: TF x=-2^31 → BCR.x=-33564428 (past -LU_MAX)
-// Matrix showed: mx.e=-2.148e9 → BCR.x=-2147483648 (negative saturation)
-// Q: can negative overflow wrap to positive? (signed→unsigned confusion)
-// ════════════════════════════════════════════════════════════════════════
-function runNEG(){
-  hdr('NEG: negative coordinate wrap — can negative overflow produce positive BCR?');
-
-  // NEG[1]: viewBox with very negative x values
-  hdr('NEG[1]: very negative viewBox min-x + rect at x=0 → does it produce positive BCR past 2^31?');
-  var negTests=[
-    {vb:'-2147483648 0 2147483648 100', rx:0, note:'min-x=-INT32_MAX, w=INT32_MAX → rect@0 should be at +huge'},
-    {vb:'-2147483649 0 2147483649 100', rx:0, note:'min-x=-(2^31+1)'},
-    {vb:'-4294967296 0 4294967296 100', rx:0, note:'min-x=-2^32'},
-    {vb:'-1e10 0 1e10 100', rx:0, note:'min-x=-1e10'},
-    {vb:'0 0 0.01 0.01', rx:-214748, note:'rect at -214748 SVG units → screen x=-2.14B px'},
-    {vb:'0 0 0.01 0.01', rx:-214749, note:'rect at -214749 SVG units → screen x=-2.14B-'},
-    {vb:'0 0 0.01 0.01', rx:-1e6,    note:'rect at -1M → screen x=-10B px'},
-  ];
-  for(var i=0;i<negTests.length;i++){
-    var t=negTests[i];
-    var svg=mkSVG(100,100,t.vb);
-    var r=mkRect(svg,t.rx,0,1,1);
-    var bcr=null;
-    try{bcr=r.getBoundingClientRect();}catch(e){log('NEG[1]: err','fail');svg.remove();continue;}
-    log('NEG[1]: ['+t.note+']\n  BCR.x='+bcr.x.toExponential(4),
-      (bcr.x>0&&t.rx<0?'uaf — POSITIVE BCR FROM NEGATIVE INPUT! wrap!':
-       bcr.x>LU_MAX&&t.rx>=0?'star — past LU_MAX':
-       bcr.x<-INT32_OVF?'crit — BCR past -2^31: '+bcr.x:
-       bcr.x===-INT32_OVF?'crit — BCR AT -2^31':
-       'info'));
-    svg.remove();
-  }
-
-  // NEG[2]: matrix negative translate fine sweep around -2^31
-  hdr('NEG[2]: matrix negative translate fine sweep around -2^31');
-  var svg2=mkSVG(100,100);
-  var r2=mkRect(svg2,0,0,10,10);
-  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx=r2.transform.baseVal.getItem(0).matrix;
-  svg2.removeChild(r2);
-  var negMX=[
-    -INT32_OVF+2, -INT32_OVF+1, -INT32_OVF,
-    -(INT32_OVF+1), -(INT32_OVF+2),
-    -(INT32_OVF+100), -(INT32_OVF+65536),
-    -INT32_OVF*2
-  ];
-  for(var j=0;j<negMX.length;j++){
-    try{mx.e=negMX[j];}catch(e){continue;}
-    svg2.appendChild(r2);
-    var bcr2=r2.getBoundingClientRect();
-    svg2.removeChild(r2);
-    log('NEG[2]: mx.e='+negMX[j]+' BCR.x='+bcr2.x,
-      (bcr2.x>0&&negMX[j]<0?'uaf — POSITIVE BCR FROM NEGATIVE MATRIX! WRAP!':
-       bcr2.x<-INT32_OVF?'crit — past -2^31: '+bcr2.x:
-       bcr2.x===-INT32_OVF?'crit — AT -2^31':
-       'info'));
-  }
-  svg2.remove();
-
-  // NEG[3]: TF negative write + viewBox amplification
-  hdr('NEG[3]: TF negative write + viewBox amplification');
-  var svg3=mkSVG(100,100,'0 0 0.01 0.01');  // 1 unit = 10000px
-  var r3=mkRect(svg3,0,0,0.1,0.1);
-  var tf3=r3.x.baseVal;
-  svg3.removeChild(r3);
-  var negTF=[-214748,-214749,-214750,-300000,-1e6];
-  for(var k=0;k<negTF.length;k++){
-    try{tf3.value=negTF[k];}catch(e){continue;}
-    svg3.appendChild(r3);
-    var bcr3=r3.getBoundingClientRect();
-    svg3.removeChild(r3);
-    var exp=negTF[k]*10000;
-    log('NEG[3]: TF x='+negTF[k]+' exp='+exp.toExponential(3)+' BCR.x='+bcr3.x,
-      (bcr3.x>0&&negTF[k]<0?'uaf — POSITIVE FROM NEGATIVE TF+VIEWBOX! WRAP!':
-       bcr3.x<-INT32_OVF?'crit — past -2^31':
-       bcr3.x===-INT32_OVF?'crit — AT -2^31':
-       'info'));
-    svg3.removeChild?null:null;
-  }
-  svg3.remove();
+  svg.remove();svg2.remove();
 }
 </script>
 </body>
