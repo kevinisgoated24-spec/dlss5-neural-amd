@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v26 — viewBox Amplification + Matrix INT32 Overflow</title>
+<title>SVG v27 — INT32 Wrap Hunt + ViewBox Precision Probe</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0a;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -25,17 +25,17 @@ button:active{background:#0d0;color:#000}
 </style>
 </head>
 <body>
-<h1>SVG v26 — viewBox Amplification + Matrix INT32 Overflow</h1>
-<h2>iOS 26.5.2 · VBX / VBA / VBN / MXI / CTM / INA</h2>
+<h1>SVG v27 — INT32 Wrap Hunt + viewBox Precision</h1>
+<h2>iOS 26.5.2 · W32 / VBF / MXB / CTX / VBW / NEG</h2>
 
 <div class="suite">
 <button id="btn-all" onclick="runAll()">▶ ALL</button>
-<button onclick="go('VBX')">VBX</button>
-<button onclick="go('VBA')">VBA</button>
-<button onclick="go('VBN')">VBN</button>
-<button onclick="go('MXI')">MXI</button>
-<button onclick="go('CTM')">CTM</button>
-<button onclick="go('INA')">INA</button>
+<button onclick="go('W32')">W32</button>
+<button onclick="go('VBF')">VBF</button>
+<button onclick="go('MXB')">MXB</button>
+<button onclick="go('CTX')">CTX</button>
+<button onclick="go('VBW')">VBW</button>
+<button onclick="go('NEG')">NEG</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -43,9 +43,9 @@ button:active{background:#0d0;color:#000}
 
 <script>
 var NS='http://www.w3.org/2000/svg';
-var LU_MAX=33554432;  // LayoutUnit::max() ≈ 33.5M px
+var LU_MAX=33554432;
 var INT32_MAX=2147483647;
-var INT32_OVF=2147483648;  // 2^31 — where BCR saturated in v25
+var INT32_OVF=2147483648;  // 2^31
 
 function log(m,c){
   var d=document.getElementById('out');
@@ -64,526 +64,562 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runVBX();
-  setTimeout(function(){runVBA();},300);
-  setTimeout(function(){runVBN();},600);
-  setTimeout(function(){runMXI();},900);
-  setTimeout(function(){runCTM();},1200);
-  setTimeout(function(){runINA();},1500);
+  runW32();
+  setTimeout(function(){runVBF();},400);
+  setTimeout(function(){runMXB();},800);
+  setTimeout(function(){runCTX();},1200);
+  setTimeout(function(){runVBW();},1600);
+  setTimeout(function(){runNEG();},2000);
 }
 
-// float utils
 var _fb=new ArrayBuffer(8);
 var _fv=new Float32Array(_fb);
 var _dv=new Float64Array(_fb);
 var _uv=new Uint32Array(_fb);
-function bitsF32(u){_uv[0]=u;return _fv[0];}
-function f32b(f){_fv[0]=f;return _uv[0];}
-function bitsF64(hi,lo){_uv[1]=hi;_uv[0]=lo;return _dv[0];}
 function f64h(f){_dv[0]=f;return{hi:_uv[1],lo:_uv[0]};}
+function bitsF64(hi,lo){_uv[1]=hi;_uv[0]=lo;return _dv[0];}
 function f64hex(f){var h=f64h(f);return'0x'+h.hi.toString(16).padStart(8,'0')+'_'+h.lo.toString(16).padStart(8,'0');}
 
-function classifyBCR(bcr,label){
-  var x=bcr?bcr.x:null;
-  if(x===null)return'fail';
-  if(x<-LU_MAX)return'crit — NEGATIVE OVF: '+label+'='+x.toExponential(3);
-  if(x>LU_MAX&&x<INT32_OVF)return'uaf — PAST LU_MAX! '+label+'='+x.toExponential(3);
-  if(x>=INT32_OVF)return'crit — AT/PAST INT32_OVF: '+label+'='+x;
-  return null;
-}
-
-function mkSVG(w,h,vb){
+function mkSVG(w,h,vb,vis){
   var s=document.createElementNS(NS,'svg');
   s.setAttribute('width',w||100);s.setAttribute('height',h||100);
   if(vb)s.setAttribute('viewBox',vb);
-  s.style.cssText='position:absolute;left:-9999px;top:-9999px';
+  if(vis){s.style.cssText='position:absolute;left:0px;top:0px';}
+  else{s.style.cssText='position:absolute;left:-9999px;top:-9999px';}
   document.body.appendChild(s);
   return s;
 }
-function mkRect(svg,x,y,w,h){
+function mkRect(parent,x,y,w,h){
   var r=document.createElementNS(NS,'rect');
   r.setAttribute('x',x||0);r.setAttribute('y',y||0);
   r.setAttribute('width',w||10);r.setAttribute('height',h||10);
-  svg.appendChild(r);
+  parent.appendChild(r);
   return r;
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// VBX — viewBox zoom: does BCR bypass LayoutUnit clamping?
-// v25 showed: viewBox="0 0 0.000001 0.000001" on 100px SVG gives BCR.w=1e8
-// LayoutUnit max ≈ 33,554,432 — we got 100,000,000 → PAST IT
+// W32 — fine probe around the 2^31 saturation point via viewBox path
+// v26 confirmed: viewBox bypasses LU_MAX, hits 2^31 hard
+// Key question: is 2^31 a hard clamp, or can values slip past?
+// Try to find BCR.x values between 2^31 and (2^31)+N
 // ════════════════════════════════════════════════════════════════════════
-function runVBX(){
-  hdr('VBX: viewBox amplification — does BCR bypass LayoutUnit max?');
-  hdr('LU_MAX='+LU_MAX+' INT32_OVF='+INT32_OVF);
+function runW32(){
+  hdr('W32: fine probe around 2^31 saturation — can we slip past?');
+  hdr('INT32_OVF='+INT32_OVF+' (0x'+INT32_OVF.toString(16)+')');
 
-  // VBX[1]: sweep viewBox zoom levels, rect at fixed fractional position
-  // Each test: how small can viewBox be before BCR blows past LU_MAX?
-  var tests=[
-    {vb:'0 0 100 100',   rectX:0,   note:'baseline (1px/unit)'},
-    {vb:'0 0 10 10',     rectX:35000000, note:'10px/unit, x=35M units (LU territory)'},
-    {vb:'0 0 1 1',       rectX:50000000, note:'100px/unit, x=50M units'},
-    {vb:'0 0 0.1 0.1',   rectX:340000,  note:'1000px/unit, x=340K→340M px'},
-    {vb:'0 0 0.01 0.01', rectX:34000,   note:'10000px/unit, x=34K→340M px'},
-    {vb:'0 0 0.001 0.001', rectX:34000, note:'100K px/unit, x=34K→3.4B px [INT32 zone]'},
-    {vb:'0 0 0.0001 0.0001', rectX:2200, note:'1M px/unit, x=2200→2.2B px [INT32 zone]'},
-    {vb:'0 0 0.00001 0.00001', rectX:215, note:'10M px/unit, x=215→2.15B px [INT32 zone]'},
-    {vb:'0 0 0.000001 0.000001', rectX:21, note:'100M px/unit, x=21→2.1B px [INT32 zone]'},
-    {vb:'0 0 0.0000001 0.0000001', rectX:2, note:'1B px/unit, x=2→2B px'},
-    {vb:'0 0 1e-9 1e-9',  rectX:2,  note:'10B px/unit, x=2→20B px [PAST INT32]'},
-    {vb:'0 0 1e-10 1e-10', rectX:1, note:'100B px/unit, x=1→100B px'},
-  ];
+  // W32[1]: viewBox "0 0 0.01 0.01" on 100px SVG → 1 unit = 10000px
+  // To get BCR = 2^31: x = 2147483648/10000 = 214748.3648 SVG units
+  // Fine sweep around that
+  var svg=mkSVG(100,100,'0 0 0.01 0.01');
+  var r=mkRect(svg,0,0,1,1);
+  var tf=r.x.baseVal;
+  svg.removeChild(r);
 
-  for(var i=0;i<tests.length;i++){
-    var t=tests[i];
-    var svg=mkSVG(100,100,t.vb);
-    var r=mkRect(svg,t.rectX,0,1,1);
-    var bcr=null;
-    try{bcr=r.getBoundingClientRect();}catch(e){log('VBX[1]: ['+t.note+'] BCR err: '+e.message,'fail');svg.remove();continue;}
-    var x=bcr.x;
-    var flag=null;
-    if(x<-LU_MAX)flag='crit — NEGATIVE (neg overflow?)';
-    else if(x>LU_MAX&&x<INT32_OVF-1)flag='uaf — PAST LU_MAX (float path, no LayoutUnit clamp!)';
-    else if(x>=INT32_OVF-1&&x<=INT32_OVF+1)flag='crit — AT INT32_OVF boundary!';
-    else if(x<-1e8)flag='crit — MASSIVE NEGATIVE!';
-    log('VBX[1]: ['+t.note+']\n  → BCR.x='+x.toExponential(4)+' LU_MAX='+(x>LU_MAX?'EXCEEDED':'ok')+' INT32='+(Math.abs(x)>=INT32_OVF?'OVERFLOW':'ok'),
-      flag||((x>LU_MAX)?'star — past LU_MAX':'info'));
-    svg.remove();
+  hdr('W32[1]: viewBox 0.01 (10000px/unit) — probing near 2^31 boundary');
+  var scale=100/0.01;  // px per SVG unit = 10000
+  var target=INT32_OVF/scale;  // SVG x that should give BCR≈2^31
+  // target = 214748.3648
+  var probes=[];
+  // Step down from target, then up past it
+  for(var d=-10;d<=25;d++){
+    probes.push(target - 10 + d*1.5);
   }
+  // Also try exact fractions near the boundary
+  probes.push(INT32_MAX/scale);    // exactly INT32_MAX/scale
+  probes.push(INT32_OVF/scale);    // exactly INT32_OVF/scale
+  probes.push((INT32_OVF+1)/scale);
+  probes.push((INT32_OVF+100)/scale);
+  probes.push((INT32_OVF+1000)/scale);
+  probes.push((INT32_OVF+65536)/scale);  // +0x10000
+  probes.push((INT32_OVF*2)/scale);      // 2^32
 
-  // VBX[2]: fine binary search near INT32_OVF boundary with viewBox 1e-8
-  hdr('VBX[2]: binary search near INT32 boundary (viewBox 1e-8)');
-  // viewBox="0 0 1e-8 1e-8" on 100px SVG → 1 SVG unit = 10B screen px
-  // INT32_MAX = 2147483647, INT32_OVF = 2147483648
-  // To get screen x = 2147483648, need SVG x = 2147483648 / (100/1e-8) = 2147483648/1e10 = 0.0000002147...
-  var vbSVG=mkSVG(100,100,'0 0 1e-8 1e-8');
-  var xProbes=[
-    0.0000001,   // 0.0000001 * 1e10 = 1M px
-    0.0000334,   // 0.0000334 * 1e10 = 334M px
-    0.000100,    // 1B px
-    0.000200,    // 2B px (near INT32)
-    0.000210,    // 2.1B px
-    0.000214,    // 2.14B px
-    0.000215,    // 2.15B px
-    0.0002147,   // 2.147B px (very near INT32_MAX)
-    0.00021474836,  // exactly INT32_MAX/1e10 = 0.0002147483647
-    0.000215,    // just past INT32_MAX/1e10
-    0.00025,     // 2.5B px (past INT32)
-    0.001,       // 10B px (well past)
-  ];
-  for(var j=0;j<xProbes.length;j++){
-    var xp=xProbes[j];
-    var rp=mkRect(vbSVG,xp,0,1,1);
-    var bcrp=null;
-    try{bcrp=rp.getBoundingClientRect();}catch(e){log('VBX[2]: err: '+e.message,'fail');vbSVG.removeChild(rp);continue;}
-    var expectedPx=(xp*(100/1e-8))-9999;  // subtract SVG's off-screen offset
-    var actualX=bcrp.x;
-    var delta=actualX-expectedPx;
-    log('VBX[2]: svgX='+xp.toExponential(4)+' expectedPx='+expectedPx.toExponential(4)+' actualX='+actualX.toExponential(4)+' delta='+delta.toExponential(2),
-      (actualX<0&&expectedPx>0?'crit — SIGNED INT OVERFLOW! expected +'+expectedPx.toExponential(3)+' got '+actualX:
-       Math.abs(actualX)>=INT32_OVF?'crit — AT INT32 BOUNDARY':
-       actualX>LU_MAX?'star — past LU_MAX, float path confirmed':'info'));
-    vbSVG.removeChild(rp);
+  for(var i=0;i<probes.length;i++){
+    var xv=probes[i];
+    try{tf.value=xv;}catch(e){log('W32[1]: x='+xv+' err','fail');continue;}
+    svg.appendChild(r);
+    var bcr=r.getBoundingClientRect();
+    svg.removeChild(r);
+    var expected=xv*scale;
+    var bx=bcr.x;
+    log('W32[1]: svgX='+xv.toFixed(4)+' exp='+expected.toFixed(0)+' BCR.x='+bx,
+      (bx<0&&expected>0?'uaf — NEGATIVE WRAP! exp='+expected+' got='+bx:
+       bx>INT32_OVF?'uaf — PAST 2^31! BCR.x='+bx:
+       bx===INT32_OVF?'crit — AT 2^31 exactly':
+       bx>LU_MAX&&bx<INT32_OVF?'star — between LU_MAX and 2^31: '+bx:
+       'info'));
   }
-  vbSVG.remove();
+  svg.remove();
+
+  // W32[2]: ultra-fine sweep right at boundary — 1px increments
+  hdr('W32[2]: ultra-fine sweep — 1-unit steps around 2^31 boundary');
+  var svg2=mkSVG(100,100,'0 0 0.001 0.001');  // 1 unit=100000px
+  var r2=mkRect(svg2,0,0,0.1,0.1);
+  var tf2=r2.x.baseVal;
+  svg2.removeChild(r2);
+  var scale2=100/0.001;
+  var t2=INT32_OVF/scale2;  // ≈21474.83648 SVG units
+
+  for(var j=-5;j<=15;j++){
+    var xv2=t2 + j;
+    try{tf2.value=xv2;}catch(e){continue;}
+    svg2.appendChild(r2);
+    var bcr2=r2.getBoundingClientRect();
+    svg2.removeChild(r2);
+    log('W32[2]: svgX='+xv2.toFixed(3)+' exp='+(xv2*scale2).toFixed(0)+' BCR.x='+bcr2.x,
+      (bcr2.x<0&&xv2*scale2>0?'uaf — NEGATIVE WRAP!':
+       bcr2.x>INT32_OVF?'uaf — PAST 2^31! '+bcr2.x:
+       bcr2.x===INT32_OVF?'crit — AT boundary':'info'));
+  }
+  svg2.remove();
+
+  // W32[3]: non-integer viewBox ratios — does float rounding slip past 2^31?
+  hdr('W32[3]: irrational scale factors (float rounding near 2^31)');
+  // Use viewBox values that create irrational px/unit ratios
+  // Hope: rounding at float→int cast creates a value just above 2^31
+  var vbTests=[
+    {vb:'0 0 0.03 0.03', scale:100/0.03, name:'0.03 (irrational ×3333.3...)'},
+    {vb:'0 0 0.07 0.07', scale:100/0.07, name:'0.07 (×1428.57...)'},
+    {vb:'0 0 0.13 0.13', scale:100/0.13, name:'0.13 (×769.23...)'},
+    {vb:'0 0 0.17 0.17', scale:100/0.17, name:'0.17 (×588.23...)'},
+    {vb:'0 0 0.19 0.19', scale:100/0.19, name:'0.19 (×526.31...)'},
+    {vb:'0 0 0.003 0.003', scale:100/0.003, name:'0.003 (×33333.3...)'},
+    {vb:'0 0 0.007 0.007', scale:100/0.007, name:'0.007 (×14285.7...)'},
+  ];
+  for(var k=0;k<vbTests.length;k++){
+    var vt=vbTests[k];
+    var svgk=mkSVG(100,100,vt.vb);
+    var rk=mkRect(svgk,0,0,0.1,0.1);
+    var tfk=rk.x.baseVal;
+    svgk.removeChild(rk);
+    // Try x values that should give screen coords near and past 2^31
+    var xt=(INT32_OVF+1)/vt.scale;
+    var targets=[
+      INT32_OVF/vt.scale,
+      (INT32_OVF+1)/vt.scale,
+      (INT32_OVF+100)/vt.scale,
+      (INT32_OVF+65536)/vt.scale,
+    ];
+    for(var t=0;t<targets.length;t++){
+      try{tfk.value=targets[t];}catch(e){continue;}
+      svgk.appendChild(rk);
+      var bcrk=rk.getBoundingClientRect();
+      svgk.removeChild(rk);
+      var bx=bcrk.x;
+      if(bx>INT32_OVF||bx<0){
+        log('W32[3]: ['+vt.name+'] x='+targets[t].toFixed(4)+' BCR.x='+bx,
+          (bx<0?'uaf — NEGATIVE WRAP! got '+bx:'uaf — PAST 2^31! got '+bx));
+      }
+    }
+    // Just log the boundary hit
+    var xbnd=INT32_OVF/vt.scale;
+    try{tfk.value=xbnd;}catch(e){svgk.remove();continue;}
+    svgk.appendChild(rk);
+    var bcrk2=rk.getBoundingClientRect();
+    svgk.removeChild(rk);
+    log('W32[3]: ['+vt.name+'] boundary x='+xbnd.toFixed(6)+' BCR.x='+bcrk2.x,
+      (bcrk2.x>INT32_OVF?'uaf — PAST 2^31!':
+       bcrk2.x===INT32_OVF?'crit — AT 2^31 exactly':
+       bcrk2.x<0?'uaf — NEGATIVE!':'info'));
+    svgk.remove();
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// VBA — viewBox + TF write amplification
-// Write x via TF (bypassing normal setAttribute parsing),
-// then amplify via tiny viewBox → does it compound?
+// VBF — viewBox float precision: does the float→int conversion lose bits?
+// If viewBox coordinate = 2^31 + N and N gets lost in float32 truncation
+// we might get values that round differently through the pipeline
 // ════════════════════════════════════════════════════════════════════════
-function runVBA(){
-  hdr('VBA: TF write + viewBox amplification combo');
+function runVBF(){
+  hdr('VBF: float precision at 2^31 boundary — does the cast truncate?');
 
-  // VBA[1]: write large x via TF, inner SVG has tiny viewBox
-  // Strategy: outer SVG normal, inner SVG with tiny viewBox
-  // Place rect in inner SVG, modify its x via TF
-  var outerSVG=mkSVG(500,500);
-  var innerSVG=document.createElementNS(NS,'svg');
-  innerSVG.setAttribute('width',100);innerSVG.setAttribute('height',100);
-  innerSVG.setAttribute('viewBox','0 0 0.000001 0.000001');  // 1 SVG unit = 100M px
-  outerSVG.appendChild(innerSVG);
+  // At 2^31, float32 precision is 256 (2^8), so nearby values can't all be repr.
+  // float64 precision at 2^31 is still fine (53 bit mantissa)
+  // The Q: what type is used for the int cast? float32→int32 or float64→int32?
 
-  var r=mkRect(innerSVG,0.1,0,0.01,0.01);  // x=0.1 → 10M px (normal)
-  var tf=r.x.baseVal;
-  log('VBA[1]: inner SVG viewBox=0.000001, rect x=0.1 → expected screen x≈10M px','info');
-  var bcr1=r.getBoundingClientRect();
-  log('VBA[1]: baseline BCR.x='+bcr1.x.toExponential(4),(bcr1.x>LU_MAX?'star — PAST LU_MAX already':'info'));
-
-  // Now remove rect, write larger x via TF, re-attach
-  innerSVG.removeChild(r);
-  tf.value=0.34;  // 0.34 × 100M = 34M (just past LU_MAX)
-  innerSVG.appendChild(r);
-  var bcr2=r.getBoundingClientRect();
-  log('VBA[1]: TF x=0.34 → 34M expected, BCR.x='+bcr2.x.toExponential(4),
-    (bcr2.x>LU_MAX?'uaf — PAST LU_MAX via TF+viewBox!':bcr2.x===LU_MAX||Math.abs(bcr2.x-LU_MAX)<10000?'warn — CLAMPED to LU_MAX':'info'));
-
-  innerSVG.removeChild(r);
-  tf.value=0.22;  // 0.22 × 100M = 22M (under LU_MAX)
-  innerSVG.appendChild(r);
-  var bcr3=r.getBoundingClientRect();
-  log('VBA[1]: TF x=0.22 → 22M, BCR.x='+bcr3.x.toExponential(4),'info');
-
-  // approach from below
-  var steps=[0.30,0.33,0.335,0.3355,0.336,0.34,0.35,0.40,0.50,1.0,2.0,21.47484];
-  hdr('VBA[2]: sweep TF values through viewBox amplification (viewBox 1e-6)');
-  for(var k=0;k<steps.length;k++){
-    var xv=steps[k];
-    innerSVG.removeChild(r);
-    var wb=false;
-    try{tf.value=xv;wb=true;}catch(e){log('VBA[2]: x='+xv+' write err','fail');continue;}
-    innerSVG.appendChild(r);
-    var bcr=r.getBoundingClientRect();
-    var bx=bcr.x;
-    var expectedScreen=xv*1e8;  // 1 SVG unit = 100M px for viewBox 0.000001
-    log('VBA[2]: svgX='+xv+' expectedScrPx='+expectedScreen.toExponential(3)+' BCR.x='+bx.toExponential(4),
-      (bx<0&&expectedScreen>0?'uaf — NEGATIVE BCR! INT32 OVERFLOW via viewBox+TF!':
-       bx>LU_MAX&&bx<INT32_OVF?'uaf — PAST LU_MAX, no clamp! float path!':
-       bx>=INT32_OVF?'crit — AT INT32 BOUNDARY':
-       'info'));
-    innerSVG.removeChild(r);
+  // VBF[1]: check float32 precision at 2^31
+  hdr('VBF[1]: float32 representable values near 2^31 (step=256)');
+  var _fb2=new ArrayBuffer(4);
+  var _fv2=new Float32Array(_fb2);
+  var _iv2=new Int32Array(_fb2);
+  // float32 at 2^31: exponent=31, so ulp = 2^(31-23) = 2^8 = 256
+  var f32near=[];
+  for(var d2=-5;d2<=10;d2++){
+    _iv2[0]=0x4f000000+(d2);  // 2^31 in f32 is 0x4f000000, step by raw bits
+    f32near.push({bits:'0x'+(0x4f000000+d2).toString(16), val:_fv2[0]});
+  }
+  for(var i=0;i<f32near.length;i++){
+    log('VBF[1]: f32['+f32near[i].bits+']='+f32near[i].val,'info');
   }
 
-  outerSVG.remove();
+  // VBF[2]: does viewBox pipeline use float32 or float64 for coords?
+  // Test: can we distinguish values 1 apart near 2^31 via BCR?
+  hdr('VBF[2]: can BCR distinguish values 1 apart near 2^31? (float64 vs float32 path)');
+  // viewBox="0 0 1 1" on 100px SVG → 1 unit = 100px
+  // To get BCR=2^31: x = 2147483648/100 = 21474836.48
+  var svg=mkSVG(100,100,'0 0 1 1');
+  var r=mkRect(svg,0,0,0.1,0.1);
+  var tf=r.x.baseVal;
+  svg.removeChild(r);
+  var scale=100;
+  var base=INT32_OVF/scale;  // 21474836.48
+  var fine=[-200,-100,-10,-1,0,1,10,100,200,256,257,512,1024];
+  var prevBCR=null;
+  for(var j=0;j<fine.length;j++){
+    var xv=base+fine[j];
+    try{tf.value=xv;}catch(e){continue;}
+    svg.appendChild(r);
+    var bcr=r.getBoundingClientRect();
+    svg.removeChild(r);
+    var bx=bcr.x;
+    var changed=(prevBCR!==null&&bx!==prevBCR);
+    log('VBF[2]: delta='+fine[j]+' svgX='+xv.toFixed(2)+' BCR.x='+bx+(changed?' ← CHANGED from '+prevBCR:''),
+      (bx<0?'uaf — NEGATIVE!':bx>INT32_OVF?'uaf — PAST 2^31!':bx===INT32_OVF?'crit':'info'));
+    prevBCR=bx;
+  }
+  svg.remove();
 
-  // VBA[3]: viewBox 1e-8 + TF write — can we reach INT32 overflow?
-  hdr('VBA[3]: viewBox 1e-8 + TF write (targeting INT32 overflow)');
+  // VBF[3]: matrix path — same fine sweep (matrix clamps at LU_MAX for normal values,
+  // but showed transition at INT32_MAX threshold in v26)
+  hdr('VBF[3]: matrix fine sweep at the INT32_MAX threshold (v26 found behavioral change there)');
   var svg3=mkSVG(100,100);
-  var inner3=document.createElementNS(NS,'svg');
-  inner3.setAttribute('width',100);inner3.setAttribute('height',100);
-  inner3.setAttribute('viewBox','0 0 1e-8 1e-8');  // 1 unit = 10B px
-  svg3.appendChild(inner3);
-
-  var r3=mkRect(inner3,0,0,0.000001,0.000001);
-  var tf3=r3.x.baseVal;
-  var probes3=[0.0001, 0.0002, 0.00021, 0.000214, 0.0002147, 0.00021475, 0.00025, 0.001];
-  for(var p=0;p<probes3.length;p++){
-    var xp3=probes3[p];
-    inner3.removeChild(r3);
-    try{tf3.value=xp3;}catch(e){log('VBA[3]: x='+xp3+' err','fail');continue;}
-    inner3.appendChild(r3);
-    var bcrp3=r3.getBoundingClientRect();
-    var exp3=xp3*1e10;
-    log('VBA[3]: svgX='+xp3.toExponential(4)+' exp='+exp3.toExponential(3)+' BCR.x='+bcrp3.x.toExponential(4),
-      (bcrp3.x<0&&exp3>0?'uaf — SIGNED INT OVERFLOW via viewBox+TF!':
-       bcrp3.x>LU_MAX?'star — past LU_MAX':'info'));
-    inner3.removeChild(r3);
+  var r3=mkRect(svg3,0,0,10,10);
+  r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var mx=r3.transform.baseVal.getItem(0).matrix;
+  svg3.removeChild(r3);
+  // v26 line 70: mx.e=INT32_MAX → BCR=2147473664 (not LU_MAX, not exactly 2^31)
+  // v26 line 71: mx.e=INT32_MAX+1 → BCR=2147483648 (2^31)
+  // Fine sweep in that zone
+  var mxFine=[
+    2147483640, 2147483641, 2147483642, 2147483643,
+    2147483644, 2147483645, 2147483646,
+    INT32_MAX,       // 2147483647
+    INT32_OVF-1,     // 2147483647
+    INT32_OVF,       // 2147483648
+    INT32_OVF+1,
+    INT32_OVF+2,
+    INT32_OVF+100,
+    INT32_OVF+65536,
+    2147483648*2,    // 2^32
+  ];
+  for(var k=0;k<mxFine.length;k++){
+    try{mx.e=mxFine[k];}catch(e){continue;}
+    svg3.appendChild(r3);
+    var bcr3=r3.getBoundingClientRect();
+    svg3.removeChild(r3);
+    log('VBF[3]: mx.e='+mxFine[k]+' BCR.x='+bcr3.x,
+      (bcr3.x<0&&mxFine[k]>0?'uaf — NEGATIVE BCR FROM MATRIX!':
+       bcr3.x>INT32_OVF?'uaf — PAST 2^31! BCR='+bcr3.x:
+       bcr3.x===INT32_OVF?'crit — AT 2^31':
+       bcr3.x>LU_MAX&&bcr3.x<INT32_OVF?'star — between LU_MAX and 2^31: '+bcr3.x:
+       'info'));
   }
   svg3.remove();
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// VBN — nested viewBox cascade amplification
-// Each nested SVG multiplies the coordinate space
+// MXB — matrix BOTH axes simultaneously at extreme values
+// Does X+Y combined overflow cause cross-contamination?
+// Can simultaneous saturation on both axes produce a different result?
 // ════════════════════════════════════════════════════════════════════════
-function runVBN(){
-  hdr('VBN: nested viewBox cascade amplification');
-
-  // VBN[1]: 2 levels of tiny viewBox
-  // Outer SVG: normal 100px
-  // Middle SVG: viewBox="0 0 0.001 0.001" (1000px/unit), position x=0.001 → 1px
-  // Inner SVG: viewBox="0 0 0.001 0.001" again, width/height in middle-SVG units
-  // Net: 1 inner SVG unit = 1000 middle units × 1000 screen units = 1M px
-  // Actually nested SVG viewBox works differently — each SVG establishes its own viewport
-
-  hdr('VBN[1]: 2-level cascade');
-  var outerSVG=mkSVG(1000,1000);
-  var mid=document.createElementNS(NS,'svg');
-  mid.setAttribute('x',0);mid.setAttribute('y',0);
-  mid.setAttribute('width',100);mid.setAttribute('height',100);
-  mid.setAttribute('viewBox','0 0 0.001 0.001');  // 1 mid unit = 100000 px
-  outerSVG.appendChild(mid);
-
-  var inner=document.createElementNS(NS,'svg');
-  inner.setAttribute('x',0);inner.setAttribute('y',0);
-  inner.setAttribute('width',0.0001);inner.setAttribute('height',0.0001);  // in mid coords
-  inner.setAttribute('viewBox','0 0 0.0001 0.0001');  // 1 inner unit = 1 mid unit * (0.0001/0.0001) = 1 mid unit
-  mid.appendChild(inner);
-
-  var rect=mkRect(inner,0.0001,0,0.00001,0.00001);
-  var bcr=rect.getBoundingClientRect();
-  log('VBN[1]: 2-level viewBox cascade, BCR.x='+bcr.x.toExponential(4),
-    (bcr.x>LU_MAX?'star — past LU_MAX via cascade!':'info'));
-
-  // VBN[2]: explicit cascade with known scale factors
-  hdr('VBN[2]: explicit 3-level cascade');
-  // Level 1: SVG 1000×1000 on screen
-  // Level 2: SVG viewBox="0 0 0.001 0.001" → 1 L2 unit = 1M px
-  // Level 3: SVG viewBox="0 0 0.001 0.001" on L2 → 1 L3 unit = 1e9 px = 1B px
-  var L1=mkSVG(1000,1000);
-  var L2=document.createElementNS(NS,'svg');
-  L2.setAttribute('x',0);L2.setAttribute('y',0);
-  L2.setAttribute('width',1000);L2.setAttribute('height',1000);
-  L2.setAttribute('viewBox','0 0 0.001 0.001');
-  L1.appendChild(L2);
-  var L3=document.createElementNS(NS,'svg');
-  L3.setAttribute('x',0);L3.setAttribute('y',0);
-  L3.setAttribute('width',0.001);L3.setAttribute('height',0.001);
-  L3.setAttribute('viewBox','0 0 0.001 0.001');
-  L2.appendChild(L3);
-  var r3=mkRect(L3,0.0002,0,0.000001,0.000001);
-  var bcr3=r3.getBoundingClientRect();
-  // Expected: 0.0002 L3 units × (1000/0.001 L2px/L3unit) × (1000/0.001 px/L2unit) = 0.0002 * 1e6 * 1e6 = 2e8
-  log('VBN[2]: 3-level cascade, expected≈2e8 px, BCR.x='+bcr3.x.toExponential(4),
-    (bcr3.x<0?'uaf — NEGATIVE FROM CASCADE OVERFLOW!':
-     bcr3.x>LU_MAX?'uaf — PAST LU_MAX VIA 3-LEVEL CASCADE!':'info'));
-  var r3tf=r3.x.baseVal;
-  L3.removeChild(r3);
-  r3tf.value=0.002;  // 10× larger → 2e9 px expected (past INT32)
-  L3.appendChild(r3);
-  var bcr3b=r3.getBoundingClientRect();
-  log('VBN[2]: TF x=0.002 → exp 2e9 px, BCR.x='+bcr3b.x.toExponential(4),
-    (bcr3b.x<0&&bcr3b.x>-3e9?'uaf — SIGNED INT OVERFLOW FROM 3-LEVEL CASCADE+TF!':
-     bcr3b.x>=INT32_OVF?'crit — AT INT32 BOUNDARY from cascade+TF':
-     bcr3b.x>LU_MAX?'star — past LU_MAX from cascade+TF':'info'));
-  L1.remove();
-  outerSVG.remove();
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// MXI — Matrix INT32 overflow investigation
-// v25 showed BCR.x=2147483648 for all mx.e > ~2e9
-// Is this a real signed int overflow or saturation?
-// ════════════════════════════════════════════════════════════════════════
-function runMXI(){
-  hdr('MXI: Matrix translate INT32 overflow investigation');
-  var svg=mkSVG(200,200);
-  document.body.appendChild(svg);  // need to be in viewport for accurate BCR
-
+function runMXB(){
+  hdr('MXB: combined X+Y extreme matrix translate');
+  var svg=mkSVG(100,100);
   var r=mkRect(svg,0,0,10,10);
   r.setAttribute('transform','matrix(1 0 0 1 0 0)');
   var mx=r.transform.baseVal.getItem(0).matrix;
   svg.removeChild(r);
 
-  // MXI[1]: binary search the exact saturation point
-  hdr('MXI[1]: binary search — where does BCR.x saturate to 2^31?');
-  var mxProbes=[
-    1e6,  5e6, 1e7, 5e7, 1e8, 5e8,
-    1e9, 1.5e9, 2e9, 2.1e9, 2.14e9,
-    2.147e9, 2.1474e9, 2.14748e9,
-    INT32_MAX,   // 2147483647
-    INT32_OVF,   // 2147483648
-    2.148e9, 2.15e9, 2.2e9, 3e9, 1e10, 1e15
+  // MXB[1]: both at 2^31 simultaneously
+  hdr('MXB[1]: mx.e=mx.f=2^31 simultaneously');
+  var combined=[
+    {e:INT32_OVF,   f:INT32_OVF,   note:'both at 2^31'},
+    {e:INT32_OVF*2, f:INT32_OVF*2, note:'both at 2^32'},
+    {e:INT32_OVF,   f:0,           note:'e=2^31, f=0'},
+    {e:0,           f:INT32_OVF,   note:'e=0, f=2^31'},
+    {e:INT32_OVF-1, f:INT32_OVF-1, note:'both at INT32_MAX'},
+    {e:INT32_OVF+1, f:INT32_OVF+1, note:'both just past 2^31'},
+    {e:-INT32_OVF,  f:INT32_OVF,   note:'e=-2^31, f=+2^31 (opposite)'},
+    {e:INT32_OVF,   f:-INT32_OVF,  note:'e=+2^31, f=-2^31 (opposite)'},
   ];
-
-  for(var i=0;i<mxProbes.length;i++){
-    var mxe=mxProbes[i];
-    try{mx.e=mxe;}catch(e){log('MXI[1]: e='+mxe+' write err','fail');continue;}
+  for(var i=0;i<combined.length;i++){
+    var c=combined[i];
+    try{mx.e=c.e;mx.f=c.f;}catch(e){log('MXB[1]: err setting matrix','fail');continue;}
     svg.appendChild(r);
-    var bcr=null;
-    try{bcr=r.getBoundingClientRect();}catch(e){}
-    var bx=bcr?bcr.x:null;
+    var bcr=r.getBoundingClientRect();
     svg.removeChild(r);
-    log('MXI[1]: mx.e='+mxe.toExponential(4)+' BCR.x='+bx,
-      (bx<0?'uaf — NEGATIVE BCR FROM INT32 OVERFLOW! e='+mxe:
-       bx===INT32_OVF?'crit — AT 2^31 (saturation point)':
-       bx>LU_MAX&&bx<INT32_OVF?'star — BETWEEN LU_MAX AND 2^31 ('+bx+')':'info'));
+    log('MXB[1]: ['+c.note+'] BCR.x='+bcr.x+' BCR.y='+bcr.y,
+      (bcr.x<0&&c.e>0?'uaf — X NEGATIVE! e='+c.e+' got x='+bcr.x:
+       bcr.y<0&&c.f>0?'uaf — Y NEGATIVE! f='+c.f+' got y='+bcr.y:
+       bcr.x>INT32_OVF||bcr.y>INT32_OVF?'uaf — AXIS PAST 2^31!':
+       'info'));
   }
 
-  // MXI[2]: negative direction — mirror test
-  hdr('MXI[2]: negative translate saturation');
-  var negProbes=[-1e7,-1e8,-1e9,-2e9,-2.147e9,-2.148e9,-1e10,-1e15];
-  for(var j=0;j<negProbes.length;j++){
-    var mxen=negProbes[j];
-    try{mx.e=mxen;}catch(e){continue;}
+  // MXB[2]: scale + translate combo — does scale interact with translate overflow?
+  hdr('MXB[2]: scale overflow + translate near 2^31');
+  var sxcombos=[
+    {a:2, e:INT32_OVF/2, note:'scale=2 × translate=2^30 (product=2^31)'},
+    {a:2, e:INT32_OVF/2+1, note:'scale=2 × translate=2^30+1 (product just past 2^31)'},
+    {a:3, e:INT32_OVF/3, note:'scale=3 × (2^31/3)'},
+    {a:100, e:INT32_OVF/100, note:'scale=100 × (2^31/100)'},
+    {a:1000, e:INT32_OVF/1000, note:'scale=1000 × (2^31/1000) [each< LU_MAX]'},
+    {a:1e6, e:LU_MAX+1, note:'scale=1M × (LU_MAX+1) [translate under LU clamp]'},
+  ];
+  for(var j=0;j<sxcombos.length;j++){
+    var sc=sxcombos[j];
+    try{mx.a=sc.a;mx.e=sc.e;mx.f=0;}catch(e){continue;}
     svg.appendChild(r);
-    var bcrn=null;try{bcrn=r.getBoundingClientRect();}catch(e){}
+    var bcr2=r.getBoundingClientRect();
     svg.removeChild(r);
-    log('MXI[2]: mx.e='+mxen.toExponential(3)+' BCR.x='+(bcrn?bcrn.x:null),
-      (bcrn&&bcrn.x>0&&mxen<0?'uaf — POSITIVE BCR FROM NEGATIVE OVERFLOW!':
-       bcrn&&bcrn.x<-LU_MAX?'crit — past -LU_MAX: '+bcrn.x:'info'));
+    // rect is at x=0,w=10, so position from translate only, but scale affects content
+    // The element starts at x=0 in local coords, translate gives screen offset
+    log('MXB[2]: ['+sc.note+'] BCR.x='+bcr2.x+' BCR.w='+bcr2.width,
+      (bcr2.x<0&&sc.e>0?'uaf — NEGATIVE X! a='+sc.a+' e='+sc.e+' got '+bcr2.x:
+       bcr2.width<0?'uaf — NEGATIVE WIDTH!':
+       bcr2.x>INT32_OVF||bcr2.width>INT32_OVF?'star — past 2^31 on axis':
+       'info'));
   }
-
-  // MXI[3]: Y translate overflow — does it affect X or vice versa?
-  hdr('MXI[3]: Y translate overflow → does it spill into X?');
-  mx.e=0;
-  var yProbes=[1e9,2e9,2.147e9,2.148e9,1e10,1e15];
-  for(var k=0;k<yProbes.length;k++){
-    mx.f=yProbes[k];
-    svg.appendChild(r);
-    var bcry=null;try{bcry=r.getBoundingClientRect();}catch(e){}
-    svg.removeChild(r);
-    log('MXI[3]: mx.f='+yProbes[k].toExponential(3)+' BCR.x='+(bcry?bcry.x:null)+' BCR.y='+(bcry?bcry.y:null),
-      (bcry&&bcry.x!==0&&yProbes[k]>1e9?'crit — Y OVERFLOW CORRUPTED X! x='+bcry.x:'info'));
-  }
-
-  // MXI[4]: scale overflow — mx.a (scale X) extreme values
-  hdr('MXI[4]: scale factor overflow (mx.a)');
-  mx.e=0;mx.f=0;
-  var scaleProbes=[1,1e3,1e6,1e8,1e10,1e15,1e30];
-  for(var s=0;s<scaleProbes.length;s++){
-    try{mx.a=scaleProbes[s];}catch(e){continue;}
-    svg.appendChild(r);
-    // rect is at x=0,width=10, so BCR.width = 10 * scale
-    var bcrs=null;try{bcrs=r.getBoundingClientRect();}catch(e){}
-    svg.removeChild(r);
-    log('MXI[4]: mx.a='+scaleProbes[s].toExponential(2)+' BCR.w='+(bcrs?bcrs.width.toExponential(4):null),
-      (bcrs&&bcrs.width<0?'uaf — NEGATIVE WIDTH FROM SCALE OVERFLOW!':
-       bcrs&&bcrs.width>LU_MAX?'star — WIDTH past LU_MAX: '+bcrs.width.toExponential(3):'info'));
-  }
-  mx.a=1;
+  mx.a=1;mx.e=0;mx.f=0;
   svg.remove();
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// CTM — getScreenCTM raw float64 investigation
-// BCR clamps at INT32, but getScreenCTM returns raw float64
-// Can we use this discrepancy?
+// CTX — getScreenCTM extraction: can we read back values via CTM
+// that differ from BCR due to the float64 vs int32 discrepancy?
 // ════════════════════════════════════════════════════════════════════════
-function runCTM(){
-  hdr('CTM: getScreenCTM vs getBCR discrepancy — raw float64 path');
+function runCTX(){
+  hdr('CTX: getScreenCTM float64 vs BCR int32 — extract info from the gap');
   var svg=mkSVG(100,100);
-
-  // CTM[1]: write known pattern to matrix, read via getScreenCTM
   var r=mkRect(svg,0,0,10,10);
   r.setAttribute('transform','matrix(1 0 0 1 0 0)');
   var mx=r.transform.baseVal.getItem(0).matrix;
   svg.removeChild(r);
 
-  hdr('CTM[1]: verify getScreenCTM passes exact float64');
-  var ctmTests=[
-    {e:1234.5678, name:'normal'},
-    {e:1e15, name:'1e15'},
-    {e:1e30, name:'1e30'},
-    {e:bitsF64(0x00000001,0x80000000), name:'arm64_ptr_shape'},
-    {e:bitsF64(0x00000001,0x00106000), name:'arm64_ptr2'},
-    {e:1.7976931348623157e308, name:'float64_max'},
-    {e:5e-324, name:'float64_min'},
-    {e:2.225073858507201e-308, name:'float64_denorm_min'},
+  // CTX[1]: at 2^31, does CTM.e = exact float64 or the clamped int32?
+  hdr('CTX[1]: does CTM.e give exact float64 even when BCR is clamped?');
+  var ctxTests=[
+    LU_MAX,           // 33.5M — LU clamp point
+    LU_MAX+1,
+    LU_MAX*2,         // 67M — above LU_MAX, in the "transition zone"
+    1e8,
+    1e9,
+    INT32_MAX,
+    INT32_OVF,
+    INT32_OVF+1,
+    INT32_OVF+65536,
+    INT32_OVF*2,      // 2^32
+    1e10,
+    1e15,
+    1e30,
   ];
-  for(var i=0;i<ctmTests.length;i++){
-    var t=ctmTests[i];
-    try{mx.e=t.e;}catch(e){log('CTM[1]: ['+t.name+'] write err: '+e.message,'fail');continue;}
+  for(var i=0;i<ctxTests.length;i++){
+    var v=ctxTests[i];
+    try{mx.e=v;}catch(e){continue;}
     svg.appendChild(r);
-    var ctm=null;try{ctm=r.getScreenCTM();}catch(e){log('CTM[1]: getScreenCTM err','fail');}
-    var bcr=null;try{bcr=r.getBoundingClientRect();}catch(e){}
+    var ctm=null,bcr=null;
+    try{ctm=r.getScreenCTM();}catch(e){}
+    try{bcr=r.getBoundingClientRect();}catch(e){}
     svg.removeChild(r);
-    var ctmE=ctm?ctm.e:null;
-    var bcrX=bcr?bcr.x:null;
-    var exact=ctmE===t.e;
-    log('CTM[1]: ['+t.name+'='+t.e.toExponential(4)+']\n  CTM.e='+ctmE+' exact='+exact+' BCR.x='+bcrX,
-      (exact&&Math.abs(t.e)>1e10?'star — CTM returns EXACT float64 even for extreme values':
-       !exact&&ctmE!==null?'warn — CTM rounded: got '+ctmE:
+    var ctme=ctm?ctm.e:null;
+    var bx=bcr?bcr.x:null;
+    var exact=(ctme===v);
+    log('CTX[1]: v='+v.toExponential(4)+' CTM.e='+ctme+' exact='+exact+' BCR.x='+bx,
+      (ctme!==null&&ctme!==bx&&Math.abs(v)>LU_MAX?'star — CTM≠BCR at extreme: CTM='+ctme+' BCR='+bx:
+       exact&&Math.abs(v)>INT32_OVF?'star — CTM exact even past 2^31: '+ctme:
        'info'));
-    if(ctm)log('CTM[1]:   CTM.e bits='+f64hex(ctmE)+' written='+f64hex(t.e),'info');
+    if(ctm&&ctme!==null)log('CTX[1]:   CTM.e bits='+f64hex(ctme)+' written='+f64hex(v),'info');
   }
 
-  // CTM[2]: getTransformToElement between two extreme-coordinate elements
-  hdr('CTM[2]: getTransformToElement between extreme-coord elements');
-  var r2=mkRect(svg,0,0,10,10);
+  // CTX[2]: viewBox + getScreenCTM — does CTM give unclamped amplified value?
+  hdr('CTX[2]: viewBox amplified coord — CTM vs BCR');
+  var svg2=mkSVG(100,100,'0 0 0.01 0.01');  // 1 unit = 10000px
+  var r2=mkRect(svg2,0,0,0.1,0.1);
   r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
   var mx2=r2.transform.baseVal.getItem(0).matrix;
-  svg.appendChild(r2);
-
-  try{
-    mx.e=1e15;mx2.e=-1e15;  // two elements at opposite extremes
-    svg.appendChild(r);
-    var xform=null;
-    try{xform=r.getTransformToElement(r2);}catch(e){log('CTM[2]: getTransformToElement err: '+e.message,'warn');}
-    if(xform){
-      log('CTM[2]: transform between +1e15 and -1e15: e='+xform.e,'info');
-      log('CTM[2]:   bits='+f64hex(xform.e),
-        (xform.e===0?'info — expected 2e15 translation':
-         xform.e===2e15?'star — 2e15 exact': 'star — e='+xform.e.toExponential(4)));
-    }
-    svg.removeChild(r);
-  }catch(e){log('CTM[2]: exception: '+e.message,'warn');}
-
-  // CTM[3]: getScreenCTM after extreme viewBox + normal transform
-  hdr('CTM[3]: getScreenCTM with viewBox amplification');
-  var svg2=mkSVG(100,100,'0 0 0.000001 0.000001');  // viewBox amplification
-  var r3=mkRect(svg2,0,0,0.00001,0.00001);
-  r3.setAttribute('transform','matrix(1 0 0 1 0.1 0)');  // translate by 0.1 SVG units = 10M px
-  var ctm3=null;
-  try{ctm3=r3.getScreenCTM();}catch(e){log('CTM[3]: err: '+e.message,'warn');}
-  if(ctm3){
-    log('CTM[3]: viewBox 1e-6 + translate 0.1 SVG unit → CTM.e='+ctm3.e,
-      (ctm3.e>LU_MAX?'uaf — CTM.e PAST LU_MAX! float path!':
+  svg2.removeChild(r2);
+  // In viewBox=0.01 space, we need translate in SVG user units
+  // CTM.e should reflect screen px (amplified by viewBox)
+  var vb2Tests=[
+    {t:100, note:'100 SVG units → 1M px'},
+    {t:3355, note:'3355 SVG units → 33.55M px (LU_MAX zone)'},
+    {t:214748, note:'214748 SVG units → 2.147B px (INT32 zone)'},
+    {t:214749, note:'214749 SVG units → just past INT32'},
+    {t:214750, note:'214750 SVG units → deep past INT32'},
+    {t:1000000, note:'1M SVG units → 10B px'},
+  ];
+  for(var j=0;j<vb2Tests.length;j++){
+    var vt=vb2Tests[j];
+    try{mx2.e=vt.t;}catch(e){continue;}
+    svg2.appendChild(r2);
+    var ctm2=null,bcr2=null;
+    try{ctm2=r2.getScreenCTM();}catch(e){}
+    try{bcr2=r2.getBoundingClientRect();}catch(e){}
+    svg2.removeChild(r2);
+    var ctm2e=ctm2?ctm2.e:null;
+    var bcr2x=bcr2?bcr2.x:null;
+    var expPx=vt.t*10000;
+    log('CTX[2]: ['+vt.note+']\n  exp='+expPx.toExponential(3)+' CTM.e='+ctm2e+' BCR.x='+bcr2x,
+      (ctm2e!==null&&ctm2e>LU_MAX&&(bcr2x===null||bcr2x<=LU_MAX)?'star — CTM past LU_MAX but BCR clamped!':
+       ctm2e!==null&&ctm2e>INT32_OVF&&(bcr2x===null||bcr2x<=INT32_OVF)?'uaf — CTM past 2^31 while BCR capped!':
+       ctm2e!==null&&ctm2e<0&&expPx>0?'uaf — CTM NEGATIVE (overflow)!':
        'info'));
-    log('CTM[3]:   CTM.e bits='+f64hex(ctm3.e),'info');
-    log('CTM[3]:   BCR.x='+(r3.getBoundingClientRect().x).toExponential(4),'info');
   }
   svg2.remove();
   svg.remove();
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// INA — inch amplification via newValueSpecifiedUnits
-// v25 STR[3]: unit=8 (inches) gives 9.6e31 px for 1e30 input
-// Does this value flow through the rendering pipeline?
+// VBW — viewBox width/height amplification (not just x)
+// Can we overflow the width/height coordinates differently than x?
+// Also: what if viewBox min-x is negative — does that shift the coord range?
 // ════════════════════════════════════════════════════════════════════════
-function runINA(){
-  hdr('INA: inch unit amplification (1in = 96px)');
-  var svg=mkSVG(200,200);
-  document.body.appendChild(svg);
+function runVBW(){
+  hdr('VBW: viewBox width/height overflow + negative min-x offset');
 
-  // INA[1]: write in inches, re-attach, check BCR
-  hdr('INA[1]: newValueSpecifiedUnits(8=IN, value) → re-attach → BCR');
-  var inTests=[
-    {val:1e6,  note:'1M in = 96M px > LU_MAX'},
-    {val:2.24e7, note:'22.4M in ≈ 2.147B px = INT32_MAX/96'},
-    {val:2.24e7+1e5, note:'just past INT32_MAX/96'},
-    {val:1e8, note:'100M in = 9.6B px >> INT32'},
-    {val:1e10, note:'10B in = 960B px'},
-    {val:1e30, note:'1e30 in = 9.6e31 px'},
+  // VBW[1]: negative viewBox min-x to shift coordinates
+  // If viewBox="-2147483648 0 0.001 0.001" the SVG coordinate system
+  // starts at -2^31, so an element at x=0 in SVG space should be at
+  // screen x = 0 - (-2^31) * scale = +2^31 * scale
+  hdr('VBW[1]: negative viewBox min-x to shift elem into overflow range');
+  var negMinX=[
+    {vb:'-100 0 200 100', rectX:0, note:'rect at x=0 with min-x=-100 → screen ~50px'},
+    {vb:'-33554432 0 67108864 100', rectX:0, note:'min-x=-LU_MAX, width=2*LU_MAX → rect@0 → LU_MAX px'},
+    {vb:'-2147483648 0 4294967296 100', rectX:0, note:'min-x=-2^31, width=2^32 → rect@0 → 2^31 screen?'},
+    {vb:'-1e10 0 2e10 100', rectX:0, note:'min-x=-1e10'},
+    {vb:'-1e15 0 2e15 100', rectX:0, note:'min-x=-1e15'},
+    {vb:'-1e30 0 2e30 100', rectX:0, note:'min-x=-1e30'},
   ];
-
-  for(var i=0;i<inTests.length;i++){
-    var t=inTests[i];
-    var r=mkRect(svg,0,0,10,10);
-    var tf=r.x.baseVal;
-    svg.removeChild(r);
-    try{
-      tf.newValueSpecifiedUnits(8,t.val);  // unit 8 = IN
-    }catch(e){log('INA[1]: ['+t.note+'] write err: '+e.message,'fail');continue;}
-    svg.appendChild(r);
-    var bcr=null;try{bcr=r.getBoundingClientRect();}catch(e){}
-    var bx=bcr?bcr.x:null;
-    var expectedPx=t.val*96;
-    log('INA[1]: ['+t.note+']\n  written='+t.val+'in expected_px='+expectedPx.toExponential(3)+' BCR.x='+bx,
-      (bx!==null&&bx<0&&expectedPx>0?'uaf — SIGNED INT OVERFLOW FROM INCH AMPLIFICATION!':
-       bx!==null&&bx>LU_MAX&&bx<INT32_OVF?'uaf — PAST LU_MAX via inch unit!':
-       bx!==null&&Math.abs(bx)>=INT32_OVF?'crit — AT INT32 BOUNDARY':
-       bx!==null&&bx>0&&bx<=LU_MAX?'warn — clamped to LU_MAX ≈ '+LU_MAX:'info'));
-    svg.removeChild(r);
+  for(var i=0;i<negMinX.length;i++){
+    var t=negMinX[i];
+    var svg=mkSVG(100,100,t.vb);
+    var r=mkRect(svg,t.rectX,0,1,1);
+    var bcr=r.getBoundingClientRect();
+    log('VBW[1]: ['+t.note+']\n  BCR.x='+bcr.x.toExponential(4)+' BCR.y='+bcr.y,
+      (bcr.x<-1e8?'crit — LARGE NEGATIVE BCR.x: '+bcr.x:
+       bcr.x>LU_MAX?'star — past LU_MAX: '+bcr.x.toExponential(3):
+       'info'));
+    svg.remove();
   }
 
-  // INA[2]: inch unit + viewBox combo — double amplification
-  hdr('INA[2]: inch write + viewBox amplification combo');
-  var inner=document.createElementNS(NS,'svg');
-  inner.setAttribute('width',100);inner.setAttribute('height',100);
-  inner.setAttribute('viewBox','0 0 0.001 0.001');  // 1 SVG unit = 100K px
-  svg.appendChild(inner);
-
-  var r2=mkRect(inner,0,0,0.001,0.001);
-  var tf2=r2.x.baseVal;
-  inner.removeChild(r2);
-  // write 1 inch = 96px on a viewBox scale of 100K:1
-  // so 1in in this SVG's coordinate system = 96 * 100000 = 9.6M px total?
-  // Actually: SVGLength in inches is converted to user units (SVG px) first
-  // Then viewBox scales user units to screen px
-  // 1 SVG unit = 100K screen px, 1in = 96 SVG user units
-  // So 1in → 96 SVG units → 96 × 100K = 9.6M screen px
-  var inViewTests=[100,350,1000];  // in SVG user units... wait need to check
-  // Actually newValueSpecifiedUnits(8, v) sets the stored value in inches
-  // .value returns converted user units (SVG px, where 1in=96px)
-  // So tf2.value = v * 96 in SVG user units
-  // viewBox makes 1 SVG user unit = 100K screen px
-  // So screen px = v * 96 * 100K = v * 9.6M
-  for(var j=0;j<inViewTests.length;j++){
-    var iv=inViewTests[j];
-    try{tf2.newValueSpecifiedUnits(8,iv);}catch(e){log('INA[2]: err','fail');continue;}
-    inner.appendChild(r2);
-    var bcr2=null;try{bcr2=r2.getBoundingClientRect();}catch(e){}
-    inner.removeChild(r2);
-    var svgPx=iv*96;
-    var screenPx=svgPx*(100/0.001);
-    log('INA[2]: '+iv+'in → '+svgPx+' SVG px → '+screenPx.toExponential(3)+' screen px, BCR.x='+(bcr2?bcr2.x.toExponential(4):null),
-      (bcr2&&bcr2.x<0&&screenPx>0?'uaf — INT32 OVERFLOW via INCH+VIEWBOX!':
-       bcr2&&bcr2.x>LU_MAX?'star — PAST LU_MAX via inch+viewBox':'info'));
+  // VBW[2]: extreme viewBox width — not position, but size
+  // If viewBox width is tiny, elements appear large on screen
+  // But can we make the rect's RIGHT edge overflow past 2^31 while the LEFT is at 0?
+  hdr('VBW[2]: element WIDTH overflow past 2^31 via viewBox');
+  var wTests=[
+    {vb:'0 0 0.01 0.01', rectW:214748, note:'rect W=214748 SVG units → 2.14B px (near INT32)'},
+    {vb:'0 0 0.01 0.01', rectW:214749, note:'rect W=214749 → just past INT32'},
+    {vb:'0 0 0.01 0.01', rectW:214750, note:'rect W=214750 → past INT32'},
+    {vb:'0 0 0.01 0.01', rectW:1e6,    note:'rect W=1M SVG units → 10B px'},
+  ];
+  for(var j=0;j<wTests.length;j++){
+    var wt=wTests[j];
+    var svgw=mkSVG(100,100,wt.vb);
+    var rw=mkRect(svgw,0,0,wt.rectW,wt.rectW);
+    var bcrw=rw.getBoundingClientRect();
+    log('VBW[2]: ['+wt.note+']\n  BCR.w='+bcrw.width.toExponential(4)+' BCR.right='+bcrw.right.toExponential(4),
+      (bcrw.width<0?'uaf — NEGATIVE WIDTH! INT32 overflow on width!':
+       bcrw.width>INT32_OVF?'uaf — WIDTH past 2^31!':
+       bcrw.width>LU_MAX?'star — WIDTH past LU_MAX: '+bcrw.width.toExponential(3):
+       'info'));
+    svgw.remove();
   }
-  svg.remove();
+
+  // VBW[3]: can BCR.right or BCR.bottom overflow independently?
+  hdr('VBW[3]: BCR.right overflow (x+width) — can right > 2^31 when both are near the limit?');
+  var svg3=mkSVG(100,100,'0 0 0.01 0.01');
+  // rect at x=214000 SVG units (2.14B px) with width=750 SVG units (7.5M px)
+  // right edge = 2.147B + ... near INT32
+  var r3=mkRect(svg3,214000,0,750,750);
+  var bcr3=r3.getBoundingClientRect();
+  log('VBW[3]: x=214000, w=750 SVG units → BCR.x='+bcr3.x+' BCR.right='+bcr3.right+' BCR.w='+bcr3.width,
+    (bcr3.right<0&&bcr3.x>0?'uaf — RIGHT EDGE NEGATIVE OVERFLOW!':
+     bcr3.right>INT32_OVF?'uaf — RIGHT past 2^31!':
+     bcr3.right>LU_MAX?'star — RIGHT past LU_MAX':
+     'info'));
+  svg3.remove();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// NEG — negative coordinate overflow: can we get BCR.x > 0 from negative inputs?
+// The v26 RAT suite showed: TF x=-2^31 → BCR.x=-33564428 (past -LU_MAX)
+// Matrix showed: mx.e=-2.148e9 → BCR.x=-2147483648 (negative saturation)
+// Q: can negative overflow wrap to positive? (signed→unsigned confusion)
+// ════════════════════════════════════════════════════════════════════════
+function runNEG(){
+  hdr('NEG: negative coordinate wrap — can negative overflow produce positive BCR?');
+
+  // NEG[1]: viewBox with very negative x values
+  hdr('NEG[1]: very negative viewBox min-x + rect at x=0 → does it produce positive BCR past 2^31?');
+  var negTests=[
+    {vb:'-2147483648 0 2147483648 100', rx:0, note:'min-x=-INT32_MAX, w=INT32_MAX → rect@0 should be at +huge'},
+    {vb:'-2147483649 0 2147483649 100', rx:0, note:'min-x=-(2^31+1)'},
+    {vb:'-4294967296 0 4294967296 100', rx:0, note:'min-x=-2^32'},
+    {vb:'-1e10 0 1e10 100', rx:0, note:'min-x=-1e10'},
+    {vb:'0 0 0.01 0.01', rx:-214748, note:'rect at -214748 SVG units → screen x=-2.14B px'},
+    {vb:'0 0 0.01 0.01', rx:-214749, note:'rect at -214749 SVG units → screen x=-2.14B-'},
+    {vb:'0 0 0.01 0.01', rx:-1e6,    note:'rect at -1M → screen x=-10B px'},
+  ];
+  for(var i=0;i<negTests.length;i++){
+    var t=negTests[i];
+    var svg=mkSVG(100,100,t.vb);
+    var r=mkRect(svg,t.rx,0,1,1);
+    var bcr=null;
+    try{bcr=r.getBoundingClientRect();}catch(e){log('NEG[1]: err','fail');svg.remove();continue;}
+    log('NEG[1]: ['+t.note+']\n  BCR.x='+bcr.x.toExponential(4),
+      (bcr.x>0&&t.rx<0?'uaf — POSITIVE BCR FROM NEGATIVE INPUT! wrap!':
+       bcr.x>LU_MAX&&t.rx>=0?'star — past LU_MAX':
+       bcr.x<-INT32_OVF?'crit — BCR past -2^31: '+bcr.x:
+       bcr.x===-INT32_OVF?'crit — BCR AT -2^31':
+       'info'));
+    svg.remove();
+  }
+
+  // NEG[2]: matrix negative translate fine sweep around -2^31
+  hdr('NEG[2]: matrix negative translate fine sweep around -2^31');
+  var svg2=mkSVG(100,100);
+  var r2=mkRect(svg2,0,0,10,10);
+  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var mx=r2.transform.baseVal.getItem(0).matrix;
+  svg2.removeChild(r2);
+  var negMX=[
+    -INT32_OVF+2, -INT32_OVF+1, -INT32_OVF,
+    -(INT32_OVF+1), -(INT32_OVF+2),
+    -(INT32_OVF+100), -(INT32_OVF+65536),
+    -INT32_OVF*2
+  ];
+  for(var j=0;j<negMX.length;j++){
+    try{mx.e=negMX[j];}catch(e){continue;}
+    svg2.appendChild(r2);
+    var bcr2=r2.getBoundingClientRect();
+    svg2.removeChild(r2);
+    log('NEG[2]: mx.e='+negMX[j]+' BCR.x='+bcr2.x,
+      (bcr2.x>0&&negMX[j]<0?'uaf — POSITIVE BCR FROM NEGATIVE MATRIX! WRAP!':
+       bcr2.x<-INT32_OVF?'crit — past -2^31: '+bcr2.x:
+       bcr2.x===-INT32_OVF?'crit — AT -2^31':
+       'info'));
+  }
+  svg2.remove();
+
+  // NEG[3]: TF negative write + viewBox amplification
+  hdr('NEG[3]: TF negative write + viewBox amplification');
+  var svg3=mkSVG(100,100,'0 0 0.01 0.01');  // 1 unit = 10000px
+  var r3=mkRect(svg3,0,0,0.1,0.1);
+  var tf3=r3.x.baseVal;
+  svg3.removeChild(r3);
+  var negTF=[-214748,-214749,-214750,-300000,-1e6];
+  for(var k=0;k<negTF.length;k++){
+    try{tf3.value=negTF[k];}catch(e){continue;}
+    svg3.appendChild(r3);
+    var bcr3=r3.getBoundingClientRect();
+    svg3.removeChild(r3);
+    var exp=negTF[k]*10000;
+    log('NEG[3]: TF x='+negTF[k]+' exp='+exp.toExponential(3)+' BCR.x='+bcr3.x,
+      (bcr3.x>0&&negTF[k]<0?'uaf — POSITIVE FROM NEGATIVE TF+VIEWBOX! WRAP!':
+       bcr3.x<-INT32_OVF?'crit — past -2^31':
+       bcr3.x===-INT32_OVF?'crit — AT -2^31':
+       'info'));
+    svg3.removeChild?null:null;
+  }
+  svg3.remove();
 }
 </script>
 </body>
