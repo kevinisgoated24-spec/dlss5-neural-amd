@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v44 — HB[3] pct deep dive / currentScale / useHref swap / filter coords</title>
+<title>SVG v45 — Ultimate: LayoutUnit overflow / Houdini / OffscreenCanvas / WASM / CSS matrix / paint timing</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -27,8 +27,8 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v44 — HB[3] pct=1 anomaly deep dive / currentScale / useHref swap / filter coords</h1>
-<h2>100% pct bug · SVGSVGElement.currentScale · use href swap · filterUnits extremes · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v45 — ULTIMATE: LayoutUnit C++ overflow / Houdini / OffscreenCanvas / WASM / CSS transform matrix / paint timing</h1>
+<h2>JA:Houdini · JB:OffscreenCanvas+SVG · JC:LayoutUnit overflow boundary · JD:CSS matrix readback · JE:WASM memory · JF:paint timing side-channel — iOS 26.5.2 / A16 arm64e</h2>
 <div class="suite">
 <div class="legend">
   <span class="leg leg-r">🔴 holy shit</span>
@@ -36,12 +36,12 @@ button:active{background:#0f0;color:#000}
   <span class="leg leg-p">🟣 useless</span>
 </div>
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('IA')">IA</button>
-<button onclick="go('IB')">IB</button>
-<button onclick="go('IC')">IC</button>
-<button onclick="go('ID')">ID</button>
-<button onclick="go('IE')">IE</button>
-<button onclick="go('IF')">IF</button>
+<button onclick="go('JA')">JA</button>
+<button onclick="go('JB')">JB</button>
+<button onclick="go('JC')">JC</button>
+<button onclick="go('JD')">JD</button>
+<button onclick="go('JE')">JE</button>
+<button onclick="go('JF')">JF</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -80,578 +80,712 @@ function log(m,c){
 function R(m){log(m,'red');}
 function B(m){log(m,'blue');}
 function P(m){log(m,'purple');}
-function hdr(m){log(m,'hdr');}
-function prog(m){document.getElementById('progress').textContent=m;}
-function clearOut(){document.getElementById('out').innerHTML='';prog('');}
-function copyAll(){
-  var lines=[];
-  document.querySelectorAll('#out .result').forEach(function(e){lines.push(e.textContent);});
-  navigator.clipboard&&navigator.clipboard.writeText(lines.join('\n'));
-}
-function go(s){clearOut();window['run'+s]();}
-function runAll(){
-  clearOut();
-  runIA();
-  setTimeout(runIB,300);
-  setTimeout(runIC,600);
-  setTimeout(runID,900);
-  setTimeout(runIE,1200);
-  setTimeout(runIF,1500);
+function logV(label,v){
+  var h=f64hex(v);
+  var w=isWeird(v)?'weird='+v:'';
+  var c=classifyPtr(v);
+  var cls='purple';
+  if(c)cls='red';
+  else if(isWeird(v))cls='blue';
+  log(label+'='+h+(w?' '+w:'')+(c?' PTR:'+c.type:''),cls);
 }
 
-function mkSVG(w,h,extra){
+function mkSVG(w,h){
   var s=document.createElementNS(NS,'svg');
-  s.setAttribute('width',w||200); s.setAttribute('height',h||200);
-  if(extra)Object.keys(extra).forEach(function(k){s.setAttribute(k,extra[k]);});
-  s.style.cssText='position:fixed;left:0;top:0;width:'+(w||200)+'px;height:'+(h||200)+'px;opacity:0.001;pointer-events:none';
-  document.body.appendChild(s); return s;
+  s.setAttribute('width',w); s.setAttribute('height',h);
+  s.setAttribute('xmlns',NS);
+  s.style.position='absolute';s.style.left='-9999px';s.style.top='-9999px';
+  document.body.appendChild(s);
+  return s;
 }
 function mkEl(p,tag,attrs){
   var e=document.createElementNS(NS,tag);
   if(attrs)Object.keys(attrs).forEach(function(k){e.setAttribute(k,attrs[k]);});
-  p.appendChild(e); return e;
+  p.appendChild(e);
+  return e;
 }
-function probeVal(label,v){
-  var p=classifyPtr(v),w=isWeird(v);
-  if(p){R(label+'='+f64hex(v)+' POINTER! type='+p.type);}
-  else if(w){B(label+'='+f64hex(v)+' weird='+v);}
-  else{P(label+'='+v);}
-}
+function rm(el){if(el&&el.parentNode)el.parentNode.removeChild(el);}
 
-// ════════════════════════════════════════════════════════════════════════
-// IA — HB[3] deep dive: SVGLength percentage resolution
-// In v43: 50% of SVG width=1e9 → 500000000 (correct)
-//         100% of SVG width=1e9 → 1 (WRONG — should be 1e9)
-// Hypothesis: the SVG width=1e9 is clamped in internal layout
-// but the % resolution uses a mix of internal (clamped) and DOM (unclamped)
-// The "1" might mean internal LayoutUnit(1e9) → clamped LayoutUnit → 1px
-// then 100% * 1px = 1? OR it's an overflow/wraparound
-// DEEP PROBE: test many % values, many SVG widths, find the crossover
-// ════════════════════════════════════════════════════════════════════════
-function runIA(){
-  hdr('IA: HB[3] pct=1 anomaly — 100% of SVG width=1e9 deep dive');
+// --- JA: CSS Houdini Paint Worklet probe ---
+function JA(){
+  P('JA: CSS Houdini Paint Worklet availability probe');
 
-  // IA[1]: reproduce the exact anomaly and verify
-  hdr('IA[1]: exact reproduce — 100% pct of SVG width=1e9');
-  var svg=mkSVG(1,1);
-  svg.setAttribute('width','1000000000');
-  svg.setAttribute('height','1000000000');
-  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  var xl=rect.x.baseVal;
-  // set 50% first (like v43 did)
-  xl.newValueSpecifiedUnits(2,50);
-  probeVal('IA[1]: first: 50% SVG-w=1e9',xl.value);
-  // now 100%
-  xl.newValueSpecifiedUnits(2,100);
-  probeVal('IA[1]: then: 100% SVG-w=1e9',xl.value);
-  // 100% without prior 50%?
-  var rect2=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
-  var xl2=rect2.x.baseVal;
-  xl2.newValueSpecifiedUnits(2,100);
-  probeVal('IA[1]: fresh rect: 100% SVG-w=1e9',xl2.value);
-  // 200%
-  xl2.newValueSpecifiedUnits(2,200);
-  probeVal('IA[1]: 200% SVG-w=1e9',xl2.value);
-  // 1%
-  xl2.newValueSpecifiedUnits(2,1);
-  probeVal('IA[1]: 1% SVG-w=1e9',xl2.value);
-  // 0.001%
-  xl2.newValueSpecifiedUnits(2,0.001);
-  probeVal('IA[1]: 0.001% SVG-w=1e9',xl2.value);
-  svg.remove();
-
-  // IA[2]: sweep SVG widths — find crossover where pct starts glitching
-  hdr('IA[2]: pct=100% across SVG widths — find crossover');
-  var widths=[100,10000,1000000,10000000,33554428,33554429,100000000,
-    2147483647,2147483648,4294967296,1000000000,1000000000000];
-  widths.forEach(function(w){
-    var s=mkSVG(1,1);
-    s.setAttribute('width',w);
-    s.setAttribute('height',w);
-    var r=mkEl(s,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-    var xln=r.x.baseVal;
-    xln.newValueSpecifiedUnits(2,100); // 100%
-    var v=xln.value;
-    var p=classifyPtr(v),ww=isWeird(v);
-    if(p){R('IA[2]: SVG-w='+w+' 100%='+f64hex(v)+' POINTER!');}
-    else if(ww){B('IA[2]: SVG-w='+w+' 100%='+f64hex(v)+' weird='+v);}
-    else{P('IA[2]: SVG-w='+w+' 100%='+v+' (expect '+w+')');}
-    s.remove();
-  });
-
-  // IA[3]: pct resolution on rect.width vs rect.x — different internals?
-  hdr('IA[3]: pct on rect.width vs rect.x vs rect.height — different paths?');
-  var svg3=mkSVG(1,1);
-  svg3.setAttribute('width','1000000000');
-  svg3.setAttribute('height','1000000000');
-  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  ['x','y','width','height'].forEach(function(attr){
-    [1,10,50,100,200].forEach(function(pct){
-      var ln=rect3[attr].baseVal;
-      ln.newValueSpecifiedUnits(2,pct);
-      probeVal('IA[3]: '+attr+' '+pct+'% of 1e9',ln.value);
-    });
-  });
-  svg3.remove();
-
-  // IA[4]: pct on SVG circle cx/cy/r
-  hdr('IA[4]: pct on circle cx/cy/r — different resolution paths');
-  var svg4=mkSVG(1,1);
-  svg4.setAttribute('width','1000000000');
-  svg4.setAttribute('height','1000000000');
-  var circ=mkEl(svg4,'circle',{cx:'0',cy:'0',r:'50',fill:'blue'});
-  ['cx','cy','r'].forEach(function(attr){
-    [50,100].forEach(function(pct){
-      var ln=circ[attr].baseVal;
-      ln.newValueSpecifiedUnits(2,pct);
-      probeVal('IA[4]: circle.'+attr+' '+pct+'% of 1e9',ln.value);
-    });
-  });
-  svg4.remove();
-
-  // IA[5]: createSVGLength on SVG with matching CSS size (not 1px)
-  hdr('IA[5]: createSVGLength pct — SVG width attr matches CSS width');
-  var svg5=document.createElementNS(NS,'svg');
-  svg5.setAttribute('width','1000000000');
-  svg5.setAttribute('height','200');
-  // give it real CSS size so pct resolves against SVG attr not CSS layout
-  svg5.style.cssText='position:fixed;left:0;top:0;width:1000000000px;height:200px;opacity:0.001;pointer-events:none';
-  document.body.appendChild(svg5);
-  var ln5=svg5.createSVGLength();
-  [1,50,100,200].forEach(function(pct){
-    try{
-      ln5.newValueSpecifiedUnits(2,pct);
-      probeVal('IA[5]: createSVGLength '+pct+'% css-w=1e9',ln5.value);
-    }catch(e){P('IA[5]: '+pct+'% threw: '+e.name);}
-  });
-  svg5.remove();
-
-  prog('IA done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// IB — SVGSVGElement.currentScale / currentTranslate
-// These are root SVG viewport transform properties.
-// currentScale is a float, currentTranslate is SVGPoint
-// Setting extreme values: does the engine expose internal state?
-// Also: SVGSVGElement.getEnclosureList / checkIntersection / checkEnclosure
-// ════════════════════════════════════════════════════════════════════════
-function runIB(){
-  hdr('IB: SVGSVGElement.currentScale / currentTranslate extreme probe');
-  var svg=mkSVG(400,400);
-
-  // IB[1]: currentScale extreme values
-  hdr('IB[1]: svg.currentScale at extreme values');
-  P('IB[1]: initial currentScale='+svg.currentScale);
-  [1e6, 1e9, 1e12, 2147483648, 4294967296, 1e15].forEach(function(v){
-    try{
-      svg.currentScale=v;
-      var rb=svg.currentScale;
-      probeVal('IB[1]: set='+v+' readback',rb);
-    }catch(e){P('IB[1]: set='+v+' threw: '+e.name);}
-  });
-  svg.currentScale=1; // reset
-
-  // IB[2]: currentTranslate (SVGPoint) extreme
-  hdr('IB[2]: svg.currentTranslate.x at extreme values');
+  // JA[1]: Check CSS.paintWorklet / CSS.registerProperty
+  P('JA[1]: CSS.paintWorklet / CSS Houdini API check');
   try{
-    var ct=svg.currentTranslate;
-    P('IB[2]: initial currentTranslate=('+ct.x+','+ct.y+')');
-    [1e9, 1e12, 1e15, 2147483648].forEach(function(v){
-      ct.x=v;
-      probeVal('IB[2]: set x='+v+' readback',ct.x);
-    });
-    ct.x=0;
-  }catch(e){P('IB[2]: threw: '+e.name);}
-
-  // IB[3]: SVGSVGElement.createSVGMatrix — fresh SVGMatrix from root
-  hdr('IB[3]: svg.createSVGMatrix() — read initial values of a fresh matrix');
-  var freshMx=svg.createSVGMatrix();
-  ['a','b','c','d','e','f'].forEach(function(k){
-    var v=freshMx[k];
-    var p=classifyPtr(v),w=isWeird(v);
-    if(p){R('IB[3]: fresh SVGMatrix.'+k+'='+f64hex(v)+' POINTER!');}
-    else if(w){B('IB[3]: fresh SVGMatrix.'+k+'='+f64hex(v)+' weird='+v);}
-    else{P('IB[3]: fresh SVGMatrix.'+k+'='+v);}
-  });
-
-  // IB[4]: getScreenCTM after currentScale change
-  hdr('IB[4]: rect.getScreenCTM after svg.currentScale=1e6');
-  var rect=mkEl(svg,'rect',{x:'10',y:'10',width:'50',height:'50',fill:'red'});
-  svg.currentScale=1000000;
-  var ctm=null;
-  try{ctm=rect.getScreenCTM();}catch(e){}
-  if(ctm){
-    ['a','b','c','d','e','f'].forEach(function(k){
-      probeVal('IB[4]: currentScale=1e6 CTM.'+k,ctm[k]);
-    });
-  }
-  svg.currentScale=1;
-
-  // IB[5]: SVGSVGElement.getViewboxToViewportTransform (if exists)
-  hdr('IB[5]: SVGSVGElement viewport transform methods');
-  ['getViewboxToViewportTransform','getTransformToElement','getCTM'].forEach(function(m){
-    if(typeof svg[m]==='function'){
-      var result=null;
-      try{result=svg[m]();}catch(e){P('IB[5]: '+m+'() threw: '+e.name);}
-      P('IB[5]: '+m+' exists, result type='+(result?typeof result:'null'));
-    } else {
-      P('IB[5]: '+m+' not available');
-    }
-  });
-
-  svg.remove();
-  prog('IB done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// IC — SVGUseElement href swap / referencing changes
-// <use> elements maintain a shadow tree referencing the original element.
-// Swapping the href while the original is being animated:
-// does the internal ref-counting / shadow update path expose state?
-// Also: use referencing an element that gets detached/reattached
-// ════════════════════════════════════════════════════════════════════════
-function runIC(){
-  hdr('IC: SVGUseElement href swap / shadow tree probe');
-  var svg=mkSVG(400,400);
-  var defs=mkEl(svg,'defs');
-
-  // IC[1]: use element href swap — read CTM before and after swap
-  hdr('IC[1]: use href swap — CTM probe before/after');
-  // create two elements in defs
-  var sym1=mkEl(defs,'symbol',{id:'icsym1',overflow:'visible'});
-  var r1=mkEl(sym1,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  var sym2=mkEl(defs,'symbol',{id:'icsym2',overflow:'visible'});
-  var r2=mkEl(sym2,'rect',{x:'0',y:'0',width:'30',height:'30',fill:'blue'});
-
-  var useEl=mkEl(svg,'use',{href:'#icsym1',x:'10',y:'10',width:'100',height:'100'});
-
-  // read CTM before swap
-  var ctm1=null;
-  try{ctm1=r1.getScreenCTM();}catch(e){}
-  P('IC[1]: before swap CTM.e='+(ctm1?ctm1.e:'null'));
-
-  // swap href to sym2
-  useEl.setAttribute('href','#icsym2');
-
-  // immediately read CTM of original r1 (now detached from use shadow)
-  var ctm1_after=null;
-  try{ctm1_after=r1.getScreenCTM();}catch(e){P('IC[1]: r1 CTM after swap threw: '+e.name);}
-  if(ctm1_after){probeVal('IC[1]: r1 CTM.e after href swap',ctm1_after.e);}
-
-  // read CTM of r2 (now in use shadow)
-  var ctm2=null;
-  try{ctm2=r2.getScreenCTM();}catch(e){P('IC[1]: r2 CTM threw: '+e.name);}
-  if(ctm2){probeVal('IC[1]: r2 CTM.e after href swap',ctm2.e);}
-
-  // IC[2]: use referencing element with active animation — mid-animation swap
-  hdr('IC[2]: use href swap DURING active animation');
-  var sym3=mkEl(defs,'symbol',{id:'icsym3',overflow:'visible'});
-  var r3=mkEl(sym3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'green'});
-  mkEl(r3,'animateTransform',{
-    attributeName:'transform',type:'translate',
-    from:'0 0',to:'1000000000 0',
-    dur:'5s',repeatCount:'indefinite'
-  });
-
-  var useEl2=mkEl(svg,'use',{href:'#icsym3',x:'0',y:'0',width:'200',height:'200'});
-
-  setTimeout(function(){
-    // mid-animation: read animVal CTM of r3
-    var ctm3_before=null;
-    try{ctm3_before=r3.getScreenCTM();}catch(e){}
-    P('IC[2]: r3 CTM.e before swap='+(ctm3_before?ctm3_before.e.toFixed(0):'null'));
-
-    // swap href away
-    useEl2.setAttribute('href','#icsym1');
-
-    // immediately read CTM of r3 (animation still running internally?)
-    var ctm3_after=null;
-    try{ctm3_after=r3.getScreenCTM();}catch(e){P('IC[2]: r3 CTM after swap threw: '+e.name);}
-    if(ctm3_after){
-      var e_=ctm3_after.e;
-      var p=classifyPtr(e_),w=isWeird(e_);
-      if(p){R('IC[2]: r3 CTM.e after href swap='+f64hex(e_)+' POINTER!');}
-      else if(w){B('IC[2]: r3 CTM.e after href swap='+f64hex(e_)+' weird='+e_);}
-      else{P('IC[2]: r3 CTM.e after href swap='+e_);}
-    }
-  },300);
-
-  // IC[3]: use element with no matching href — what does CTM return?
-  hdr('IC[3]: use with non-existent href → CTM probe');
-  var useEl3=mkEl(svg,'use',{href:'#does_not_exist_xyz',x:'50',y:'50'});
-  var ctm_bad=null;
-  try{ctm_bad=useEl3.getScreenCTM();}catch(e){P('IC[3]: useEl3 CTM threw: '+e.name);}
-  if(ctm_bad){
-    ['a','b','c','d','e','f'].forEach(function(k){
-      probeVal('IC[3]: bad-href use CTM.'+k,ctm_bad[k]);
-    });
-  }
-
-  // IC[4]: rapid href cycle — 10 swaps only (safe)
-  hdr('IC[4]: rapid href cycle — 10 swaps');
-  var ids=['#icsym1','#icsym2','#icsym3'];
-  for(var i=0;i<10;i++){
-    useEl.setAttribute('href',ids[i%ids.length]);
-  }
-  var ctm_spray=null;
-  try{ctm_spray=r1.getScreenCTM();}catch(e){}
-  if(ctm_spray){probeVal('IC[4]: r1 CTM.e after 10 swaps',ctm_spray.e);}
-  try{ctm_spray=r2.getScreenCTM();}catch(e){}
-  if(ctm_spray){probeVal('IC[4]: r2 CTM.e after 10 swaps',ctm_spray.e);}
-
-  svg.remove();
-  prog('IC done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// ID — SVGFilterElement filterUnits / primitiveUnits extremes
-// When filterUnits="userSpaceOnUse", the filter region uses SVG user coords
-// If the SVG element is at an extreme translate, the filter region coords
-// are also extreme — does the filter processing expose internal values?
-// Also: feImage with data URI + filtered element CTM probe
-// Also: SVGFilterElement.{x,y,width,height}.baseVal at extreme
-// ════════════════════════════════════════════════════════════════════════
-function runID(){
-  hdr('ID: SVGFilterElement filterUnits / extremes + feImage probe');
-  var svg=mkSVG(200,200);
-  var defs=mkEl(svg,'defs');
-
-  // ID[1]: filter region at extreme user space coords
-  hdr('ID[1]: SVGFilter x/y/width/height baseVal at extreme (filterUnits=userSpaceOnUse)');
-  var filter=mkEl(defs,'filter',{id:'idf1',
-    filterUnits:'userSpaceOnUse',
-    x:'-1000000000',y:'-1000000000',
-    width:'2000000000',height:'2000000000'
-  });
-  mkEl(filter,'feFlood',{'flood-color':'red','flood-opacity':'1'});
-
-  // probe the filter element's x/y/width/height
-  ['x','y','width','height'].forEach(function(attr){
-    try{
-      var bv=filter[attr].baseVal;
-      probeVal('ID[1]: filter.'+attr+'.baseVal.value',bv.value);
-    }catch(e){P('ID[1]: filter.'+attr+' threw: '+e.name);}
-  });
-
-  // ID[2]: apply extreme filter to element at extreme transform
-  hdr('ID[2]: apply extreme filter + extreme element transform → CTM/BCR');
-  var filter2=mkEl(defs,'filter',{id:'idf2',filterUnits:'userSpaceOnUse',
-    x:'0',y:'0',width:'100',height:'100'});
-  mkEl(filter2,'feGaussianBlur',{stdDeviation:'2'});
-
-  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red',filter:'url(#idf2)'});
-  var tl=rect.transform.baseVal;
-  var xf=svg.createSVGTransform();
-  xf.setTranslate(1e9,0);
-  tl.appendItem(xf);
-
-  var ctm=null;
-  try{ctm=rect.getScreenCTM();}catch(e){}
-  if(ctm){
-    ['e','f'].forEach(function(k){probeVal('ID[2]: filtered rect CTM.'+k,ctm[k]);});
-  }
-
-  // ID[3]: feImage with data URI — does image loading expose internal addresses?
-  hdr('ID[3]: feImage with data URI in filter — internal image object probe');
-  var filter3=mkEl(defs,'filter',{id:'idf3'});
-  var feImg=mkEl(filter3,'feImage',{
-    href:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-    result:'img',preserveAspectRatio:'none',
-    x:'0',y:'0',width:'1',height:'1'
-  });
-  var rect3=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red',filter:'url(#idf3)'});
-  // sync probe — no wait
-  var ctm3=null;
-  try{ctm3=rect3.getScreenCTM();}catch(e){}
-  if(ctm3){probeVal('ID[3]: feImage filtered CTM.e',ctm3.e);}
-  try{
-    var imgX=feImg.x.baseVal;
-    probeVal('ID[3]: feImage.x.baseVal',imgX.value);
-  }catch(e){P('ID[3]: feImage.x threw: '+e.name);}
-
-  // ID[4]: SVGFilterPrimitiveStandardAttributes x/y with extreme pct
-  hdr('ID[4]: filter primitive region as pct of extreme filter region');
-  var filter4=mkEl(defs,'filter',{id:'idf4',
-    filterUnits:'objectBoundingBox',
-    primitiveUnits:'userSpaceOnUse',
-    x:'0%',y:'0%',width:'100%',height:'100%'
-  });
-  var feBlur=mkEl(filter4,'feGaussianBlur',{
-    stdDeviation:'0',
-    x:'-1000000000',y:'-1000000000',width:'2000000000',height:'2000000000'
-  });
-  try{
-    // probe the primitive subregion
-    ['x','y','width','height'].forEach(function(attr){
-      var bv=feBlur[attr].baseVal;
-      probeVal('ID[4]: feGaussianBlur.'+attr+'.baseVal',bv.value);
-    });
-  }catch(e){P('ID[4]: threw: '+e.name);}
-
-  svg.remove();
-  prog('ID done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// IE — SVGTextElement / SVGTSpanElement getCharNumAtPosition / getExtentOfChar
-// Text layout goes through a completely different internal path (Core Text on iOS)
-// getExtentOfChar returns a DOMRect for each character's bounding box
-// getStartPositionOfChar / getEndPositionOfChar return SVGPoints
-// At extreme font sizes, do text layout positions expose internal values?
-// ════════════════════════════════════════════════════════════════════════
-function runIE(){
-  hdr('IE: SVGTextElement getExtentOfChar / getStartPositionOfChar extreme font');
-  var svg=mkSVG(400,400);
-
-  // IE[1]: getExtentOfChar at extreme font size
-  hdr('IE[1]: SVGText getExtentOfChar at extreme font size');
-  var text=mkEl(svg,'text',{
-    x:'0',y:'200',
-    'font-size':'1000000',
-    'font-family':'sans-serif',
-    fill:'white'
-  });
-  text.textContent='A';
-
-  // force layout sync — no setTimeout
-  var extent=null;
-  try{extent=text.getExtentOfChar(0);}catch(e){P('IE[1]: getExtentOfChar threw: '+e.name);}
-  if(extent){
-    ['x','y','width','height'].forEach(function(k){
-      probeVal('IE[1]: font=1e6 getExtentOfChar.'+k,extent[k]);
-    });
-  }
-
-  var startPt=null;
-  try{startPt=text.getStartPositionOfChar(0);}catch(e){}
-  if(startPt){
-    probeVal('IE[1]: font=1e6 getStartPositionOfChar.x',startPt.x);
-    probeVal('IE[1]: font=1e6 getStartPositionOfChar.y',startPt.y);
-  }
-
-  // IE[2]: getExtentOfChar on text with extreme translate
-  hdr('IE[2]: SVGText getExtentOfChar after extreme translate');
-  var tl=text.transform.baseVal;
-  var xf=svg.createSVGTransform();
-  xf.setTranslate(1e9,0);
-  tl.appendItem(xf);
-
-  var extent2=null;
-  try{extent2=text.getExtentOfChar(0);}catch(e){P('IE[2]: threw: '+e.name);}
-  if(extent2){
-    ['x','y','width','height'].forEach(function(k){
-      probeVal('IE[2]: font=1e6 tx=1e9 getExtentOfChar.'+k,extent2[k]);
-    });
-  }
-
-  // IE[3]: getComputedTextLength at extreme font size
-  hdr('IE[3]: getComputedTextLength at extreme font size');
-  var ctl=null;
-  try{ctl=text.getComputedTextLength();}catch(e){}
-  probeVal('IE[3]: font=1e6 getComputedTextLength',ctl);
-
-  // IE[4]: getCharNumAtPosition with extreme SVGPoint
-  hdr('IE[4]: getCharNumAtPosition with extreme SVGPoint');
-  var pt=svg.createSVGPoint();
-  pt.x=1e15; pt.y=1e15;
-  var charNum=null;
-  try{charNum=text.getCharNumAtPosition(pt);}catch(e){P('IE[4]: threw: '+e.name);}
-  P('IE[4]: charNum at (1e15,1e15)='+charNum);
-
-  svg.remove();
-  prog('IE done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// IF — SVGAnimationElement timing: begin/end values + computedTiming
-// Web Animations API on SMIL elements: element.getAnimations()
-// computedTiming.currentTime / localTime during active animation
-// Also: SVGSVGElement.getCurrentTime() — the SVG document clock
-// Also: SVGAnimationElement.getCurrentTime() vs startTime
-// ════════════════════════════════════════════════════════════════════════
-function runIF(){
-  hdr('IF: SVGAnimation timing / computedTiming / Web Animations probe');
-  var svg=mkSVG(400,400);
-  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-
-  // create animation with extreme begin/dur
-  var anim=mkEl(rect,'animateTransform',{
-    attributeName:'transform',type:'translate',
-    from:'0 0',to:'1000000000000 0',
-    dur:'1000000s',
-    repeatCount:'indefinite'
-  });
-
-  // IF[1]: SVGSVGElement.getCurrentTime()
-  hdr('IF[1]: svg.getCurrentTime() — SVG document clock');
-  var svgTime=null;
-  try{svgTime=svg.getCurrentTime();}catch(e){P('IF[1]: threw: '+e.name);}
-  P('IF[1]: getCurrentTime()='+svgTime);
-
-  // IF[2]: SVGAnimationElement timing attributes
-  hdr('IF[2]: anim.getStartTime() / getCurrentTime()');
-  var startT=null,curT=null;
-  try{startT=anim.getStartTime();}catch(e){P('IF[2]: getStartTime threw: '+e.name);}
-  try{curT=anim.getCurrentTime();}catch(e){P('IF[2]: getCurrentTime threw: '+e.name);}
-  probeVal('IF[2]: anim.getStartTime()',startT);
-  probeVal('IF[2]: anim.getCurrentTime()',curT);
-
-  // IF[3]: Web Animations API getAnimations()
-  hdr('IF[3]: rect.getAnimations() — Web Animations API');
-  var anims=[];
-  try{anims=rect.getAnimations();}catch(e){P('IF[3]: getAnimations threw: '+e.name);}
-  P('IF[3]: getAnimations().length='+anims.length);
-  anims.forEach(function(a,i){
-    P('IF[3]: anim['+i+'] type='+a.constructor.name);
-    // probe effect timing
-    if(a.effect){
-      var ct=null;
-      try{ct=a.effect.getComputedTiming();}catch(e){}
-      if(ct){
-        ['currentIteration','progress','localTime','activeDuration','endTime'].forEach(function(k){
-          if(ct[k]!==undefined&&ct[k]!==null){
-            probeVal('IF[3]: computedTiming.'+k,+ct[k]);
-          }
+    var hasPaint=typeof CSS !== 'undefined' && typeof CSS.paintWorklet !== 'undefined';
+    var hasRegProp=typeof CSS !== 'undefined' && typeof CSS.registerProperty !== 'undefined';
+    var hasHoudini=typeof CSS !== 'undefined' && typeof CSS.supports === 'function';
+    P('JA[1]: CSS.paintWorklet available='+hasPaint);
+    P('JA[1]: CSS.registerProperty available='+hasRegProp);
+    P('JA[1]: CSS.supports available='+hasHoudini);
+    if(hasPaint) R('JA[1]: HOUDINI PAINT WORKLET EXISTS ON IOS');
+    if(hasRegProp){
+      B('JA[1]: CSS.registerProperty available — Houdini Custom Props');
+      // Try to register a custom property with initial numeric value
+      try{
+        CSS.registerProperty({
+          name:'--houdini-test',
+          syntax:'<number>',
+          inherits:false,
+          initialValue:'0'
         });
-      }
+        B('JA[1]: registerProperty succeeded');
+        // Try to read back the computed value
+        var testDiv=document.createElement('div');
+        document.body.appendChild(testDiv);
+        testDiv.style.setProperty('--houdini-test','42');
+        var cs=getComputedStyle(testDiv);
+        var val=cs.getPropertyValue('--houdini-test');
+        B('JA[1]: custom prop --houdini-test readback="'+val.trim()+'"');
+        rm(testDiv);
+      }catch(e2){P('JA[1]: registerProperty error: '+e2.message);}
     }
-    // probe animation.currentTime
-    var curTime=null;
-    try{curTime=a.currentTime;}catch(e){}
-    probeVal('IF[3]: anim.currentTime',+curTime);
-  });
+  }catch(e){P('JA[1]: exception: '+e.message);}
 
-  // IF[4]: setCurrentTime to extreme value → read CTM
-  hdr('IF[4]: svg.setCurrentTime(extreme) → rect CTM probe');
-  [1e6, 1e9, 2147483648, 1e12].forEach(function(t){
+  // JA[2]: CSS.registerProperty with <length> type — pointer-shaped value?
+  P('JA[2]: registerProperty <length> + extreme value readback');
+  try{
+    CSS.registerProperty({
+      name:'--houdini-len',
+      syntax:'<length>',
+      inherits:false,
+      initialValue:'0px'
+    });
+    var d2=document.createElement('div');
+    document.body.appendChild(d2);
+    d2.style.setProperty('--houdini-len','1000000000px');
+    var cs2=getComputedStyle(d2);
+    var v2=cs2.getPropertyValue('--houdini-len');
+    B('JA[2]: --houdini-len=1e9px readback="'+v2.trim()+'"');
+    // Also try matrix type if supported
     try{
-      svg.setCurrentTime(t);
-      var ctm=null;
-      try{ctm=rect.getScreenCTM();}catch(e){}
-      if(ctm){
-        probeVal('IF[4]: setCurrentTime='+t+' CTM.e',ctm.e);
+      CSS.registerProperty({
+        name:'--houdini-xform',
+        syntax:'<transform-list>',
+        inherits:false,
+        initialValue:'none'
+      });
+      d2.style.setProperty('--houdini-xform','translateX(1000000000px)');
+      var v3=getComputedStyle(d2).getPropertyValue('--houdini-xform');
+      B('JA[2]: --houdini-xform readback="'+v3.trim()+'"');
+    }catch(e3){P('JA[2]: transform-list registerProperty: '+e3.message);}
+    rm(d2);
+  }catch(e){P('JA[2]: <length> registerProperty: '+e.message);}
+
+  // JA[3]: CSS typed OM — CSSNumericValue / CSSStyleValue
+  P('JA[3]: CSS Typed OM probe (attributeStyleMap)');
+  try{
+    var d3=document.createElement('div');
+    document.body.appendChild(d3);
+    var hasTypedOM=typeof d3.attributeStyleMap !== 'undefined';
+    P('JA[3]: attributeStyleMap available='+hasTypedOM);
+    if(hasTypedOM){
+      B('JA[3]: CSS Typed OM available');
+      d3.attributeStyleMap.set('transform','translateX(1000000000px)');
+      var xform=d3.computedStyleMap().get('transform');
+      B('JA[3]: computedStyleMap transform='+JSON.stringify(xform));
+      // Try to get raw value
+      var txVal=d3.computedStyleMap().get('transform-origin');
+      B('JA[3]: transform-origin='+JSON.stringify(txVal));
+    }
+    rm(d3);
+  }catch(e){P('JA[3]: typed OM: '+e.message);}
+
+  // JA[4]: CSS.supports for Houdini features
+  P('JA[4]: CSS.supports Houdini feature detection');
+  try{
+    var feats=[
+      ['paint()', '(background: paint(test))'],
+      ['<custom-ident>', '(--x: 1)'],
+      ['@property', '@property (--x: 1)']
+    ];
+    feats.forEach(function(f){
+      try{
+        var sup=CSS.supports(f[1]);
+        P('JA[4]: '+f[0]+' supported='+sup);
+      }catch(e){P('JA[4]: '+f[0]+' error='+e.message);}
+    });
+  }catch(e){P('JA[4]: CSS.supports error: '+e.message);}
+
+  // JA[5]: Worklet.addModule attempt
+  P('JA[5]: CSS.paintWorklet.addModule attempt');
+  try{
+    if(typeof CSS !== 'undefined' && CSS.paintWorklet){
+      var blob=new Blob([
+        'registerPaint("nono-test", class { paint(ctx, size, props) { ctx.fillStyle="red"; ctx.fillRect(0,0,size.width,size.height); } })'
+      ],{type:'application/javascript'});
+      var url=URL.createObjectURL(blob);
+      CSS.paintWorklet.addModule(url).then(function(){
+        R('JA[5]: paintWorklet.addModule SUCCEEDED — Houdini paint live on iOS');
+      }).catch(function(e){
+        P('JA[5]: paintWorklet.addModule rejected: '+e.message);
+      });
+    } else {
+      P('JA[5]: CSS.paintWorklet not available, skip addModule');
+    }
+  }catch(e){P('JA[5]: addModule exception: '+e.message);}
+}
+
+// --- JB: OffscreenCanvas + SVG filter / drawImage pipeline ---
+function JB(){
+  P('JB: OffscreenCanvas + SVG filter drawImage pipeline');
+
+  // JB[1]: OffscreenCanvas availability
+  P('JB[1]: OffscreenCanvas availability');
+  try{
+    var hasOC=typeof OffscreenCanvas !== 'undefined';
+    P('JB[1]: OffscreenCanvas='+hasOC);
+    if(!hasOC){ P('JB[1]: no OffscreenCanvas, skip suite'); return; }
+    var oc=new OffscreenCanvas(100,100);
+    var ctx=oc.getContext('2d');
+    P('JB[1]: OffscreenCanvas 2d context='+!!ctx);
+
+    // JB[2]: draw SVG with extreme transform into OffscreenCanvas → pixel probe
+    P('JB[2]: SVG with extreme transform → OffscreenCanvas → getImageData');
+    var s=mkSVG(200,200);
+    var r=mkEl(s,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+    r.setAttribute('transform','translate(1000000000, 0)');
+    // serialize SVG to data URL
+    var svgStr=new XMLSerializer().serializeToString(s);
+    var svgBlob=new Blob([svgStr],{type:'image/svg+xml'});
+    var svgUrl=URL.createObjectURL(svgBlob);
+    var img=new Image();
+    img.onload=function(){
+      try{
+        ctx.drawImage(img,0,0);
+        var px=ctx.getImageData(0,0,100,100);
+        B('JB[2]: drawImage succeeded, pixel[0]='+(px.data[0])+' pixel[1]='+(px.data[1]));
+      }catch(ee){P('JB[2]: getImageData error: '+ee.message);}
+      URL.revokeObjectURL(svgUrl);
+    };
+    img.onerror=function(){P('JB[2]: SVG image load failed');};
+    img.src=svgUrl;
+    rm(s);
+  }catch(e){P('JB[1]: exception: '+e.message);}
+
+  // JB[3]: OffscreenCanvas transferToImageBitmap → canvas CTM after extreme transform
+  P('JB[3]: OffscreenCanvas transferToImageBitmap + SVG filter cascade');
+  try{
+    var oc2=new OffscreenCanvas(256,256);
+    var ctx2=oc2.getContext('2d');
+    // Apply extreme transform to context
+    ctx2.setTransform(1,0,0,1,1000000000,0);
+    var ctm2=ctx2.getTransform();
+    logV('JB[3]: OffscreenCanvas CTM.e after tx=1e9',ctm2.e);
+    logV('JB[3]: OffscreenCanvas CTM.f after tx=1e9',ctm2.f);
+    // Try even more extreme
+    ctx2.setTransform(1,0,0,1,Number.MAX_SAFE_INTEGER,0);
+    var ctm3=ctx2.getTransform();
+    logV('JB[3]: OffscreenCanvas CTM.e after tx=MAX_SAFE_INT',ctm3.e);
+  }catch(e){P('JB[3]: exception: '+e.message);}
+
+  // JB[4]: OffscreenCanvas with WebGL — check precision / uniform limits
+  P('JB[4]: OffscreenCanvas WebGL precision limits');
+  try{
+    var oc3=new OffscreenCanvas(64,64);
+    var gl=oc3.getContext('webgl');
+    if(gl){
+      B('JB[4]: WebGL on OffscreenCanvas available');
+      var vfp=gl.getShaderPrecisionFormat(gl.VERTEX_SHADER,gl.HIGH_FLOAT);
+      B('JB[4]: highFloat precision range: 2^'+vfp.rangeMin+' to 2^'+vfp.rangeMax+' precision='+vfp.precision);
+      var ffp=gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER,gl.HIGH_FLOAT);
+      B('JB[4]: fragment highFloat range: 2^'+ffp.rangeMin+' to 2^'+ffp.rangeMax);
+      // Check RENDERER / VENDOR
+      var dbgInfo=gl.getExtension('WEBGL_debug_renderer_info');
+      if(dbgInfo){
+        R('JB[4]: RENDERER='+gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL));
+        R('JB[4]: VENDOR='+gl.getParameter(dbgInfo.UNMASKED_VENDOR_WEBGL));
       }
-    }catch(e){P('IF[4]: setCurrentTime='+t+' threw: '+e.name);}
+    } else {
+      P('JB[4]: no WebGL on OffscreenCanvas');
+    }
+  }catch(e){P('JB[4]: exception: '+e.message);}
+
+  // JB[5]: OffscreenCanvas WebGL — read pixel after extreme uniform
+  P('JB[5]: OffscreenCanvas WebGL — extreme uniform value → readPixels probe');
+  try{
+    var oc4=new OffscreenCanvas(4,4);
+    var gl2=oc4.getContext('webgl');
+    if(gl2){
+      var vs='attribute vec2 a;uniform float u;void main(){gl_Position=vec4(a.x+u,a.y,0.0,1.0);}';
+      var fs='void main(){gl_FragColor=vec4(1.0,0.0,0.0,1.0);}';
+      var vsh=gl2.createShader(gl2.VERTEX_SHADER);
+      gl2.shaderSource(vsh,vs); gl2.compileShader(vsh);
+      var fsh=gl2.createShader(gl2.FRAGMENT_SHADER);
+      gl2.shaderSource(fsh,fs); gl2.compileShader(fsh);
+      var prog=gl2.createProgram();
+      gl2.attachShader(prog,vsh); gl2.attachShader(prog,fsh);
+      gl2.linkProgram(prog); gl2.useProgram(prog);
+      var uloc=gl2.getUniformLocation(prog,'u');
+      gl2.uniform1f(uloc,1e38);
+      B('JB[5]: WebGL extreme uniform set to 1e38, no crash');
+      // readPixels — does it produce uniform value leakage?
+      gl2.viewport(0,0,4,4);
+      var buf=new Uint8Array(4*4*4);
+      gl2.readPixels(0,0,4,4,gl2.RGBA,gl2.UNSIGNED_BYTE,buf);
+      P('JB[5]: pixel[0]='+buf[0]+' (should be 0 — geometry off-screen)');
+    }
+  }catch(e){P('JB[5]: WebGL uniform: '+e.message);}
+}
+
+// --- JC: LayoutUnit C++ integer overflow boundary probe ---
+function JC(){
+  P('JC: LayoutUnit overflow boundary — exact crossover at 2^31/64=33554432');
+  // Known ceiling from previous runs: 33554428 (HTML LayoutUnit max)
+  // 33554432 = 2^25 = 2^31/64 — this is exactly where signed 32-bit overflows in fixed-point
+  // If WebKit code path: int32 fixed = (int)(f64 * 64) → at f64=33554432, 33554432*64 = 2^31 → INT_MIN overflow
+
+  // JC[1]: probe exact boundary on getScreenCTM — does it wrap or clamp?
+  P('JC[1]: getScreenCTM boundary at 33554428/33554429/33554432');
+  var vals=[
+    33554420, 33554424, 33554426, 33554427, 33554428,
+    33554429, 33554430, 33554431, 33554432, 33554433,
+    33554440, 33554448, 33554460, 33554476, 33554492,
+    33554508, 33600000, 67108864, 134217728
+  ];
+  vals.forEach(function(tx){
+    var s=mkSVG(1,1);
+    var r=mkEl(s,'rect',{x:'0',y:'0',width:'10',height:'10',fill:'red'});
+    r.setAttribute('transform','translate('+tx+',0)');
+    var ctm=r.getScreenCTM();
+    var e=ctm?ctm.e:null;
+    logV('JC[1]: tx='+tx+' CTM.e',e);
+    // Also check BCR for comparison
+    s.style.position='fixed'; s.style.left='0'; s.style.top='0';
+    s.style.width='1px'; s.style.height='1px';
+    var bcr=r.getBoundingClientRect();
+    P('JC[1]: tx='+tx+' BCR.left='+bcr.left);
+    rm(s);
   });
 
-  // IF[5]: animateTransform with extreme begin time offset
-  hdr('IF[5]: animateTransform with negative/extreme begin → CTM');
-  var anim2=mkEl(rect,'animateTransform',{
-    attributeName:'transform',type:'translate',
-    from:'0 0',to:'999999999999 0',
-    begin:'-999999s',  // start in the past — animation is far advanced
-    dur:'1000000s',
-    repeatCount:'1',
-    fill:'freeze',
-    additive:'replace'
+  // JC[2]: SVGMatrix.e — does it clamp or overflow?
+  P('JC[2]: SVGMatrix.e at LayoutUnit boundary — does the ceiling apply to matrix storage?');
+  var s2=mkSVG(1,1);
+  var testVals=[33554427,33554428,33554429,33554432,33554433,67108864,2147483648];
+  testVals.forEach(function(v){
+    var m=s2.createSVGMatrix();
+    m.e=v;
+    logV('JC[2]: SVGMatrix.e set='+v+' readback',m.e);
   });
-  var ctm_neg=null;
-  try{ctm_neg=rect.getScreenCTM();}catch(e){}
-  if(ctm_neg){probeVal('IF[5]: begin=-999999s CTM.e',ctm_neg.e);}
+  rm(s2);
 
-  svg.remove();
-  prog('IF done — v44 complete');
+  // JC[3]: CSS transform on SVG — different fixed-point path?
+  P('JC[3]: CSS transform:translateX on SVG element — different internal path than SVG transform attribute?');
+  var s3=mkSVG(1,1);
+  var r3=mkEl(s3,'rect',{x:'0',y:'0',width:'10',height:'10',fill:'red'});
+  [33554427,33554428,33554429,33554432,33554433,33554460,67108864].forEach(function(tx){
+    r3.style.transform='translateX('+tx+'px)';
+    var ctm=r3.getScreenCTM();
+    logV('JC[3]: CSS tx='+tx+'px CTM.e',ctm?ctm.e:null);
+  });
+  rm(s3);
+
+  // JC[4]: nested SVG viewBox scaling — does the scaling multiply through fixed-point?
+  P('JC[4]: nested SVG viewBox scaling — multiplication at boundary');
+  // Outer SVG 1px wide, inner SVG viewBox="0 0 1 1" width=1px
+  // scale = outer_width/viewbox_width = 1/1 = 1 normally
+  // But if outer has extreme width and inner has viewBox that creates 2x scale...
+  var outer=mkSVG(2,1);
+  var inner=document.createElementNS(NS,'svg');
+  inner.setAttribute('x','0'); inner.setAttribute('y','0');
+  inner.setAttribute('width','2'); inner.setAttribute('height','1');
+  inner.setAttribute('viewBox','0 0 1 1'); // 2x scale
+  outer.appendChild(inner);
+  var r4=mkEl(inner,'rect',{x:'0',y:'0',width:'1',height:'1',fill:'red'});
+  [16777214,16777215,16777216,16777217,33554428,33554432].forEach(function(tx){
+    r4.setAttribute('transform','translate('+tx+',0)');
+    var ctm=r4.getScreenCTM();
+    logV('JC[4]: inner-viewBox 2x scale, tx='+tx+' CTM.e',ctm?ctm.e:null);
+  });
+  rm(outer);
+
+  // JC[5]: feDisplacementMap scale at exactly the overflow boundary
+  P('JC[5]: feDisplacementMap scale at LayoutUnit overflow point');
+  var s5=mkSVG(100,100);
+  var defs=mkEl(s5,'defs',{});
+  var filt=mkEl(defs,'filter',{id:'f5',x:'0%',y:'0%',width:'100%',height:'100%'});
+  var feTurb=mkEl(filt,'feTurbulence',{baseFrequency:'0.01',numOctaves:'1',result:'turb'});
+  var feDM=mkEl(filt,'feDisplacementMap',{in:'SourceGraphic',in2:'turb',xChannelSelector:'R',yChannelSelector:'G'});
+  [33554427,33554428,33554429,33554432,33554433].forEach(function(scale){
+    feDM.setAttribute('scale',scale);
+    var scaleParsed=feDM.scale.baseVal;
+    logV('JC[5]: feDisplacementMap scale='+scale+' baseVal',scaleParsed);
+  });
+  rm(s5);
+}
+
+// --- JD: CSS transform matrix readback — different internal path ---
+function JD(){
+  P('JD: CSS transform:matrix() readback — DOMMatrix via computedStyle vs getComputedStyle');
+
+  // JD[1]: CSS matrix() on HTML element → getComputedStyle → decompose
+  P('JD[1]: CSS matrix(a,b,c,d,e,f) on HTML element → computed style readback');
+  var d=document.createElement('div');
+  d.style.position='absolute';
+  d.style.width='10px'; d.style.height='10px';
+  document.body.appendChild(d);
+  var txVals=[1000000000, 2147483648, 4294967296, 1e15, 33554432, 33554428];
+  txVals.forEach(function(tx){
+    d.style.transform='matrix(1,0,0,1,'+tx+',0)';
+    var cs=getComputedStyle(d);
+    var txStr=cs.transform;
+    B('JD[1]: matrix(1,0,0,1,'+tx+',0) computed='+txStr);
+    // Parse the matrix string
+    var m=txStr.match(/matrix\(([^)]+)\)/);
+    if(m){
+      var parts=m[1].split(',').map(Number);
+      logV('JD[1]: parsed e (tx)',parts[4]);
+      logV('JD[1]: parsed f (ty)',parts[5]);
+    }
+  });
+  rm(d);
+
+  // JD[2]: CSS matrix3d with extreme values
+  P('JD[2]: CSS matrix3d with extreme translation');
+  var d2=document.createElement('div');
+  d2.style.position='absolute';
+  document.body.appendChild(d2);
+  [1000000000, 2147483648, 4294967296].forEach(function(tx){
+    d2.style.transform='matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,'+tx+',0,0,1)';
+    var cs2=getComputedStyle(d2);
+    var txStr2=cs2.transform;
+    B('JD[2]: matrix3d tx='+tx+' computed='+txStr2.slice(0,80));
+    var m2=txStr2.match(/matrix3d\(([^)]+)\)/);
+    if(m2){
+      var parts2=m2[1].split(',').map(Number);
+      logV('JD[2]: tx component (index 12)',parts2[12]);
+    }
+  });
+  rm(d2);
+
+  // JD[3]: SVG element with CSS transform — does it go through different C++ path?
+  P('JD[3]: SVG element CSS transform vs SVG transform attribute — compare overflow behavior');
+  var s=mkSVG(10,10);
+  var r=mkEl(s,'rect',{x:'0',y:'0',width:'5',height:'5',fill:'red'});
+  [33554427,33554428,33554429,33554432,33554433,2147483647,2147483648].forEach(function(tx){
+    // path 1: SVG attribute transform
+    r.setAttribute('transform','translate('+tx+',0)');
+    var ctm1=r.getScreenCTM();
+    logV('JD[3]: attr tx='+tx+' CTM.e',ctm1?ctm1.e:null);
+    // path 2: CSS transform on same element
+    r.setAttribute('transform','');
+    r.style.transform='translateX('+tx+'px)';
+    var ctm2=r.getScreenCTM();
+    logV('JD[3]: CSS tx='+tx+' CTM.e',ctm2?ctm2.e:null);
+    r.style.transform='';
+  });
+  rm(s);
+
+  // JD[4]: DOMMatrix.fromMatrix with extreme values — internal conversion
+  P('JD[4]: DOMMatrix.fromMatrix({e:extreme}) readback chain');
+  [1000000000,2147483648,4294967296,1e15].forEach(function(tx){
+    var dm=new DOMMatrix([1,0,0,1,tx,0]);
+    logV('JD[4]: DOMMatrix({e:'+tx+'}) .e',dm.e);
+    // Multiply through — does it overflow?
+    var dm2=dm.multiply(dm);
+    logV('JD[4]: dm.multiply(dm) .e (expect 2x)',dm2.e);
+  });
+
+  // JD[5]: SVGSVGElement.getScreenCTM() vs getCTM() comparison
+  P('JD[5]: SVGSVGElement itself — getScreenCTM vs getCTM at extreme viewport');
+  var s2=mkSVG(1000000000,1);
+  s2.style.width='1000000000px';
+  var r2=mkEl(s2,'rect',{x:'500000000',y:'0',width:'1',height:'1',fill:'red'});
+  var ctmS=s2.getScreenCTM();
+  var ctmR=r2.getScreenCTM();
+  var ctmC=r2.getCTM?r2.getCTM():null;
+  logV('JD[5]: SVG root getScreenCTM.e',ctmS?ctmS.e:null);
+  logV('JD[5]: rect getScreenCTM.e (tx=5e8)',ctmR?ctmR.e:null);
+  logV('JD[5]: rect getCTM.e',ctmC?ctmC.e:null);
+  rm(s2);
+}
+
+// --- JE: WebAssembly memory + SharedArrayBuffer / atomics ---
+function JE(){
+  P('JE: WebAssembly / SharedArrayBuffer / Atomics probe');
+
+  // JE[1]: WebAssembly availability
+  P('JE[1]: WebAssembly availability check');
+  try{
+    var hasWasm=typeof WebAssembly !== 'undefined';
+    P('JE[1]: WebAssembly='+hasWasm);
+    if(!hasWasm){ P('JE[1]: no WASM, skip suite'); return; }
+    B('JE[1]: WebAssembly available on iOS');
+
+    // JE[2]: SharedArrayBuffer (requires COOP/COEP — might not work on GitHub Pages)
+    P('JE[2]: SharedArrayBuffer availability');
+    var hasSAB=typeof SharedArrayBuffer !== 'undefined';
+    P('JE[2]: SharedArrayBuffer='+hasSAB);
+    if(hasSAB) R('JE[2]: SAB AVAILABLE — Atomics timing attacks possible');
+
+    // JE[3]: Atomics
+    P('JE[3]: Atomics availability');
+    var hasAt=typeof Atomics !== 'undefined';
+    P('JE[3]: Atomics='+hasAt);
+
+    // JE[4]: Compile minimal WASM module — check if compilation works
+    P('JE[4]: WASM minimal module compile');
+    // Minimal WASM: (module (func (export "f64_id") (param f64) (result f64) (local.get 0)))
+    // Returns f64 input unchanged — tests if WASM can pass f64 through
+    var wasmBytes=new Uint8Array([
+      0x00,0x61,0x73,0x6d, // magic
+      0x01,0x00,0x00,0x00, // version
+      0x01,0x06,           // type section, 6 bytes
+      0x01,                // 1 type
+      0x60,0x01,0x7c,0x01,0x7c, // func (f64) -> (f64)
+      0x03,0x02,           // function section, 2 bytes
+      0x01,0x00,           // 1 function, type 0
+      0x07,0x08,           // export section
+      0x01,                // 1 export
+      0x06,0x66,0x36,0x34,0x5f,0x69,0x64, // "f64_id"
+      0x00,0x00,           // func 0
+      0x0a,0x06,           // code section, 6 bytes
+      0x01,0x04,           // 1 function body, 4 bytes
+      0x00,                // 0 locals
+      0x20,0x00,           // local.get 0
+      0x0b                 // end
+    ]);
+    WebAssembly.instantiate(wasmBytes).then(function(result){
+      B('JE[4]: WASM module compiled and instantiated');
+      var f64_id=result.instance.exports.f64_id;
+      // Pass pointer-shaped values through WASM f64 passthrough
+      var testVals=[
+        1.0,                           // 0x3ff00000_00000000 normal
+        1000000000.0,                  // 0x41cdcd65_00000000
+        // These look like JSC cell pointers
+        5.1e-315,                      // hi=0x00010000 — jsc_cell range
+        1.1e-308,                      // near denormal
+        2.3e-316,                      // hi=0x00000001 — arm64_tagged range
+        5.3e-319                       // very small
+      ];
+      testVals.forEach(function(v){
+        var r=f64_id(v);
+        logV('JE[4]: WASM f64_id('+v+')',r);
+        var c=classifyPtr(r);
+        if(c) R('JE[4]: PTR SHAPE in WASM passthrough: '+c.type);
+      });
+    }).catch(function(e){P('JE[4]: WASM instantiate error: '+e.message);});
+
+    // JE[5]: WASM memory — write f64 value, read back as i32 pair (bit pattern access)
+    P('JE[5]: WASM memory — f64 write → i32 read (direct bit pattern access)');
+    // Module: memory + store/load functions
+    var wasmBytes2=new Uint8Array([
+      0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+      // type section: 3 types
+      0x01,0x11,0x03,
+      0x60,0x01,0x7c,0x00,       // (f64)->()
+      0x60,0x01,0x7f,0x01,0x7f,  // (i32)->(i32)
+      0x60,0x00,0x01,0x7f,       // ()->(i32)  -- not used
+      // function section
+      0x03,0x03,0x03,0x00,0x01,0x01,
+      // memory section: 1 page (64KB)
+      0x05,0x03,0x01,0x00,0x01,
+      // export section
+      0x07,0x19,0x03,
+      0x08,0x73,0x74,0x6f,0x72,0x65,0x5f,0x66,0x36,0x34, // "store_f64"
+      0x00,0x00,
+      0x08,0x6c,0x6f,0x61,0x64,0x5f,0x69,0x33,0x32, // "load_i32"
+      0x00,0x01,
+      0x06,0x6d,0x65,0x6d,0x6f,0x72,0x79, // "memory"
+      0x02,0x00,
+      // code section
+      0x0a,0x14,0x03,
+      // store_f64: (f64 value) -> void — f64.store at addr 0
+      0x07,0x00,
+      0x41,0x00,     // i32.const 0
+      0x20,0x00,     // local.get 0
+      0x39,0x03,0x00,// f64.store align=8 offset=0
+      0x0b,
+      // load_i32: (i32 offset) -> i32
+      0x05,0x00,
+      0x20,0x00,     // local.get 0
+      0x28,0x02,0x00,// i32.load align=4 offset=0
+      0x0b,
+      // placeholder
+      0x02,0x00,0x0b
+    ]);
+    WebAssembly.instantiate(wasmBytes2).then(function(result2){
+      var ex=result2.instance.exports;
+      B('JE[5]: WASM memory module ready, store_f64='+!!ex.store_f64+' load_i32='+!!ex.load_i32);
+      if(ex.store_f64 && ex.load_i32){
+        // Store a known f64 value and read its bits as i32
+        ex.store_f64(1.0);
+        var lo=ex.load_i32(0);
+        var hi=ex.load_i32(4);
+        B('JE[5]: f64=1.0 → i32 lo=0x'+lo.toString(16)+' hi=0x'+hi.toString(16));
+        // Now try to store an SVGMatrix.e value and read its bits
+        // If we could get a pointer from SVGMatrix.e, we could decode it here
+        ex.store_f64(1000000000.0);
+        var lo2=ex.load_i32(0);
+        var hi2=ex.load_i32(4);
+        B('JE[5]: f64=1e9 → i32 lo=0x'+lo2.toString(16)+' hi=0x'+hi2.toString(16));
+      }
+    }).catch(function(e){P('JE[5]: WASM memory module error: '+e.message);});
+
+  }catch(e){P('JE[1]: exception: '+e.message);}
+}
+
+// --- JF: Paint timing / Layout timing side-channel ---
+function JF(){
+  P('JF: Paint timing / layout timing side-channel probe');
+
+  // JF[1]: performance.now() resolution
+  P('JF[1]: performance.now() resolution (clamped to 1ms on iOS?)');
+  var samples=[];
+  for(var i=0;i<20;i++){
+    var t0=performance.now();
+    var t1=performance.now();
+    samples.push(t1-t0);
+  }
+  var minDelta=Math.min.apply(null,samples.filter(function(x){return x>0;}));
+  B('JF[1]: performance.now() min delta='+minDelta+'ms (iOS clamp=1ms?)');
+  P('JF[1]: samples='+samples.slice(0,10).join(','));
+
+  // JF[2]: PerformanceObserver — paint / layout entries
+  P('JF[2]: PerformanceObserver entry types');
+  try{
+    var types=PerformanceObserver.supportedEntryTypes;
+    B('JF[2]: supportedEntryTypes='+JSON.stringify(types));
+    if(types.indexOf('layout-shift')>=0) B('JF[2]: layout-shift supported');
+    if(types.indexOf('paint')>=0) B('JF[2]: paint timing supported');
+    if(types.indexOf('largest-contentful-paint')>=0) B('JF[2]: LCP supported');
+  }catch(e){P('JF[2]: PerformanceObserver.supportedEntryTypes: '+e.message);}
+
+  // JF[3]: forced layout timing — does layout time differ based on internal overflow?
+  P('JF[3]: forced layout timing at LayoutUnit overflow boundary');
+  var timings={};
+  var testVals=[100, 33554427, 33554428, 33554429, 33554432, 33554433, 2147483648];
+  testVals.forEach(function(tx){
+    var s=document.createElementNS(NS,'svg');
+    s.setAttribute('width','1'); s.setAttribute('height','1');
+    s.style.position='absolute'; s.style.left='-9999px';
+    var r=document.createElementNS(NS,'rect');
+    r.setAttribute('x','0'); r.setAttribute('y','0');
+    r.setAttribute('width','5'); r.setAttribute('height','5');
+    r.setAttribute('transform','translate('+tx+',0)');
+    s.appendChild(r); document.body.appendChild(s);
+    var t0=performance.now();
+    // Force layout reads
+    for(var j=0;j<100;j++){
+      r.getScreenCTM();
+    }
+    var t1=performance.now();
+    timings[tx]=(t1-t0).toFixed(3);
+    if(s.parentNode) s.parentNode.removeChild(s);
+  });
+  P('JF[3]: layout timing (100 getScreenCTM calls):');
+  Object.keys(timings).forEach(function(k){
+    B('JF[3]: tx='+k+' time='+timings[k]+'ms');
+  });
+
+  // JF[4]: requestAnimationFrame timing delta — animation frame jitter at boundary
+  P('JF[4]: rAF timing jitter probe — does overflow trigger extra GC/layout?');
+  var rafS=document.createElementNS(NS,'svg');
+  rafS.setAttribute('width','1'); rafS.setAttribute('height','1');
+  rafS.style.position='absolute'; rafS.style.left='-9999px';
+  var rafR=document.createElementNS(NS,'rect');
+  rafR.setAttribute('x','0'); rafR.setAttribute('y','0');
+  rafR.setAttribute('width','5'); rafR.setAttribute('height','5');
+  rafS.appendChild(rafR); document.body.appendChild(rafS);
+  var rafTimes=[];
+  var rafIter=0;
+  var rafTxVals=[33554428,33554429,33554432,33554428,33554429,33554432];
+  function rafProbe(ts){
+    if(rafIter>=rafTxVals.length){
+      B('JF[4]: rAF delta sequence: '+rafTimes.map(function(x){return x.toFixed(2);}).join(',')+'ms');
+      if(rafS.parentNode) rafS.parentNode.removeChild(rafS);
+      return;
+    }
+    var tx=rafTxVals[rafIter];
+    rafR.setAttribute('transform','translate('+tx+',0)');
+    rafR.getScreenCTM(); // force layout
+    var t0=performance.now();
+    rafR.getScreenCTM();
+    rafR.getScreenCTM();
+    rafR.getScreenCTM();
+    var t1=performance.now();
+    rafTimes.push(t1-t0);
+    rafIter++;
+    requestAnimationFrame(rafProbe);
+  }
+  requestAnimationFrame(rafProbe);
+
+  // JF[5]: PerformanceNavigationTiming — page load internals
+  P('JF[5]: PerformanceNavigationTiming + resource timing');
+  try{
+    var nav=performance.getEntriesByType('navigation');
+    if(nav.length>0){
+      var n=nav[0];
+      B('JF[5]: navigationStart='+n.startTime+' domComplete='+n.domComplete+' loadEventEnd='+n.loadEventEnd);
+    }
+    // Check if performance.memory exists (Chrome-only, not iOS)
+    var hasMem=typeof performance.memory !== 'undefined';
+    P('JF[5]: performance.memory available='+hasMem);
+    if(hasMem){
+      R('JF[5]: performance.memory EXISTS: usedJSHeapSize='+performance.memory.usedJSHeapSize);
+      R('JF[5]: performance.memory.totalJSHeapSize='+performance.memory.totalJSHeapSize);
+    }
+  }catch(e){P('JF[5]: perf timing: '+e.message);}
+
+  // JF[6]: CSS.supports — check for bleeding-edge WebKit features
+  P('JF[6]: CSS feature probes — bleeding edge WebKit');
+  var cssFeats=[
+    ['anchor positioning','anchor-name: --foo'],
+    ['scroll-driven animations','animation-timeline: scroll()'],
+    ['view-timeline','view-timeline: --t'],
+    ['container queries','container-type: inline-size'],
+    ['cascade layers','@layer foo {}'],
+    ['color-mix','color: color-mix(in srgb, red, blue)'],
+    ['individual transforms','translate: 1px 0px'],
+    ['initial-letter','initial-letter: 2'],
+    ['text-box-trim','text-box-trim: both'],
+    ['field-sizing','field-sizing: content']
+  ];
+  cssFeats.forEach(function(f){
+    try{
+      var sup=CSS.supports(f[1]);
+      if(sup) B('JF[6]: '+f[0]+'=SUPPORTED');
+      else P('JF[6]: '+f[0]+'=no');
+    }catch(e){P('JF[6]: '+f[0]+'=err:'+e.message);}
+  });
+}
+
+// runner
+var SUITES={JA,JB,JC,JD,JE,JF};
+function go(s){
+  document.getElementById('progress').textContent='Running '+s+'...';
+  log('=== '+s+' ===','purple');
+  try{SUITES[s]();}catch(e){log('SUITE CRASH: '+e.message+' @ '+e.stack,'red');}
+  document.getElementById('progress').textContent=s+' done.';
+}
+
+var suiteKeys=['JA','JB','JC','JD','JE','JF'];
+var allIdx=0;
+function runAll(){
+  allIdx=0;
+  document.getElementById('out').innerHTML='';
+  function next(){
+    if(allIdx>=suiteKeys.length){
+      document.getElementById('progress').textContent='ALL DONE';
+      return;
+    }
+    var k=suiteKeys[allIdx++];
+    document.getElementById('progress').textContent='Running '+k+' ('+allIdx+'/'+suiteKeys.length+')...';
+    log('=== '+k+' ===','purple');
+    try{SUITES[k]();}catch(e){log('SUITE CRASH: '+e.message,'red');}
+    setTimeout(next,400);
+  }
+  next();
+}
+function copyAll(){
+  var items=document.querySelectorAll('#out .result');
+  var txt=Array.from(items).map(function(e){return e.textContent;}).join('\n');
+  navigator.clipboard.writeText(txt).catch(function(){});
+}
+function clearOut(){
+  document.getElementById('out').innerHTML='';
+  document.getElementById('progress').textContent='';
 }
 </script>
 </body>
