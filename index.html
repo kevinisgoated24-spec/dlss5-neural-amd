@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v42 — filter primitives / displacement map / canvas feedback</title>
+<title>SVG v43 — DOMMatrix / animVal race / em units / CSSMatrix probe</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -27,8 +27,8 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v42 — FILTER PRIMITIVES / DISPLACEMENT MAP / CANVAS FEEDBACK</h1>
-<h2>feDisplacementMap · feColorMatrix feedback · canvas drawImage filtered · getImageData probe · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v43 — DOMMatrix / animVal race / em units / CSSMatrix / WebKitCSSMatrix</h1>
+<h2>DOMMatrix conversion · animVal mid-anim freeze · SVGLength em/ex units · WebKitCSSMatrix · canvas transform matrix · iOS 26.5.2 / A16 arm64e</h2>
 <div class="suite">
 <div class="legend">
   <span class="leg leg-r">🔴 holy shit</span>
@@ -36,12 +36,12 @@ button:active{background:#0f0;color:#000}
   <span class="leg leg-p">🟣 useless</span>
 </div>
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('GA')">GA</button>
-<button onclick="go('GB')">GB</button>
-<button onclick="go('GC')">GC</button>
-<button onclick="go('GD')">GD</button>
-<button onclick="go('GE')">GE</button>
-<button onclick="go('GF')">GF</button>
+<button onclick="go('HA')">HA</button>
+<button onclick="go('HB')">HB</button>
+<button onclick="go('HC')">HC</button>
+<button onclick="go('HD')">HD</button>
+<button onclick="go('HE')">HE</button>
+<button onclick="go('HF')">HF</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -70,8 +70,7 @@ function classifyPtr(v){
 }
 function isWeird(v){
   if(typeof v!=='number'||!isFinite(v)||isNaN(v))return false;
-  if(Math.abs(v)<16777216)return false;
-  return true;
+  return Math.abs(v)>=16777216;
 }
 
 function log(m,c){
@@ -93,18 +92,17 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runGA();
-  setTimeout(runGB,800);
-  setTimeout(runGC,1600);
-  setTimeout(runGD,2400);
-  setTimeout(runGE,3200);
-  setTimeout(runGF,4000);
+  runHA();
+  setTimeout(runHB,500);
+  setTimeout(runHC,1000);
+  setTimeout(runHD,1500);
+  setTimeout(runHE,2000);
+  setTimeout(runHF,2500);
 }
 
-function mkSVG(w,h,attrs){
+function mkSVG(w,h){
   var s=document.createElementNS(NS,'svg');
   s.setAttribute('width',w||200); s.setAttribute('height',h||200);
-  if(attrs)Object.keys(attrs).forEach(function(k){s.setAttribute(k,attrs[k]);});
   s.style.cssText='position:fixed;left:0;top:0;width:'+(w||200)+'px;height:'+(h||200)+'px;opacity:0.001;pointer-events:none';
   document.body.appendChild(s); return s;
 }
@@ -119,531 +117,617 @@ function probeVal(label,v){
   else if(w){B(label+'='+f64hex(v)+' weird='+v);}
   else{P(label+'='+v);}
 }
-
-// helper: probe all pixel values in a 4-byte run from getImageData
-function probePixels(label,data,offset,count){
-  for(var i=0;i<count&&offset+i*4+3<data.length;i++){
-    var r=data[offset+i*4],g=data[offset+i*4+1],b=data[offset+i*4+2],a=data[offset+i*4+3];
-    if(r!==0||g!==0||b!==0){
-      P(label+' px['+i+']: r='+r+' g='+g+' b='+b+' a='+a);
-    }
-  }
+function probeDOMMatrix(label,m){
+  if(!m){P(label+' null');return;}
+  ['m11','m12','m13','m14','m21','m22','m23','m24',
+   'm31','m32','m33','m34','m41','m42','m43','m44'].forEach(function(k){
+    var v=m[k];
+    var p=classifyPtr(v),w=isWeird(v);
+    if(p){R(label+'.'+k+'='+f64hex(v)+' POINTER! type='+p.type);}
+    else if(w){B(label+'.'+k+'='+f64hex(v)+' weird='+v);}
+    // only log non-identity / non-zero to save space
+    else if(v!==0&&v!==1){P(label+'.'+k+'='+v);}
+  });
 }
 
-// reassemble 4 bytes as a 32-bit value from RGBA
-function pixToU32(r,g,b,a){return(r<<24|g<<16|b<<8|a)>>>0;}
+// ════════════════════════════════════════════════════════════════════════
+// HA — SVGAnimatedTransformList animVal vs baseVal during active SMIL animation
+// Key question: mid-animation, animVal.getItem(0).matrix reads the COMPOSED
+// animated value. Does the SMIL interpolation engine expose internal state?
+// Also: animVal during a paused animation (beginElementAt then pause)
+// ════════════════════════════════════════════════════════════════════════
+function runHA(){
+  hdr('HA: SVGAnimatedTransformList animVal mid-anim probe');
+
+  // HA[1]: read animVal during running animation at multiple frames
+  hdr('HA[1]: animVal.getItem(0).matrix during active translateX animation');
+  var svg=mkSVG(400,400);
+  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+  var anim=mkEl(rect,'animateTransform',{
+    attributeName:'transform',
+    type:'translate',
+    from:'0 0',
+    to:'1000000000 0',  // 1e9 endpoint
+    dur:'10s',
+    repeatCount:'indefinite'
+  });
+
+  // sample animVal at multiple requestAnimationFrame ticks
+  var samples=[];
+  var maxSamples=12;
+  var startTime=performance.now();
+
+  function sampleAnimVal(){
+    var tl=rect.transform.animVal;
+    var mx=null;
+    try{
+      if(tl.numberOfItems>0){mx=tl.getItem(0).matrix;}
+    }catch(e){}
+    var t=performance.now()-startTime;
+    if(mx){
+      var e_=mx.e;
+      var p=classifyPtr(e_),w=isWeird(e_);
+      if(p){R('HA[1]: t='+t.toFixed(0)+'ms animVal.matrix.e='+f64hex(e_)+' POINTER!');}
+      else if(w){B('HA[1]: t='+t.toFixed(0)+'ms animVal.matrix.e='+f64hex(e_)+' weird='+e_);}
+      else{P('HA[1]: t='+t.toFixed(0)+'ms animVal.matrix.e='+e_.toFixed(2));}
+    } else {
+      P('HA[1]: t='+t.toFixed(0)+'ms animVal items='+tl.numberOfItems);
+    }
+    samples.push(t);
+    if(samples.length<maxSamples){requestAnimationFrame(sampleAnimVal);}
+    else{
+      svg.remove();
+      B('HA[1]: sampling done, '+samples.length+' samples');
+    }
+  }
+  requestAnimationFrame(sampleAnimVal);
+
+  // HA[2]: animVal vs baseVal divergence during animation
+  hdr('HA[2]: animVal vs baseVal divergence mid-animation');
+  var svg2=mkSVG(200,200);
+  var rect2=mkEl(svg2,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
+  // set baseVal to known large value
+  var tl2=rect2.transform.baseVal;
+  var xf2=svg2.createSVGTransform();
+  xf2.setTranslate(1e9, 0);
+  tl2.appendItem(xf2);
+  // start animation that changes from 0 to 1e12
+  var anim2=mkEl(rect2,'animateTransform',{
+    attributeName:'transform',
+    type:'translate',
+    from:'0 0',
+    to:'1000000000000 0',
+    dur:'5s',
+    repeatCount:'indefinite',
+    additive:'replace'
+  });
+  // read both animVal and baseVal in same frame
+  var frameCount=0;
+  function compareAnimBase(){
+    var bv=rect2.transform.baseVal;
+    var av=rect2.transform.animVal;
+    var bv_e=bv.numberOfItems>0?bv.getItem(0).matrix.e:null;
+    var av_e=null;
+    try{av_e=av.numberOfItems>0?av.getItem(0).matrix.e:null;}catch(e){}
+    if(av_e!==null&&bv_e!==null){
+      var pA=classifyPtr(av_e),wA=isWeird(av_e);
+      if(pA){R('HA[2]: frame '+frameCount+' animVal.e='+f64hex(av_e)+' POINTER!');}
+      else if(wA){B('HA[2]: frame '+frameCount+' baseVal.e='+bv_e+' animVal.e='+f64hex(av_e)+' weird='+av_e);}
+      else{P('HA[2]: frame '+frameCount+' baseVal.e='+bv_e+' animVal.e='+av_e.toFixed(2));}
+    } else {
+      P('HA[2]: frame '+frameCount+' av_e='+av_e+' bv_e='+bv_e);
+    }
+    frameCount++;
+    if(frameCount<8){requestAnimationFrame(compareAnimBase);}
+    else{svg2.remove();}
+  }
+  setTimeout(function(){requestAnimationFrame(compareAnimBase);},100);
+
+  // HA[3]: SVGAnimateTransform with calc-mode=spline at extreme endpoint
+  hdr('HA[3]: calcMode=spline animation to 1e12');
+  var svg3=mkSVG(200,200);
+  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'20',height:'20',fill:'green'});
+  mkEl(rect3,'animateTransform',{
+    attributeName:'transform',
+    type:'translate',
+    values:'0,0;1000000000000,0',
+    keyTimes:'0;1',
+    calcMode:'spline',
+    keySplines:'0.5 0 0.5 1',
+    dur:'8s',
+    repeatCount:'indefinite'
+  });
+  setTimeout(function(){
+    var av3=rect3.transform.animVal;
+    var mx3=null;
+    try{if(av3.numberOfItems>0)mx3=av3.getItem(0).matrix;}catch(e){}
+    if(mx3){
+      probeVal('HA[3]: spline animVal.e mid-anim',mx3.e);
+    } else {
+      P('HA[3]: no animVal items');
+    }
+    svg3.remove();
+  },200);
+
+  prog('HA running (rAF samples)...');
+}
 
 // ════════════════════════════════════════════════════════════════════════
-// GA — feDisplacementMap: use extreme scale value
-// feDisplacementMap reads pixel values from one image, uses them to
-// DISPLACE pixels of another image by: out_x = in_x + scale * (Xc - 0.5)
-// where Xc is the channel value [0,1]. If scale is extreme (1e12),
-// the displacement could overflow internal coordinate types
-// getImageData on canvas after drawing the filtered SVG → pixel bleed?
+// HB — SVGLength with EM/EX/VWVH units — font metrics path
+// SVGLength with SVG_LENGTHTYPE_EMS internally references the element's
+// computed font size. When reading .value (px), the engine converts
+// em→px using the element's font metrics. Does this expose font object ptr?
+// Also: SVG_LENGTHTYPE_PERCENTAGE with extreme SVG viewport
 // ════════════════════════════════════════════════════════════════════════
-function runGA(){
-  hdr('GA: feDisplacementMap extreme scale → canvas getImageData probe');
+function runHB(){
+  hdr('HB: SVGLength em/ex/vw/vh units → internal font metrics path');
 
-  // GA[1]: basic displacement — does extreme scale bleed internal values?
-  hdr('GA[1]: feDisplacementMap scale=1e9 → canvas getImageData');
+  // HB[1]: SVGLength set to em units, read .value (requires font metrics)
+  hdr('HB[1]: SVGLength set to em units → .value px conversion');
+  var svg=mkSVG(400,400);
+  svg.style.fontSize='16px'; // base font size
+
+  // Create rect with x set via length in em units
+  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'red'});
+  var xLen=rect.x.baseVal;
+
+  // Set to various em values using newValueSpecifiedUnits
+  // SVG_LENGTHTYPE_EMS = 3, SVG_LENGTHTYPE_EXS = 4
+  // SVG_LENGTHTYPE_PX = 5, SVG_LENGTHTYPE_CM = 6
+  // SVG_LENGTHTYPE_MM = 7, SVG_LENGTHTYPE_IN = 8
+  // SVG_LENGTHTYPE_PT = 9, SVG_LENGTHTYPE_PC = 10
+  // SVG_LENGTHTYPE_PERCENTAGE = 2
+  var unitTypes={EMS:3,EXS:4,PX:5,CM:6,MM:7,IN:8,PT:9,PC:10,PCT:2};
+
+  Object.keys(unitTypes).forEach(function(name){
+    var ut=unitTypes[name];
+    [1, 1000, 1e6, 1e8, 1e9, 1e12].forEach(function(v){
+      try{
+        xLen.newValueSpecifiedUnits(ut,v);
+        var pxVal=xLen.value;
+        var visuVal=xLen.valueInSpecifiedUnits;
+        var p=classifyPtr(pxVal),w=isWeird(pxVal);
+        if(p){R('HB[1]: unit='+name+' spec='+v+' .value='+f64hex(pxVal)+' POINTER!');}
+        else if(w){B('HB[1]: unit='+name+' spec='+v+' .value='+f64hex(pxVal)+' weird='+pxVal);}
+        else if(v>=1e6){P('HB[1]: unit='+name+' spec='+v+' .value='+pxVal+' visu='+visuVal);}
+      }catch(e){P('HB[1]: unit='+name+' spec='+v+' threw: '+e.name);}
+    });
+  });
+
+  // HB[2]: SVGLength in em units, element has extreme computed font size
+  hdr('HB[2]: SVGLength in em units on element with extreme font-size');
+  var div=document.createElement('div');
+  div.style.cssText='position:fixed;left:0;top:0;font-size:1000000px;opacity:0.001';
+  document.body.appendChild(div);
+  var svg2=document.createElementNS(NS,'svg');
+  svg2.setAttribute('width','100'); svg2.setAttribute('height','100');
+  div.appendChild(svg2);
+  var rect2=mkEl(svg2,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
+  var xLen2=rect2.x.baseVal;
+  try{
+    xLen2.newValueSpecifiedUnits(3,1); // 1em
+    var pxFromEm=xLen2.value;
+    probeVal('HB[2]: 1em on font-size=1e6px element .value',pxFromEm);
+  }catch(e){P('HB[2]: threw: '+e.name);}
+  div.remove();
+
+  // HB[3]: SVGLength percentage of extreme SVG viewport
+  hdr('HB[3]: SVGLength percentage of extreme SVG viewport size');
+  var svg3=mkSVG(1,1);
+  svg3.setAttribute('width','1000000000');
+  svg3.setAttribute('height','1000000000');
+  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'green'});
+  var xLen3=rect3.x.baseVal;
+  try{
+    xLen3.newValueSpecifiedUnits(2,50); // 50%
+    var pxFromPct=xLen3.value;
+    probeVal('HB[3]: 50% of SVG width=1e9 .value',pxFromPct);
+    xLen3.newValueSpecifiedUnits(2,100);
+    probeVal('HB[3]: 100% of SVG width=1e9 .value',xLen3.value);
+  }catch(e){P('HB[3]: threw: '+e.name);}
+  svg3.remove();
+
+  // HB[4]: SVGLength convertToSpecifiedUnits between all unit types at extremes
+  hdr('HB[4]: SVGLength convertToSpecifiedUnits chain: mm→em→px at extreme');
+  var svg4=mkSVG(200,200);
+  var rect4=mkEl(svg4,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+  var xl4=rect4.x.baseVal;
+  try{
+    // set a huge mm value
+    xl4.newValueSpecifiedUnits(7,1e9); // 1e9mm
+    var pxFromMm=xl4.value;
+    probeVal('HB[4]: 1e9mm → .value (px)',pxFromMm);
+    // now convertToSpecifiedUnits to em
+    xl4.convertToSpecifiedUnits(3); // convert to EMS
+    probeVal('HB[4]: after convertToSpecifiedUnits(EMS) .value (px)',xl4.value);
+    probeVal('HB[4]: after convertToSpecifiedUnits(EMS) .valueInSpecifiedUnits',xl4.valueInSpecifiedUnits);
+  }catch(e){P('HB[4]: threw: '+e.name);}
+  svg4.remove();
+
+  prog('HB done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// HC — DOMMatrix / WebKitCSSMatrix conversion from SVGMatrix
+// DOMMatrix is a newer CSS/geometry API, different internal code path
+// WebKitCSSMatrix (window.WebKitCSSMatrix) is the older prefixed version
+// Both have .m41/.m42 (4x4 matrix translation components)
+// fromMatrix, fromFloat64Array, multiply — different internal path
+// ════════════════════════════════════════════════════════════════════════
+function runHC(){
+  hdr('HC: DOMMatrix / WebKitCSSMatrix from SVGMatrix extreme values');
+
+  // HC[1]: DOMMatrix.fromMatrix with extreme SVGMatrix
+  hdr('HC[1]: DOMMatrix.fromMatrix(svgMatrix with e=1e15)');
+  var svg=mkSVG(200,200);
+  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+  var tl=rect.transform.baseVal;
+  var xf=svg.createSVGTransform();
+
+  [1e9, 1e12, 1e15, 1e18, Number.MAX_SAFE_INTEGER].forEach(function(v){
+    xf.setTranslate(v,0);
+    var svgMx=xf.matrix;
+    var dm=null;
+    try{dm=DOMMatrix.fromMatrix(svgMx);}catch(e){P('HC[1]: v='+v+' DOMMatrix.fromMatrix threw: '+e.name); return;}
+    if(dm){
+      ['m41','m42','m43','m44'].forEach(function(k){
+        var kv=dm[k];
+        var p=classifyPtr(kv),w=isWeird(kv);
+        if(p){R('HC[1]: v='+v+' DOMMatrix.'+k+'='+f64hex(kv)+' POINTER! type='+p.type);}
+        else if(w){B('HC[1]: v='+v+' DOMMatrix.'+k+'='+f64hex(kv)+' weird='+kv);}
+        else if(kv!==0&&kv!==1){P('HC[1]: v='+v+' DOMMatrix.'+k+'='+kv);}
+      });
+    }
+  });
+
+  // HC[2]: DOMMatrix.fromFloat64Array — bypass SVGMatrix, raw f64 array
+  hdr('HC[2]: DOMMatrix.fromFloat64Array with extreme translation values');
+  // 4x4 column-major: [a,b,0,0, c,d,0,0, 0,0,1,0, tx,ty,0,1]
+  var arr=new Float64Array(16);
+  arr[0]=1; arr[5]=1; arr[10]=1; arr[15]=1; // identity diagonal
+  [1e9, 1e12, 1e15].forEach(function(v){
+    arr[12]=v; arr[13]=0; // m41=v
+    var dm=null;
+    try{dm=DOMMatrix.fromFloat64Array(arr);}catch(e){P('HC[2]: v='+v+' threw: '+e.name); return;}
+    if(dm){
+      var p=classifyPtr(dm.m41),w=isWeird(dm.m41);
+      if(p){R('HC[2]: v='+v+' DOMMatrix.m41='+f64hex(dm.m41)+' POINTER!');}
+      else if(w){B('HC[2]: v='+v+' DOMMatrix.m41='+f64hex(dm.m41)+' weird='+dm.m41);}
+      else{P('HC[2]: v='+v+' DOMMatrix.m41='+dm.m41);}
+    }
+  });
+
+  // HC[3]: WebKitCSSMatrix (if available)
+  hdr('HC[3]: WebKitCSSMatrix / CSSMatrix probe');
+  var WKM=window.WebKitCSSMatrix||window.CSSMatrix||window.MSCSSMatrix;
+  if(WKM){
+    [1e9, 1e12, 1e15].forEach(function(v){
+      var wkm=null;
+      try{wkm=new WKM('matrix(1,0,0,1,'+v+',0)');}catch(e){P('HC[3]: threw: '+e.name);}
+      if(wkm){
+        probeVal('HC[3]: v='+v+' WKM.m41',wkm.m41||wkm.e);
+        probeVal('HC[3]: v='+v+' WKM.e',wkm.e);
+      }
+    });
+  } else {
+    P('HC[3]: WebKitCSSMatrix / CSSMatrix not available');
+  }
+
+  // HC[4]: DOMMatrix multiply chain — does multiply of two extreme matrices
+  // go through a different code path that might expose internal state?
+  hdr('HC[4]: DOMMatrix.multiply of two extreme matrices');
+  [
+    {tx:1e9, label:'1e9'},
+    {tx:1e12, label:'1e12'},
+    {tx:1e15, label:'1e15'}
+  ].forEach(function(spec){
+    var dmA=new DOMMatrix([1,0,0,1,spec.tx,0]);
+    var dmB=new DOMMatrix([1,0,0,1,spec.tx,0]);
+    var prod=null;
+    try{prod=dmA.multiply(dmB);}catch(e){P('HC[4]: '+spec.label+' multiply threw: '+e.name); return;}
+    if(prod){
+      probeVal('HC[4]: ('+spec.label+')^2 DOMMatrix product.m41',prod.m41);
+      probeVal('HC[4]: ('+spec.label+')^2 DOMMatrix product.m42',prod.m42);
+    }
+  });
+
+  // HC[5]: DOMMatrix.inverse of extreme matrix
+  hdr('HC[5]: DOMMatrix.inverse of extreme translation');
+  [1e9, 1e12, 1e15].forEach(function(v){
+    var dm=new DOMMatrix([1,0,0,1,v,0]);
+    var inv=null;
+    try{inv=dm.inverse();}catch(e){P('HC[5]: v='+v+' inverse threw: '+e.name); return;}
+    if(inv){
+      probeVal('HC[5]: v='+v+' inverse.m41',inv.m41);
+    }
+  });
+
+  svg.remove();
+  prog('HC done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// HD — Canvas 2D context transform matrix — getTransform()
+// canvas.getTransform() returns a DOMMatrix reflecting the canvas CTM
+// canvas.setTransform with extreme values → getTransform → DOMMatrix
+// canvas.transform with extreme values accumulated
+// Also: canvas.measureText on extreme font size → TextMetrics
+// ════════════════════════════════════════════════════════════════════════
+function runHD(){
+  hdr('HD: Canvas 2D getTransform / setTransform → DOMMatrix + TextMetrics');
   var canvas=document.createElement('canvas');
-  canvas.width=64; canvas.height=64;
+  canvas.width=200; canvas.height=200;
   canvas.style.cssText='position:fixed;left:0;top:0;opacity:0.001;pointer-events:none';
   document.body.appendChild(canvas);
   var ctx=canvas.getContext('2d');
 
-  // build inline SVG data URI with feDisplacementMap
-  var svgStr=[
-    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">',
-    '<defs>',
-    '<filter id="dm" x="0" y="0" width="100%" height="100%">',
-    '<feTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" result="noise"/>',
-    '<feDisplacementMap in="SourceGraphic" in2="noise" scale="1000000000" xChannelSelector="R" yChannelSelector="G"/>',
-    '</filter>',
-    '</defs>',
-    '<rect x="0" y="0" width="64" height="64" fill="rgb(128,64,32)" filter="url(#dm)"/>',
-    '</svg>'
-  ].join('');
-
-  var img=new Image();
-  img.onload=function(){
-    ctx.drawImage(img,0,0);
-    var data=ctx.getImageData(0,0,64,64).data;
-    var nonzero=0;
-    var weirdPixels=[];
-    for(var i=0;i<data.length;i+=4){
-      if(data[i]!==0||data[i+1]!==0||data[i+2]!==0){
-        nonzero++;
-        // check if any pixel channel looks like a pointer byte
-        var u32=pixToU32(data[i],data[i+1],data[i+2],data[i+3]);
-        if(data[i]>0&&data[i+1]===0&&data[i+2]===0&&data[i+3]===0){
-          weirdPixels.push({idx:i/4,r:data[i],g:data[i+1],b:data[i+2],a:data[i+3]});
-        }
+  // HD[1]: canvas.setTransform with extreme translation → getTransform
+  hdr('HD[1]: canvas.setTransform(1,0,0,1,extreme,0) → ctx.getTransform()');
+  [1e6, 1e9, 2147483648, 1e12, 1e15].forEach(function(v){
+    try{
+      ctx.setTransform(1,0,0,1,v,0);
+      var dm=ctx.getTransform();
+      if(dm){
+        ['m41','m42','e','f'].forEach(function(k){
+          if(dm[k]!==undefined){
+            var kv=dm[k];
+            var p=classifyPtr(kv),w=isWeird(kv);
+            if(p){R('HD[1]: v='+v+' getTransform.'+k+'='+f64hex(kv)+' POINTER!');}
+            else if(w){B('HD[1]: v='+v+' getTransform.'+k+'='+f64hex(kv)+' weird='+kv);}
+            else if(kv!==0&&kv!==1){P('HD[1]: v='+v+' getTransform.'+k+'='+kv);}
+          }
+        });
       }
-    }
-    B('GA[1]: scale=1e9 nonzero pixels='+nonzero+'/'+data.length/4);
-    if(nonzero===0){P('GA[1]: all pixels zero — displacement moved everything off canvas');}
-    else{P('GA[1]: some pixels survived displacement at scale=1e9');}
-    canvas.remove();
-  };
-  img.onerror=function(){P('GA[1]: image load error');canvas.remove();};
-  img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svgStr);
-
-  // GA[2]: probe feDisplacementMap.scale.baseVal at extreme values
-  hdr('GA[2]: feDisplacementMap.scale.baseVal at extreme values');
-  var svg=mkSVG(200,200);
-  var defs=mkEl(svg,'defs');
-  var filter=mkEl(defs,'filter',{id:'gadm2',x:'0',y:'0',width:'100%',height:'100%'});
-  var feTurb=mkEl(filter,'feTurbulence',{type:'fractalNoise',baseFrequency:'0.5',result:'noise'});
-  var feDM=mkEl(filter,'feDisplacementMap',{
-    in:'SourceGraphic',in2:'noise',
-    scale:'100',xChannelSelector:'R',yChannelSelector:'G'
+    }catch(e){P('HD[1]: v='+v+' threw: '+e.name);}
+    ctx.resetTransform();
   });
 
-  [1e6, 1e8, 2147483648, 4294967296, 1e12, 1e15].forEach(function(v){
-    feDM.setAttribute('scale',v);
-    var bv=feDM.scale.baseVal;
-    probeVal('GA[2]: scale='+v+' scale.baseVal',bv);
-  });
-
-  svg.remove();
-  prog('GA done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// GB — feColorMatrix feedback via canvas
-// apply feColorMatrix with extreme values to SVG rendered to canvas
-// getImageData → do the extreme matrix values "bleed" into output pixels
-// also: feColorMatrix type=saturate/hueRotate with extreme values
-// ════════════════════════════════════════════════════════════════════════
-function runGB(){
-  hdr('GB: feColorMatrix extreme values → canvas pixel feedback');
-
-  // GB[1]: identity matrix with one extreme value → canvas pixels
-  hdr('GB[1]: feColorMatrix values[4]=1e12 (bias) → canvas getImageData');
-  // The 5th value in each row is the bias term (additive).
-  // If the bias overflows the [0,1] clamp, we might see garbage pixels.
-  var canvas=document.createElement('canvas');
-  canvas.width=32; canvas.height=32;
-  document.body.appendChild(canvas);
-  var ctx=canvas.getContext('2d');
-
-  var biasVals=[1, 255, 65535, 1e6, 1e9, 2147483648, 1e12];
-  var results=[];
-
-  function testBias(idx){
-    if(idx>=biasVals.length){
-      B('GB[1]: bias sweep complete');
-      canvas.remove();
-      return;
-    }
-    var bias=biasVals[idx];
-    // matrix: identity + extreme bias on red channel
-    var matStr='1 0 0 0 '+bias+'  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0';
-    var svgStr=[
-      '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">',
-      '<defs><filter id="gcm"><feColorMatrix type="matrix" values="'+matStr+'"/></filter></defs>',
-      '<rect x="0" y="0" width="32" height="32" fill="rgb(1,1,1)" filter="url(#gcm)"/>',
-      '</svg>'
-    ].join('');
-    var img=new Image();
-    img.onload=function(){
-      ctx.clearRect(0,0,32,32);
-      ctx.drawImage(img,0,0);
-      var data=ctx.getImageData(0,0,1,1).data;
-      var r=data[0],g=data[1],b=data[2],a=data[3];
-      var p=classifyPtr(r)|| classifyPtr(g)||classifyPtr(b);
-      B('GB[1]: bias='+bias+' pixel=('+r+','+g+','+b+','+a+')');
-      testBias(idx+1);
-    };
-    img.onerror=function(){P('GB[1]: bias='+bias+' img error'); testBias(idx+1);};
-    img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svgStr);
+  // HD[2]: accumulated canvas.translate — does overflow wrap?
+  hdr('HD[2]: accumulated canvas.translate(1e9,0) repeated → getTransform');
+  ctx.resetTransform();
+  var N=20;
+  for(var i=0;i<N;i++){
+    try{ctx.translate(1e9,0);}catch(e){break;}
   }
-  testBias(0);
+  try{
+    var dm2=ctx.getTransform();
+    probeVal('HD[2]: after '+N+'x translate(1e9) getTransform.m41',dm2.m41||dm2.e);
+  }catch(e){P('HD[2]: getTransform threw: '+e.name);}
+  ctx.resetTransform();
 
-  // GB[2]: feColorMatrix.values baseVal items unclamped
-  hdr('GB[2]: feColorMatrix.values[4] (bias) baseVal stored unclamped?');
-  var svg=mkSVG(100,100);
-  var defs2=mkEl(svg,'defs');
-  var f2=mkEl(defs2,'filter',{id:'gbf2'});
-  var cm2=mkEl(f2,'feColorMatrix',{type:'matrix',
-    values:'1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0'});
-
-  [1e9, 1e12, 1e15, 2147483648, 4294967296].forEach(function(v){
-    var vl=cm2.values.baseVal;
-    if(vl.numberOfItems>=5){
-      vl.getItem(4).value=v;
-      var rb=vl.getItem(4).value;
-      probeVal('GB[2]: bias set='+v+' readback',rb);
-    }
-  });
-
-  // GB[3]: feColorMatrix type=saturate extreme
-  hdr('GB[3]: feColorMatrix type=saturate extreme values');
-  var cm3=mkEl(mkEl(mkEl(svg,'defs'),'filter',{id:'gbf3'}),
-    'feColorMatrix',{type:'saturate',values:'1'});
-  [1e6, 1e8, 2147483648, 1e12].forEach(function(v){
-    cm3.setAttribute('values',v);
-    var bv=cm3.values.baseVal;
-    // saturate has 1 value
-    if(bv.numberOfItems>0){probeVal('GB[3]: saturate='+v+' baseVal[0]',bv.getItem(0).value);}
-  });
-
-  // GB[4]: feColorMatrix type=hueRotate extreme
-  hdr('GB[4]: feColorMatrix type=hueRotate extreme angle');
-  var cm4=mkEl(mkEl(svg,'defs'),'feColorMatrix',{type:'hueRotate',values:'0'});
-  [1e6, 360*1000000, 2147483648, 1e12].forEach(function(v){
-    cm4.setAttribute('values',v);
-    var bv=cm4.values.baseVal;
-    if(bv.numberOfItems>0){probeVal('GB[4]: hueRotate='+v+' baseVal[0]',bv.getItem(0).value);}
-  });
-
-  svg.remove();
-  prog('GB done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// GC — SVGFEFlood + feComposite + canvas readback
-// feFlood fills with a color, feComposite combines — both have
-// internal rect computations for the flood region
-// feFlood with extreme x/y/width/height subregion attributes
-// ════════════════════════════════════════════════════════════════════════
-function runGC(){
-  hdr('GC: feFlood / feComposite subregion extreme attributes');
-  var svg=mkSVG(200,200);
-  var defs=mkEl(svg,'defs');
-
-  // GC[1]: feFlood subregion x/y/width/height at extremes
-  hdr('GC[1]: feFlood subregion attributes at extreme values');
-  var filter=mkEl(defs,'filter',{id:'gcf1',x:'0',y:'0',width:'100%',height:'100%'});
-  var flood=mkEl(filter,'feFlood',{'flood-color':'red','flood-opacity':'1',
-    result:'flood', x:'0',y:'0',width:'100%',height:'100%'});
-
-  // probe the filter primitive subregion SVGAnimatedLength baseVal
-  ['x','y','width','height'].forEach(function(attr){
-    [1e6, 2147483648, 1e12].forEach(function(v){
-      flood.setAttribute(attr,v);
-      try{
-        var al=flood[attr]&&flood[attr].baseVal;
-        if(al&&typeof al.value!=='undefined'){
-          probeVal('GC[1]: feFlood.'+attr+'='+v+' baseVal',al.value);
-        } else {
-          P('GC[1]: feFlood.'+attr+'='+v+' (no baseVal accessor)');
+  // HD[3]: canvas.measureText on element with extreme font size
+  hdr('HD[3]: canvas.measureText with extreme font-size → TextMetrics');
+  ['1000000px', '1e9px', '999999999px'].forEach(function(fs){
+    try{
+      ctx.font=fs+' sans-serif';
+      var actualFont=ctx.font; // what did it actually set?
+      var tm=ctx.measureText('A');
+      var props=['width','actualBoundingBoxLeft','actualBoundingBoxRight',
+        'actualBoundingBoxAscent','actualBoundingBoxDescent',
+        'fontBoundingBoxAscent','fontBoundingBoxDescent'];
+      props.forEach(function(k){
+        if(tm[k]!==undefined){
+          var kv=tm[k];
+          var p=classifyPtr(kv),w=isWeird(kv);
+          if(p){R('HD[3]: font='+fs+' tm.'+k+'='+f64hex(kv)+' POINTER!');}
+          else if(w){B('HD[3]: font='+fs+' tm.'+k+'='+f64hex(kv)+' weird='+kv);}
+          else if(kv!==0){P('HD[3]: font='+fs+' tm.'+k+'='+kv);}
         }
-      }catch(e){P('GC[1]: feFlood.'+attr+'='+v+' threw: '+e.name);}
-      flood.setAttribute(attr,'0');
-    });
+      });
+    }catch(e){P('HD[3]: font='+fs+' threw: '+e.name);}
   });
 
-  // GC[2]: feComposite k1/k2/k3/k4 extreme values
-  hdr('GC[2]: feComposite k values at extremes');
-  var filter2=mkEl(defs,'filter',{id:'gcf2'});
-  mkEl(filter2,'feFlood',{'flood-color':'white',result:'white'});
-  var comp=mkEl(filter2,'feComposite',{
-    in:'SourceGraphic',in2:'white',
-    operator:'arithmetic',
-    k1:'0',k2:'1',k3:'0',k4:'0'
-  });
-
-  ['k1','k2','k3','k4'].forEach(function(k){
-    [1e6, 1e8, 1e12, 2147483648].forEach(function(v){
-      comp.setAttribute(k,v);
-      try{
-        var kv=comp[k]&&comp[k].baseVal;
-        if(typeof kv==='number'){probeVal('GC[2]: feComposite.'+k+'='+v+' baseVal',kv);}
-        else{P('GC[2]: feComposite.'+k+'='+v+' no baseVal accessor');}
-      }catch(e){}
-      comp.setAttribute(k,'0');
-    });
-  });
-
-  // GC[3]: feMorphology radius extreme
-  hdr('GC[3]: feMorphology radius at extreme values');
-  var filter3=mkEl(defs,'filter',{id:'gcf3'});
-  var morph=mkEl(filter3,'feMorphology',{operator:'erode',radius:'1'});
-  [1e6, 1e8, 2147483648, 1e12].forEach(function(v){
-    morph.setAttribute('radius',v);
-    var rx=morph.radiusX.baseVal, ry=morph.radiusY.baseVal;
-    probeVal('GC[3]: morph.radius='+v+' radiusX.baseVal',rx);
-    probeVal('GC[3]: morph.radius='+v+' radiusY.baseVal',ry);
-  });
-
-  svg.remove();
-  prog('GC done');
+  canvas.remove();
+  prog('HD done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// GD — SVGFEConvolveMatrix / feDiffuseLighting / feSpecularLighting
-// convolution kernel values stored as SVGAnimatedNumberList
-// lighting position values (fePointLight x/y/z, feSpotLight)
-// these go through 3D math → different overflow path
+// HE — SVGGeometryElement.getTotalLength / getPointAtLength on
+//       COMBINED extreme viewBox + path coords
+// When an SVG has a tiny viewBox (e.g. viewBox="0 0 0.001 0.001") and the
+// path uses coords near 1, the internal path coordinates after CTM multiply
+// become 1e3+ per SVG unit. Does path parameterization then overflow?
+// Also: SVGGraphicsElement.getBBox() after extreme transform
 // ════════════════════════════════════════════════════════════════════════
-function runGD(){
-  hdr('GD: feConvolveMatrix / feLighting position → 3D math overflow probe');
-  var svg=mkSVG(200,200);
-  var defs=mkEl(svg,'defs');
+function runHE(){
+  hdr('HE: extreme viewBox + path coords combined → path geometry ops');
+  var svg=mkSVG(400,400);
 
-  // GD[1]: feConvolveMatrix kernelMatrix extreme values
-  hdr('GD[1]: feConvolveMatrix kernelMatrix extreme values');
-  var f1=mkEl(defs,'filter',{id:'gdf1'});
-  var conv=mkEl(f1,'feConvolveMatrix',{
-    order:'3',
-    kernelMatrix:'0 0 0 0 1 0 0 0 0',
-    divisor:'1', bias:'0'
-  });
+  // HE[1]: tiny viewBox + path at scale=1 (but internal coords are huge)
+  hdr('HE[1]: SVG viewBox=0 0 0.001 0.001 width=400 → path coords at [0,1]');
+  svg.setAttribute('viewBox','0 0 0.001 0.001'); // amplifier: 1 unit = 400000px
+  var path=mkEl(svg,'path',{d:'M 0 0 L 0.001 0',fill:'none',stroke:'red','stroke-width':'0.0001'});
+  var tl=null,pt=null;
+  try{tl=path.getTotalLength();}catch(e){P('HE[1]: getTotalLength threw: '+e.name);}
+  try{pt=path.getPointAtLength(0.0005);}catch(e){}
+  B('HE[1]: viewBox=0.001 getTotalLength='+tl);
+  if(pt){probeVal('HE[1]: getPointAtLength(0.0005) pt.x',pt.x);}
 
-  // probe kernelMatrix SVGAnimatedNumberList
-  var kl=conv.kernelMatrix.baseVal;
-  P('GD[1]: kernelMatrix items='+kl.numberOfItems);
-  if(kl.numberOfItems>0){
-    kl.getItem(4).value=1e12;
-    probeVal('GD[1]: kernelMatrix[4] set 1e12 readback',kl.getItem(4).value);
-    kl.getItem(4).value=2147483648;
-    probeVal('GD[1]: kernelMatrix[4] set 2^31 readback',kl.getItem(4).value);
+  // HE[2]: even tinier viewBox amplifier
+  svg.setAttribute('viewBox','0 0 1e-9 1e-9');
+  path.setAttribute('d','M 0 0 L 1e-9 0');
+  var tl2=null;
+  try{tl2=path.getTotalLength();}catch(e){P('HE[2]: threw: '+e.name);}
+  B('HE[2]: viewBox=1e-9 getTotalLength='+tl2);
+  if(tl2){
+    var pt2=null;
+    try{pt2=path.getPointAtLength(5e-10);}catch(e){}
+    if(pt2){probeVal('HE[2]: getPointAtLength(5e-10) pt.x',pt2.x);}
   }
 
-  // GD[2]: feConvolveMatrix.bias extreme
-  hdr('GD[2]: feConvolveMatrix bias/divisor at extremes');
-  [1e6, 1e9, 1e12, 2147483648].forEach(function(v){
-    conv.setAttribute('bias',v);
-    probeVal('GD[2]: bias='+v+' bias.baseVal',conv.bias.baseVal);
-  });
-
-  // GD[3]: fePointLight x/y/z — 3D light position
-  hdr('GD[3]: fePointLight x/y/z at extreme values — 3D math path');
-  var f2=mkEl(defs,'filter',{id:'gdf2'});
-  var diff=mkEl(f2,'feDiffuseLighting',{
-    'lighting-color':'white','diffuseConstant':'1',surfaceScale:'1'
-  });
-  var ptLight=mkEl(diff,'fePointLight',{x:'0',y:'0',z:'100'});
-
-  ['x','y','z'].forEach(function(coord){
-    [1e6, 1e9, 2147483648, 1e12, 1e15].forEach(function(v){
-      ptLight.setAttribute(coord,v);
-      try{
-        var bv=ptLight[coord]&&ptLight[coord].baseVal;
-        if(typeof bv==='number'){probeVal('GD[3]: ptLight.'+coord+'='+v+' baseVal',bv);}
-        else{P('GD[3]: ptLight.'+coord+'='+v+' (no baseVal)');}
-      }catch(e){}
-      ptLight.setAttribute(coord,'0');
+  // HE[3]: extreme viewBox + getBBox — does getBBox use pre-CTM or post-CTM?
+  hdr('HE[3]: getBBox() after extreme viewBox amplification');
+  svg.setAttribute('viewBox','0 0 0.001 0.001');
+  path.setAttribute('d','M 0 0 L 0.001 0');
+  var bbox=null;
+  try{bbox=path.getBBox();}catch(e){P('HE[3]: getBBox threw: '+e.name);}
+  if(bbox){
+    ['x','y','width','height'].forEach(function(k){
+      probeVal('HE[3]: bbox.'+k,bbox[k]);
     });
-  });
+  }
 
-  // GD[4]: feSpotLight extreme + limitingConeAngle
-  hdr('GD[4]: feSpotLight extreme position + limitingConeAngle');
-  var f3=mkEl(defs,'filter',{id:'gdf3'});
-  var spec=mkEl(f3,'feSpecularLighting',{'specularConstant':'1','specularExponent':'20','surfaceScale':'1','lighting-color':'white'});
-  var spotLight=mkEl(spec,'feSpotLight',{x:'0',y:'0',z:'100',pointsAtX:'0',pointsAtY:'0',pointsAtZ:'0',limitingConeAngle:'30'});
-
-  [1e9, 2147483648, 1e12].forEach(function(v){
-    spotLight.setAttribute('x',v);
-    spotLight.setAttribute('pointsAtX',v);
-    ['x','pointsAtX','limitingConeAngle'].forEach(function(attr){
-      try{
-        var bv=spotLight[attr]&&spotLight[attr].baseVal;
-        if(typeof bv==='number'){probeVal('GD[4]: spotLight.'+attr+'@x='+v+' baseVal',bv);}
-      }catch(e){}
+  // HE[4]: getBBox with large scale transform + extreme path
+  hdr('HE[4]: getBBox with large SVGTransform scale + extreme path coords');
+  svg.setAttribute('viewBox','0 0 400 400');
+  var rect2=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
+  var tl_rect=rect2.transform.baseVal;
+  var scaleXF=svg.createSVGTransform();
+  scaleXF.setScale(1e9,1e9);
+  tl_rect.appendItem(scaleXF);
+  var bbox2=null;
+  try{bbox2=rect2.getBBox();}catch(e){}
+  if(bbox2){
+    ['x','y','width','height'].forEach(function(k){
+      probeVal('HE[4]: rect(scale=1e9).getBBox().'+k,bbox2[k]);
     });
-    spotLight.setAttribute('x','0');
-    spotLight.setAttribute('pointsAtX','0');
-  });
+  }
 
-  svg.remove();
-  prog('GD done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// GE — SVG pattern / symbol / use — coordinate transform chain
-// SVGPatternElement has patternTransform (matrix) + x/y/width/height
-// SVGSymbolElement has viewBox (amplification!) + preserveAspectRatio
-// use references symbol — does the symbol viewBox amplify through use?
-// ════════════════════════════════════════════════════════════════════════
-function runGE(){
-  hdr('GE: SVGPatternElement / SVGSymbolElement viewBox amplification probe');
-  var svg=mkSVG(400,400);
-  var defs=mkEl(svg,'defs');
-
-  // GE[1]: symbol with extreme viewBox used via <use>
-  hdr('GE[1]: SVGSymbolElement with extreme viewBox → use → CTM');
-  var sym=mkEl(defs,'symbol',{id:'gesym1',viewBox:'0 0 0.0001 0.0001',
-    width:'100',height:'100'});
-  var innerRect=mkEl(sym,'rect',{x:'0.00001',y:'0',width:'0.00001',height:'0.00001',fill:'red'});
-  var useEl=mkEl(svg,'use',{href:'#gesym1',x:'0',y:'0',width:'100',height:'100'});
-
-  // probe CTM on the rect inside the symbol (accessed via shadow root or direct)
+  // HE[5]: getScreenCTM after nested extreme viewBox
+  hdr('HE[5]: nested SVG with extreme viewBox → inner element getScreenCTM');
+  svg.setAttribute('viewBox','0 0 400 400');
+  var innerSvg=mkEl(svg,'svg',{x:'0',y:'0',width:'400',height:'400',
+    viewBox:'0 0 0.000001 0.000001'}); // 1 unit = 4e8px
+  var innerRect=mkEl(innerSvg,'rect',{x:'0',y:'0',width:'0.000001',height:'0.000001',fill:'red'});
   var ctm=null;
-  try{ctm=innerRect.getScreenCTM();}catch(e){P('GE[1]: innerRect CTM threw: '+e.name);}
+  try{ctm=innerRect.getScreenCTM();}catch(e){}
   if(ctm){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=ctm[f];
-      var p=classifyPtr(v),w=isWeird(v);
-      if(p){R('GE[1]: symbol viewBox CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-      else if(w){B('GE[1]: symbol viewBox CTM.'+f+'='+f64hex(v)+' weird='+v);}
-      else{P('GE[1]: symbol viewBox CTM.'+f+'='+v);}
+    ['a','b','c','d','e','f'].forEach(function(k){
+      probeVal('HE[5]: nested vb CTM.'+k,ctm[k]);
     });
-  }
-
-  // GE[2]: pattern with extreme patternTransform matrix
-  hdr('GE[2]: SVGPatternElement with extreme patternTransform');
-  var pat=mkEl(defs,'pattern',{id:'gepat1',x:'0',y:'0',width:'10',height:'10',
-    patternUnits:'userSpaceOnUse',
-    patternTransform:'matrix(1 0 0 1 1e9 0)'});
-  mkEl(pat,'rect',{x:'0',y:'0',width:'5',height:'5',fill:'blue'});
-  var patRect=mkEl(svg,'rect',{x:'0',y:'0',width:'200',height:'200',fill:'url(#gepat1)'});
-
-  var patCTM=null;
-  try{patCTM=patRect.getScreenCTM();}catch(e){}
-  if(patCTM){P('GE[2]: patRect CTM.e='+patCTM.e);}
-
-  // probe pattern's patternTransform matrix
-  try{
-    var ptl=pat.patternTransform.baseVal;
-    if(ptl.numberOfItems>0){
-      var pmx=ptl.getItem(0).matrix;
-      probeVal('GE[2]: patternTransform matrix.e',pmx.e);
-    }
-  }catch(e){P('GE[2]: patternTransform threw: '+e.name);}
-
-  // GE[3]: pattern x/y baseVal at extreme values
-  hdr('GE[3]: SVGPatternElement x/y/width/height baseVal extremes');
-  ['x','y','width','height'].forEach(function(attr){
-    [1e9, 2147483648, 1e12].forEach(function(v){
-      pat.setAttribute(attr,v);
-      try{
-        var bv=pat[attr]&&pat[attr].baseVal&&pat[attr].baseVal.value;
-        if(bv!==undefined){probeVal('GE[3]: pattern.'+attr+'='+v+' baseVal',bv);}
-        else{P('GE[3]: pattern.'+attr+'='+v+' no baseVal');}
-      }catch(e){}
-      pat.setAttribute(attr,'0');
-    });
-  });
-
-  // GE[4]: nested use elements — does transform stack through use chain?
-  hdr('GE[4]: nested use elements transform stacking');
-  var sym2=mkEl(defs,'symbol',{id:'gesym2',overflow:'visible'});
-  var symR=mkEl(sym2,'rect',{x:'0',y:'0',width:'10',height:'10',fill:'green'});
-  // use that references use that references symbol
-  var use1=mkEl(defs,'g',{id:'geuse_wrapper'});
-  mkEl(use1,'use',{href:'#gesym2',transform:'translate(999999,0)'});
-  var outerUse=mkEl(svg,'use',{href:'#geuse_wrapper',transform:'translate(999999,0)'});
-
-  var outerCTM=null;
-  try{outerCTM=symR.getScreenCTM();}catch(e){P('GE[4]: outerCTM threw: '+e.name);}
-  if(outerCTM){
-    var e_=outerCTM.e;
-    var p=classifyPtr(e_),w=isWeird(e_);
-    if(p){R('GE[4]: nested use CTM.e='+f64hex(e_)+' POINTER!');}
-    else if(w){B('GE[4]: nested use CTM.e='+e_+' weird (expected ~2e6)');}
-    else{P('GE[4]: nested use CTM.e='+e_);}
   }
 
   svg.remove();
-  prog('GE done');
+  prog('HE done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// GF — SVGPathElement.getTotalLength / getPointAtLength at extreme values
-// getPointAtLength computes a point along the path at a given distance
-// extreme length values → different f64 internal path parameterization
-// also: SVGPathElement with extreme coordinates in the path data
-// getPathData() (if supported) — returns internal path segment data
+// HF — ResizeObserver / IntersectionObserver with SVG off-screen
+//       layout geometry at extreme positions
+// ResizeObserver.callback receives DOMRectReadOnly for each observed element
+// IntersectionObserver.callback receives IntersectionObserverEntry
+// boundingClientRect on an element at extreme position (via SVG transform)
+// Also: element.getBoundingClientRect() during SMIL animation (live BCR)
 // ════════════════════════════════════════════════════════════════════════
-function runGF(){
-  hdr('GF: SVGPathElement getPointAtLength extreme + path segment probes');
+function runHF(){
+  hdr('HF: ResizeObserver / IntersectionObserver geometry at extreme SVG positions');
+
+  // HF[1]: ResizeObserver on SVG element with extreme translate
+  hdr('HF[1]: ResizeObserver contentRect on SVG rect with 1e9 translate');
   var svg=mkSVG(400,400);
+  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+  // apply extreme translate
+  var tl=rect.transform.baseVal;
+  var xf=svg.createSVGTransform();
+  xf.setTranslate(1e9,0);
+  tl.appendItem(xf);
 
-  // GF[1]: getPointAtLength at extreme distances
-  hdr('GF[1]: getPointAtLength at extreme distance values');
-  var path=mkEl(svg,'path',{d:'M 0 0 L 100 0'});
-  var totalLen=null;
-  try{totalLen=path.getTotalLength();}catch(e){P('GF[1]: getTotalLength threw: '+e.name);}
-  P('GF[1]: path L 0 0 to 100 0 — getTotalLength='+totalLen);
+  if(typeof ResizeObserver!=='undefined'){
+    var ro=new ResizeObserver(function(entries){
+      entries.forEach(function(e){
+        var cr=e.contentRect||e.contentBoxSize;
+        // probe contentRect values
+        if(e.contentRect){
+          ['x','y','width','height','top','left','bottom','right'].forEach(function(k){
+            if(e.contentRect[k]!==undefined){
+              var v=e.contentRect[k];
+              var p=classifyPtr(v),w=isWeird(v);
+              if(p){R('HF[1]: ResizeObserver contentRect.'+k+'='+f64hex(v)+' POINTER!');}
+              else if(w){B('HF[1]: ResizeObserver contentRect.'+k+'='+f64hex(v)+' weird='+v);}
+              else if(v!==0){P('HF[1]: ResizeObserver contentRect.'+k+'='+v);}
+            }
+          });
+        }
+        ro.disconnect();
+        svg.remove();
+      });
+    });
+    ro.observe(rect);
+  } else {
+    P('HF[1]: ResizeObserver not available');
+    svg.remove();
+  }
 
-  [0, 50, 100, 1e6, 1e9, 2147483648, 4294967296, 1e12, 1e15, Infinity].forEach(function(len){
-    var pt=null;
-    try{pt=path.getPointAtLength(len);}catch(e){P('GF[1]: len='+len+' threw: '+e.name); return;}
-    if(pt){
-      var p=classifyPtr(pt.x)||classifyPtr(pt.y);
-      var w=isWeird(pt.x)||isWeird(pt.y);
-      if(p){R('GF[1]: len='+len+' pt.x='+f64hex(pt.x)+' pt.y='+f64hex(pt.y)+' POINTER!');}
-      else if(w){B('GF[1]: len='+len+' pt.x='+f64hex(pt.x)+' pt.y='+f64hex(pt.y)+' weird');}
-      else{P('GF[1]: len='+len+' pt=('+pt.x.toFixed(4)+','+pt.y.toFixed(4)+')');}
-    }
+  // HF[2]: IntersectionObserver on element at extreme SVG translate
+  hdr('HF[2]: IntersectionObserver on element at extreme SVG position');
+  var svg2=mkSVG(400,400);
+  var rect2=mkEl(svg2,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
+  var tl2=rect2.transform.baseVal;
+  var xf2=svg2.createSVGTransform();
+  xf2.setTranslate(1e9,0);
+  tl2.appendItem(xf2);
+
+  if(typeof IntersectionObserver!=='undefined'){
+    var io=new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        ['boundingClientRect','rootBounds','intersectionRect'].forEach(function(rectName){
+          var r=e[rectName];
+          if(r){
+            ['x','y','width','height','top','left','bottom','right'].forEach(function(k){
+              var v=r[k];
+              if(v===null||v===undefined)return;
+              var p=classifyPtr(v),w=isWeird(v);
+              if(p){R('HF[2]: IO '+rectName+'.'+k+'='+f64hex(v)+' POINTER!');}
+              else if(w){B('HF[2]: IO '+rectName+'.'+k+'='+f64hex(v)+' weird='+v);}
+            });
+          }
+        });
+        io.disconnect();
+        svg2.remove();
+      });
+    });
+    io.observe(rect2);
+  } else {
+    P('HF[2]: IntersectionObserver not available');
+    svg2.remove();
+  }
+
+  // HF[3]: live getBoundingClientRect during SVGAnimateTransform
+  hdr('HF[3]: BCR during active animateTransform → 1e9 endpoint');
+  var svg3=mkSVG(400,400);
+  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'green'});
+  mkEl(rect3,'animateTransform',{
+    attributeName:'transform',type:'translate',
+    from:'0 0',to:'1000000000 0',
+    dur:'5s',repeatCount:'indefinite'
   });
+  var bcrSamples=0;
+  function sampleBCR(){
+    var bcr=rect3.getBoundingClientRect();
+    ['x','y','width','height','top','left','right','bottom'].forEach(function(k){
+      var v=bcr[k];
+      var p=classifyPtr(v),w=isWeird(v);
+      if(p){R('HF[3]: live BCR.'+k+'='+f64hex(v)+' POINTER!');}
+      else if(w){B('HF[3]: live BCR.'+k+'='+f64hex(v)+' weird='+v);}
+    });
+    bcrSamples++;
+    if(bcrSamples<5){setTimeout(sampleBCR,100);}
+    else{svg3.remove();}
+  }
+  setTimeout(sampleBCR,50);
 
-  // GF[2]: path with extreme coords — getTotalLength overflow
-  hdr('GF[2]: path with extreme coords — getTotalLength');
-  var extremePaths=[
-    {d:'M 0 0 L 1e9 0', label:'L 1e9'},
-    {d:'M 0 0 L 1e12 0', label:'L 1e12'},
-    {d:'M 0 0 L 1e15 0', label:'L 1e15'},
-    {d:'M 0 0 C 1e9 0 1e9 100 0 100', label:'C 1e9'},
-    {d:'M 0 0 A 1e9 1e9 0 0 1 100 0', label:'A 1e9'},
-  ];
-  extremePaths.forEach(function(spec){
-    path.setAttribute('d',spec.d);
-    var tl=null;
-    try{tl=path.getTotalLength();}catch(e){tl='THROWS:'+e.name;}
-    var pt=null;
-    try{pt=path.getPointAtLength(0.5);}catch(e){}
-    var p=typeof tl==='number'&&classifyPtr(tl);
-    var w=typeof tl==='number'&&isWeird(tl);
-    if(p){R('GF[2]: '+spec.label+' getTotalLength='+f64hex(tl)+' POINTER!');}
-    else if(w){B('GF[2]: '+spec.label+' getTotalLength='+tl);}
-    else{P('GF[2]: '+spec.label+' getTotalLength='+tl+' pt@0.5='+(pt?'('+pt.x.toFixed(1)+','+pt.y.toFixed(1)+')':'null'));}
-  });
-
-  // GF[3]: getPointAtLength on circular arc path — trig overflow
-  hdr('GF[3]: getPointAtLength on extreme arc radius');
-  path.setAttribute('d','M 0 0 A 1e9 1e9 0 0 1 1e9 0');
-  var arcLen=null;
-  try{arcLen=path.getTotalLength();}catch(e){}
-  P('GF[3]: arc getTotalLength='+arcLen);
-  if(arcLen){
-    [0, arcLen*0.5, arcLen].forEach(function(d){
-      var pt=null;
-      try{pt=path.getPointAtLength(d);}catch(e){}
-      if(pt){
-        var pp=classifyPtr(pt.x)||classifyPtr(pt.y);
-        var pw=isWeird(pt.x)||isWeird(pt.y);
-        if(pp){R('GF[3]: arc d='+d.toFixed(0)+' pt.x='+f64hex(pt.x)+' POINTER!');}
-        else if(pw){B('GF[3]: arc d='+d.toFixed(0)+' pt.x='+f64hex(pt.x)+' pt.y='+f64hex(pt.y)+' weird');}
-        else{P('GF[3]: arc d='+d.toFixed(0)+' pt=('+pt.x.toFixed(0)+','+pt.y.toFixed(0)+')');}
-      }
+  // HF[4]: Element.getClientRects() on SVG with extreme CTM
+  hdr('HF[4]: getClientRects() on SVG element at extreme position');
+  var svg4=mkSVG(400,400);
+  var rect4=mkEl(svg4,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'red'});
+  var tl4=rect4.transform.baseVal;
+  var xf4=svg4.createSVGTransform();
+  xf4.setTranslate(1e9,0);
+  tl4.appendItem(xf4);
+  var rects=rect4.getClientRects();
+  P('HF[4]: getClientRects length='+rects.length);
+  for(var i=0;i<rects.length;i++){
+    var r=rects[i];
+    ['x','y','width','height','left','top','right','bottom'].forEach(function(k){
+      var v=r[k];
+      var p=classifyPtr(v),w=isWeird(v);
+      if(p){R('HF[4]: rect['+i+'].'+k+'='+f64hex(v)+' POINTER!');}
+      else if(w){B('HF[4]: rect['+i+'].'+k+'='+f64hex(v)+' weird='+v);}
     });
   }
+  svg4.remove();
 
-  // GF[4]: SVGGeometryElement.isPointInFill / isPointInStroke with extreme point
-  hdr('GF[4]: isPointInFill / isPointInStroke with extreme SVGPoint');
-  path.setAttribute('d','M 0 0 L 100 0 L 100 100 Z');
-  var extremePt=svg.createSVGPoint();
-  extremePt.x=1e15; extremePt.y=1e15;
-  try{
-    var inFill=path.isPointInFill(extremePt);
-    var inStroke=path.isPointInStroke(extremePt);
-    P('GF[4]: extreme pt (1e15,1e15) inFill='+inFill+' inStroke='+inStroke);
-  }catch(e){P('GF[4]: threw: '+e.name);}
-
-  // GF[5]: pathLength attribute — custom total path length
-  hdr('GF[5]: pathLength attribute distortion → getPointAtLength');
-  path.setAttribute('d','M 0 0 L 100 0');
-  path.setAttribute('pathLength','1');  // remap: logical 1 unit = real 100px
-  var pt_at_half=null;
-  try{pt_at_half=path.getPointAtLength(0.5);}catch(e){}
-  P('GF[5]: pathLength=1 real=100px getPointAtLength(0.5)='+(pt_at_half?'('+pt_at_half.x.toFixed(2)+','+pt_at_half.y.toFixed(2)+')':'null'));
-
-  path.setAttribute('pathLength','1e-15');
-  var pt_extreme=null;
-  try{pt_extreme=path.getPointAtLength(1e-15);}catch(e){}
-  if(pt_extreme){
-    var pp=classifyPtr(pt_extreme.x),pw=isWeird(pt_extreme.x);
-    if(pp){R('GF[5]: pathLength=1e-15 pt.x='+f64hex(pt_extreme.x)+' POINTER!');}
-    else if(pw){B('GF[5]: pathLength=1e-15 pt.x='+f64hex(pt_extreme.x)+' weird='+pt_extreme.x);}
-    else{P('GF[5]: pathLength=1e-15 pt.x='+pt_extreme.x.toFixed(6));}
-  }
-
-  svg.remove();
-  prog('GF done — v42 complete');
+  prog('HF done — v43 complete');
 }
 </script>
 </body>
