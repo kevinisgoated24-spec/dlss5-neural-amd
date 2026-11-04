@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v43 — DOMMatrix / animVal race / em units / CSSMatrix probe</title>
+<title>SVG v44 — HB[3] pct deep dive / currentScale / useHref swap / filter coords</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -27,8 +27,8 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v43 — DOMMatrix / animVal race / em units / CSSMatrix / WebKitCSSMatrix</h1>
-<h2>DOMMatrix conversion · animVal mid-anim freeze · SVGLength em/ex units · WebKitCSSMatrix · canvas transform matrix · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v44 — HB[3] pct=1 anomaly deep dive / currentScale / useHref swap / filter coords</h1>
+<h2>100% pct bug · SVGSVGElement.currentScale · use href swap · filterUnits extremes · iOS 26.5.2 / A16 arm64e</h2>
 <div class="suite">
 <div class="legend">
   <span class="leg leg-r">🔴 holy shit</span>
@@ -36,12 +36,12 @@ button:active{background:#0f0;color:#000}
   <span class="leg leg-p">🟣 useless</span>
 </div>
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('HA')">HA</button>
-<button onclick="go('HB')">HB</button>
-<button onclick="go('HC')">HC</button>
-<button onclick="go('HD')">HD</button>
-<button onclick="go('HE')">HE</button>
-<button onclick="go('HF')">HF</button>
+<button onclick="go('IA')">IA</button>
+<button onclick="go('IB')">IB</button>
+<button onclick="go('IC')">IC</button>
+<button onclick="go('ID')">ID</button>
+<button onclick="go('IE')">IE</button>
+<button onclick="go('IF')">IF</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -72,7 +72,6 @@ function isWeird(v){
   if(typeof v!=='number'||!isFinite(v)||isNaN(v))return false;
   return Math.abs(v)>=16777216;
 }
-
 function log(m,c){
   var d=document.getElementById('out'),e=document.createElement('div');
   e.className='result '+(c||'purple'); e.textContent=m;
@@ -92,17 +91,18 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runHA();
-  setTimeout(runHB,500);
-  setTimeout(runHC,1000);
-  setTimeout(runHD,1500);
-  setTimeout(runHE,2000);
-  setTimeout(runHF,2500);
+  runIA();
+  setTimeout(runIB,1000);
+  setTimeout(runIC,2000);
+  setTimeout(runID,3000);
+  setTimeout(runIE,4000);
+  setTimeout(runIF,5000);
 }
 
-function mkSVG(w,h){
+function mkSVG(w,h,extra){
   var s=document.createElementNS(NS,'svg');
   s.setAttribute('width',w||200); s.setAttribute('height',h||200);
+  if(extra)Object.keys(extra).forEach(function(k){s.setAttribute(k,extra[k]);});
   s.style.cssText='position:fixed;left:0;top:0;width:'+(w||200)+'px;height:'+(h||200)+'px;opacity:0.001;pointer-events:none';
   document.body.appendChild(s); return s;
 }
@@ -117,617 +117,542 @@ function probeVal(label,v){
   else if(w){B(label+'='+f64hex(v)+' weird='+v);}
   else{P(label+'='+v);}
 }
-function probeDOMMatrix(label,m){
-  if(!m){P(label+' null');return;}
-  ['m11','m12','m13','m14','m21','m22','m23','m24',
-   'm31','m32','m33','m34','m41','m42','m43','m44'].forEach(function(k){
-    var v=m[k];
-    var p=classifyPtr(v),w=isWeird(v);
-    if(p){R(label+'.'+k+'='+f64hex(v)+' POINTER! type='+p.type);}
-    else if(w){B(label+'.'+k+'='+f64hex(v)+' weird='+v);}
-    // only log non-identity / non-zero to save space
-    else if(v!==0&&v!==1){P(label+'.'+k+'='+v);}
-  });
-}
 
 // ════════════════════════════════════════════════════════════════════════
-// HA — SVGAnimatedTransformList animVal vs baseVal during active SMIL animation
-// Key question: mid-animation, animVal.getItem(0).matrix reads the COMPOSED
-// animated value. Does the SMIL interpolation engine expose internal state?
-// Also: animVal during a paused animation (beginElementAt then pause)
+// IA — HB[3] deep dive: SVGLength percentage resolution
+// In v43: 50% of SVG width=1e9 → 500000000 (correct)
+//         100% of SVG width=1e9 → 1 (WRONG — should be 1e9)
+// Hypothesis: the SVG width=1e9 is clamped in internal layout
+// but the % resolution uses a mix of internal (clamped) and DOM (unclamped)
+// The "1" might mean internal LayoutUnit(1e9) → clamped LayoutUnit → 1px
+// then 100% * 1px = 1? OR it's an overflow/wraparound
+// DEEP PROBE: test many % values, many SVG widths, find the crossover
 // ════════════════════════════════════════════════════════════════════════
-function runHA(){
-  hdr('HA: SVGAnimatedTransformList animVal mid-anim probe');
+function runIA(){
+  hdr('IA: HB[3] pct=1 anomaly — 100% of SVG width=1e9 deep dive');
 
-  // HA[1]: read animVal during running animation at multiple frames
-  hdr('HA[1]: animVal.getItem(0).matrix during active translateX animation');
-  var svg=mkSVG(400,400);
+  // IA[1]: reproduce the exact anomaly and verify
+  hdr('IA[1]: exact reproduce — 100% pct of SVG width=1e9');
+  var svg=mkSVG(1,1);
+  svg.setAttribute('width','1000000000');
+  svg.setAttribute('height','1000000000');
   var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  var anim=mkEl(rect,'animateTransform',{
-    attributeName:'transform',
-    type:'translate',
-    from:'0 0',
-    to:'1000000000 0',  // 1e9 endpoint
-    dur:'10s',
-    repeatCount:'indefinite'
+  var xl=rect.x.baseVal;
+  // set 50% first (like v43 did)
+  xl.newValueSpecifiedUnits(2,50);
+  probeVal('IA[1]: first: 50% SVG-w=1e9',xl.value);
+  // now 100%
+  xl.newValueSpecifiedUnits(2,100);
+  probeVal('IA[1]: then: 100% SVG-w=1e9',xl.value);
+  // 100% without prior 50%?
+  var rect2=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
+  var xl2=rect2.x.baseVal;
+  xl2.newValueSpecifiedUnits(2,100);
+  probeVal('IA[1]: fresh rect: 100% SVG-w=1e9',xl2.value);
+  // 200%
+  xl2.newValueSpecifiedUnits(2,200);
+  probeVal('IA[1]: 200% SVG-w=1e9',xl2.value);
+  // 1%
+  xl2.newValueSpecifiedUnits(2,1);
+  probeVal('IA[1]: 1% SVG-w=1e9',xl2.value);
+  // 0.001%
+  xl2.newValueSpecifiedUnits(2,0.001);
+  probeVal('IA[1]: 0.001% SVG-w=1e9',xl2.value);
+  svg.remove();
+
+  // IA[2]: sweep SVG widths — find crossover where pct starts glitching
+  hdr('IA[2]: pct=100% across SVG widths — find crossover');
+  var widths=[100,10000,1000000,10000000,33554428,33554429,100000000,
+    2147483647,2147483648,4294967296,1000000000,1000000000000];
+  widths.forEach(function(w){
+    var s=mkSVG(1,1);
+    s.setAttribute('width',w);
+    s.setAttribute('height',w);
+    var r=mkEl(s,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+    var xln=r.x.baseVal;
+    xln.newValueSpecifiedUnits(2,100); // 100%
+    var v=xln.value;
+    var p=classifyPtr(v),ww=isWeird(v);
+    if(p){R('IA[2]: SVG-w='+w+' 100%='+f64hex(v)+' POINTER!');}
+    else if(ww){B('IA[2]: SVG-w='+w+' 100%='+f64hex(v)+' weird='+v);}
+    else{P('IA[2]: SVG-w='+w+' 100%='+v+' (expect '+w+')');}
+    s.remove();
   });
 
-  // sample animVal at multiple requestAnimationFrame ticks
-  var samples=[];
-  var maxSamples=12;
-  var startTime=performance.now();
-
-  function sampleAnimVal(){
-    var tl=rect.transform.animVal;
-    var mx=null;
-    try{
-      if(tl.numberOfItems>0){mx=tl.getItem(0).matrix;}
-    }catch(e){}
-    var t=performance.now()-startTime;
-    if(mx){
-      var e_=mx.e;
-      var p=classifyPtr(e_),w=isWeird(e_);
-      if(p){R('HA[1]: t='+t.toFixed(0)+'ms animVal.matrix.e='+f64hex(e_)+' POINTER!');}
-      else if(w){B('HA[1]: t='+t.toFixed(0)+'ms animVal.matrix.e='+f64hex(e_)+' weird='+e_);}
-      else{P('HA[1]: t='+t.toFixed(0)+'ms animVal.matrix.e='+e_.toFixed(2));}
-    } else {
-      P('HA[1]: t='+t.toFixed(0)+'ms animVal items='+tl.numberOfItems);
-    }
-    samples.push(t);
-    if(samples.length<maxSamples){requestAnimationFrame(sampleAnimVal);}
-    else{
-      svg.remove();
-      B('HA[1]: sampling done, '+samples.length+' samples');
-    }
-  }
-  requestAnimationFrame(sampleAnimVal);
-
-  // HA[2]: animVal vs baseVal divergence during animation
-  hdr('HA[2]: animVal vs baseVal divergence mid-animation');
-  var svg2=mkSVG(200,200);
-  var rect2=mkEl(svg2,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
-  // set baseVal to known large value
-  var tl2=rect2.transform.baseVal;
-  var xf2=svg2.createSVGTransform();
-  xf2.setTranslate(1e9, 0);
-  tl2.appendItem(xf2);
-  // start animation that changes from 0 to 1e12
-  var anim2=mkEl(rect2,'animateTransform',{
-    attributeName:'transform',
-    type:'translate',
-    from:'0 0',
-    to:'1000000000000 0',
-    dur:'5s',
-    repeatCount:'indefinite',
-    additive:'replace'
-  });
-  // read both animVal and baseVal in same frame
-  var frameCount=0;
-  function compareAnimBase(){
-    var bv=rect2.transform.baseVal;
-    var av=rect2.transform.animVal;
-    var bv_e=bv.numberOfItems>0?bv.getItem(0).matrix.e:null;
-    var av_e=null;
-    try{av_e=av.numberOfItems>0?av.getItem(0).matrix.e:null;}catch(e){}
-    if(av_e!==null&&bv_e!==null){
-      var pA=classifyPtr(av_e),wA=isWeird(av_e);
-      if(pA){R('HA[2]: frame '+frameCount+' animVal.e='+f64hex(av_e)+' POINTER!');}
-      else if(wA){B('HA[2]: frame '+frameCount+' baseVal.e='+bv_e+' animVal.e='+f64hex(av_e)+' weird='+av_e);}
-      else{P('HA[2]: frame '+frameCount+' baseVal.e='+bv_e+' animVal.e='+av_e.toFixed(2));}
-    } else {
-      P('HA[2]: frame '+frameCount+' av_e='+av_e+' bv_e='+bv_e);
-    }
-    frameCount++;
-    if(frameCount<8){requestAnimationFrame(compareAnimBase);}
-    else{svg2.remove();}
-  }
-  setTimeout(function(){requestAnimationFrame(compareAnimBase);},100);
-
-  // HA[3]: SVGAnimateTransform with calc-mode=spline at extreme endpoint
-  hdr('HA[3]: calcMode=spline animation to 1e12');
-  var svg3=mkSVG(200,200);
-  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'20',height:'20',fill:'green'});
-  mkEl(rect3,'animateTransform',{
-    attributeName:'transform',
-    type:'translate',
-    values:'0,0;1000000000000,0',
-    keyTimes:'0;1',
-    calcMode:'spline',
-    keySplines:'0.5 0 0.5 1',
-    dur:'8s',
-    repeatCount:'indefinite'
-  });
-  setTimeout(function(){
-    var av3=rect3.transform.animVal;
-    var mx3=null;
-    try{if(av3.numberOfItems>0)mx3=av3.getItem(0).matrix;}catch(e){}
-    if(mx3){
-      probeVal('HA[3]: spline animVal.e mid-anim',mx3.e);
-    } else {
-      P('HA[3]: no animVal items');
-    }
-    svg3.remove();
-  },200);
-
-  prog('HA running (rAF samples)...');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// HB — SVGLength with EM/EX/VWVH units — font metrics path
-// SVGLength with SVG_LENGTHTYPE_EMS internally references the element's
-// computed font size. When reading .value (px), the engine converts
-// em→px using the element's font metrics. Does this expose font object ptr?
-// Also: SVG_LENGTHTYPE_PERCENTAGE with extreme SVG viewport
-// ════════════════════════════════════════════════════════════════════════
-function runHB(){
-  hdr('HB: SVGLength em/ex/vw/vh units → internal font metrics path');
-
-  // HB[1]: SVGLength set to em units, read .value (requires font metrics)
-  hdr('HB[1]: SVGLength set to em units → .value px conversion');
-  var svg=mkSVG(400,400);
-  svg.style.fontSize='16px'; // base font size
-
-  // Create rect with x set via length in em units
-  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'red'});
-  var xLen=rect.x.baseVal;
-
-  // Set to various em values using newValueSpecifiedUnits
-  // SVG_LENGTHTYPE_EMS = 3, SVG_LENGTHTYPE_EXS = 4
-  // SVG_LENGTHTYPE_PX = 5, SVG_LENGTHTYPE_CM = 6
-  // SVG_LENGTHTYPE_MM = 7, SVG_LENGTHTYPE_IN = 8
-  // SVG_LENGTHTYPE_PT = 9, SVG_LENGTHTYPE_PC = 10
-  // SVG_LENGTHTYPE_PERCENTAGE = 2
-  var unitTypes={EMS:3,EXS:4,PX:5,CM:6,MM:7,IN:8,PT:9,PC:10,PCT:2};
-
-  Object.keys(unitTypes).forEach(function(name){
-    var ut=unitTypes[name];
-    [1, 1000, 1e6, 1e8, 1e9, 1e12].forEach(function(v){
-      try{
-        xLen.newValueSpecifiedUnits(ut,v);
-        var pxVal=xLen.value;
-        var visuVal=xLen.valueInSpecifiedUnits;
-        var p=classifyPtr(pxVal),w=isWeird(pxVal);
-        if(p){R('HB[1]: unit='+name+' spec='+v+' .value='+f64hex(pxVal)+' POINTER!');}
-        else if(w){B('HB[1]: unit='+name+' spec='+v+' .value='+f64hex(pxVal)+' weird='+pxVal);}
-        else if(v>=1e6){P('HB[1]: unit='+name+' spec='+v+' .value='+pxVal+' visu='+visuVal);}
-      }catch(e){P('HB[1]: unit='+name+' spec='+v+' threw: '+e.name);}
-    });
-  });
-
-  // HB[2]: SVGLength in em units, element has extreme computed font size
-  hdr('HB[2]: SVGLength in em units on element with extreme font-size');
-  var div=document.createElement('div');
-  div.style.cssText='position:fixed;left:0;top:0;font-size:1000000px;opacity:0.001';
-  document.body.appendChild(div);
-  var svg2=document.createElementNS(NS,'svg');
-  svg2.setAttribute('width','100'); svg2.setAttribute('height','100');
-  div.appendChild(svg2);
-  var rect2=mkEl(svg2,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
-  var xLen2=rect2.x.baseVal;
-  try{
-    xLen2.newValueSpecifiedUnits(3,1); // 1em
-    var pxFromEm=xLen2.value;
-    probeVal('HB[2]: 1em on font-size=1e6px element .value',pxFromEm);
-  }catch(e){P('HB[2]: threw: '+e.name);}
-  div.remove();
-
-  // HB[3]: SVGLength percentage of extreme SVG viewport
-  hdr('HB[3]: SVGLength percentage of extreme SVG viewport size');
+  // IA[3]: pct resolution on rect.width vs rect.x — different internals?
+  hdr('IA[3]: pct on rect.width vs rect.x vs rect.height — different paths?');
   var svg3=mkSVG(1,1);
   svg3.setAttribute('width','1000000000');
   svg3.setAttribute('height','1000000000');
-  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'green'});
-  var xLen3=rect3.x.baseVal;
-  try{
-    xLen3.newValueSpecifiedUnits(2,50); // 50%
-    var pxFromPct=xLen3.value;
-    probeVal('HB[3]: 50% of SVG width=1e9 .value',pxFromPct);
-    xLen3.newValueSpecifiedUnits(2,100);
-    probeVal('HB[3]: 100% of SVG width=1e9 .value',xLen3.value);
-  }catch(e){P('HB[3]: threw: '+e.name);}
+  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+  ['x','y','width','height'].forEach(function(attr){
+    [1,10,50,100,200].forEach(function(pct){
+      var ln=rect3[attr].baseVal;
+      ln.newValueSpecifiedUnits(2,pct);
+      probeVal('IA[3]: '+attr+' '+pct+'% of 1e9',ln.value);
+    });
+  });
   svg3.remove();
 
-  // HB[4]: SVGLength convertToSpecifiedUnits between all unit types at extremes
-  hdr('HB[4]: SVGLength convertToSpecifiedUnits chain: mm→em→px at extreme');
-  var svg4=mkSVG(200,200);
-  var rect4=mkEl(svg4,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  var xl4=rect4.x.baseVal;
-  try{
-    // set a huge mm value
-    xl4.newValueSpecifiedUnits(7,1e9); // 1e9mm
-    var pxFromMm=xl4.value;
-    probeVal('HB[4]: 1e9mm → .value (px)',pxFromMm);
-    // now convertToSpecifiedUnits to em
-    xl4.convertToSpecifiedUnits(3); // convert to EMS
-    probeVal('HB[4]: after convertToSpecifiedUnits(EMS) .value (px)',xl4.value);
-    probeVal('HB[4]: after convertToSpecifiedUnits(EMS) .valueInSpecifiedUnits',xl4.valueInSpecifiedUnits);
-  }catch(e){P('HB[4]: threw: '+e.name);}
+  // IA[4]: pct on SVG circle cx/cy/r
+  hdr('IA[4]: pct on circle cx/cy/r — different resolution paths');
+  var svg4=mkSVG(1,1);
+  svg4.setAttribute('width','1000000000');
+  svg4.setAttribute('height','1000000000');
+  var circ=mkEl(svg4,'circle',{cx:'0',cy:'0',r:'50',fill:'blue'});
+  ['cx','cy','r'].forEach(function(attr){
+    [50,100].forEach(function(pct){
+      var ln=circ[attr].baseVal;
+      ln.newValueSpecifiedUnits(2,pct);
+      probeVal('IA[4]: circle.'+attr+' '+pct+'% of 1e9',ln.value);
+    });
+  });
   svg4.remove();
 
-  prog('HB done');
+  // IA[5]: check the internal viewport dimension that pct uses
+  // createSVGLength().newValueSpecifiedUnits on the SVG element itself
+  hdr('IA[5]: createSVGLength pct on SVG root — internal viewport context');
+  var svg5=mkSVG(1,1);
+  svg5.setAttribute('width','1000000000');
+  svg5.setAttribute('height','1000000000');
+  var ln5=svg5.createSVGLength();
+  [1,10,50,100,200,1000].forEach(function(pct){
+    ln5.newValueSpecifiedUnits(2,pct);
+    probeVal('IA[5]: svg.createSVGLength() '+pct+'%',ln5.value);
+  });
+  svg5.remove();
+
+  prog('IA done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// HC — DOMMatrix / WebKitCSSMatrix conversion from SVGMatrix
-// DOMMatrix is a newer CSS/geometry API, different internal code path
-// WebKitCSSMatrix (window.WebKitCSSMatrix) is the older prefixed version
-// Both have .m41/.m42 (4x4 matrix translation components)
-// fromMatrix, fromFloat64Array, multiply — different internal path
+// IB — SVGSVGElement.currentScale / currentTranslate
+// These are root SVG viewport transform properties.
+// currentScale is a float, currentTranslate is SVGPoint
+// Setting extreme values: does the engine expose internal state?
+// Also: SVGSVGElement.getEnclosureList / checkIntersection / checkEnclosure
 // ════════════════════════════════════════════════════════════════════════
-function runHC(){
-  hdr('HC: DOMMatrix / WebKitCSSMatrix from SVGMatrix extreme values');
-
-  // HC[1]: DOMMatrix.fromMatrix with extreme SVGMatrix
-  hdr('HC[1]: DOMMatrix.fromMatrix(svgMatrix with e=1e15)');
-  var svg=mkSVG(200,200);
-  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  var tl=rect.transform.baseVal;
-  var xf=svg.createSVGTransform();
-
-  [1e9, 1e12, 1e15, 1e18, Number.MAX_SAFE_INTEGER].forEach(function(v){
-    xf.setTranslate(v,0);
-    var svgMx=xf.matrix;
-    var dm=null;
-    try{dm=DOMMatrix.fromMatrix(svgMx);}catch(e){P('HC[1]: v='+v+' DOMMatrix.fromMatrix threw: '+e.name); return;}
-    if(dm){
-      ['m41','m42','m43','m44'].forEach(function(k){
-        var kv=dm[k];
-        var p=classifyPtr(kv),w=isWeird(kv);
-        if(p){R('HC[1]: v='+v+' DOMMatrix.'+k+'='+f64hex(kv)+' POINTER! type='+p.type);}
-        else if(w){B('HC[1]: v='+v+' DOMMatrix.'+k+'='+f64hex(kv)+' weird='+kv);}
-        else if(kv!==0&&kv!==1){P('HC[1]: v='+v+' DOMMatrix.'+k+'='+kv);}
-      });
-    }
-  });
-
-  // HC[2]: DOMMatrix.fromFloat64Array — bypass SVGMatrix, raw f64 array
-  hdr('HC[2]: DOMMatrix.fromFloat64Array with extreme translation values');
-  // 4x4 column-major: [a,b,0,0, c,d,0,0, 0,0,1,0, tx,ty,0,1]
-  var arr=new Float64Array(16);
-  arr[0]=1; arr[5]=1; arr[10]=1; arr[15]=1; // identity diagonal
-  [1e9, 1e12, 1e15].forEach(function(v){
-    arr[12]=v; arr[13]=0; // m41=v
-    var dm=null;
-    try{dm=DOMMatrix.fromFloat64Array(arr);}catch(e){P('HC[2]: v='+v+' threw: '+e.name); return;}
-    if(dm){
-      var p=classifyPtr(dm.m41),w=isWeird(dm.m41);
-      if(p){R('HC[2]: v='+v+' DOMMatrix.m41='+f64hex(dm.m41)+' POINTER!');}
-      else if(w){B('HC[2]: v='+v+' DOMMatrix.m41='+f64hex(dm.m41)+' weird='+dm.m41);}
-      else{P('HC[2]: v='+v+' DOMMatrix.m41='+dm.m41);}
-    }
-  });
-
-  // HC[3]: WebKitCSSMatrix (if available)
-  hdr('HC[3]: WebKitCSSMatrix / CSSMatrix probe');
-  var WKM=window.WebKitCSSMatrix||window.CSSMatrix||window.MSCSSMatrix;
-  if(WKM){
-    [1e9, 1e12, 1e15].forEach(function(v){
-      var wkm=null;
-      try{wkm=new WKM('matrix(1,0,0,1,'+v+',0)');}catch(e){P('HC[3]: threw: '+e.name);}
-      if(wkm){
-        probeVal('HC[3]: v='+v+' WKM.m41',wkm.m41||wkm.e);
-        probeVal('HC[3]: v='+v+' WKM.e',wkm.e);
-      }
-    });
-  } else {
-    P('HC[3]: WebKitCSSMatrix / CSSMatrix not available');
-  }
-
-  // HC[4]: DOMMatrix multiply chain — does multiply of two extreme matrices
-  // go through a different code path that might expose internal state?
-  hdr('HC[4]: DOMMatrix.multiply of two extreme matrices');
-  [
-    {tx:1e9, label:'1e9'},
-    {tx:1e12, label:'1e12'},
-    {tx:1e15, label:'1e15'}
-  ].forEach(function(spec){
-    var dmA=new DOMMatrix([1,0,0,1,spec.tx,0]);
-    var dmB=new DOMMatrix([1,0,0,1,spec.tx,0]);
-    var prod=null;
-    try{prod=dmA.multiply(dmB);}catch(e){P('HC[4]: '+spec.label+' multiply threw: '+e.name); return;}
-    if(prod){
-      probeVal('HC[4]: ('+spec.label+')^2 DOMMatrix product.m41',prod.m41);
-      probeVal('HC[4]: ('+spec.label+')^2 DOMMatrix product.m42',prod.m42);
-    }
-  });
-
-  // HC[5]: DOMMatrix.inverse of extreme matrix
-  hdr('HC[5]: DOMMatrix.inverse of extreme translation');
-  [1e9, 1e12, 1e15].forEach(function(v){
-    var dm=new DOMMatrix([1,0,0,1,v,0]);
-    var inv=null;
-    try{inv=dm.inverse();}catch(e){P('HC[5]: v='+v+' inverse threw: '+e.name); return;}
-    if(inv){
-      probeVal('HC[5]: v='+v+' inverse.m41',inv.m41);
-    }
-  });
-
-  svg.remove();
-  prog('HC done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// HD — Canvas 2D context transform matrix — getTransform()
-// canvas.getTransform() returns a DOMMatrix reflecting the canvas CTM
-// canvas.setTransform with extreme values → getTransform → DOMMatrix
-// canvas.transform with extreme values accumulated
-// Also: canvas.measureText on extreme font size → TextMetrics
-// ════════════════════════════════════════════════════════════════════════
-function runHD(){
-  hdr('HD: Canvas 2D getTransform / setTransform → DOMMatrix + TextMetrics');
-  var canvas=document.createElement('canvas');
-  canvas.width=200; canvas.height=200;
-  canvas.style.cssText='position:fixed;left:0;top:0;opacity:0.001;pointer-events:none';
-  document.body.appendChild(canvas);
-  var ctx=canvas.getContext('2d');
-
-  // HD[1]: canvas.setTransform with extreme translation → getTransform
-  hdr('HD[1]: canvas.setTransform(1,0,0,1,extreme,0) → ctx.getTransform()');
-  [1e6, 1e9, 2147483648, 1e12, 1e15].forEach(function(v){
-    try{
-      ctx.setTransform(1,0,0,1,v,0);
-      var dm=ctx.getTransform();
-      if(dm){
-        ['m41','m42','e','f'].forEach(function(k){
-          if(dm[k]!==undefined){
-            var kv=dm[k];
-            var p=classifyPtr(kv),w=isWeird(kv);
-            if(p){R('HD[1]: v='+v+' getTransform.'+k+'='+f64hex(kv)+' POINTER!');}
-            else if(w){B('HD[1]: v='+v+' getTransform.'+k+'='+f64hex(kv)+' weird='+kv);}
-            else if(kv!==0&&kv!==1){P('HD[1]: v='+v+' getTransform.'+k+'='+kv);}
-          }
-        });
-      }
-    }catch(e){P('HD[1]: v='+v+' threw: '+e.name);}
-    ctx.resetTransform();
-  });
-
-  // HD[2]: accumulated canvas.translate — does overflow wrap?
-  hdr('HD[2]: accumulated canvas.translate(1e9,0) repeated → getTransform');
-  ctx.resetTransform();
-  var N=20;
-  for(var i=0;i<N;i++){
-    try{ctx.translate(1e9,0);}catch(e){break;}
-  }
-  try{
-    var dm2=ctx.getTransform();
-    probeVal('HD[2]: after '+N+'x translate(1e9) getTransform.m41',dm2.m41||dm2.e);
-  }catch(e){P('HD[2]: getTransform threw: '+e.name);}
-  ctx.resetTransform();
-
-  // HD[3]: canvas.measureText on element with extreme font size
-  hdr('HD[3]: canvas.measureText with extreme font-size → TextMetrics');
-  ['1000000px', '1e9px', '999999999px'].forEach(function(fs){
-    try{
-      ctx.font=fs+' sans-serif';
-      var actualFont=ctx.font; // what did it actually set?
-      var tm=ctx.measureText('A');
-      var props=['width','actualBoundingBoxLeft','actualBoundingBoxRight',
-        'actualBoundingBoxAscent','actualBoundingBoxDescent',
-        'fontBoundingBoxAscent','fontBoundingBoxDescent'];
-      props.forEach(function(k){
-        if(tm[k]!==undefined){
-          var kv=tm[k];
-          var p=classifyPtr(kv),w=isWeird(kv);
-          if(p){R('HD[3]: font='+fs+' tm.'+k+'='+f64hex(kv)+' POINTER!');}
-          else if(w){B('HD[3]: font='+fs+' tm.'+k+'='+f64hex(kv)+' weird='+kv);}
-          else if(kv!==0){P('HD[3]: font='+fs+' tm.'+k+'='+kv);}
-        }
-      });
-    }catch(e){P('HD[3]: font='+fs+' threw: '+e.name);}
-  });
-
-  canvas.remove();
-  prog('HD done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// HE — SVGGeometryElement.getTotalLength / getPointAtLength on
-//       COMBINED extreme viewBox + path coords
-// When an SVG has a tiny viewBox (e.g. viewBox="0 0 0.001 0.001") and the
-// path uses coords near 1, the internal path coordinates after CTM multiply
-// become 1e3+ per SVG unit. Does path parameterization then overflow?
-// Also: SVGGraphicsElement.getBBox() after extreme transform
-// ════════════════════════════════════════════════════════════════════════
-function runHE(){
-  hdr('HE: extreme viewBox + path coords combined → path geometry ops');
+function runIB(){
+  hdr('IB: SVGSVGElement.currentScale / currentTranslate extreme probe');
   var svg=mkSVG(400,400);
 
-  // HE[1]: tiny viewBox + path at scale=1 (but internal coords are huge)
-  hdr('HE[1]: SVG viewBox=0 0 0.001 0.001 width=400 → path coords at [0,1]');
-  svg.setAttribute('viewBox','0 0 0.001 0.001'); // amplifier: 1 unit = 400000px
-  var path=mkEl(svg,'path',{d:'M 0 0 L 0.001 0',fill:'none',stroke:'red','stroke-width':'0.0001'});
-  var tl=null,pt=null;
-  try{tl=path.getTotalLength();}catch(e){P('HE[1]: getTotalLength threw: '+e.name);}
-  try{pt=path.getPointAtLength(0.0005);}catch(e){}
-  B('HE[1]: viewBox=0.001 getTotalLength='+tl);
-  if(pt){probeVal('HE[1]: getPointAtLength(0.0005) pt.x',pt.x);}
+  // IB[1]: currentScale extreme values
+  hdr('IB[1]: svg.currentScale at extreme values');
+  P('IB[1]: initial currentScale='+svg.currentScale);
+  [1e6, 1e9, 1e12, 2147483648, 4294967296, 1e15].forEach(function(v){
+    try{
+      svg.currentScale=v;
+      var rb=svg.currentScale;
+      probeVal('IB[1]: set='+v+' readback',rb);
+    }catch(e){P('IB[1]: set='+v+' threw: '+e.name);}
+  });
+  svg.currentScale=1; // reset
 
-  // HE[2]: even tinier viewBox amplifier
-  svg.setAttribute('viewBox','0 0 1e-9 1e-9');
-  path.setAttribute('d','M 0 0 L 1e-9 0');
-  var tl2=null;
-  try{tl2=path.getTotalLength();}catch(e){P('HE[2]: threw: '+e.name);}
-  B('HE[2]: viewBox=1e-9 getTotalLength='+tl2);
-  if(tl2){
-    var pt2=null;
-    try{pt2=path.getPointAtLength(5e-10);}catch(e){}
-    if(pt2){probeVal('HE[2]: getPointAtLength(5e-10) pt.x',pt2.x);}
-  }
-
-  // HE[3]: extreme viewBox + getBBox — does getBBox use pre-CTM or post-CTM?
-  hdr('HE[3]: getBBox() after extreme viewBox amplification');
-  svg.setAttribute('viewBox','0 0 0.001 0.001');
-  path.setAttribute('d','M 0 0 L 0.001 0');
-  var bbox=null;
-  try{bbox=path.getBBox();}catch(e){P('HE[3]: getBBox threw: '+e.name);}
-  if(bbox){
-    ['x','y','width','height'].forEach(function(k){
-      probeVal('HE[3]: bbox.'+k,bbox[k]);
+  // IB[2]: currentTranslate (SVGPoint) extreme
+  hdr('IB[2]: svg.currentTranslate.x at extreme values');
+  try{
+    var ct=svg.currentTranslate;
+    P('IB[2]: initial currentTranslate=('+ct.x+','+ct.y+')');
+    [1e9, 1e12, 1e15, 2147483648].forEach(function(v){
+      ct.x=v;
+      probeVal('IB[2]: set x='+v+' readback',ct.x);
     });
-  }
+    ct.x=0;
+  }catch(e){P('IB[2]: threw: '+e.name);}
 
-  // HE[4]: getBBox with large scale transform + extreme path
-  hdr('HE[4]: getBBox with large SVGTransform scale + extreme path coords');
-  svg.setAttribute('viewBox','0 0 400 400');
-  var rect2=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
-  var tl_rect=rect2.transform.baseVal;
-  var scaleXF=svg.createSVGTransform();
-  scaleXF.setScale(1e9,1e9);
-  tl_rect.appendItem(scaleXF);
-  var bbox2=null;
-  try{bbox2=rect2.getBBox();}catch(e){}
-  if(bbox2){
-    ['x','y','width','height'].forEach(function(k){
-      probeVal('HE[4]: rect(scale=1e9).getBBox().'+k,bbox2[k]);
-    });
-  }
+  // IB[3]: SVGSVGElement.createSVGMatrix — fresh SVGMatrix from root
+  hdr('IB[3]: svg.createSVGMatrix() — read initial values of a fresh matrix');
+  var freshMx=svg.createSVGMatrix();
+  ['a','b','c','d','e','f'].forEach(function(k){
+    var v=freshMx[k];
+    var p=classifyPtr(v),w=isWeird(v);
+    if(p){R('IB[3]: fresh SVGMatrix.'+k+'='+f64hex(v)+' POINTER!');}
+    else if(w){B('IB[3]: fresh SVGMatrix.'+k+'='+f64hex(v)+' weird='+v);}
+    else{P('IB[3]: fresh SVGMatrix.'+k+'='+v);}
+  });
 
-  // HE[5]: getScreenCTM after nested extreme viewBox
-  hdr('HE[5]: nested SVG with extreme viewBox → inner element getScreenCTM');
-  svg.setAttribute('viewBox','0 0 400 400');
-  var innerSvg=mkEl(svg,'svg',{x:'0',y:'0',width:'400',height:'400',
-    viewBox:'0 0 0.000001 0.000001'}); // 1 unit = 4e8px
-  var innerRect=mkEl(innerSvg,'rect',{x:'0',y:'0',width:'0.000001',height:'0.000001',fill:'red'});
+  // IB[4]: getScreenCTM after currentScale change
+  hdr('IB[4]: rect.getScreenCTM after svg.currentScale=1e6');
+  var rect=mkEl(svg,'rect',{x:'10',y:'10',width:'50',height:'50',fill:'red'});
+  svg.currentScale=1000000;
   var ctm=null;
-  try{ctm=innerRect.getScreenCTM();}catch(e){}
+  try{ctm=rect.getScreenCTM();}catch(e){}
   if(ctm){
     ['a','b','c','d','e','f'].forEach(function(k){
-      probeVal('HE[5]: nested vb CTM.'+k,ctm[k]);
+      probeVal('IB[4]: currentScale=1e6 CTM.'+k,ctm[k]);
     });
   }
+  svg.currentScale=1;
+
+  // IB[5]: SVGSVGElement.getViewboxToViewportTransform (if exists)
+  hdr('IB[5]: SVGSVGElement viewport transform methods');
+  ['getViewboxToViewportTransform','getTransformToElement','getCTM'].forEach(function(m){
+    if(typeof svg[m]==='function'){
+      var result=null;
+      try{result=svg[m]();}catch(e){P('IB[5]: '+m+'() threw: '+e.name);}
+      P('IB[5]: '+m+' exists, result type='+(result?typeof result:'null'));
+    } else {
+      P('IB[5]: '+m+' not available');
+    }
+  });
 
   svg.remove();
-  prog('HE done');
+  prog('IB done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// HF — ResizeObserver / IntersectionObserver with SVG off-screen
-//       layout geometry at extreme positions
-// ResizeObserver.callback receives DOMRectReadOnly for each observed element
-// IntersectionObserver.callback receives IntersectionObserverEntry
-// boundingClientRect on an element at extreme position (via SVG transform)
-// Also: element.getBoundingClientRect() during SMIL animation (live BCR)
+// IC — SVGUseElement href swap / referencing changes
+// <use> elements maintain a shadow tree referencing the original element.
+// Swapping the href while the original is being animated:
+// does the internal ref-counting / shadow update path expose state?
+// Also: use referencing an element that gets detached/reattached
 // ════════════════════════════════════════════════════════════════════════
-function runHF(){
-  hdr('HF: ResizeObserver / IntersectionObserver geometry at extreme SVG positions');
-
-  // HF[1]: ResizeObserver on SVG element with extreme translate
-  hdr('HF[1]: ResizeObserver contentRect on SVG rect with 1e9 translate');
+function runIC(){
+  hdr('IC: SVGUseElement href swap / shadow tree probe');
   var svg=mkSVG(400,400);
-  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
-  // apply extreme translate
+  var defs=mkEl(svg,'defs');
+
+  // IC[1]: use element href swap — read CTM before and after swap
+  hdr('IC[1]: use href swap — CTM probe before/after');
+  // create two elements in defs
+  var sym1=mkEl(defs,'symbol',{id:'icsym1',overflow:'visible'});
+  var r1=mkEl(sym1,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+  var sym2=mkEl(defs,'symbol',{id:'icsym2',overflow:'visible'});
+  var r2=mkEl(sym2,'rect',{x:'0',y:'0',width:'30',height:'30',fill:'blue'});
+
+  var useEl=mkEl(svg,'use',{href:'#icsym1',x:'10',y:'10',width:'100',height:'100'});
+
+  // read CTM before swap
+  var ctm1=null;
+  try{ctm1=r1.getScreenCTM();}catch(e){}
+  P('IC[1]: before swap CTM.e='+(ctm1?ctm1.e:'null'));
+
+  // swap href to sym2
+  useEl.setAttribute('href','#icsym2');
+
+  // immediately read CTM of original r1 (now detached from use shadow)
+  var ctm1_after=null;
+  try{ctm1_after=r1.getScreenCTM();}catch(e){P('IC[1]: r1 CTM after swap threw: '+e.name);}
+  if(ctm1_after){probeVal('IC[1]: r1 CTM.e after href swap',ctm1_after.e);}
+
+  // read CTM of r2 (now in use shadow)
+  var ctm2=null;
+  try{ctm2=r2.getScreenCTM();}catch(e){P('IC[1]: r2 CTM threw: '+e.name);}
+  if(ctm2){probeVal('IC[1]: r2 CTM.e after href swap',ctm2.e);}
+
+  // IC[2]: use referencing element with active animation — mid-animation swap
+  hdr('IC[2]: use href swap DURING active animation');
+  var sym3=mkEl(defs,'symbol',{id:'icsym3',overflow:'visible'});
+  var r3=mkEl(sym3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'green'});
+  mkEl(r3,'animateTransform',{
+    attributeName:'transform',type:'translate',
+    from:'0 0',to:'1000000000 0',
+    dur:'5s',repeatCount:'indefinite'
+  });
+
+  var useEl2=mkEl(svg,'use',{href:'#icsym3',x:'0',y:'0',width:'200',height:'200'});
+
+  setTimeout(function(){
+    // mid-animation: read animVal CTM of r3
+    var ctm3_before=null;
+    try{ctm3_before=r3.getScreenCTM();}catch(e){}
+    P('IC[2]: r3 CTM.e before swap='+(ctm3_before?ctm3_before.e.toFixed(0):'null'));
+
+    // swap href away
+    useEl2.setAttribute('href','#icsym1');
+
+    // immediately read CTM of r3 (animation still running internally?)
+    var ctm3_after=null;
+    try{ctm3_after=r3.getScreenCTM();}catch(e){P('IC[2]: r3 CTM after swap threw: '+e.name);}
+    if(ctm3_after){
+      var e_=ctm3_after.e;
+      var p=classifyPtr(e_),w=isWeird(e_);
+      if(p){R('IC[2]: r3 CTM.e after href swap='+f64hex(e_)+' POINTER!');}
+      else if(w){B('IC[2]: r3 CTM.e after href swap='+f64hex(e_)+' weird='+e_);}
+      else{P('IC[2]: r3 CTM.e after href swap='+e_);}
+    }
+  },300);
+
+  // IC[3]: use element with no matching href — what does CTM return?
+  hdr('IC[3]: use with non-existent href → CTM probe');
+  var useEl3=mkEl(svg,'use',{href:'#does_not_exist_xyz',x:'50',y:'50'});
+  var ctm_bad=null;
+  try{ctm_bad=useEl3.getScreenCTM();}catch(e){P('IC[3]: useEl3 CTM threw: '+e.name);}
+  if(ctm_bad){
+    ['a','b','c','d','e','f'].forEach(function(k){
+      probeVal('IC[3]: bad-href use CTM.'+k,ctm_bad[k]);
+    });
+  }
+
+  // IC[4]: rapid href cycle — spray multiple swaps per frame
+  hdr('IC[4]: rapid href cycle — 1000 swaps');
+  var ids=['#icsym1','#icsym2','#icsym3'];
+  for(var i=0;i<1000;i++){
+    useEl.setAttribute('href',ids[i%ids.length]);
+  }
+  var ctm_spray=null;
+  try{ctm_spray=r1.getScreenCTM();}catch(e){}
+  if(ctm_spray){probeVal('IC[4]: r1 CTM.e after 1000 swaps',ctm_spray.e);}
+  try{ctm_spray=r2.getScreenCTM();}catch(e){}
+  if(ctm_spray){probeVal('IC[4]: r2 CTM.e after 1000 swaps',ctm_spray.e);}
+
+  svg.remove();
+  prog('IC done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// ID — SVGFilterElement filterUnits / primitiveUnits extremes
+// When filterUnits="userSpaceOnUse", the filter region uses SVG user coords
+// If the SVG element is at an extreme translate, the filter region coords
+// are also extreme — does the filter processing expose internal values?
+// Also: feImage with data URI + filtered element CTM probe
+// Also: SVGFilterElement.{x,y,width,height}.baseVal at extreme
+// ════════════════════════════════════════════════════════════════════════
+function runID(){
+  hdr('ID: SVGFilterElement filterUnits / extremes + feImage probe');
+  var svg=mkSVG(200,200);
+  var defs=mkEl(svg,'defs');
+
+  // ID[1]: filter region at extreme user space coords
+  hdr('ID[1]: SVGFilter x/y/width/height baseVal at extreme (filterUnits=userSpaceOnUse)');
+  var filter=mkEl(defs,'filter',{id:'idf1',
+    filterUnits:'userSpaceOnUse',
+    x:'-1000000000',y:'-1000000000',
+    width:'2000000000',height:'2000000000'
+  });
+  mkEl(filter,'feFlood',{'flood-color':'red','flood-opacity':'1'});
+
+  // probe the filter element's x/y/width/height
+  ['x','y','width','height'].forEach(function(attr){
+    try{
+      var bv=filter[attr].baseVal;
+      probeVal('ID[1]: filter.'+attr+'.baseVal.value',bv.value);
+    }catch(e){P('ID[1]: filter.'+attr+' threw: '+e.name);}
+  });
+
+  // ID[2]: apply extreme filter to element at extreme transform
+  hdr('ID[2]: apply extreme filter + extreme element transform → CTM/BCR');
+  var filter2=mkEl(defs,'filter',{id:'idf2',filterUnits:'userSpaceOnUse',
+    x:'0',y:'0',width:'100',height:'100'});
+  mkEl(filter2,'feGaussianBlur',{stdDeviation:'2'});
+
+  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red',filter:'url(#idf2)'});
   var tl=rect.transform.baseVal;
   var xf=svg.createSVGTransform();
   xf.setTranslate(1e9,0);
   tl.appendItem(xf);
 
-  if(typeof ResizeObserver!=='undefined'){
-    var ro=new ResizeObserver(function(entries){
-      entries.forEach(function(e){
-        var cr=e.contentRect||e.contentBoxSize;
-        // probe contentRect values
-        if(e.contentRect){
-          ['x','y','width','height','top','left','bottom','right'].forEach(function(k){
-            if(e.contentRect[k]!==undefined){
-              var v=e.contentRect[k];
-              var p=classifyPtr(v),w=isWeird(v);
-              if(p){R('HF[1]: ResizeObserver contentRect.'+k+'='+f64hex(v)+' POINTER!');}
-              else if(w){B('HF[1]: ResizeObserver contentRect.'+k+'='+f64hex(v)+' weird='+v);}
-              else if(v!==0){P('HF[1]: ResizeObserver contentRect.'+k+'='+v);}
-            }
-          });
-        }
-        ro.disconnect();
-        svg.remove();
-      });
-    });
-    ro.observe(rect);
-  } else {
-    P('HF[1]: ResizeObserver not available');
-    svg.remove();
+  var ctm=null;
+  try{ctm=rect.getScreenCTM();}catch(e){}
+  if(ctm){
+    ['e','f'].forEach(function(k){probeVal('ID[2]: filtered rect CTM.'+k,ctm[k]);});
   }
 
-  // HF[2]: IntersectionObserver on element at extreme SVG translate
-  hdr('HF[2]: IntersectionObserver on element at extreme SVG position');
-  var svg2=mkSVG(400,400);
-  var rect2=mkEl(svg2,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'blue'});
-  var tl2=rect2.transform.baseVal;
-  var xf2=svg2.createSVGTransform();
-  xf2.setTranslate(1e9,0);
-  tl2.appendItem(xf2);
+  // ID[3]: feImage with data URI — does image loading expose internal addresses?
+  hdr('ID[3]: feImage with data URI in filter — internal image object probe');
+  var filter3=mkEl(defs,'filter',{id:'idf3'});
+  var feImg=mkEl(filter3,'feImage',{
+    href:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    result:'img',preserveAspectRatio:'none',
+    x:'0',y:'0',width:'1',height:'1'
+  });
+  var rect3=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red',filter:'url(#idf3)'});
+  setTimeout(function(){
+    // probe feImage after potential async image load
+    var ctm3=null;
+    try{ctm3=rect3.getScreenCTM();}catch(e){}
+    if(ctm3){probeVal('ID[3]: feImage filtered CTM.e',ctm3.e);}
+    // try to read internal feImage properties
+    try{
+      var imgX=feImg.x.baseVal;
+      probeVal('ID[3]: feImage.x.baseVal',imgX.value);
+    }catch(e){P('ID[3]: feImage.x threw: '+e.name);}
+  },200);
 
-  if(typeof IntersectionObserver!=='undefined'){
-    var io=new IntersectionObserver(function(entries){
-      entries.forEach(function(e){
-        ['boundingClientRect','rootBounds','intersectionRect'].forEach(function(rectName){
-          var r=e[rectName];
-          if(r){
-            ['x','y','width','height','top','left','bottom','right'].forEach(function(k){
-              var v=r[k];
-              if(v===null||v===undefined)return;
-              var p=classifyPtr(v),w=isWeird(v);
-              if(p){R('HF[2]: IO '+rectName+'.'+k+'='+f64hex(v)+' POINTER!');}
-              else if(w){B('HF[2]: IO '+rectName+'.'+k+'='+f64hex(v)+' weird='+v);}
-            });
+  // ID[4]: SVGFilterPrimitiveStandardAttributes x/y with extreme pct
+  hdr('ID[4]: filter primitive region as pct of extreme filter region');
+  var filter4=mkEl(defs,'filter',{id:'idf4',
+    filterUnits:'objectBoundingBox',
+    primitiveUnits:'userSpaceOnUse',
+    x:'0%',y:'0%',width:'100%',height:'100%'
+  });
+  var feBlur=mkEl(filter4,'feGaussianBlur',{
+    stdDeviation:'0',
+    x:'-1000000000',y:'-1000000000',width:'2000000000',height:'2000000000'
+  });
+  try{
+    // probe the primitive subregion
+    ['x','y','width','height'].forEach(function(attr){
+      var bv=feBlur[attr].baseVal;
+      probeVal('ID[4]: feGaussianBlur.'+attr+'.baseVal',bv.value);
+    });
+  }catch(e){P('ID[4]: threw: '+e.name);}
+
+  svg.remove();
+  prog('ID done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// IE — SVGTextElement / SVGTSpanElement getCharNumAtPosition / getExtentOfChar
+// Text layout goes through a completely different internal path (Core Text on iOS)
+// getExtentOfChar returns a DOMRect for each character's bounding box
+// getStartPositionOfChar / getEndPositionOfChar return SVGPoints
+// At extreme font sizes, do text layout positions expose internal values?
+// ════════════════════════════════════════════════════════════════════════
+function runIE(){
+  hdr('IE: SVGTextElement getExtentOfChar / getStartPositionOfChar extreme font');
+  var svg=mkSVG(400,400);
+
+  // IE[1]: getExtentOfChar at extreme font size
+  hdr('IE[1]: SVGText getExtentOfChar at extreme font size');
+  var text=mkEl(svg,'text',{
+    x:'0',y:'200',
+    'font-size':'1000000',
+    'font-family':'sans-serif',
+    fill:'white'
+  });
+  text.textContent='A';
+
+  setTimeout(function(){
+    var extent=null;
+    try{extent=text.getExtentOfChar(0);}catch(e){P('IE[1]: getExtentOfChar threw: '+e.name);}
+    if(extent){
+      ['x','y','width','height'].forEach(function(k){
+        probeVal('IE[1]: font=1e6 getExtentOfChar.'+k,extent[k]);
+      });
+    }
+
+    var startPt=null;
+    try{startPt=text.getStartPositionOfChar(0);}catch(e){}
+    if(startPt){
+      probeVal('IE[1]: font=1e6 getStartPositionOfChar.x',startPt.x);
+      probeVal('IE[1]: font=1e6 getStartPositionOfChar.y',startPt.y);
+    }
+
+    // IE[2]: getExtentOfChar on text with extreme translate
+    hdr('IE[2]: SVGText getExtentOfChar after extreme translate');
+    var tl=text.transform.baseVal;
+    var xf=svg.createSVGTransform();
+    xf.setTranslate(1e9,0);
+    tl.appendItem(xf);
+
+    var extent2=null;
+    try{extent2=text.getExtentOfChar(0);}catch(e){P('IE[2]: threw: '+e.name);}
+    if(extent2){
+      ['x','y','width','height'].forEach(function(k){
+        probeVal('IE[2]: font=1e6 tx=1e9 getExtentOfChar.'+k,extent2[k]);
+      });
+    }
+
+    // IE[3]: getComputedTextLength at extreme font size
+    hdr('IE[3]: getComputedTextLength at extreme font size');
+    var ctl=null;
+    try{ctl=text.getComputedTextLength();}catch(e){}
+    probeVal('IE[3]: font=1e6 getComputedTextLength',ctl);
+
+    // IE[4]: getCharNumAtPosition with extreme SVGPoint
+    hdr('IE[4]: getCharNumAtPosition with extreme SVGPoint');
+    var pt=svg.createSVGPoint();
+    pt.x=1e15; pt.y=1e15;
+    var charNum=null;
+    try{charNum=text.getCharNumAtPosition(pt);}catch(e){P('IE[4]: threw: '+e.name);}
+    P('IE[4]: charNum at (1e15,1e15)='+charNum);
+
+    svg.remove();
+  },100); // wait for text layout
+
+  prog('IE running (layout wait)...');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// IF — SVGAnimationElement timing: begin/end values + computedTiming
+// Web Animations API on SMIL elements: element.getAnimations()
+// computedTiming.currentTime / localTime during active animation
+// Also: SVGSVGElement.getCurrentTime() — the SVG document clock
+// Also: SVGAnimationElement.getCurrentTime() vs startTime
+// ════════════════════════════════════════════════════════════════════════
+function runIF(){
+  hdr('IF: SVGAnimation timing / computedTiming / Web Animations probe');
+  var svg=mkSVG(400,400);
+  var rect=mkEl(svg,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'red'});
+
+  // create animation with extreme begin/dur
+  var anim=mkEl(rect,'animateTransform',{
+    attributeName:'transform',type:'translate',
+    from:'0 0',to:'1000000000000 0',
+    dur:'1000000s',
+    repeatCount:'indefinite'
+  });
+
+  // IF[1]: SVGSVGElement.getCurrentTime()
+  hdr('IF[1]: svg.getCurrentTime() — SVG document clock');
+  var svgTime=null;
+  try{svgTime=svg.getCurrentTime();}catch(e){P('IF[1]: threw: '+e.name);}
+  P('IF[1]: getCurrentTime()='+svgTime);
+
+  // IF[2]: SVGAnimationElement timing attributes
+  hdr('IF[2]: anim.getStartTime() / getCurrentTime()');
+  var startT=null,curT=null;
+  try{startT=anim.getStartTime();}catch(e){P('IF[2]: getStartTime threw: '+e.name);}
+  try{curT=anim.getCurrentTime();}catch(e){P('IF[2]: getCurrentTime threw: '+e.name);}
+  probeVal('IF[2]: anim.getStartTime()',startT);
+  probeVal('IF[2]: anim.getCurrentTime()',curT);
+
+  // IF[3]: Web Animations API getAnimations()
+  hdr('IF[3]: rect.getAnimations() — Web Animations API');
+  var anims=[];
+  try{anims=rect.getAnimations();}catch(e){P('IF[3]: getAnimations threw: '+e.name);}
+  P('IF[3]: getAnimations().length='+anims.length);
+  anims.forEach(function(a,i){
+    P('IF[3]: anim['+i+'] type='+a.constructor.name);
+    // probe effect timing
+    if(a.effect){
+      var ct=null;
+      try{ct=a.effect.getComputedTiming();}catch(e){}
+      if(ct){
+        ['currentIteration','progress','localTime','activeDuration','endTime'].forEach(function(k){
+          if(ct[k]!==undefined&&ct[k]!==null){
+            probeVal('IF[3]: computedTiming.'+k,+ct[k]);
           }
         });
-        io.disconnect();
-        svg2.remove();
-      });
-    });
-    io.observe(rect2);
-  } else {
-    P('HF[2]: IntersectionObserver not available');
-    svg2.remove();
-  }
-
-  // HF[3]: live getBoundingClientRect during SVGAnimateTransform
-  hdr('HF[3]: BCR during active animateTransform → 1e9 endpoint');
-  var svg3=mkSVG(400,400);
-  var rect3=mkEl(svg3,'rect',{x:'0',y:'0',width:'50',height:'50',fill:'green'});
-  mkEl(rect3,'animateTransform',{
-    attributeName:'transform',type:'translate',
-    from:'0 0',to:'1000000000 0',
-    dur:'5s',repeatCount:'indefinite'
+      }
+    }
+    // probe animation.currentTime
+    var curTime=null;
+    try{curTime=a.currentTime;}catch(e){}
+    probeVal('IF[3]: anim.currentTime',+curTime);
   });
-  var bcrSamples=0;
-  function sampleBCR(){
-    var bcr=rect3.getBoundingClientRect();
-    ['x','y','width','height','top','left','right','bottom'].forEach(function(k){
-      var v=bcr[k];
-      var p=classifyPtr(v),w=isWeird(v);
-      if(p){R('HF[3]: live BCR.'+k+'='+f64hex(v)+' POINTER!');}
-      else if(w){B('HF[3]: live BCR.'+k+'='+f64hex(v)+' weird='+v);}
-    });
-    bcrSamples++;
-    if(bcrSamples<5){setTimeout(sampleBCR,100);}
-    else{svg3.remove();}
-  }
-  setTimeout(sampleBCR,50);
 
-  // HF[4]: Element.getClientRects() on SVG with extreme CTM
-  hdr('HF[4]: getClientRects() on SVG element at extreme position');
-  var svg4=mkSVG(400,400);
-  var rect4=mkEl(svg4,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'red'});
-  var tl4=rect4.transform.baseVal;
-  var xf4=svg4.createSVGTransform();
-  xf4.setTranslate(1e9,0);
-  tl4.appendItem(xf4);
-  var rects=rect4.getClientRects();
-  P('HF[4]: getClientRects length='+rects.length);
-  for(var i=0;i<rects.length;i++){
-    var r=rects[i];
-    ['x','y','width','height','left','top','right','bottom'].forEach(function(k){
-      var v=r[k];
-      var p=classifyPtr(v),w=isWeird(v);
-      if(p){R('HF[4]: rect['+i+'].'+k+'='+f64hex(v)+' POINTER!');}
-      else if(w){B('HF[4]: rect['+i+'].'+k+'='+f64hex(v)+' weird='+v);}
-    });
-  }
-  svg4.remove();
+  // IF[4]: setCurrentTime to extreme value → read CTM
+  hdr('IF[4]: svg.setCurrentTime(extreme) → rect CTM probe');
+  [1e6, 1e9, 2147483648, 1e12].forEach(function(t){
+    try{
+      svg.setCurrentTime(t);
+      var ctm=null;
+      try{ctm=rect.getScreenCTM();}catch(e){}
+      if(ctm){
+        probeVal('IF[4]: setCurrentTime='+t+' CTM.e',ctm.e);
+      }
+    }catch(e){P('IF[4]: setCurrentTime='+t+' threw: '+e.name);}
+  });
 
-  prog('HF done — v43 complete');
+  // IF[5]: animateTransform with extreme begin time offset
+  hdr('IF[5]: animateTransform with negative/extreme begin → CTM');
+  var anim2=mkEl(rect,'animateTransform',{
+    attributeName:'transform',type:'translate',
+    from:'0 0',to:'999999999999 0',
+    begin:'-999999s',  // start in the past — animation is far advanced
+    dur:'1000000s',
+    repeatCount:'1',
+    fill:'freeze',
+    additive:'replace'
+  });
+  var ctm_neg=null;
+  try{ctm_neg=rect.getScreenCTM();}catch(e){}
+  if(ctm_neg){probeVal('IF[5]: begin=-999999s CTM.e',ctm_neg.e);}
+
+  svg.remove();
+  prog('IF done — v44 complete');
 }
 </script>
 </body>
