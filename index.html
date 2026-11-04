@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v39 — Text/Font/Clip/Foreign Pointer Hunt</title>
+<title>SVG v40 — foreignObject Boundary Overflow Hunt</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -10,11 +10,8 @@ h1{color:#0f0;font-size:13px;margin-bottom:2px;text-shadow:0 0 8px #0f0}
 h2{color:#333;font-size:9px;text-transform:uppercase;letter-spacing:.15em;margin-bottom:8px}
 .suite{background:#080808;border:1px solid #111;border-radius:3px;padding:10px;margin-bottom:8px}
 .result{padding:4px 8px;border-radius:2px;margin-bottom:2px;font-size:11px;word-break:break-all}
-/* RED — holy shit */
 .red{background:#1a0000;border-left:4px solid #ff0000;color:#ff4444;font-weight:bold;font-size:12px;padding:6px 10px}
-/* BLUE — alright */
 .blue{background:#00001a;border-left:3px solid #3366ff;color:#6699ff;font-weight:bold}
-/* PINK — useless */
 .pink{background:#0d000d;border-left:2px solid #663366;color:#996699;font-size:10px}
 .hdr{color:#333;font-size:9px;text-transform:uppercase;letter-spacing:.1em;padding:3px 0 5px;border-bottom:1px solid #111;margin-bottom:6px}
 button{background:#050505;color:#0f0;border:1px solid #0f0;padding:4px 10px;font-family:monospace;font-size:10px;cursor:pointer;border-radius:2px;margin:0 3px 4px 0;text-shadow:0 0 4px #0f0}
@@ -30,8 +27,8 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v39 — TEXT / FONT / CLIP / FOREIGN / MARKER</h1>
-<h2>getStartPositionOfChar · textPath · canvas font metrics · clip-path polygon · foreignObject · marker BCR · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v40 — FOREIGNOBJECT BOUNDARY OVERFLOW</h1>
+<h2>BCR overflow · transform stacking · viewBox amplification · animation race · nested boundary · iOS 26.5.2 / A16 arm64e</h2>
 <div class="suite">
 <div class="legend">
   <span class="leg leg-r">🔴 holy shit</span>
@@ -39,12 +36,12 @@ button:active{background:#0f0;color:#000}
   <span class="leg leg-p">🩷 useless</span>
 </div>
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('TX')">TX</button>
-<button onclick="go('TP')">TP</button>
-<button onclick="go('CF')">CF</button>
-<button onclick="go('CP')">CP</button>
-<button onclick="go('FO')">FO</button>
-<button onclick="go('MK')">MK</button>
+<button onclick="go('FA')">FA</button>
+<button onclick="go('FB')">FB</button>
+<button onclick="go('FC')">FC</button>
+<button onclick="go('FD')">FD</button>
+<button onclick="go('FE')">FE</button>
+<button onclick="go('FF')">FF</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -52,21 +49,23 @@ button:active{background:#0f0;color:#000}
 
 <script>
 var NS='http://www.w3.org/2000/svg';
+var XNS='http://www.w3.org/1999/xhtml';
 var _fb=new ArrayBuffer(8);
 var _dv=new Float64Array(_fb);
 var _uv=new Uint32Array(_fb);
 
 function f64hex(f){
   if(f===null||f===undefined)return'null';
-  if(typeof f==='string')return f;
-  _dv[0]=f; return'0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0');
+  _dv[0]=f;
+  return'0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0');
 }
 function fromHiLo(hi,lo){_uv[1]=hi>>>0;_uv[0]=lo>>>0;return _dv[0];}
 
 function classifyPtr(v){
   if(v===null||v===undefined||isNaN(v)||!isFinite(v))return null;
-  _dv[0]=v; var hi=_uv[1],lo=_uv[0];
-  if(hi===0x00000001)return{type:'arm64_user',hi,lo};
+  _dv[0]=v;
+  var hi=_uv[1],lo=_uv[0];
+  if(hi===0x00000001&&lo>0x1000)return{type:'arm64_tagged',hi,lo};
   if(hi>=0x00000002&&hi<=0x0000ffff&&lo>0x1000)return{type:'native_heap',hi,lo};
   if(hi>=0x00010000&&hi<=0x0001ffff)return{type:'jsc_cell',hi,lo};
   if(hi>=0x00100000&&hi<=0x001fffff)return{type:'pac_ptr',hi,lo};
@@ -76,9 +75,10 @@ function classifyPtr(v){
 function isWeird(v){
   if(!isFinite(v)||isNaN(v)||v===0||v===1||v===-1)return false;
   _dv[0]=v; var hi=_uv[1];
-  // skip normal layout float ranges
-  if(hi>=0x3f000000&&hi<=0x43400000)return false;
-  if(hi>=0xbf000000&&hi<=0xc3400000)return false;
+  // skip normal layout ranges: [-2^24, 2^24]
+  if(Math.abs(v)<16777216)return false;
+  // skip values that are exactly our test constants
+  if(v===1000010||v===2000009||v===2000008)return false;
   return true;
 }
 
@@ -101,12 +101,12 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runTX();
-  setTimeout(function(){runTP();},2000);
-  setTimeout(function(){runCF();},4000);
-  setTimeout(function(){runCP();},6000);
-  setTimeout(function(){runFO();},8000);
-  setTimeout(function(){runMK();},10000);
+  runFA();
+  setTimeout(function(){runFB();},1500);
+  setTimeout(function(){runFC();},3000);
+  setTimeout(function(){runFD();},4500);
+  setTimeout(function(){runFE();},6000);
+  setTimeout(function(){runFF();},9000);
 }
 
 function mkSVG(w,h){
@@ -116,491 +116,482 @@ function mkSVG(w,h){
   document.body.appendChild(s); return s;
 }
 function mkEl(p,tag,attrs){
-  var e=document.createElementNS(NS,tag);
+  var ns=tag==='div'||tag==='span'?XNS:NS;
+  var e=document.createElementNS(ns,tag);
   if(attrs)Object.keys(attrs).forEach(function(k){e.setAttribute(k,attrs[k]);});
   p.appendChild(e); return e;
 }
-function probePoint(label,pt){
-  if(!pt){P(label+': null point'); return;}
-  var xp=classifyPtr(pt.x), yp=classifyPtr(pt.y);
-  var xw=isWeird(pt.x), yw=isWeird(pt.y);
-  if(xp||yp){
-    R(label+': POINTER! x='+f64hex(pt.x)+' y='+f64hex(pt.y)+
-      ' x_type='+(xp?xp.type:'clean')+' y_type='+(yp?yp.type:'clean'));
-  } else if(xw||yw){
-    B(label+': weird coords x='+f64hex(pt.x)+' y='+f64hex(pt.y));
-  } else {
-    P(label+': x='+pt.x.toFixed(4)+' y='+pt.y.toFixed(4));
-  }
+function mkHTMLEl(p,tag,attrs){
+  var e=document.createElementNS(XNS,tag);
+  if(attrs)Object.keys(attrs).forEach(function(k){e.setAttribute(k,attrs[k]);});
+  p.appendChild(e); return e;
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// TX — SVGTextElement.getStartPositionOfChar / getEndPositionOfChar
-// text layout is completely separate from transform pipeline
-// char positions come from font shaper → glyph advance cache → SVGPoint
-// getExtentOfChar returns SVGRect — 4 fields instead of 2
-// ════════════════════════════════════════════════════════════════════════
-function runTX(){
-  hdr('TX: SVGTextElement char position probe');
-  var svg=mkSVG(600,200);
-
-  // TX[1]: basic getStartPositionOfChar
-  hdr('TX[1]: getStartPositionOfChar — ASCII text');
-  var t1=mkEl(svg,'text',{x:'10',y:'50','font-size':'24','font-family':'monospace'});
-  t1.textContent='AAAAAAAAAA';
-  for(var i=0;i<10;i++){
-    var pt=null;
-    try{pt=t1.getStartPositionOfChar(i);}catch(e){P('TX[1]: char '+i+' threw: '+e.name); break;}
-    probePoint('TX[1]: char['+i+']',pt);
-  }
-
-  // TX[2]: getEndPositionOfChar — returns a NEW SVGPoint
-  hdr('TX[2]: getEndPositionOfChar');
-  for(var i=0;i<5;i++){
-    var pt=null;
-    try{pt=t1.getEndPositionOfChar(i);}catch(e){break;}
-    probePoint('TX[2]: end['+i+']',pt);
-  }
-
-  // TX[3]: getExtentOfChar — returns SVGRect (4 fields)
-  hdr('TX[3]: getExtentOfChar — SVGRect probe (4 fields)');
-  for(var i=0;i<5;i++){
-    var rect=null;
-    try{rect=t1.getExtentOfChar(i);}catch(e){P('TX[3]: char '+i+' threw: '+e.name); break;}
-    if(!rect){P('TX[3]: char '+i+': null'); continue;}
-    ['x','y','width','height'].forEach(function(f){
-      var v=rect[f];
-      var p=classifyPtr(v);
-      if(p){R('TX[3]: char['+i+'].'+f+'='+f64hex(v)+' POINTER type='+p.type);}
-      else if(isWeird(v)){B('TX[3]: char['+i+'].'+f+'='+f64hex(v)+' weird');}
-      else{P('TX[3]: char['+i+'].'+f+'='+v.toFixed(4));}
-    });
-  }
-
-  // TX[4]: Unicode/emoji/RTL text — different shaper path
-  hdr('TX[4]: Unicode/RTL/emoji char positions');
-  var texts=[
-    {label:'RTL Arabic',text:'مرحبا'},
-    {label:'CJK',text:'中文文字'},
-    {label:'Emoji',text:'😀😁😂'},
-    {label:'Math',text:'αβγδε'},
-  ];
-  texts.forEach(function(spec){
-    var t=mkEl(svg,'text',{x:'10',y:'100','font-size':'24'});
-    t.textContent=spec.text;
-    var pt=null;
-    try{pt=t.getStartPositionOfChar(0);}catch(e){P('TX[4]: '+spec.label+' threw: '+e.name); return;}
-    probePoint('TX[4]: '+spec.label+' char[0]',pt);
-    var ext=null;
-    try{ext=t.getExtentOfChar(0);}catch(e){}
-    if(ext){
-      ['x','y','width','height'].forEach(function(f){
-        var v=ext[f];
-        if(classifyPtr(v)||isWeird(v)){
-          classifyPtr(v)?R('TX[4]: '+spec.label+' extent.'+f+'='+f64hex(v)+' POINTER!'):
-          B('TX[4]: '+spec.label+' extent.'+f+'='+f64hex(v));
-        }
-      });
-    }
-  });
-
-  // TX[5]: getCharNumAtPosition — reverse lookup
-  hdr('TX[5]: getCharNumAtPosition with extreme coords');
-  var extremePt=svg.createSVGPoint();
-  extremePt.x=1e15; extremePt.y=1e15;
-  var charNum=null;
-  try{charNum=t1.getCharNumAtPosition(extremePt);}catch(e){charNum='THROWS: '+e.name;}
-  P('TX[5]: getCharNumAtPosition(1e15,1e15)='+charNum);
-
-  // TX[6]: selectSubString — may touch internal selection struct
-  hdr('TX[6]: selectSubString probe');
-  try{t1.selectSubString(0,5);}catch(e){P('TX[6]: selectSubString threw: '+e.name);}
-  // read positions after selection
-  var selPt=null;
-  try{selPt=t1.getStartPositionOfChar(2);}catch(e){}
-  probePoint('TX[6]: char[2] after selectSubString',selPt);
-
-  svg.remove();
-  prog('TX done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// TP — SVGTextPathElement — text on a path
-// combines path geometry engine + text layout engine
-// char positions are computed from path parameterization
-// getStartPositionOfChar on textPath element
-// ════════════════════════════════════════════════════════════════════════
-function runTP(){
-  hdr('TP: SVGTextPathElement — text on path char positions');
-  var svg=mkSVG(600,300);
-  var defs=mkEl(svg,'defs');
-
-  // TP[1]: circular path textPath
-  hdr('TP[1]: text on circular arc path');
-  var circ=mkEl(defs,'path',{
-    id:'tp_circ',
-    d:'M 150 150 m -100 0 a 100 100 0 1 1 200 0 a 100 100 0 1 1 -200 0'
-  });
-  var txt1=mkEl(svg,'text',{'font-size':'16','font-family':'monospace'});
-  var tp1=mkEl(txt1,'textPath',{href:'#tp_circ'});
-  tp1.textContent='ABCDEFGHIJ';
-
-  for(var i=0;i<10;i++){
-    var pt=null;
-    try{pt=txt1.getStartPositionOfChar(i);}catch(e){P('TP[1]: char '+i+' threw: '+e.name); break;}
-    probePoint('TP[1]: circ['+i+']',pt);
-  }
-
-  // TP[2]: extreme-coord path
-  hdr('TP[2]: textPath on extreme-coord path');
-  var extPath=mkEl(defs,'path',{id:'tp_ext',d:'M 0 0 L 1e9 0'});
-  var txt2=mkEl(svg,'text',{'font-size':'16'});
-  var tp2=mkEl(txt2,'textPath',{href:'#tp_ext'});
-  tp2.textContent='HELLO';
-  for(var i=0;i<5;i++){
-    var pt=null;
-    try{pt=txt2.getStartPositionOfChar(i);}catch(e){P('TP[2]: char '+i+' threw: '+e.name); break;}
-    probePoint('TP[2]: extreme['+i+']',pt);
-  }
-
-  // TP[3]: getExtentOfChar on textPath chars — combines two engines
-  hdr('TP[3]: getExtentOfChar on textPath element');
-  for(var i=0;i<5;i++){
-    var rect=null;
-    try{rect=txt1.getExtentOfChar(i);}catch(e){P('TP[3]: threw: '+e.name); break;}
-    if(rect){
-      ['x','y','width','height'].forEach(function(f){
-        var v=rect[f];
-        if(classifyPtr(v)||isWeird(v)){
-          classifyPtr(v)?R('TP[3]: textPath extent['+i+'].'+f+'='+f64hex(v)+' POINTER!'):
-          B('TP[3]: textPath extent['+i+'].'+f+'='+f64hex(v)+' weird');
-        }
-      });
-    }
-  }
-
-  svg.remove();
-  prog('TP done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// CF — Canvas font metrics leak
-// CanvasRenderingContext2D.measureText → TextMetrics
-// 12 fields: width, actualBoundingBox*, fontBoundingBox*, etc.
-// all go through CoreText font shaper → different internal pipeline
-// ════════════════════════════════════════════════════════════════════════
-function runCF(){
-  hdr('CF: Canvas font metrics leak probe');
-  var canvas=document.createElement('canvas');
-  canvas.width=800; canvas.height=200;
-  canvas.style.cssText='position:fixed;left:0;top:0;opacity:0.001;pointer-events:none';
-  document.body.appendChild(canvas);
-  var ctx=canvas.getContext('2d');
-
-  var tmFields=[
-    'width','actualBoundingBoxLeft','actualBoundingBoxRight',
-    'fontBoundingBoxAscent','fontBoundingBoxDescent',
-    'actualBoundingBoxAscent','actualBoundingBoxDescent',
-    'emHeightAscent','emHeightDescent','hangingBaseline',
-    'alphabeticBaseline','ideographicBaseline'
-  ];
-
-  function probeMetrics(label,text,font){
-    ctx.font=font;
-    var tm=ctx.measureText(text);
-    tmFields.forEach(function(f){
-      var v=tm[f];
-      if(v===undefined||v===null)return;
-      var p=classifyPtr(v);
-      if(p){R('CF: '+label+' .'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-      else if(isWeird(v)){B('CF: '+label+' .'+f+'='+f64hex(v)+' weird='+v);}
-    });
-    P('CF: '+label+' width='+( tm.width?tm.width.toFixed(4):'null'));
-  }
-
-  // CF[1]: system font fallback chain — different shaper per font
-  hdr('CF[1]: system font metrics — various fonts');
-  ['10px monospace','10px serif','10px sans-serif',
-   '10px -apple-system','10px Arial','10px Helvetica',
-   '1px monospace','0.001px monospace','1000px monospace'].forEach(function(font){
-    probeMetrics(font,'AAAA',font);
-  });
-
-  // CF[2]: unusual Unicode through CoreText shaper
-  hdr('CF[2]: Unicode/emoji/RTL through CoreText');
-  [
-    ['مرحبا','16px Arial','Arabic'],
-    ['中文','16px PingFang SC','CJK'],
-    ['😀','32px Arial','Emoji'],
-    ['Ω∫∂','16px serif','Math'],
-    ['‮ HELLO','16px monospace','RTL override'],
-  ].forEach(function(spec){
-    probeMetrics(spec[2],spec[0],spec[1]);
-  });
-
-  // CF[3]: very long strings — buffer sizing
-  hdr('CF[3]: long string metrics — internal buffer sizing');
-  probeMetrics('1000-char string','A'.repeat(1000),'12px monospace');
-  probeMetrics('10000-char string','A'.repeat(10000),'12px monospace');
-
-  // CF[4]: font size extremes
-  hdr('CF[4]: extreme font sizes');
-  ['0.0001px monospace','1e10px monospace','1e15px monospace'].forEach(function(font){
-    try{probeMetrics(font,'A',font);}catch(e){P('CF[4]: '+font+' threw: '+e);}
-  });
-
-  canvas.remove();
-  prog('CF done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// CP — CSS clip-path polygon() with extreme coords
-// clip-path goes through GeometryUtilities / Path::apply
-// different pipeline from SVG transform — no LayoutUnit in some paths
-// BCR on clipped element may expose clip region geometry
-// ════════════════════════════════════════════════════════════════════════
-function runCP(){
-  hdr('CP: CSS clip-path polygon extreme coords');
-
-  // CP[1]: clip-path with 1e15 coords on SVG element
-  hdr('CP[1]: SVG element with clip-path polygon(1e15)');
-  var svg=mkSVG(400,400);
-  var r=mkEl(svg,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'red'});
-  r.style.clipPath='polygon(0px 0px, 1e9px 0px, 1e9px 1e9px)';
-
-  var b=r.getBoundingClientRect();
+function probeBCR(label,el){
+  var b=el.getBoundingClientRect();
   ['x','y','width','height','right','bottom'].forEach(function(f){
     var v=b[f];
     var p=classifyPtr(v);
-    if(p){R('CP[1]: clip-path BCR.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-    else if(isWeird(v)){B('CP[1]: clip-path BCR.'+f+'='+f64hex(v)+' weird='+v);}
-    else{P('CP[1]: BCR.'+f+'='+v);}
+    var w=isWeird(v);
+    if(p){R(label+' BCR.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
+    else if(w){B(label+' BCR.'+f+'='+f64hex(v)+' weird='+v);}
+    else{P(label+' BCR.'+f+'='+v);}
   });
-
-  // CP[2]: clip-path on HTML div — HTML renderer path
-  hdr('CP[2]: HTML div clip-path polygon extreme');
-  var div=document.createElement('div');
-  div.style.cssText='position:fixed;left:0;top:0;width:200px;height:200px;background:red';
-  div.style.clipPath='polygon(0px 0px, 999999999px 0px, 0px 999999999px)';
-  document.body.appendChild(div);
-  var db=div.getBoundingClientRect();
-  ['x','y','width','height'].forEach(function(f){
-    var v=db[f];
+}
+function probeCTM(label,el){
+  var c=null;
+  try{c=el.getScreenCTM();}catch(e){P(label+' CTM: threw '+e.name); return;}
+  if(!c){P(label+' CTM: null'); return;}
+  ['a','b','c','d','e','f'].forEach(function(f){
+    var v=c[f];
     var p=classifyPtr(v);
-    if(p){R('CP[2]: div clip-path BCR.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-    else if(isWeird(v)){B('CP[2]: div clip-path BCR.'+f+'='+f64hex(v)+' weird='+v);}
-    else{P('CP[2]: div BCR.'+f+'='+v);}
+    var w=isWeird(v);
+    if(p){R(label+' CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
+    else if(w){B(label+' CTM.'+f+'='+f64hex(v)+' weird='+v);}
+    else{P(label+' CTM.'+f+'='+v);}
   });
-  div.remove();
-
-  // CP[3]: SVG clipPath element with extreme coords
-  hdr('CP[3]: SVG <clipPath> element with 1e9 coords');
-  var defs=mkEl(svg,'defs');
-  var clipEl=mkEl(defs,'clipPath',{id:'cp3'});
-  mkEl(clipEl,'rect',{x:'0',y:'0',width:'1000000000',height:'1000000000'});
-  var r3=mkEl(svg,'rect',{x:'0',y:'0',width:'100',height:'100',fill:'blue','clip-path':'url(#cp3)'});
-  var b3=r3.getBoundingClientRect();
-  ['x','y','width','height'].forEach(function(f){
-    var v=b3[f];
-    var p=classifyPtr(v);
-    if(p){R('CP[3]: SVG clipPath BCR.'+f+'='+f64hex(v)+' POINTER!');}
-    else if(isWeird(v)){B('CP[3]: SVG clipPath BCR.'+f+'='+f64hex(v)+' weird');}
-    else{P('CP[3]: SVG clipPath BCR.'+f+'='+v);}
-  });
-
-  // CP[4]: getScreenCTM on element with clip-path
-  hdr('CP[4]: getScreenCTM on clip-path element');
-  var c4=null;
-  try{c4=r3.getScreenCTM();}catch(e){}
-  if(c4){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=c4[f];
-      var p=classifyPtr(v);
-      if(p){R('CP[4]: CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-      else if(isWeird(v)){B('CP[4]: CTM.'+f+'='+f64hex(v)+' weird');}
-    });
-    P('CP[4]: CTM.e='+c4.e+' f='+c4.f);
-  }
-
-  svg.remove();
-  prog('CP done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// FO — SVGForeignObjectElement
-// creates mixed renderer boundary: SVG renderer + HTML renderer
-// BCR and CTM at the boundary may expose internal compositor coords
+// FA — inner CSS left value overflow sweep
+// push inner HTML element's left past 2^31, 2^32, MAX_SAFE_INT
+// foreignObject boundary: does BCR wrap, saturate, or stay linear?
 // ════════════════════════════════════════════════════════════════════════
-function runFO(){
-  hdr('FO: SVGForeignObjectElement renderer boundary probe');
+function runFA(){
+  hdr('FA: inner div CSS left overflow sweep through foreignObject boundary');
   var svg=mkSVG(400,400);
+  var fo=mkEl(svg,'foreignObject',{x:'0',y:'0',width:'400',height:'400'});
 
-  // FO[1]: basic foreignObject BCR
-  hdr('FO[1]: foreignObject BCR and CTM at renderer boundary');
-  var fo=mkEl(svg,'foreignObject',{x:'10',y:'10',width:'100',height:'100'});
-  var div=document.createElementNS('http://www.w3.org/1999/xhtml','div');
-  div.style.cssText='width:100px;height:100px;background:red;';
-  fo.appendChild(div);
+  var testVals=[
+    1e6, 1e7, 1e8, 1e9,
+    0x7fffffff,       // 2^31-1 = 2147483647
+    0x80000000,       // 2^31   = 2147483648
+    0x100000000,      // 2^32   = 4294967296
+    Number.MAX_SAFE_INTEGER,  // 2^53-1
+    1e15, 1e16, 1e17, 1e18, 1e20,
+  ];
 
-  var fb=fo.getBoundingClientRect();
-  ['x','y','width','height'].forEach(function(f){
-    var v=fb[f];
-    var p=classifyPtr(v);
-    if(p){R('FO[1]: fo BCR.'+f+'='+f64hex(v)+' POINTER!');}
-    else if(isWeird(v)){B('FO[1]: fo BCR.'+f+'='+f64hex(v)+' weird');}
-    else{P('FO[1]: fo BCR.'+f+'='+v);}
+  testVals.forEach(function(leftVal){
+    var div=document.createElementNS(XNS,'div');
+    div.style.cssText='position:absolute;left:'+leftVal+'px;top:0;width:10px;height:10px;background:red';
+    fo.appendChild(div);
+    var b=div.getBoundingClientRect();
+    var x=b.x;
+    var p=classifyPtr(x);
+    var w=isWeird(x);
+    if(p){R('FA: left='+leftVal+' BCR.x='+f64hex(x)+' POINTER! type='+p.type);}
+    else if(w){B('FA: left='+leftVal+' BCR.x='+f64hex(x)+' (weird, expected '+leftVal+')');}
+    else{P('FA: left='+leftVal+' BCR.x='+x);}
+    fo.removeChild(div);
   });
 
-  var fc=null;
-  try{fc=fo.getScreenCTM();}catch(e){}
-  if(fc){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=fc[f];
+  // FA[2]: check if BCR.x is clamped at 2^31
+  hdr('FA[2]: fine sweep around 2^31 boundary');
+  var JUST_BEFORE=2147483646;
+  var AT=2147483648;
+  var JUST_AFTER=2147483650;
+  [JUST_BEFORE, AT, JUST_AFTER, AT*2, AT*4].forEach(function(v){
+    var div=document.createElementNS(XNS,'div');
+    div.style.cssText='position:absolute;left:'+v+'px;top:0;width:10px;height:10px;background:red';
+    fo.appendChild(div);
+    var b=div.getBoundingClientRect();
+    var x=b.x;
+    P('FA[2]: left='+v+' BCR.x='+x+' hex='+f64hex(x));
+    fo.removeChild(div);
+  });
+
+  svg.remove();
+  prog('FA done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FB — foreignObject transform stacking sweep
+// stack transform="matrix(1 0 0 1 TX 0)" on foreignObject
+// inner element has fixed CSS left=100px
+// probe: does stacked tx accumulate past 2^31?
+// ════════════════════════════════════════════════════════════════════════
+function runFB(){
+  hdr('FB: foreignObject transform stacking — sweep TX past 2^31');
+  var svg=mkSVG(400,400);
+
+  var txVals=[
+    1e6, 1e8,
+    2147483646,  // 2^31-2
+    2147483648,  // 2^31
+    2147483650,  // 2^31+2
+    4294967296,  // 2^32
+    1e12, 1e15,
+  ];
+
+  txVals.forEach(function(tx){
+    var fo=mkEl(svg,'foreignObject',{
+      x:'0',y:'0',width:'400',height:'400',
+      transform:'matrix(1 0 0 1 '+tx+' 0)'
+    });
+    var div=document.createElementNS(XNS,'div');
+    div.style.cssText='position:absolute;left:100px;top:0;width:10px;height:10px;background:red';
+    fo.appendChild(div);
+
+    var b=div.getBoundingClientRect();
+    var x=b.x;
+    var p=classifyPtr(x);
+    var w=isWeird(x);
+    if(p){R('FB: fo_tx='+tx+' div BCR.x='+f64hex(x)+' POINTER! type='+p.type);}
+    else if(w){B('FB: fo_tx='+tx+' div BCR.x='+f64hex(x)+' weird='+x);}
+    else{P('FB: fo_tx='+tx+' div BCR.x='+x);}
+
+    // also probe nested SVG CTM
+    var innerSVG=document.createElementNS(NS,'svg');
+    innerSVG.setAttribute('width','10'); innerSVG.setAttribute('height','10');
+    fo.appendChild(innerSVG);
+    var innerR=mkEl(innerSVG,'rect',{x:'0',y:'0',width:'10',height:'10'});
+    var c=null;
+    try{c=innerR.getScreenCTM();}catch(e){}
+    if(c){
+      var e_=c.e;
+      var pp=classifyPtr(e_);
+      var ww=isWeird(e_);
+      if(pp){R('FB: fo_tx='+tx+' nested CTM.e='+f64hex(e_)+' POINTER! type='+pp.type);}
+      else if(ww){B('FB: fo_tx='+tx+' nested CTM.e='+f64hex(e_)+' weird='+e_);}
+      else{P('FB: fo_tx='+tx+' nested CTM.e='+e_);}
+    }
+
+    svg.removeChild(fo);
+  });
+
+  svg.remove();
+  prog('FB done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FC — viewBox amplification + foreignObject
+// confirmed: viewBox tiny values bypass LayoutUnit for CTM
+// combine: outer SVG viewBox amplification + foreignObject + nested SVG CTM
+// does the amplification propagate through the boundary?
+// ════════════════════════════════════════════════════════════════════════
+function runFC(){
+  hdr('FC: viewBox amplification through foreignObject boundary');
+
+  // FC[1]: outer SVG with viewBox amplification, foreignObject inside
+  hdr('FC[1]: viewBox amplified SVG with foreignObject — nested SVG CTM');
+  // viewBox="0 0 0.0001 0.0001" width="400" height="400"
+  // means 1 user unit = 400/0.0001 = 4,000,000px
+  var vbScales=[
+    {vb:'0 0 0.001 0.001',  label:'scale=400000x'},
+    {vb:'0 0 0.0001 0.0001',label:'scale=4000000x'},
+    {vb:'0 0 0.00001 0.00001',label:'scale=40000000x'},
+    {vb:'0 0 1e-7 1e-7',    label:'scale=4e9x'},
+    {vb:'0 0 1e-9 1e-9',    label:'scale=4e11x'},
+    {vb:'0 0 1e-12 1e-12',  label:'scale=4e14x'},
+  ];
+
+  vbScales.forEach(function(spec){
+    var svg=document.createElementNS(NS,'svg');
+    svg.setAttribute('width','400'); svg.setAttribute('height','400');
+    svg.setAttribute('viewBox',spec.vb);
+    svg.style.cssText='position:fixed;left:0;top:0;width:400px;height:400px;opacity:0.001;pointer-events:none';
+    document.body.appendChild(svg);
+
+    // foreignObject in viewBox coords (tiny)
+    var fo=mkEl(svg,'foreignObject',{x:'0',y:'0',width:'0.00001',height:'0.00001'});
+    var innerSVG=document.createElementNS(NS,'svg');
+    innerSVG.setAttribute('width','100'); innerSVG.setAttribute('height','100');
+    fo.appendChild(innerSVG);
+    var r=mkEl(innerSVG,'rect',{x:'1',y:'0',width:'1',height:'1'});
+
+    var c=null;
+    try{c=r.getScreenCTM();}catch(e){P('FC[1]: '+spec.label+' threw: '+e.name); svg.remove(); return;}
+    if(c){
+      ['e','f','a','d'].forEach(function(f){
+        var v=c[f];
+        var p=classifyPtr(v);
+        var w=isWeird(v);
+        if(p){R('FC[1]: '+spec.label+' CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
+        else if(w){B('FC[1]: '+spec.label+' CTM.'+f+'='+f64hex(v)+' weird='+v);}
+        else{P('FC[1]: '+spec.label+' CTM.'+f+'='+v);}
+      });
+    }
+
+    svg.remove();
+  });
+
+  // FC[2]: foreignObject x in viewBox coords — does tiny x amplify through boundary?
+  hdr('FC[2]: foreignObject x offset in amplified viewBox coords');
+  var svg2=document.createElementNS(NS,'svg');
+  svg2.setAttribute('width','400'); svg2.setAttribute('height','400');
+  svg2.setAttribute('viewBox','0 0 0.0001 0.0001');
+  svg2.style.cssText='position:fixed;left:0;top:0;width:400px;height:400px;opacity:0.001;pointer-events:none';
+  document.body.appendChild(svg2);
+
+  // x=0.00001 in viewBox coords = 0.00001 * (400/0.0001) = 40px in screen coords
+  // push x so that x * scale > 2^31
+  // need x * 4e6 > 2^31 = 2147483648 → x > 536.87
+  // but we're in viewBox 0.0001 total width, so x > viewBox width is clipped
+  // try: separate viewBox that gives big scale AND allows large x
+  var fo2=mkEl(svg2,'foreignObject',{x:'0.00001',y:'0',width:'0.00001',height:'0.00001'});
+  var div2=document.createElementNS(XNS,'div');
+  div2.style.cssText='position:absolute;left:0;top:0;width:10px;height:10px;background:red';
+  fo2.appendChild(div2);
+
+  var b2=div2.getBoundingClientRect();
+  P('FC[2]: amplified fo x offset BCR.x='+b2.x+' y='+b2.y);
+
+  // FC[3]: SVG translate inside foreignObject, nested SVG CTM
+  hdr('FC[3]: SVG g translate inside foreignObject nested SVG CTM');
+  var fo3=mkEl(svg2,'foreignObject',{x:'0',y:'0',width:'0.0001',height:'0.0001'});
+  var innerSVG3=document.createElementNS(NS,'svg');
+  innerSVG3.setAttribute('width','400'); innerSVG3.setAttribute('height','400');
+  fo3.appendChild(innerSVG3);
+  var g3=mkEl(innerSVG3,'g',{transform:'translate(999999,0)'});
+  var r3=mkEl(g3,'rect',{x:'0',y:'0',width:'10',height:'10'});
+  var c3=null;
+  try{c3=r3.getScreenCTM();}catch(e){}
+  if(c3){
+    ['e','f'].forEach(function(f){
+      var v=c3[f];
       var p=classifyPtr(v);
-      if(p){R('FO[1]: fo CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-      else if(isWeird(v)){B('FO[1]: fo CTM.'+f+'='+f64hex(v)+' weird');}
+      var w=isWeird(v);
+      if(p){R('FC[3]: inner translate+fo CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
+      else if(w){B('FC[3]: inner translate+fo CTM.'+f+'='+f64hex(v)+' weird='+v);}
+      else{P('FC[3]: inner translate+fo CTM.'+f+'='+v);}
     });
   }
 
-  // FO[2]: inner HTML div BCR — does it inherit SVG coordinate space?
-  hdr('FO[2]: inner HTML element BCR inside foreignObject');
-  var innerDiv=document.createElementNS('http://www.w3.org/1999/xhtml','div');
-  innerDiv.style.cssText='width:50px;height:50px;position:absolute;left:1000000px;top:0';
-  fo.appendChild(innerDiv);
-  var idb=innerDiv.getBoundingClientRect();
-  ['x','y','width','height'].forEach(function(f){
-    var v=idb[f];
-    var p=classifyPtr(v);
-    if(p){R('FO[2]: inner div BCR.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-    else if(isWeird(v)){B('FO[2]: inner div BCR.'+f+'='+f64hex(v)+' weird='+v);}
-    else{P('FO[2]: inner div BCR.'+f+'='+v);}
+  svg2.remove();
+  prog('FC done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FD — animated foreignObject — mid-frame pipeline desync probe
+// animate foreignObject x from 0 to 2^31 over 1s
+// sample BCR of inner element every rAF frame
+// look for frames where SVG pipeline and HTML layout pipeline disagree
+// ════════════════════════════════════════════════════════════════════════
+function runFD(){
+  hdr('FD: animated foreignObject x sweep — mid-frame desync probe');
+  var svg=mkSVG(600,400);
+
+  var fo=mkEl(svg,'foreignObject',{x:'0',y:'0',width:'600',height:'400'});
+  mkEl(fo,'animate',{
+    attributeName:'x',
+    from:'0', to:'2200000000',
+    dur:'2s', repeatCount:'1', fill:'freeze'
   });
 
-  // FO[3]: apply transform to foreignObject, read inner element BCR
-  hdr('FO[3]: transformed foreignObject — inner element BCR');
-  fo.setAttribute('transform','matrix(1 0 0 1 999999 0)');
-  var idb3=innerDiv.getBoundingClientRect();
-  ['x','y'].forEach(function(f){
-    var v=idb3[f];
-    var p=classifyPtr(v);
-    if(p){R('FO[3]: transformed inner BCR.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-    else if(isWeird(v)){B('FO[3]: transformed inner BCR.'+f+'='+f64hex(v)+' weird='+v);}
-    else{P('FO[3]: transformed inner BCR.'+f+'='+v);}
-  });
+  var div=document.createElementNS(XNS,'div');
+  div.style.cssText='position:absolute;left:100px;top:50px;width:10px;height:10px;background:red';
+  fo.appendChild(div);
 
-  // FO[4]: getScreenCTM on inner HTML element inside foreignObject
-  hdr('FO[4]: getScreenCTM on inner HTML element');
-  // only SVG elements have getScreenCTM — create nested SVG inside foreignObject
   var innerSVG=document.createElementNS(NS,'svg');
   innerSVG.setAttribute('width','50'); innerSVG.setAttribute('height','50');
   fo.appendChild(innerSVG);
-  var innerRect=mkEl(innerSVG,'rect',{x:'0',y:'0',width:'10',height:'10',fill:'green'});
-  var irCTM=null;
-  try{irCTM=innerRect.getScreenCTM();}catch(e){}
-  if(irCTM){
-    ['a','b','c','d','e','f'].forEach(function(f){
-      var v=irCTM[f];
-      var p=classifyPtr(v);
-      if(p){R('FO[4]: nested SVG in foreignObject CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-      else if(isWeird(v)){B('FO[4]: nested SVG CTM.'+f+'='+f64hex(v)+' weird');}
-    });
-    P('FO[4]: nested SVG CTM: e='+irCTM.e+' f='+irCTM.f);
+  var innerR=mkEl(innerSVG,'rect',{x:'0',y:'0',width:'10',height:'10'});
+
+  var samples=[];
+  var weirdSamples=[];
+  var start=performance.now();
+  var frameCount=0;
+
+  function fdFrame(){
+    var elapsed=performance.now()-start;
+    frameCount++;
+
+    // sample both BCR (HTML pipeline) and CTM (SVG pipeline)
+    var bx=div.getBoundingClientRect().x;
+    var ctm=null;
+    try{ctm=innerR.getScreenCTM();}catch(e){}
+    var ce=ctm?ctm.e:null;
+
+    var bp=classifyPtr(bx), cp=classifyPtr(ce);
+    var bw=isWeird(bx), cw=isWeird(ce);
+
+    // check pipeline desync: if BCR and CTM disagree significantly
+    var desync=(ce!==null&&bx!==null)?(Math.abs(bx-ce)>10):false;
+
+    if(bp||cp){
+      R('FD: t='+elapsed.toFixed(0)+'ms BCR.x='+f64hex(bx)+' CTM.e='+f64hex(ce)+'  POINTER!');
+      weirdSamples.push({t:elapsed,bx,ce,type:'ptr'});
+    } else if(bw||cw){
+      B('FD: t='+elapsed.toFixed(0)+'ms BCR.x='+f64hex(bx)+' CTM.e='+(ce?f64hex(ce):'null')+' weird');
+      weirdSamples.push({t:elapsed,bx,ce,type:'weird'});
+    } else if(desync){
+      B('FD: t='+elapsed.toFixed(0)+'ms DESYNC BCR.x='+bx.toFixed(0)+' CTM.e='+ce.toFixed(0)+' delta='+(bx-ce).toFixed(0));
+      weirdSamples.push({t:elapsed,bx,ce,type:'desync'});
+    }
+
+    if(elapsed<2200){
+      requestAnimationFrame(fdFrame);
+    } else {
+      B('FD: animation complete. frames='+frameCount+' weird/ptr/desync='+weirdSamples.length);
+      if(weirdSamples.length===0){P('FD: no weird values or desync during animated foreignObject x sweep');}
+      svg.remove();
+      prog('FD done');
+    }
   }
 
-  svg.remove();
-  prog('FO done');
+  setTimeout(function(){requestAnimationFrame(fdFrame);},50);
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// MK — SVGMarkerElement BCR during animation
-// markers are recomputed per stroke point, per frame
-// marker has its own coordinate system (markerWidth/Height/viewBox)
-// BCR on marker element during active path stroke animation
+// FE — nested foreignObject chain
+// SVG → foreignObject → nested SVG → foreignObject → nested SVG → rect
+// each boundary transition may accumulate float precision errors
+// or expose a different integer overflow path
 // ════════════════════════════════════════════════════════════════════════
-function runMK(){
-  hdr('MK: SVGMarkerElement BCR during animated stroke');
+function runFE(){
+  hdr('FE: nested foreignObject chain — boundary accumulation probe');
   var svg=mkSVG(400,400);
-  var defs=mkEl(svg,'defs');
 
-  // MK[1]: basic marker BCR
-  hdr('MK[1]: marker element BCR — static');
-  var marker=mkEl(defs,'marker',{
-    id:'mk1',markerWidth:'10',markerHeight:'10',
-    refX:'5',refY:'5',orient:'auto'
-  });
-  var markerCircle=mkEl(marker,'circle',{cx:'5',cy:'5',r:'4',fill:'red'});
+  // FE[1]: double nested foreignObject — SVG→FO→SVG→FO→SVG
+  hdr('FE[1]: double nested foreignObject — CTM at each level');
+  var fo1=mkEl(svg,'foreignObject',{x:'100',y:'100',width:'200',height:'200'});
+  var svg2=document.createElementNS(NS,'svg');
+  svg2.setAttribute('width','200'); svg2.setAttribute('height','200');
+  fo1.appendChild(svg2);
 
-  var mb=marker.getBoundingClientRect();
-  ['x','y','width','height'].forEach(function(f){
-    var v=mb[f];
-    var p=classifyPtr(v);
-    if(p){R('MK[1]: marker BCR.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-    else if(isWeird(v)){B('MK[1]: marker BCR.'+f+'='+f64hex(v)+' weird='+v);}
-    else{P('MK[1]: marker BCR.'+f+'='+v);}
-  });
+  var fo2=mkEl(svg2,'foreignObject',{x:'50',y:'50',width:'100',height:'100'});
+  var svg3=document.createElementNS(NS,'svg');
+  svg3.setAttribute('width','100'); svg3.setAttribute('height','100');
+  fo2.appendChild(svg3);
 
-  // MK[2]: path with marker-start/mid/end + animation
-  hdr('MK[2]: animated path with markers — BCR during animation');
-  var path=mkEl(svg,'path',{
-    d:'M 50 100 L 350 100',
-    stroke:'blue','stroke-width':'2',fill:'none',
-    'marker-start':'url(#mk1)',
-    'marker-mid':'url(#mk1)',
-    'marker-end':'url(#mk1)'
-  });
-  mkEl(path,'animate',{
-    attributeName:'d',
-    from:'M 50 100 L 350 100',
-    to:'M 50 50 L 350 350',
-    dur:'1s', repeatCount:'indefinite'
-  });
+  var r3=mkEl(svg3,'rect',{x:'10',y:'10',width:'10',height:'10'});
+  probeCTM('FE[1]: depth-2 nested rect',r3);
+  probeBCR('FE[1]: depth-1 foreignObject',fo1);
+  probeBCR('FE[1]: depth-2 foreignObject',fo2);
 
-  // read BCR on marker element during animation
-  var mkSamples=[];
-  var mkStart=performance.now();
+  // FE[2]: apply large transforms at each boundary level
+  hdr('FE[2]: transformed nested foreignObjects');
+  fo1.setAttribute('transform','matrix(1 0 0 1 10000 0)');
+  var inner_div=document.createElementNS(XNS,'div');
+  inner_div.style.cssText='position:absolute;left:10000px;top:0;width:10px;height:10px;background:red';
+  fo2.appendChild(inner_div);
 
-  function mkFrame(){
-    var elapsed=performance.now()-mkStart;
-    if(elapsed>1000){
-      hdr('MK[2]: '+mkSamples.length+' marker BCR samples during animation');
-      var weird=mkSamples.filter(function(s){return s.weird||s.ptr;});
-      B('MK[2]: total='+mkSamples.length+' weird/ptr='+weird.length);
-      weird.forEach(function(s){
-        s.ptr?R('MK[2]: t='+s.t.toFixed(0)+'ms field='+s.f+' val='+f64hex(s.v)+' type='+s.ptr.type):
-        B('MK[2]: t='+s.t.toFixed(0)+'ms field='+s.f+' val='+f64hex(s.v)+' weird');
+  var bd2=inner_div.getBoundingClientRect();
+  var x2=bd2.x;
+  var p2=classifyPtr(x2);
+  if(p2){R('FE[2]: double fo + 10000 inner div BCR.x='+f64hex(x2)+' POINTER! type='+p2.type);}
+  else if(isWeird(x2)){B('FE[2]: double fo BCR.x='+f64hex(x2)+' weird='+x2);}
+  else{P('FE[2]: double fo inner div BCR.x='+x2);}
+
+  // FE[3]: extreme nested transform chain
+  hdr('FE[3]: extreme translate chain through nested boundary');
+  fo1.setAttribute('transform','matrix(1 0 0 1 999999 0)');
+  fo2.setAttribute('transform','matrix(1 0 0 1 999999 0)');
+  inner_div.style.left='999999px';
+
+  var bd3=inner_div.getBoundingClientRect();
+  var x3=bd3.x;
+  var p3=classifyPtr(x3);
+  if(p3){R('FE[3]: triple 999999 stacked BCR.x='+f64hex(x3)+' POINTER! type='+p3.type);}
+  else if(isWeird(x3)){B('FE[3]: triple 999999 stacked BCR.x='+f64hex(x3)+' weird='+x3);}
+  else{P('FE[3]: triple 999999 stacked BCR.x='+x3);}
+
+  probeCTM('FE[3]: depth-2 nested rect after extreme transforms',r3);
+
+  svg.remove();
+  prog('FE done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FF — foreignObject + getBBox + getComputedStyle integer overflow
+// getBBox is SVG-internal; on a foreignObject it bridges to HTML layout
+// getComputedStyle on element inside foreignObject — does it expose internal coords?
+// also: SVGForeignObjectElement.width.baseVal.value at extreme values
+// ════════════════════════════════════════════════════════════════════════
+function runFF(){
+  hdr('FF: foreignObject getBBox / getComputedStyle / baseVal overflow');
+  var svg=mkSVG(400,400);
+
+  // FF[1]: getBBox on foreignObject at extreme x
+  hdr('FF[1]: getBBox on foreignObject with extreme x attribute');
+  var xVals=[1e6, 2147483648, 4294967296, 1e12, 1e15];
+  xVals.forEach(function(x){
+    var fo=mkEl(svg,'foreignObject',{x:x,y:'0',width:'100',height:'100'});
+    var div=document.createElementNS(XNS,'div');
+    div.style.cssText='width:50px;height:50px;background:red';
+    fo.appendChild(div);
+
+    var bb=null;
+    try{bb=fo.getBBox();}catch(e){P('FF[1]: x='+x+' getBBox threw: '+e.name); svg.removeChild(fo); return;}
+    if(bb){
+      ['x','y','width','height'].forEach(function(f){
+        var v=bb[f];
+        var p=classifyPtr(v);
+        var w=isWeird(v);
+        if(p){R('FF[1]: fo_x='+x+' getBBox.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
+        else if(w){B('FF[1]: fo_x='+x+' getBBox.'+f+'='+f64hex(v)+' weird='+v);}
+        else{P('FF[1]: fo_x='+x+' getBBox.'+f+'='+v);}
       });
-      if(weird.length===0)P('MK[2]: no weird values in marker BCR during animation');
-
-      // MK[3]: getScreenCTM on the marker circle during animation
-      hdr('MK[3]: getScreenCTM on marker child element during animation');
-      var mc=null;
-      try{mc=markerCircle.getScreenCTM();}catch(e){}
-      if(mc){
-        ['a','b','c','d','e','f'].forEach(function(f){
-          var v=mc[f];
-          var p=classifyPtr(v);
-          if(p){R('MK[3]: marker child CTM.'+f+'='+f64hex(v)+' POINTER! type='+p.type);}
-          else if(isWeird(v)){B('MK[3]: marker child CTM.'+f+'='+f64hex(v)+' weird');}
-          else{P('MK[3]: marker CTM.'+f+'='+v);}
-        });
-      }
-
-      svg.remove();
-      prog('MK done — v39 complete');
-      return;
     }
+    svg.removeChild(fo);
+  });
 
-    // sample marker BCR
-    var mb2=marker.getBoundingClientRect();
-    ['x','y','width','height','right','bottom'].forEach(function(f){
-      var v=mb2[f];
-      var p=classifyPtr(v);
-      var w=isWeird(v);
-      if(p||w)mkSamples.push({t:elapsed,f:f,v:v,ptr:p,weird:w});
-    });
-    requestAnimationFrame(mkFrame);
-  }
-  setTimeout(function(){requestAnimationFrame(mkFrame);},50);
+  // FF[2]: getComputedStyle on element inside foreignObject
+  hdr('FF[2]: getComputedStyle on inner element in transformed foreignObject');
+  var fo2=mkEl(svg,'foreignObject',{x:'0',y:'0',width:'400',height:'400',
+    transform:'matrix(1 0 0 1 2000000 0)'});
+  var div2=document.createElementNS(XNS,'div');
+  div2.style.cssText='position:absolute;left:1000000px;top:0;width:50px;height:50px;background:red';
+  fo2.appendChild(div2);
+
+  var cs=window.getComputedStyle(div2);
+  ['left','top','width','height','transform'].forEach(function(prop){
+    var v=cs[prop];
+    P('FF[2]: getComputedStyle.'+prop+'='+v);
+    // parse px value
+    var num=parseFloat(v);
+    if(!isNaN(num)){
+      var p=classifyPtr(num);
+      var w=isWeird(num);
+      if(p){R('FF[2]: getComputedStyle.'+prop+' parsed='+f64hex(num)+' POINTER! type='+p.type);}
+      else if(w){B('FF[2]: getComputedStyle.'+prop+' parsed='+f64hex(num)+' weird='+num);}
+    }
+  });
+
+  // FF[3]: foreignObject width/height baseVal at extreme values
+  hdr('FF[3]: foreignObject width.baseVal.value at extreme attr values');
+  [2147483648, 4294967296, 1e12, 1e15].forEach(function(w){
+    var fo3=mkEl(svg,'foreignObject',{x:'0',y:'0',width:w,height:'100'});
+    var div3=document.createElementNS(XNS,'div');
+    div3.style.cssText='width:100%;height:100%;background:red';
+    fo3.appendChild(div3);
+
+    var bv=null;
+    try{bv=fo3.width.baseVal.value;}catch(e){}
+    P('FF[3]: attr_width='+w+' width.baseVal.value='+bv);
+
+    var db=div3.getBoundingClientRect();
+    var dw=db.width;
+    var p=classifyPtr(dw);
+    var ww=isWeird(dw);
+    if(p){R('FF[3]: attr_width='+w+' inner BCR.width='+f64hex(dw)+' POINTER! type='+p.type);}
+    else if(ww){B('FF[3]: attr_width='+w+' inner BCR.width='+f64hex(dw)+' weird='+dw);}
+    else{P('FF[3]: attr_width='+w+' inner BCR.width='+dw);}
+
+    svg.removeChild(fo3);
+  });
+
+  // FF[4]: foreignObject.x.baseVal mutation — does setting to 2^31 overflow internally?
+  hdr('FF[4]: foreignObject.x.baseVal.value mutation overflow probe');
+  var fo4=mkEl(svg,'foreignObject',{x:'0',y:'0',width:'100',height:'100'});
+  var div4=document.createElementNS(XNS,'div');
+  div4.style.cssText='width:50px;height:50px;position:absolute;left:0;top:0;background:red';
+  fo4.appendChild(div4);
+
+  [0, 1e6, 2147483648, 4294967296, 1e12].forEach(function(val){
+    try{fo4.x.baseVal.value=val;}catch(e){P('FF[4]: setting x='+val+' threw: '+e.name); return;}
+    var actual=fo4.x.baseVal.value;
+    var b=div4.getBoundingClientRect();
+    var bx=b.x;
+    var p=classifyPtr(bx);
+    var w=isWeird(bx);
+    if(p){R('FF[4]: set_x='+val+' actual_x='+actual+' div BCR.x='+f64hex(bx)+' POINTER! type='+p.type);}
+    else if(w){B('FF[4]: set_x='+val+' actual_x='+actual+' div BCR.x='+f64hex(bx)+' weird='+bx);}
+    else{P('FF[4]: set_x='+val+' actual_x='+actual+' div BCR.x='+bx);}
+  });
+
+  svg.remove();
+  prog('FF done — v40 complete');
 }
 </script>
 </body>
